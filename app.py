@@ -18,6 +18,25 @@ GROWW_OPTION_URLS = {
     "ASHOK LEYLAND": "https://groww.in/options/ashok-leyland-ltd",
 }
 
+INSTRUMENT_CARDS = {
+    "NIFTY": {
+        "icon": "📈",
+        "label": "NIFTY",
+    },
+    "BANKNIFTY": {
+        "icon": "🏦",
+        "label": "BANKNIFTY",
+    },
+    "ASHOK LEYLAND": {
+        "icon": "🚚",
+        "label": "ASHOK LEYLAND",
+    },
+    "TOP GAINER & TOP LOSER": {
+        "icon": "⚡",
+        "label": "TOP GAINER / LOSER",
+    },
+}
+
 GROWW_SLUG_MAP = {
     "ADANIENT": "adani-enterprises-ltd",
     "ADANIPORTS": "adani-ports-and-special-economic-zone-ltd",
@@ -762,27 +781,43 @@ def render_strategy(symbol, df_atm, df_nearby, df_chain, last_refresh):
         for reason in signal_reasons:
             st.write(f"- {reason}")
 
-    atm_cols = [
-        "strike", "CE_ltp", "CE_oi", "CE_previous_oi", "CE_change_oi", "CE_change_oi_pct",
-        "CE_volume", "CE_iv", "PE_ltp", "PE_oi", "PE_previous_oi", "PE_change_oi",
-        "PE_change_oi_pct", "PE_volume", "PE_iv",
-    ]
+if "selected_symbol" not in st.session_state:
+    st.session_state.selected_symbol = "NIFTY"
 
-    st.subheader("ATM Options")
-    st.dataframe(df_atm[atm_cols], use_container_width=True, hide_index=True)
-
-    st.subheader("Nearby Strikes")
-    st.dataframe(df_nearby[atm_cols], use_container_width=True, hide_index=True)
-
-    with st.expander("Full Option Chain"):
-        st.dataframe(df_chain, use_container_width=True, hide_index=True)
-
-
-selected_symbol = st.selectbox(
-    "Select Instrument",
-    ["NIFTY", "BANKNIFTY", "ASHOK LEYLAND", "TOP GAINER & TOP LOSER"],
-    index=0,
+st.markdown(
+    """
+    <style>
+    div[data-testid="column"] button {
+        width: 100%;
+        min-height: 92px;
+        border-radius: 10px;
+        background: rgba(15, 23, 42, 0.78);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        color: #f8fafc;
+        font-weight: 800;
+    }
+    div[data-testid="column"] button:hover {
+        border-color: #14b8a6;
+        background: rgba(20, 184, 166, 0.16);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
+
+cols = st.columns(len(INSTRUMENT_CARDS))
+
+for col, (symbol, item) in zip(cols, INSTRUMENT_CARDS.items()):
+    with col:
+        clicked = st.button(
+            f"{item['icon']}\n\n{item['label']}",
+            key=f"instrument_{symbol}",
+        )
+
+        if clicked:
+            st.session_state.selected_symbol = symbol
+
+selected_symbol = st.session_state.selected_symbol
 
 st.markdown(f'<div class="main-title">{selected_symbol} Option Strategy</div>', unsafe_allow_html=True)
 st.markdown(
