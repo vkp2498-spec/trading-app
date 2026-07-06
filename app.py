@@ -104,6 +104,47 @@ st.set_page_config(
     layout="wide"
 )
 
+APP_USERNAME = "vkp"
+APP_PASSWORD = "krish999"
+
+def require_login():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+
+    if st.session_state.logged_in:
+        return
+
+    st.markdown("""
+    <style>
+    .login-box {
+        max-width: 360px;
+        margin: 16vh auto 0 auto;
+        padding: 1.4rem;
+        border-radius: 14px;
+        background: rgba(15, 23, 42, 0.88);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="login-box">', unsafe_allow_html=True)
+    st.title("NIFTY Option Strategy")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    login = st.button("Login", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if login:
+        if username == APP_USERNAME and password == APP_PASSWORD:
+            st.session_state.logged_in = True
+            st.rerun()
+        else:
+            st.error("Invalid username or password")
+
+    st.stop()
+
+require_login()
+
 components.html(
     """
     <script>
