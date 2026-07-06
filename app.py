@@ -890,14 +890,14 @@ def get_upstox_account_summary():
         return {
             "available_funds": None,
             "net_pnl": None,
-            "status": f"Funds API failed: {funds_response.status_code} {funds_response.text[:120]}",
+            "status": f"Funds API failed: {funds_response.status_code} {funds_response.text[:500]}",
         }
 
     if positions_response.status_code != 200:
         return {
             "available_funds": None,
             "net_pnl": None,
-            "status": f"Positions API failed: {positions_response.status_code} {positions_response.text[:120]}",
+            "status": f"Positions API failed: {positions_response.status_code} {positions_response.text[:500]}",
         }
 
     funds_json = funds_response.json()
