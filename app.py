@@ -641,12 +641,15 @@ def expected_atm_option_prices(atm, levels, direction, confidence, signal_score)
     target_price = entry_price + 20
     stop_loss_price = max(entry_price - 10, 0)
 
+    target_price = entry_price * 1.20
+    stop_loss_price = entry_price * 0.90
+
     return {
         "trade_side": trade_side,
-        "entry_price": round(entry_price, 2),
-        "target_price": round(target_price, 2),
-        "stop_loss_price": round(stop_loss_price, 2),
-        "model_note": "Fixed intraday rule: target is current option price + ₹20, stop loss is current option price - ₹10",
+        "entry_price": round(entry_price, 0),
+        "target_price": round(target_price, 0),
+        "stop_loss_price": round(max(stop_loss_price, 0), 0),
+        "model_note": "Fixed intraday rule: target is current option price +20%, stop loss is current option price -10%",
     }
 
 
