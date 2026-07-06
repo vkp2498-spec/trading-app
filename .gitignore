@@ -1,5 +1,6 @@
+.env
+trade_state.json
+logs/
 venv/
 __pycache__/
 *.pyc
-.env
-groww_browser_profile/
