@@ -1,3 +1,4 @@
+import os
 import re
 from PIL import Image
 import asyncio
@@ -9,6 +10,20 @@ from playwright.async_api import async_playwright
 from zoneinfo import ZoneInfo
 import os
 import requests
+
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+load_env_file()
 
 NSE_HOME_URL = "https://www.nseindia.com"
 NSE_LIVE_ANALYSIS_URL = "https://www.nseindia.com/market-data/live-analysis"
@@ -862,7 +877,10 @@ def money_text(value):
 
 
 def get_upstox_account_summary():
-    access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    access_token = (
+    os.getenv("UPSTOX_ANALYTICS_TOKEN")
+    or os.getenv("UPSTOX_ACCESS_TOKEN")
+    )
 
     if not access_token:
         return {
