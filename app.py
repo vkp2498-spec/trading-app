@@ -638,15 +638,15 @@ def expected_atm_option_prices(atm, levels, direction, confidence, signal_score)
     target_premium_move = min(max(target_premium_move, entry_price * 0.18), entry_price * 1.20)
     sl_premium_move = min(max(sl_premium_move, entry_price * 0.22), entry_price * 0.45)
 
+    target_price = entry_price + 20
+    stop_loss_price = max(entry_price - 10, 0)
+
     return {
         "trade_side": trade_side,
         "entry_price": round(entry_price, 2),
-        "target_price": round(entry_price + target_premium_move, 2),
-        "stop_loss_price": round(max(entry_price - sl_premium_move, 0), 2),
-        "model_note": (
-            f"Intraday heuristic using delta={delta}, confidence={confidence}, "
-            f"premium factor={premium_factor:.2f}, OI factor={oi_factor:.2f}"
-        ),
+        "target_price": round(target_price, 2),
+        "stop_loss_price": round(stop_loss_price, 2),
+        "model_note": "Fixed intraday rule: target is current option price + ₹20, stop loss is current option price - ₹10",
     }
 
 
