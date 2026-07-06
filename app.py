@@ -6,6 +6,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from datetime import datetime
 from playwright.async_api import async_playwright
+from zoneinfo import ZoneInfo
 
 NSE_HOME_URL = "https://www.nseindia.com"
 NSE_LIVE_ANALYSIS_URL = "https://www.nseindia.com/market-data/live-analysis"
@@ -127,45 +128,158 @@ components.html(
     height=0,
 )
 
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background:
-            radial-gradient(circle at top left, rgba(20,184,166,0.18), transparent 28%),
-            radial-gradient(circle at top right, rgba(59,130,246,0.16), transparent 30%),
-            linear-gradient(135deg, #07111f 0%, #0d1729 48%, #111827 100%);
-        color: #f8fafc;
+st.markdown("""
+<style>
+#MainMenu, footer, header {visibility: hidden;}
+
+html, body, [data-testid="stAppViewContainer"], .stApp {
+    background:
+        radial-gradient(circle at top left, rgba(20, 184, 166, 0.22), transparent 34%),
+        linear-gradient(135deg, #07111f 0%, #0b1220 48%, #101827 100%) !important;
+    color: #f8fafc !important;
+}
+
+[data-testid="stHeader"] {
+    background: transparent !important;
+}
+
+.block-container {
+    max-width: 1180px !important;
+    padding-top: 1.1rem !important;
+    padding-bottom: 2rem !important;
+}
+
+.main-title {
+    color: #f8fafc;
+    font-size: 2.4rem;
+    font-weight: 900;
+    margin-top: 1rem;
+    letter-spacing: 0;
+}
+
+.sub-title {
+    color: #cbd5e1;
+    font-size: 0.95rem;
+    font-weight: 700;
+    margin-bottom: 1rem;
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, #15c8b7, #22d3a6) !important;
+    color: #06121f !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
+    border-radius: 12px !important;
+    font-weight: 800 !important;
+    min-height: 56px !important;
+    box-shadow: 0 10px 24px rgba(0,0,0,0.22) !important;
+    white-space: pre-line !important;
+}
+
+.stButton > button:hover {
+    background: linear-gradient(135deg, #2ee6d0, #37efb8) !important;
+    color: #020617 !important;
+    transform: translateY(-1px);
+}
+
+div[data-testid="column"] .stButton > button {
+    min-height: 78px !important;
+    font-size: 0.92rem !important;
+    line-height: 1.2 !important;
+}
+
+.strategy-card {
+    background: rgba(15, 23, 42, 0.84) !important;
+    border: 1px solid rgba(148, 163, 184, 0.28) !important;
+    border-radius: 12px !important;
+    padding: 1.25rem 1.35rem !important;
+    margin-top: 1.05rem !important;
+    box-shadow: 0 18px 45px rgba(0,0,0,0.22);
+}
+
+.card-kicker {
+    color: #aeb9ca !important;
+    font-size: 0.82rem;
+    font-weight: 800;
+    margin-bottom: 0.75rem;
+}
+
+.signal-text {
+    font-size: 1.65rem;
+    font-weight: 900;
+    line-height: 1.2;
+}
+
+.levels-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 1rem;
+}
+
+.level-label {
+    color: #94a3b8;
+    font-size: 0.82rem;
+    font-weight: 700;
+    margin-bottom: 0.35rem;
+}
+
+.level-value {
+    color: #f8fafc;
+    font-size: 1.35rem;
+    font-weight: 900;
+}
+
+.green { color: #22c55e !important; }
+.red { color: #ef4444 !important; }
+.amber { color: #f59e0b !important; }
+.muted { color: #94a3b8 !important; }
+
+@media (max-width: 760px) {
+    .block-container {
+        padding-left: 0.85rem !important;
+        padding-right: 0.85rem !important;
+        padding-top: 0.65rem !important;
     }
+
     .main-title {
-        font-size: 42px;
-        font-weight: 800;
-        color: #f8fafc;
-        margin-bottom: 4px;
+        font-size: 1.8rem;
+        margin-top: 0.7rem;
     }
+
     .sub-title {
-        color: #cbd5e1;
-        font-size: 16px;
-        margin-bottom: 24px;
+        font-size: 0.84rem;
     }
-    [data-testid="stMetricValue"] { color: #f8fafc; }
-    [data-testid="stMetricLabel"] { color: #cbd5e1; }
-    div.stButton > button {
-        background: #14b8a6;
-        color: #03111f;
-        border: 0;
-        border-radius: 8px;
-        font-weight: 700;
-        padding: 0.55rem 1.1rem;
+
+    div[data-testid="column"] .stButton > button {
+        min-height: 64px !important;
+        font-size: 0.72rem !important;
+        padding: 0.25rem 0.1rem !important;
     }
-    div.stButton > button:hover {
-        background: #2dd4bf;
-        color: #03111f;
+
+    .strategy-card {
+        padding: 1rem !important;
+        border-radius: 10px !important;
     }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
+    .signal-text {
+        font-size: 1.22rem;
+    }
+
+    .levels-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.85rem;
+    }
+
+    .level-value {
+        font-size: 1.18rem;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
+
+IST = ZoneInfo("Asia/Kolkata")
+
+def now_ist():
+    return datetime.now(IST)
 
 
 def clean_num(x):
@@ -177,7 +291,7 @@ def clean_num(x):
 
 
 def should_use_next_week_expiry():
-    return datetime.now().weekday() in [0, 1]
+    return now_ist().weekday() in [0, 1]
 
 
 def parse_oi_with_change(text):
@@ -559,7 +673,7 @@ async def fetch_groww_options(symbol, nearby=5, option_url=None):
         )
 
         rows.append({
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
             "expiry": expiry,
             "spot": spot,
@@ -698,9 +812,10 @@ def load_top_gainer_loser_data():
 
 def render_strategy(symbol, df_atm, df_nearby, df_chain, last_refresh):
     atm = df_atm.iloc[0]
-    direction, confidence, signal_score, signal_reasons = option_chain_signal(atm)
+    atm_strike = atm["strike"]
 
-    levels = option_chain_target_stoploss(df_nearby, atm["strike"], direction)
+    direction, confidence, signal_score, signal_reasons = option_chain_signal(atm)
+    levels = option_chain_target_stoploss(df_nearby, atm_strike, direction)
 
     option_price_levels = expected_atm_option_prices(
         atm=atm,
@@ -710,47 +825,29 @@ def render_strategy(symbol, df_atm, df_nearby, df_chain, last_refresh):
         signal_score=signal_score,
     )
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Spot", f"{atm['spot']:,.2f}" if pd.notna(atm["spot"]) else "N/A")
-    col2.metric("ATM Strike", f"{atm['strike']:,.0f}")
-    col3.metric("Expiry", atm["expiry"] if atm["expiry"] else "N/A")
-    col4.metric("Bias", direction)
-    col5.metric("Confidence", confidence)
-    col6.metric("Last Refresh", last_refresh)
+    trade_side = option_price_levels.get("trade_side", "N/A")
 
-    signal_color = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#f59e0b"}.get(direction, "#f8fafc")
+    if trade_side == "ATM CALL":
+        buy_strike_text = f"{int(atm_strike):,} CE"
+    elif trade_side == "ATM PUT":
+        buy_strike_text = f"{int(atm_strike):,} PE"
+    else:
+        buy_strike_text = "N/A"
+
+    signal_class = {
+        "BULLISH": "green",
+        "BEARISH": "red",
+        "NEUTRAL": "amber",
+    }.get(direction, "muted")
 
     st.markdown(
         f"""
-        <div style="margin:12px 0 20px 0;padding:16px 18px;border-radius:8px;
-        background:rgba(15,23,42,0.78);border:1px solid rgba(148,163,184,0.25);">
-            <div style="font-size:14px;color:#cbd5e1;">OPTION CHAIN SIGNAL</div>
-            <div style="font-size:30px;font-weight:800;color:{signal_color};">
+        <div class="strategy-card">
+            <div class="card-kicker">OPTION CHAIN SIGNAL</div>
+            <div class="signal-text {signal_class}">
                 {direction} | CONFIDENCE: {confidence}
             </div>
-            <div style="font-size:13px;color:#94a3b8;margin-top:6px;">Score: {signal_score}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    target_text = f"{levels['target']:,.0f}" if levels["target"] is not None else "N/A"
-    sl_text = f"{levels['stop_loss']:,.0f}" if levels["stop_loss"] is not None else "N/A"
-    support_text = f"{levels['support']:,.0f}" if levels["support"] is not None else "N/A"
-    resistance_text = f"{levels['resistance']:,.0f}" if levels["resistance"] is not None else "N/A"
-
-    st.markdown(
-        f"""
-        <div style="margin:12px 0 24px 0;padding:16px 18px;border-radius:8px;
-        background:rgba(2,6,23,0.72);border:1px solid rgba(148,163,184,0.25);">
-            <div style="font-size:14px;color:#cbd5e1;">OPTION WRITING LEVELS</div>
-            <div style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:14px;margin-top:12px;">
-                <div><div style="color:#94a3b8;font-size:13px;">Immediate Target</div><div style="color:#22c55e;font-size:28px;font-weight:800;">{target_text}</div></div>
-                <div><div style="color:#94a3b8;font-size:13px;">Immediate Stop Loss</div><div style="color:#ef4444;font-size:28px;font-weight:800;">{sl_text}</div></div>
-                <div><div style="color:#94a3b8;font-size:13px;">Nearest Support</div><div style="color:#f8fafc;font-size:24px;font-weight:700;">{support_text}</div></div>
-                <div><div style="color:#94a3b8;font-size:13px;">Nearest Resistance</div><div style="color:#f8fafc;font-size:24px;font-weight:700;">{resistance_text}</div></div>
-            </div>
-            <div style="font-size:13px;color:#94a3b8;margin-top:10px;">{levels["strategy"]}</div>
+            <div class="muted" style="font-size:0.82rem;margin-top:0.7rem;">Score: {signal_score}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -762,66 +859,79 @@ def render_strategy(symbol, df_atm, df_nearby, df_chain, last_refresh):
 
     st.markdown(
         f"""
-        <div style="margin:12px 0 24px 0;padding:16px 18px;border-radius:8px;
-        background:rgba(15,23,42,0.82);border:1px solid rgba(148,163,184,0.25);">
-            <div style="font-size:14px;color:#cbd5e1;">EXPECTED ATM OPTION PRICE</div>
-            <div style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:14px;margin-top:12px;">
-                <div><div style="color:#94a3b8;font-size:13px;">Trade Side</div><div style="color:#f8fafc;font-size:24px;font-weight:800;">{option_price_levels["trade_side"]}</div></div>
-                <div><div style="color:#94a3b8;font-size:13px;">Current Price</div><div style="color:#f8fafc;font-size:24px;font-weight:800;">{entry_text}</div></div>
-                <div><div style="color:#94a3b8;font-size:13px;">Target Price</div><div style="color:#22c55e;font-size:28px;font-weight:800;">{target_price_text}</div></div>
-                <div><div style="color:#94a3b8;font-size:13px;">Stop Loss Price</div><div style="color:#ef4444;font-size:28px;font-weight:800;">{sl_price_text}</div></div>
+        <div class="strategy-card">
+            <div class="card-kicker">EXPECTED ATM OPTION PRICE</div>
+            <div class="levels-grid">
+                <div>
+                    <div class="level-label">Buy Strike</div>
+                    <div class="level-value">{buy_strike_text}</div>
+                </div>
+                <div>
+                    <div class="level-label">Trade Side</div>
+                    <div class="level-value">{trade_side}</div>
+                </div>
+                <div>
+                    <div class="level-label">Current Price</div>
+                    <div class="level-value">{entry_text}</div>
+                </div>
+                <div>
+                    <div class="level-label">Target Price</div>
+                    <div class="level-value green">{target_price_text}</div>
+                </div>
+                <div>
+                    <div class="level-label">Stop Loss Price</div>
+                    <div class="level-value red">{sl_price_text}</div>
+                </div>
             </div>
-            <div style="font-size:13px;color:#94a3b8;margin-top:10px;">{option_price_levels["model_note"]}</div>
+            <div class="muted" style="font-size:0.82rem;margin-top:0.9rem;">
+                {option_price_levels["model_note"]}
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     with st.expander("Signal Reasoning"):
-        for reason in signal_reasons:
-            st.write(f"- {reason}")
+        if signal_reasons:
+            for reason in signal_reasons:
+                st.write(f"- {reason}")
+        else:
+            st.write("No strong signal reason found.")
 
 if "selected_symbol" not in st.session_state:
     st.session_state.selected_symbol = "NIFTY"
 
-st.markdown(
-    """
-    <style>
-    div[data-testid="column"] button {
-        width: 100%;
-        min-height: 92px;
-        border-radius: 10px;
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.25);
-        color: #f8fafc;
-        font-weight: 800;
-    }
-    div[data-testid="column"] button:hover {
-        border-color: #14b8a6;
-        background: rgba(20, 184, 166, 0.16);
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-cols = st.columns(len(INSTRUMENT_CARDS))
+
+cols = st.columns(len(INSTRUMENT_CARDS), gap="small")
 
 for col, (symbol, item) in zip(cols, INSTRUMENT_CARDS.items()):
     with col:
         clicked = st.button(
             f"{item['icon']}\n\n{item['label']}",
             key=f"instrument_{symbol}",
+            use_container_width=True,
         )
 
-        if clicked:
+        if clicked and st.session_state.selected_symbol != symbol:
             st.session_state.selected_symbol = symbol
+            st.session_state.pop("df_atm", None)
+            st.session_state.pop("df_nearby", None)
+            st.session_state.pop("df_chain", None)
+            st.session_state.pop("top_movers_data", None)
+            st.session_state.pop("last_refresh", None)
+            st.rerun()
 
 selected_symbol = st.session_state.selected_symbol
 
-st.markdown(f'<div class="main-title">{selected_symbol} Option Strategy</div>', unsafe_allow_html=True)
+title_symbol = selected_symbol.replace("TOP GAINER & TOP LOSER", "Top Movers")
+
 st.markdown(
-    f'<div class="sub-title">Current time: {datetime.now().strftime("%d %b %Y, %I:%M:%S %p")}</div>',
+    f'<div class="main-title">{title_symbol}</div>',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    f'<div class="sub-title">Current time: {now_ist().strftime("%d %b %Y, %I:%M:%S %p")}</div>',
     unsafe_allow_html=True,
 )
 
@@ -838,7 +948,7 @@ if selected_symbol == "TOP GAINER & TOP LOSER":
     if "top_movers_data" not in st.session_state or refresh:
         with st.spinner("Fetching NSE top F&O gainer and loser, then loading Groww option chains..."):
             st.session_state.top_movers_data = load_top_gainer_loser_data()
-            st.session_state.last_refresh = datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
+            st.session_state.last_refresh = now_ist().strftime("%d %b %Y, %I:%M:%S %p")
 
     for label, item in st.session_state.top_movers_data.items():
         st.header(f"{label}: {item['symbol']}")
@@ -860,7 +970,7 @@ if selected_symbol == "TOP GAINER & TOP LOSER":
 if "df_atm" not in st.session_state or refresh:
     with st.spinner(f"Fetching latest {selected_symbol} option-chain data..."):
         st.session_state.df_atm, st.session_state.df_nearby, st.session_state.df_chain = load_data(selected_symbol)
-        st.session_state.last_refresh = datetime.now().strftime("%d %b %Y, %I:%M:%S %p")
+        st.session_state.last_refresh = now_ist().strftime("%d %b %Y, %I:%M:%S %p")
 
 render_strategy(
     symbol=selected_symbol,
@@ -870,6 +980,4 @@ render_strategy(
     last_refresh=st.session_state.last_refresh,
 )
 
-st.caption(
-    "Signal, target, stop loss, and expected option prices are simple option-writing heuristics. Not a trading recommendation."
-)
+st.caption("Heuristic view only. Not a trading recommendation.")
