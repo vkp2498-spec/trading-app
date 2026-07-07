@@ -28,7 +28,7 @@ ENV_FILE = BASE_DIR / ".env"
 INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 
 TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
-MAX_TRADES_PER_DAY = 5
+MAX_TRADES_PER_DAY = 2
 
 UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
 UPSTOX_ORDER_DETAILS_URL = "https://api.upstox.com/v2/order/details"
