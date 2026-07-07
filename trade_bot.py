@@ -286,7 +286,15 @@ def run_signal_check():
         "payload": payload,
     })
 
-    log(f"LIVE GTT placed: {gtt_ids[0]}")
+    log(
+    f"LIVE GTT placed: {gtt_ids[0]} "
+    f"symbol={instrument['trading_symbol']} "
+    f"qty={instrument['lot_size']} "
+    f"direction={direction} "
+    f"entry={entry_price} "
+    f"target={target_price} "
+    f"stop_loss={stop_loss_price}"
+)
 
 def main():
     load_env()
