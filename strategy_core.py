@@ -1,5 +1,4 @@
 import os
-import json
 import socket
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -19,9 +18,19 @@ IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 
-NIFTY_INDEX_KEY = "NSE_INDEX|Nifty 50"
 UPSTOX_OPTION_CONTRACT_URL = "https://api.upstox.com/v2/option/contract"
 UPSTOX_OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
+
+INDEX_CONFIG = {
+    "NIFTY": {
+        "instrument_key": "NSE_INDEX|Nifty 50",
+        "use_next_expiry_on_mon_tue": True,
+    },
+    "BANKNIFTY": {
+        "instrument_key": "NSE_INDEX|Nifty Bank",
+        "use_next_expiry_on_mon_tue": False,
+    },
+}
 
 
 def load_env_file():
@@ -33,7 +42,6 @@ def load_env_file():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
@@ -45,18 +53,20 @@ def now_ist():
     return datetime.now(IST)
 
 
-def should_use_next_week_expiry():
-    # Monday = 0, Tuesday = 1
-    return now_ist().weekday() in [0, 1]
+def should_use_next_week_expiry(symbol):
+    return (
+        INDEX_CONFIG[symbol]["use_next_expiry_on_mon_tue"]
+        and now_ist().weekday() in [0, 1]
+    )
 
 
-def choose_expiry(expiries):
+def choose_expiry(symbol, expiries):
     expiries = sorted([e for e in expiries if e])
 
     if not expiries:
-        raise RuntimeError("No expiries available from Upstox")
+        raise RuntimeError(f"No expiries available for {symbol}")
 
-    if should_use_next_week_expiry() and len(expiries) >= 2:
+    if should_use_next_week_expiry(symbol) and len(expiries) >= 2:
         return expiries[1]
 
     return expiries[0]
@@ -64,10 +74,8 @@ def choose_expiry(expiries):
 
 def upstox_market_token():
     token = os.getenv("UPSTOX_ANALYTICS_TOKEN") or os.getenv("UPSTOX_ACCESS_TOKEN")
-
     if not token:
-        raise RuntimeError("No Upstox token found. Set UPSTOX_ANALYTICS_TOKEN or UPSTOX_ACCESS_TOKEN in .env")
-
+        raise RuntimeError("No Upstox token found in .env")
     return token
 
 
@@ -80,36 +88,34 @@ def upstox_headers():
 
 def upstox_get(url, params=None):
     response = requests.get(url, headers=upstox_headers(), params=params, timeout=30)
-
     if response.status_code >= 300:
         raise RuntimeError(f"Upstox API failed {response.status_code}: {response.text[:500]}")
-
     return response.json()
 
 
-def get_nifty_expiries_from_upstox():
+def get_expiries_from_upstox(symbol):
     payload = upstox_get(
         UPSTOX_OPTION_CONTRACT_URL,
-        params={"instrument_key": NIFTY_INDEX_KEY},
+        params={"instrument_key": INDEX_CONFIG[symbol]["instrument_key"]},
     )
 
     data = payload.get("data", [])
     expiries = sorted({item.get("expiry") for item in data if item.get("expiry")})
 
     if not expiries:
-        raise RuntimeError("No NIFTY expiries found from Upstox option contract API")
+        raise RuntimeError(f"No expiries found for {symbol}")
 
     return expiries
 
 
-def fetch_upstox_nifty_option_chain(nearby=5):
-    expiries = get_nifty_expiries_from_upstox()
-    expiry = choose_expiry(expiries)
+def fetch_upstox_option_chain(symbol, nearby=5):
+    expiries = get_expiries_from_upstox(symbol)
+    expiry = choose_expiry(symbol, expiries)
 
     payload = upstox_get(
         UPSTOX_OPTION_CHAIN_URL,
         params={
-            "instrument_key": NIFTY_INDEX_KEY,
+            "instrument_key": INDEX_CONFIG[symbol]["instrument_key"],
             "expiry_date": expiry,
         },
     )
@@ -127,7 +133,7 @@ def fetch_upstox_nifty_option_chain(nearby=5):
 
         rows.append({
             "timestamp": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": "NIFTY",
+            "symbol": symbol,
             "expiry": expiry,
             "spot": item.get("underlying_spot_price"),
             "strike": item.get("strike_price"),
@@ -152,7 +158,7 @@ def fetch_upstox_nifty_option_chain(nearby=5):
     df_chain = pd.DataFrame(rows)
 
     if df_chain.empty:
-        raise RuntimeError("No Upstox NIFTY option-chain rows found")
+        raise RuntimeError(f"No Upstox option-chain rows found for {symbol}")
 
     numeric_cols = [
         "spot", "strike",
@@ -244,27 +250,12 @@ def option_chain_target_stoploss(df_nearby, atm_strike, direction):
         resistance = resistances.sort_values(["CE_oi", "strike"], ascending=[False, True]).iloc[0]["strike"]
 
     if direction == "BULLISH":
-        return {
-            "target": resistance,
-            "stop_loss": support,
-            "support": support,
-            "resistance": resistance,
-        }
+        return {"target": resistance, "stop_loss": support, "support": support, "resistance": resistance}
 
     if direction == "BEARISH":
-        return {
-            "target": support,
-            "stop_loss": resistance,
-            "support": support,
-            "resistance": resistance,
-        }
+        return {"target": support, "stop_loss": resistance, "support": support, "resistance": resistance}
 
-    return {
-        "target": None,
-        "stop_loss": None,
-        "support": support,
-        "resistance": resistance,
-    }
+    return {"target": None, "stop_loss": None, "support": support, "resistance": resistance}
 
 
 def expected_atm_option_prices(atm, levels, direction, confidence, signal_score):
@@ -278,34 +269,21 @@ def expected_atm_option_prices(atm, levels, direction, confidence, signal_score)
         trade_side = "ATM PUT"
         entry_price = pe_ltp
     else:
-        return {
-            "trade_side": "NO TRADE",
-            "entry_price": None,
-            "target_price": None,
-            "stop_loss_price": None,
-        }
+        return {"trade_side": "NO TRADE", "entry_price": None, "target_price": None, "stop_loss_price": None}
 
     if entry_price is None:
-        return {
-            "trade_side": trade_side,
-            "entry_price": None,
-            "target_price": None,
-            "stop_loss_price": None,
-        }
-
-    target_price = entry_price * 1.20
-    stop_loss_price = entry_price * 0.90
+        return {"trade_side": trade_side, "entry_price": None, "target_price": None, "stop_loss_price": None}
 
     return {
         "trade_side": trade_side,
         "entry_price": round(entry_price, 0),
-        "target_price": round(target_price, 0),
-        "stop_loss_price": round(max(stop_loss_price, 0), 0),
+        "target_price": round(entry_price * 1.20, 0),
+        "stop_loss_price": round(max(entry_price * 0.90, 0), 0),
     }
 
 
-def get_nifty_recommendation():
-    df_atm, df_nearby, df_chain = fetch_upstox_nifty_option_chain(nearby=5)
+def get_index_recommendation(symbol):
+    df_atm, df_nearby, df_chain = fetch_upstox_option_chain(symbol, nearby=5)
 
     atm = df_atm.iloc[0]
 
@@ -314,6 +292,7 @@ def get_nifty_recommendation():
     prices = expected_atm_option_prices(atm, levels, direction, confidence, score)
 
     return {
+        "symbol": symbol,
         "direction": direction,
         "confidence": confidence,
         "score": score,
@@ -322,3 +301,11 @@ def get_nifty_recommendation():
         "levels": levels,
         "prices": prices,
     }
+
+
+def get_nifty_recommendation():
+    return get_index_recommendation("NIFTY")
+
+
+def get_banknifty_recommendation():
+    return get_index_recommendation("BANKNIFTY")

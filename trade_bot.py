@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import requests
 import urllib3.util.connection as urllib3_cn
 
-from strategy_core import get_nifty_recommendation, now_ist
+from strategy_core import get_index_recommendation, now_ist
 
 
 def allowed_gai_family():
@@ -23,18 +23,30 @@ urllib3_cn.allowed_gai_family = allowed_gai_family
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "trade_state.json"
 ENV_FILE = BASE_DIR / ".env"
 INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
-
 TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
-MAX_TRADES_PER_DAY = 2
+
+SYMBOLS = ["NIFTY", "BANKNIFTY"]
+MAX_TRADES_PER_SYMBOL_PER_DAY = 2
+
+SYMBOL_CONFIG = {
+    "NIFTY": {
+        "underlying_candidates": ["NIFTY"],
+    },
+    "BANKNIFTY": {
+        "underlying_candidates": ["BANKNIFTY", "NIFTY BANK"],
+    },
+}
 
 UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
 UPSTOX_ORDER_DETAILS_URL = "https://api.upstox.com/v2/order/details"
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
-UPSTOX_EXIT_POSITIONS_URL = "https://api.upstox.com/v2/order/positions/exit"
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+
+
+def state_file(symbol):
+    return BASE_DIR / f"trade_state_{symbol}.json"
 
 
 def load_env():
@@ -71,63 +83,64 @@ def to_int(value, default=0):
         return default
 
 
-def round_tick(value, tick=0.05):
-    return round(round(float(value) / tick) * tick, 2)
+def read_json(path, default):
+    if not path.exists():
+        return default
+
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    path.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def read_state(symbol):
+    return read_json(state_file(symbol), {})
+
+
+def write_state(symbol, state):
+    write_json(state_file(symbol), state)
+
+
+def clear_state(symbol):
+    write_state(symbol, {})
+
 
 def read_trade_count():
     today = now_ist().strftime("%Y-%m-%d")
-
-    if not TRADE_COUNT_FILE.exists():
-        return {"date": today, "count": 0}
-
-    try:
-        data = json.loads(TRADE_COUNT_FILE.read_text())
-    except Exception:
-        return {"date": today, "count": 0}
+    data = read_json(TRADE_COUNT_FILE, {"date": today, "counts": {}})
 
     if data.get("date") != today:
-        return {"date": today, "count": 0}
+        return {"date": today, "counts": {}}
 
-    return {
-        "date": today,
-        "count": int(data.get("count", 0)),
-    }
+    if "counts" not in data:
+        data["counts"] = {}
 
-
-def write_trade_count(count):
-    TRADE_COUNT_FILE.write_text(json.dumps({
-        "date": now_ist().strftime("%Y-%m-%d"),
-        "count": int(count),
-    }, indent=2))
+    return data
 
 
-def increment_trade_count():
+def write_trade_count(data):
+    write_json(TRADE_COUNT_FILE, data)
+
+
+def trade_count_for(symbol):
     data = read_trade_count()
-    new_count = data["count"] + 1
-    write_trade_count(new_count)
-    return new_count
+    return int(data.get("counts", {}).get(symbol, 0))
 
 
-def max_trades_reached():
+def increment_trade_count(symbol):
     data = read_trade_count()
-    return data["count"] >= MAX_TRADES_PER_DAY
+    counts = data.setdefault("counts", {})
+    counts[symbol] = int(counts.get(symbol, 0)) + 1
+    write_trade_count(data)
+    return counts[symbol]
 
 
-def read_state():
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def write_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
-
-
-def clear_state():
-    write_state({})
+def max_trades_reached(symbol):
+    return trade_count_for(symbol) >= MAX_TRADES_PER_SYMBOL_PER_DAY
 
 
 def upstox_headers():
@@ -144,8 +157,10 @@ def upstox_headers():
 
 def upstox_request(method, url, **kwargs):
     response = requests.request(method, url, headers=upstox_headers(), timeout=30, **kwargs)
+
     if response.status_code >= 300:
         raise RuntimeError(f"Upstox API failed {response.status_code}: {response.text[:500]}")
+
     return response.json()
 
 
@@ -155,7 +170,7 @@ def place_market_order(instrument, transaction_type, quantity):
         "product": "I",
         "validity": "DAY",
         "price": 0,
-        "tag": "nifty_bot",
+        "tag": "index_bot",
         "instrument_token": instrument["instrument_key"],
         "order_type": "MARKET",
         "transaction_type": transaction_type,
@@ -186,10 +201,7 @@ def wait_for_order_complete(order_id, attempts=5, delay_seconds=2):
         latest = get_order_details(order_id)
         status = str(latest.get("status", "")).lower()
 
-        if status in {"complete", "completed", "traded"}:
-            return latest
-
-        if status in {"rejected", "cancelled", "canceled"}:
+        if status in {"complete", "completed", "traded", "rejected", "cancelled", "canceled"}:
             return latest
 
         time_module.sleep(delay_seconds)
@@ -241,10 +253,6 @@ def position_avg_price(position):
     return None
 
 
-def exit_nse_fo_positions():
-    return upstox_request("POST", UPSTOX_EXIT_POSITIONS_URL, params={"segment": "NSE_FO"})
-
-
 def ensure_instruments_file():
     if INSTRUMENT_CACHE.exists():
         return
@@ -271,10 +279,12 @@ def parse_expiry(expiry_text):
     raise RuntimeError(f"Could not parse expiry: {expiry_text}")
 
 
-def find_nifty_option_instrument(expiry_text, strike, option_type):
+def find_index_option_instrument(symbol, expiry_text, strike, option_type):
     ensure_instruments_file()
+
     wanted_expiry = parse_expiry(expiry_text)
     wanted_strike = float(strike)
+    underlying_candidates = set(SYMBOL_CONFIG[symbol]["underlying_candidates"])
 
     with gzip.open(INSTRUMENT_CACHE, "rt", encoding="utf-8") as f:
         instruments = json.load(f)
@@ -284,7 +294,7 @@ def find_nifty_option_instrument(expiry_text, strike, option_type):
     for item in instruments:
         if item.get("segment") != "NSE_FO":
             continue
-        if item.get("underlying_symbol") != "NIFTY":
+        if item.get("underlying_symbol") not in underlying_candidates:
             continue
         if item.get("instrument_type") != option_type:
             continue
@@ -305,7 +315,7 @@ def find_nifty_option_instrument(expiry_text, strike, option_type):
             matches.append(item)
 
     if not matches:
-        raise RuntimeError(f"No Upstox instrument found for NIFTY {int(strike)} {option_type} {expiry_text}")
+        raise RuntimeError(f"No Upstox instrument found for {symbol} {int(strike)} {option_type} {expiry_text}")
 
     return sorted(matches, key=lambda x: x.get("lot_size", 0))[0]
 
@@ -315,12 +325,13 @@ def market_window_ok():
     return time(9, 30) <= now <= time(15, 15)
 
 
-def save_open_position_state(order_id, instrument, direction, confidence, score, entry_price):
+def save_open_position_state(symbol, order_id, instrument, direction, confidence, score, entry_price):
     target_price = round(float(entry_price) * 1.20, 0)
     stop_loss_price = round(float(entry_price) * 0.90, 0)
 
     state = {
         "date": now_ist().strftime("%Y-%m-%d"),
+        "symbol": symbol,
         "buy_order_id": order_id,
         "instrument_key": instrument["instrument_key"],
         "trading_symbol": instrument["trading_symbol"],
@@ -335,16 +346,16 @@ def save_open_position_state(order_id, instrument, direction, confidence, score,
         "created_at": now_ist().isoformat(),
     }
 
-    write_state(state)
+    write_state(symbol, state)
 
     log(
-        f"POSITION OPEN: symbol={instrument['trading_symbol']} "
+        f"{symbol} POSITION OPEN: symbol={instrument['trading_symbol']} "
         f"qty={instrument['lot_size']} entry={state['entry_price']} "
         f"target={target_price} stop_loss={stop_loss_price}"
     )
 
 
-def handle_existing_state(state):
+def handle_existing_state(symbol, state):
     instrument_key = state.get("instrument_key")
     if not instrument_key:
         return False
@@ -358,7 +369,7 @@ def handle_existing_state(state):
         stop_loss_price = float(state.get("stop_loss_price"))
 
         log(
-            f"Open position active: symbol={state.get('trading_symbol')} "
+            f"{symbol} open position active: {state.get('trading_symbol')} "
             f"qty={qty} ltp={ltp} entry={state.get('entry_price')} "
             f"target={target_price} stop_loss={stop_loss_price}"
         )
@@ -371,8 +382,8 @@ def handle_existing_state(state):
             }
 
             result, payload = place_market_order(instrument, "SELL", qty)
-            log(f"{exit_reason} exit MARKET SELL placed: result={result} payload={payload}")
-            clear_state()
+            log(f"{symbol} {exit_reason} exit MARKET SELL placed: result={result} payload={payload}")
+            clear_state(symbol)
 
         return True
 
@@ -382,11 +393,11 @@ def handle_existing_state(state):
         details = wait_for_order_complete(buy_order_id, attempts=1, delay_seconds=0)
         status = str(details.get("status", "")).lower()
 
-        log(f"Pending BUY order check: order_id={buy_order_id} status={status}")
+        log(f"{symbol} pending BUY check: order_id={buy_order_id} status={status}")
 
         if status in {"rejected", "cancelled", "canceled"}:
-            log("Pending BUY order was rejected/cancelled. Clearing state.")
-            clear_state()
+            log(f"{symbol} pending BUY rejected/cancelled. Clearing state.")
+            clear_state(symbol)
             return True
 
         if status in {"complete", "completed", "traded"}:
@@ -395,7 +406,7 @@ def handle_existing_state(state):
             entry_price = entry_price or to_float(details.get("average_price")) or to_float(details.get("price"))
 
             if not entry_price:
-                log("BUY completed but entry price not found. Keeping state for next check.")
+                log(f"{symbol} BUY complete but entry price not found. Keeping state.")
                 return True
 
             instrument = {
@@ -405,6 +416,7 @@ def handle_existing_state(state):
             }
 
             save_open_position_state(
+                symbol=symbol,
                 order_id=buy_order_id,
                 instrument=instrument,
                 direction=state.get("direction"),
@@ -414,18 +426,22 @@ def handle_existing_state(state):
             )
             return True
 
-        log("BUY order still pending. No new order.")
+        log(f"{symbol} BUY order still pending. No new order.")
         return True
 
-    log("State exists but no matching open position found. Clearing stale state.")
-    clear_state()
+    log(f"{symbol} state exists but no matching open position found. Clearing stale state.")
+    clear_state(symbol)
     return False
 
 
 def run_squareoff():
-    state = read_state()
+    for symbol in SYMBOLS:
+        state = read_state(symbol)
 
-    if state.get("instrument_key"):
+        if not state.get("instrument_key"):
+            log(f"{symbol} no bot state found for squareoff.")
+            continue
+
         position = find_matching_position(state["instrument_key"])
 
         if position:
@@ -437,67 +453,63 @@ def run_squareoff():
 
             try:
                 result, payload = place_market_order(instrument, "SELL", qty)
-                log(f"Bot position squareoff MARKET SELL placed: result={result} payload={payload}")
+                log(f"{symbol} bot squareoff MARKET SELL placed: result={result} payload={payload}")
             except Exception as e:
-                log(f"Bot position squareoff failed: {e}")
+                log(f"{symbol} bot squareoff failed: {e}")
         else:
-            log("No bot position found for squareoff.")
+            log(f"{symbol} no matching bot position found for squareoff.")
 
-    clear_state()
+        clear_state(symbol)
 
 
-def run_signal_check():
-    if not market_window_ok():
-        log("Outside trading window. No action.")
+def process_symbol(symbol):
+    state = read_state(symbol)
+
+    if state and handle_existing_state(symbol, state):
         return
 
-    state = read_state()
-    if state and handle_existing_state(state):
-        return
-    
-    if max_trades_reached():
-        count = read_trade_count()["count"]
-        log(f"Daily trade limit reached: {count}/{MAX_TRADES_PER_DAY}. No new order.")
+    if max_trades_reached(symbol):
+        log(f"{symbol} daily trade limit reached: {trade_count_for(symbol)}/{MAX_TRADES_PER_SYMBOL_PER_DAY}. No new order.")
         return
 
-    rec = get_nifty_recommendation()
+    rec = get_index_recommendation(symbol)
     direction = rec["direction"]
     confidence = rec["confidence"]
     score = rec["score"]
     atm = rec["atm"]
     prices = rec["prices"]
 
-    log(f"Signal: {direction}, confidence={confidence}, score={score}, strike={atm['strike']}, expiry={atm['expiry']}")
+    log(f"{symbol} signal: {direction}, confidence={confidence}, score={score}, strike={atm['strike']}, expiry={atm['expiry']}")
 
     if direction not in {"BULLISH", "BEARISH"}:
-        log("No trade: neutral signal.")
+        log(f"{symbol} no trade: neutral signal.")
         return
 
     if confidence != "HIGH" or abs(score) < 4:
-        log("No trade: signal is not strong HIGH confidence.")
+        log(f"{symbol} no trade: signal is not strong HIGH confidence.")
         return
 
     option_type = "CE" if direction == "BULLISH" else "PE"
     expected_entry_price = prices.get("entry_price")
 
     if not expected_entry_price:
-        log("No trade: missing expected entry price.")
+        log(f"{symbol} no trade: missing expected entry price.")
         return
 
-    instrument = find_nifty_option_instrument(atm["expiry"], atm["strike"], option_type)
+    instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
     expected_target = round(float(expected_entry_price) * 1.20, 0)
     expected_stop_loss = round(float(expected_entry_price) * 0.90, 0)
 
     log(
-        f"Prepared MARKET BUY: {instrument['trading_symbol']} qty={instrument['lot_size']} "
+        f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={instrument['lot_size']} "
         f"expected_entry={expected_entry_price} expected_target={expected_target} "
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
 
     if not live:
-        log("DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
+        log(f"{symbol} DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
         return
 
     result, payload = place_market_order(
@@ -508,19 +520,19 @@ def run_signal_check():
 
     order_id = result.get("data", {}).get("order_id")
     if not order_id:
-        raise RuntimeError(f"Market BUY placed but no order_id returned: {result}")
+        raise RuntimeError(f"{symbol} market BUY placed but no order_id returned: {result}")
 
-    trade_count = increment_trade_count()
-    log(f"Daily trade count updated: {trade_count}/{MAX_TRADES_PER_DAY}")
-
-    log(f"MARKET BUY placed: order_id={order_id} payload={payload}")
+    count = increment_trade_count(symbol)
+    log(f"{symbol} daily trade count updated: {count}/{MAX_TRADES_PER_SYMBOL_PER_DAY}")
+    log(f"{symbol} MARKET BUY placed: order_id={order_id} payload={payload}")
 
     order_details = wait_for_order_complete(order_id)
     order_status = str(order_details.get("status", "")).lower()
 
     if order_status not in {"complete", "completed", "traded"}:
-        write_state({
+        write_state(symbol, {
             "date": now_ist().strftime("%Y-%m-%d"),
+            "symbol": symbol,
             "buy_order_id": order_id,
             "instrument_key": instrument["instrument_key"],
             "trading_symbol": instrument["trading_symbol"],
@@ -531,7 +543,7 @@ def run_signal_check():
             "status": "BUY_PLACED_NOT_COMPLETE",
             "created_at": now_ist().isoformat(),
         })
-        log(f"BUY order not complete yet. status={order_status}. Saved state.")
+        log(f"{symbol} BUY order not complete yet. status={order_status}. Saved state.")
         return
 
     position = find_matching_position(instrument["instrument_key"])
@@ -540,6 +552,7 @@ def run_signal_check():
     entry_price = entry_price or expected_entry_price
 
     save_open_position_state(
+        symbol=symbol,
         order_id=order_id,
         instrument=instrument,
         direction=direction,
@@ -547,6 +560,18 @@ def run_signal_check():
         score=score,
         entry_price=entry_price,
     )
+
+
+def run_signal_check():
+    if not market_window_ok():
+        log("Outside trading window. No action.")
+        return
+
+    for symbol in SYMBOLS:
+        try:
+            process_symbol(symbol)
+        except Exception as e:
+            log(f"{symbol} ERROR: {e}")
 
 
 def main():
