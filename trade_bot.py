@@ -2,17 +2,17 @@ import os
 import sys
 import json
 import gzip
+import time as time_module
+import socket
 import urllib.request
 from pathlib import Path
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import requests
+import urllib3.util.connection as urllib3_cn
 
 from strategy_core import get_nifty_recommendation, now_ist
-
-import socket
-import urllib3.util.connection as urllib3_cn
 
 
 def allowed_gai_family():
@@ -27,26 +27,50 @@ STATE_FILE = BASE_DIR / "trade_state.json"
 ENV_FILE = BASE_DIR / ".env"
 INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 
-UPSTOX_GTT_PLACE_URL = "https://api.upstox.com/v3/order/gtt/place"
-UPSTOX_GTT_GET_URL = "https://api.upstox.com/v3/order/gtt"
-UPSTOX_GTT_CANCEL_URL = "https://api.upstox.com/v3/order/gtt/cancel"
+UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
+UPSTOX_ORDER_DETAILS_URL = "https://api.upstox.com/v2/order/details"
+UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 UPSTOX_EXIT_POSITIONS_URL = "https://api.upstox.com/v2/order/positions/exit"
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 
+
 def load_env():
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    if not ENV_FILE.exists():
+        return
+
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
 
 def log(msg):
     print(f"{now_ist().strftime('%Y-%m-%d %H:%M:%S')} | {msg}", flush=True)
 
+
+def to_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def to_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def round_tick(value, tick=0.05):
     return round(round(float(value) / tick) * tick, 2)
+
 
 def read_state():
     if not STATE_FILE.exists():
@@ -56,21 +80,26 @@ def read_state():
     except Exception:
         return {}
 
+
 def write_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
+
 def clear_state():
     write_state({})
+
 
 def upstox_headers():
     token = os.getenv("UPSTOX_ACCESS_TOKEN")
     if not token:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN not set in .env")
+
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
+
 
 def upstox_request(method, url, **kwargs):
     response = requests.request(method, url, headers=upstox_headers(), timeout=30, **kwargs)
@@ -78,45 +107,128 @@ def upstox_request(method, url, **kwargs):
         raise RuntimeError(f"Upstox API failed {response.status_code}: {response.text[:500]}")
     return response.json()
 
-def get_gtt_details(gtt_order_id):
-    return upstox_request("GET", UPSTOX_GTT_GET_URL, params={"gtt_order_id": gtt_order_id})
 
-def is_gtt_still_active(gtt_order_id):
-    try:
-        data = get_gtt_details(gtt_order_id).get("data", [])
-    except Exception as e:
-        log(f"GTT lookup failed, assuming inactive: {e}")
-        return False
+def place_market_order(instrument, transaction_type, quantity):
+    payload = {
+        "quantity": int(quantity),
+        "product": "I",
+        "validity": "DAY",
+        "price": 0,
+        "tag": "nifty_bot",
+        "instrument_token": instrument["instrument_key"],
+        "order_type": "MARKET",
+        "transaction_type": transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False,
+        "market_protection": -1,
+    }
 
-    if not data:
-        return False
+    result = upstox_request("POST", UPSTOX_PLACE_ORDER_URL, json=payload)
+    return result, payload
 
-    statuses = []
-    for item in data:
-        for rule in item.get("rules", []):
-            statuses.append(str(rule.get("status", "")).upper())
 
-    active_statuses = {"SCHEDULED", "OPEN", "PENDING", "TRIGGERED", "INACTIVE"}
-    return any(status in active_statuses for status in statuses)
+def get_order_details(order_id):
+    result = upstox_request("GET", UPSTOX_ORDER_DETAILS_URL, params={"order_id": order_id})
+    data = result.get("data", {})
 
-def cancel_gtt(gtt_order_id):
-    return upstox_request("DELETE", UPSTOX_GTT_CANCEL_URL, json={"gtt_order_id": gtt_order_id})
+    if isinstance(data, list):
+        return data[0] if data else {}
+
+    return data or {}
+
+
+def wait_for_order_complete(order_id, attempts=5, delay_seconds=2):
+    latest = {}
+
+    for _ in range(attempts):
+        latest = get_order_details(order_id)
+        status = str(latest.get("status", "")).lower()
+
+        if status in {"complete", "completed", "traded"}:
+            return latest
+
+        if status in {"rejected", "cancelled", "canceled"}:
+            return latest
+
+        time_module.sleep(delay_seconds)
+
+    return latest
+
+
+def get_open_positions():
+    result = upstox_request("GET", UPSTOX_POSITIONS_URL)
+    return result.get("data", []) or []
+
+
+def position_quantity(position):
+    if position.get("quantity") is not None:
+        return to_int(position.get("quantity"))
+
+    if position.get("net_quantity") is not None:
+        return to_int(position.get("net_quantity"))
+
+    buy_qty = to_int(position.get("day_buy_quantity"))
+    sell_qty = to_int(position.get("day_sell_quantity"))
+    return buy_qty - sell_qty
+
+
+def find_matching_position(instrument_key):
+    for pos in get_open_positions():
+        pos_key = pos.get("instrument_token") or pos.get("instrument_key")
+        qty = position_quantity(pos)
+
+        if pos_key == instrument_key and qty > 0:
+            return pos
+
+    return None
+
+
+def position_ltp(position):
+    for key in ["last_price", "ltp", "close_price"]:
+        value = position.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def position_avg_price(position):
+    for key in ["average_price", "buy_price", "day_buy_price"]:
+        value = position.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
 
 def exit_nse_fo_positions():
     return upstox_request("POST", UPSTOX_EXIT_POSITIONS_URL, params={"segment": "NSE_FO"})
 
+
 def ensure_instruments_file():
     if INSTRUMENT_CACHE.exists():
         return
+
     log("Downloading Upstox instrument file...")
     urllib.request.urlretrieve(UPSTOX_INSTRUMENTS_URL, INSTRUMENT_CACHE)
 
+
 def parse_expiry(expiry_text):
-    # Example: "07 Jul"
-    dt = datetime.strptime(f"{expiry_text} {now_ist().year}", "%d %b %Y").date()
-    if dt < now_ist().date():
-        dt = datetime.strptime(f"{expiry_text} {now_ist().year + 1}", "%d %b %Y").date()
-    return dt
+    text = str(expiry_text).strip()
+
+    for fmt in ["%Y-%m-%d", "%d %b", "%d %b %Y"]:
+        try:
+            if fmt == "%d %b":
+                dt = datetime.strptime(f"{text} {now_ist().year}", "%d %b %Y").date()
+                if dt < now_ist().date():
+                    dt = datetime.strptime(f"{text} {now_ist().year + 1}", "%d %b %Y").date()
+                return dt
+
+            return datetime.strptime(text, fmt).date()
+        except Exception:
+            continue
+
+    raise RuntimeError(f"Could not parse expiry: {expiry_text}")
+
 
 def find_nifty_option_instrument(expiry_text, strike, option_type):
     ensure_instruments_file()
@@ -127,6 +239,7 @@ def find_nifty_option_instrument(expiry_text, strike, option_type):
         instruments = json.load(f)
 
     matches = []
+
     for item in instruments:
         if item.get("segment") != "NSE_FO":
             continue
@@ -138,7 +251,15 @@ def find_nifty_option_instrument(expiry_text, strike, option_type):
             continue
 
         expiry_raw = item.get("expiry")
-        expiry_date = datetime.fromtimestamp(expiry_raw / 1000, IST).date() if isinstance(expiry_raw, int) else None
+
+        if isinstance(expiry_raw, int):
+            expiry_date = datetime.fromtimestamp(expiry_raw / 1000, IST).date()
+        else:
+            try:
+                expiry_date = parse_expiry(expiry_raw)
+            except Exception:
+                expiry_date = None
+
         if expiry_date == wanted_expiry:
             matches.append(item)
 
@@ -147,50 +268,139 @@ def find_nifty_option_instrument(expiry_text, strike, option_type):
 
     return sorted(matches, key=lambda x: x.get("lot_size", 0))[0]
 
-def place_gtt_order(instrument, entry_price, target_price, stop_loss_price):
-    payload = {
-        "type": "MULTIPLE",
-        "quantity": int(instrument["lot_size"]),
-        "product": "I",
-        "instrument_token": instrument["instrument_key"],
-        "transaction_type": "BUY",
-        "rules": [
-            {
-                "strategy": "ENTRY",
-                "trigger_type": "IMMEDIATE",
-                "trigger_price": round_tick(entry_price),
-            },
-            {
-                "strategy": "TARGET",
-                "trigger_type": "IMMEDIATE",
-                "trigger_price": round_tick(target_price),
-            },
-            {
-                "strategy": "STOPLOSS",
-                "trigger_type": "IMMEDIATE",
-                "trigger_price": round_tick(stop_loss_price),
-            },
-        ],
-    }
-    return upstox_request("POST", UPSTOX_GTT_PLACE_URL, json=payload), payload
 
 def market_window_ok():
     now = now_ist().time()
     return time(9, 30) <= now <= time(15, 15)
 
+
+def save_open_position_state(order_id, instrument, direction, confidence, score, entry_price):
+    target_price = round(float(entry_price) * 1.20, 0)
+    stop_loss_price = round(float(entry_price) * 0.90, 0)
+
+    state = {
+        "date": now_ist().strftime("%Y-%m-%d"),
+        "buy_order_id": order_id,
+        "instrument_key": instrument["instrument_key"],
+        "trading_symbol": instrument["trading_symbol"],
+        "quantity": int(instrument["lot_size"]),
+        "direction": direction,
+        "confidence": confidence,
+        "score": score,
+        "entry_price": round(float(entry_price), 0),
+        "target_price": target_price,
+        "stop_loss_price": stop_loss_price,
+        "status": "POSITION_OPEN",
+        "created_at": now_ist().isoformat(),
+    }
+
+    write_state(state)
+
+    log(
+        f"POSITION OPEN: symbol={instrument['trading_symbol']} "
+        f"qty={instrument['lot_size']} entry={state['entry_price']} "
+        f"target={target_price} stop_loss={stop_loss_price}"
+    )
+
+
+def handle_existing_state(state):
+    instrument_key = state.get("instrument_key")
+    if not instrument_key:
+        return False
+
+    position = find_matching_position(instrument_key)
+
+    if position:
+        ltp = position_ltp(position)
+        qty = position_quantity(position)
+        target_price = float(state.get("target_price"))
+        stop_loss_price = float(state.get("stop_loss_price"))
+
+        log(
+            f"Open position active: symbol={state.get('trading_symbol')} "
+            f"qty={qty} ltp={ltp} entry={state.get('entry_price')} "
+            f"target={target_price} stop_loss={stop_loss_price}"
+        )
+
+        if ltp is not None and (ltp >= target_price or ltp <= stop_loss_price):
+            exit_reason = "TARGET" if ltp >= target_price else "STOP_LOSS"
+            instrument = {
+                "instrument_key": instrument_key,
+                "trading_symbol": state.get("trading_symbol"),
+            }
+
+            result, payload = place_market_order(instrument, "SELL", qty)
+            log(f"{exit_reason} exit MARKET SELL placed: result={result} payload={payload}")
+            clear_state()
+
+        return True
+
+    buy_order_id = state.get("buy_order_id")
+
+    if buy_order_id and state.get("status") == "BUY_PLACED_NOT_COMPLETE":
+        details = wait_for_order_complete(buy_order_id, attempts=1, delay_seconds=0)
+        status = str(details.get("status", "")).lower()
+
+        log(f"Pending BUY order check: order_id={buy_order_id} status={status}")
+
+        if status in {"rejected", "cancelled", "canceled"}:
+            log("Pending BUY order was rejected/cancelled. Clearing state.")
+            clear_state()
+            return True
+
+        if status in {"complete", "completed", "traded"}:
+            position = find_matching_position(instrument_key)
+            entry_price = position_avg_price(position) if position else None
+            entry_price = entry_price or to_float(details.get("average_price")) or to_float(details.get("price"))
+
+            if not entry_price:
+                log("BUY completed but entry price not found. Keeping state for next check.")
+                return True
+
+            instrument = {
+                "instrument_key": instrument_key,
+                "trading_symbol": state.get("trading_symbol"),
+                "lot_size": int(state.get("quantity", 0)),
+            }
+
+            save_open_position_state(
+                order_id=buy_order_id,
+                instrument=instrument,
+                direction=state.get("direction"),
+                confidence=state.get("confidence"),
+                score=state.get("score"),
+                entry_price=entry_price,
+            )
+            return True
+
+        log("BUY order still pending. No new order.")
+        return True
+
+    log("State exists but no matching open position found. Clearing stale state.")
+    clear_state()
+    return False
+
+
 def run_squareoff():
     state = read_state()
-    gtt_order_id = state.get("gtt_order_id")
 
-    if gtt_order_id:
-        try:
-            log(f"Cancelling active GTT {gtt_order_id}")
-            cancel_gtt(gtt_order_id)
-        except Exception as e:
-            log(f"GTT cancel failed: {e}")
+    if state.get("instrument_key"):
+        position = find_matching_position(state["instrument_key"])
+
+        if position:
+            qty = position_quantity(position)
+            instrument = {
+                "instrument_key": state["instrument_key"],
+                "trading_symbol": state.get("trading_symbol"),
+            }
+            try:
+                result, payload = place_market_order(instrument, "SELL", qty)
+                log(f"State position squareoff MARKET SELL placed: result={result} payload={payload}")
+            except Exception as e:
+                log(f"State position squareoff failed: {e}")
 
     try:
-        log("Exiting NSE_FO positions")
+        log("Exiting all NSE_FO positions")
         result = exit_nse_fo_positions()
         log(f"Squareoff response: {result}")
     except Exception as e:
@@ -198,30 +408,15 @@ def run_squareoff():
 
     clear_state()
 
+
 def run_signal_check():
     if not market_window_ok():
         log("Outside trading window. No action.")
         return
 
     state = read_state()
-    gtt_order_id = state.get("gtt_order_id")
-
-    if gtt_order_id and is_gtt_still_active(gtt_order_id):
-        log(
-            "Existing GTT still active: "
-            f"{gtt_order_id}. "
-            f"symbol={state.get('trading_symbol')}, "
-            f"direction={state.get('direction')}, "
-            f"entry={state.get('entry_price')}, "
-            f"target={state.get('target_price')}, "
-            f"stop_loss={state.get('stop_loss_price')}. "
-            "No new order."
-        )
+    if state and handle_existing_state(state):
         return
-
-    if gtt_order_id:
-        log("Previous GTT no longer active. Clearing state.")
-        clear_state()
 
     rec = get_nifty_recommendation()
     direction = rec["direction"]
@@ -241,67 +436,82 @@ def run_signal_check():
         return
 
     option_type = "CE" if direction == "BULLISH" else "PE"
-    entry_price = prices.get("entry_price")
-    target_price = prices.get("target_price")
-    stop_loss_price = prices.get("stop_loss_price")
+    expected_entry_price = prices.get("entry_price")
 
-    if not entry_price or not target_price or not stop_loss_price:
-        log("No trade: missing entry/target/stop-loss price.")
-        return
-
-    if target_price <= entry_price or stop_loss_price >= entry_price:
-        log("No trade: invalid target/stop-loss relationship.")
+    if not expected_entry_price:
+        log("No trade: missing expected entry price.")
         return
 
     instrument = find_nifty_option_instrument(atm["expiry"], atm["strike"], option_type)
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
+    expected_target = round(float(expected_entry_price) * 1.20, 0)
+    expected_stop_loss = round(float(expected_entry_price) * 0.90, 0)
+
     log(
-        f"Prepared order: {instrument['trading_symbol']} qty={instrument['lot_size']} "
-        f"entry={entry_price} target={target_price} sl={stop_loss_price} live={live}"
+        f"Prepared MARKET BUY: {instrument['trading_symbol']} qty={instrument['lot_size']} "
+        f"expected_entry={expected_entry_price} expected_target={expected_target} "
+        f"expected_stop_loss={expected_stop_loss} live={live}"
     )
 
     if not live:
         log("DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
         return
 
-    result, payload = place_gtt_order(instrument, entry_price, target_price, stop_loss_price)
-    gtt_ids = result.get("data", {}).get("gtt_order_ids", [])
+    result, payload = place_market_order(
+        instrument=instrument,
+        transaction_type="BUY",
+        quantity=instrument["lot_size"],
+    )
 
-    if not gtt_ids:
-        raise RuntimeError(f"GTT placed but no ID returned: {result}")
+    order_id = result.get("data", {}).get("order_id")
+    if not order_id:
+        raise RuntimeError(f"Market BUY placed but no order_id returned: {result}")
 
-    write_state({
-        "date": now_ist().strftime("%Y-%m-%d"),
-        "gtt_order_id": gtt_ids[0],
-        "instrument_key": instrument["instrument_key"],
-        "trading_symbol": instrument["trading_symbol"],
-        "direction": direction,
-        "confidence": confidence,
-        "score": score,
-        "entry_price": entry_price,
-        "target_price": target_price,
-        "stop_loss_price": stop_loss_price,
-        "created_at": now_ist().isoformat(),
-        "payload": payload,
-    })
+    log(f"MARKET BUY placed: order_id={order_id} payload={payload}")
 
-    log(
-    f"LIVE GTT placed: {gtt_ids[0]} "
-    f"symbol={instrument['trading_symbol']} "
-    f"qty={instrument['lot_size']} "
-    f"direction={direction} "
-    f"entry={entry_price} "
-    f"target={target_price} "
-    f"stop_loss={stop_loss_price}"
-)
+    order_details = wait_for_order_complete(order_id)
+    order_status = str(order_details.get("status", "")).lower()
+
+    if order_status not in {"complete", "completed", "traded"}:
+        write_state({
+            "date": now_ist().strftime("%Y-%m-%d"),
+            "buy_order_id": order_id,
+            "instrument_key": instrument["instrument_key"],
+            "trading_symbol": instrument["trading_symbol"],
+            "quantity": int(instrument["lot_size"]),
+            "direction": direction,
+            "confidence": confidence,
+            "score": score,
+            "status": "BUY_PLACED_NOT_COMPLETE",
+            "created_at": now_ist().isoformat(),
+        })
+        log(f"BUY order not complete yet. status={order_status}. Saved state.")
+        return
+
+    position = find_matching_position(instrument["instrument_key"])
+    entry_price = position_avg_price(position) if position else None
+    entry_price = entry_price or to_float(order_details.get("average_price"))
+    entry_price = entry_price or expected_entry_price
+
+    save_open_position_state(
+        order_id=order_id,
+        instrument=instrument,
+        direction=direction,
+        confidence=confidence,
+        score=score,
+        entry_price=entry_price,
+    )
+
 
 def main():
     load_env()
+
     if "--squareoff" in sys.argv:
         run_squareoff()
     else:
         run_signal_check()
+
 
 if __name__ == "__main__":
     main()
