@@ -27,6 +27,9 @@ STATE_FILE = BASE_DIR / "trade_state.json"
 ENV_FILE = BASE_DIR / ".env"
 INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 
+TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
+MAX_TRADES_PER_DAY = 5
+
 UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
 UPSTOX_ORDER_DETAILS_URL = "https://api.upstox.com/v2/order/details"
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
@@ -70,6 +73,44 @@ def to_int(value, default=0):
 
 def round_tick(value, tick=0.05):
     return round(round(float(value) / tick) * tick, 2)
+
+def read_trade_count():
+    today = now_ist().strftime("%Y-%m-%d")
+
+    if not TRADE_COUNT_FILE.exists():
+        return {"date": today, "count": 0}
+
+    try:
+        data = json.loads(TRADE_COUNT_FILE.read_text())
+    except Exception:
+        return {"date": today, "count": 0}
+
+    if data.get("date") != today:
+        return {"date": today, "count": 0}
+
+    return {
+        "date": today,
+        "count": int(data.get("count", 0)),
+    }
+
+
+def write_trade_count(count):
+    TRADE_COUNT_FILE.write_text(json.dumps({
+        "date": now_ist().strftime("%Y-%m-%d"),
+        "count": int(count),
+    }, indent=2))
+
+
+def increment_trade_count():
+    data = read_trade_count()
+    new_count = data["count"] + 1
+    write_trade_count(new_count)
+    return new_count
+
+
+def max_trades_reached():
+    data = read_trade_count()
+    return data["count"] >= MAX_TRADES_PER_DAY
 
 
 def read_state():
@@ -417,6 +458,11 @@ def run_signal_check():
     state = read_state()
     if state and handle_existing_state(state):
         return
+    
+    if max_trades_reached():
+        count = read_trade_count()["count"]
+        log(f"Daily trade limit reached: {count}/{MAX_TRADES_PER_DAY}. No new order.")
+        return
 
     rec = get_nifty_recommendation()
     direction = rec["direction"]
@@ -467,6 +513,9 @@ def run_signal_check():
     order_id = result.get("data", {}).get("order_id")
     if not order_id:
         raise RuntimeError(f"Market BUY placed but no order_id returned: {result}")
+
+    trade_count = increment_trade_count()
+    log(f"Daily trade count updated: {trade_count}/{MAX_TRADES_PER_DAY}")
 
     log(f"MARKET BUY placed: order_id={order_id} payload={payload}")
 
