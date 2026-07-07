@@ -3,3 +3,5 @@ pandas
 playwright
 pillow
 requests
+fastapi 
+uvicorn
