@@ -434,18 +434,14 @@ def run_squareoff():
                 "instrument_key": state["instrument_key"],
                 "trading_symbol": state.get("trading_symbol"),
             }
+
             try:
                 result, payload = place_market_order(instrument, "SELL", qty)
-                log(f"State position squareoff MARKET SELL placed: result={result} payload={payload}")
+                log(f"Bot position squareoff MARKET SELL placed: result={result} payload={payload}")
             except Exception as e:
-                log(f"State position squareoff failed: {e}")
-
-    try:
-        log("Exiting all NSE_FO positions")
-        result = exit_nse_fo_positions()
-        log(f"Squareoff response: {result}")
-    except Exception as e:
-        log(f"Squareoff failed: {e}")
+                log(f"Bot position squareoff failed: {e}")
+        else:
+            log("No bot position found for squareoff.")
 
     clear_state()
 
