@@ -11,6 +11,16 @@ import requests
 
 from strategy_core import get_nifty_recommendation, now_ist
 
+import socket
+import urllib3.util.connection as urllib3_cn
+
+
+def allowed_gai_family():
+    return socket.AF_INET
+
+
+urllib3_cn.allowed_gai_family = allowed_gai_family
+
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "trade_state.json"

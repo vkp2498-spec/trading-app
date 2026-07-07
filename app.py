@@ -11,6 +11,16 @@ from zoneinfo import ZoneInfo
 import os
 import requests
 
+import socket
+import urllib3.util.connection as urllib3_cn
+
+
+def allowed_gai_family():
+    return socket.AF_INET
+
+
+urllib3_cn.allowed_gai_family = allowed_gai_family
+
 def load_env_file(path=".env"):
     if not os.path.exists(path):
         return
