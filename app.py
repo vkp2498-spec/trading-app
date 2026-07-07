@@ -131,46 +131,46 @@ st.set_page_config(
     layout="wide"
 )
 
-APP_USERNAME = "vkp"
-APP_PASSWORD = "krish999"
+# APP_USERNAME = "vkp"
+# APP_PASSWORD = "krish999"
 
-def require_login():
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
+# def require_login():
+#     if "logged_in" not in st.session_state:
+#         st.session_state.logged_in = False
 
-    if st.session_state.logged_in:
-        return
+#     if st.session_state.logged_in:
+#         return
 
-    st.markdown("""
-    <style>
-    .login-box {
-        max-width: 360px;
-        margin: 16vh auto 0 auto;
-        padding: 1.4rem;
-        border-radius: 14px;
-        background: rgba(15, 23, 42, 0.88);
-        border: 1px solid rgba(148, 163, 184, 0.28);
-    }
-    </style>
-    """, unsafe_allow_html=True)
+#     st.markdown("""
+#     <style>
+#     .login-box {
+#         max-width: 360px;
+#         margin: 16vh auto 0 auto;
+#         padding: 1.4rem;
+#         border-radius: 14px;
+#         background: rgba(15, 23, 42, 0.88);
+#         border: 1px solid rgba(148, 163, 184, 0.28);
+#     }
+#     </style>
+#     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="login-box">', unsafe_allow_html=True)
-    st.title("NIFTY Option Strategy")
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-    login = st.button("Login", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+#     st.markdown('<div class="login-box">', unsafe_allow_html=True)
+#     st.title("NIFTY Option Strategy")
+#     username = st.text_input("Username")
+#     password = st.text_input("Password", type="password")
+#     login = st.button("Login", use_container_width=True)
+#     st.markdown("</div>", unsafe_allow_html=True)
 
-    if login:
-        if username == APP_USERNAME and password == APP_PASSWORD:
-            st.session_state.logged_in = True
-            st.rerun()
-        else:
-            st.error("Invalid username or password")
+#     if login:
+#         if username == APP_USERNAME and password == APP_PASSWORD:
+#             st.session_state.logged_in = True
+#             st.rerun()
+#         else:
+#             st.error("Invalid username or password")
 
-    st.stop()
+#     st.stop()
 
-require_login()
+# require_login()
 
 components.html(
     """
@@ -880,106 +880,106 @@ def load_data(symbol):
 def load_top_gainer_loser_data():
     return asyncio.run(fetch_top_gainer_loser_data())
 
-def money_text(value):
-    if value is None:
-        return "N/A"
-    return f"₹{float(value):,.2f}"
+# def money_text(value):
+#     if value is None:
+#         return "N/A"
+#     return f"₹{float(value):,.2f}"
 
 
-def get_upstox_account_summary():
-    access_token = (
-    os.getenv("UPSTOX_ANALYTICS_TOKEN")
-    or os.getenv("UPSTOX_ACCESS_TOKEN")
-    )
+# def get_upstox_account_summary():
+#     access_token = (
+#     os.getenv("UPSTOX_ANALYTICS_TOKEN")
+#     or os.getenv("UPSTOX_ACCESS_TOKEN")
+#     )
 
-    if not access_token:
-        return {
-            "available_funds": None,
-            "net_pnl": None,
-            "status": "UPSTOX_ACCESS_TOKEN not set",
-        }
+#     if not access_token:
+#         return {
+#             "available_funds": None,
+#             "net_pnl": None,
+#             "status": "UPSTOX_ACCESS_TOKEN not set",
+#         }
 
-    headers_v3 = {
-        "Accept": "application/json",
-        "Api-Version": "3.0",
-        "Authorization": f"Bearer {access_token}",
-    }
+#     headers_v3 = {
+#         "Accept": "application/json",
+#         "Api-Version": "3.0",
+#         "Authorization": f"Bearer {access_token}",
+#     }
 
-    headers_v2 = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {access_token}",
-    }
+#     headers_v2 = {
+#         "Accept": "application/json",
+#         "Content-Type": "application/json",
+#         "Authorization": f"Bearer {access_token}",
+#     }
 
-    funds_url = "https://api.upstox.com/v3/user/get-funds-and-margin"
-    positions_url = "https://api.upstox.com/v2/portfolio/short-term-positions"
+#     funds_url = "https://api.upstox.com/v3/user/get-funds-and-margin"
+#     positions_url = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
-    funds_response = requests.get(funds_url, headers=headers_v3, timeout=20)
-    positions_response = requests.get(positions_url, headers=headers_v2, timeout=20)
+#     funds_response = requests.get(funds_url, headers=headers_v3, timeout=20)
+#     positions_response = requests.get(positions_url, headers=headers_v2, timeout=20)
 
-    if funds_response.status_code != 200:
-        return {
-            "available_funds": None,
-            "net_pnl": None,
-            "status": f"Funds API failed: {funds_response.status_code} {funds_response.text[:500]}",
-        }
+#     if funds_response.status_code != 200:
+#         return {
+#             "available_funds": None,
+#             "net_pnl": None,
+#             "status": f"Funds API failed: {funds_response.status_code} {funds_response.text[:500]}",
+#         }
 
-    if positions_response.status_code != 200:
-        return {
-            "available_funds": None,
-            "net_pnl": None,
-            "status": f"Positions API failed: {positions_response.status_code} {positions_response.text[:500]}",
-        }
+#     if positions_response.status_code != 200:
+#         return {
+#             "available_funds": None,
+#             "net_pnl": None,
+#             "status": f"Positions API failed: {positions_response.status_code} {positions_response.text[:500]}",
+#         }
 
-    funds_json = funds_response.json()
-    positions_json = positions_response.json()
+#     funds_json = funds_response.json()
+#     positions_json = positions_response.json()
 
-    available_funds = (
-        funds_json
-        .get("data", {})
-        .get("available_to_trade", {})
-        .get("total")
-    )
+#     available_funds = (
+#         funds_json
+#         .get("data", {})
+#         .get("available_to_trade", {})
+#         .get("total")
+#     )
 
-    positions = positions_json.get("data", [])
-    net_pnl = sum(float(pos.get("pnl") or 0) for pos in positions)
+#     positions = positions_json.get("data", [])
+#     net_pnl = sum(float(pos.get("pnl") or 0) for pos in positions)
 
-    return {
-        "available_funds": available_funds,
-        "net_pnl": net_pnl,
-        "status": "Updated",
-    }
+#     return {
+#         "available_funds": available_funds,
+#         "net_pnl": net_pnl,
+#         "status": "Updated",
+#     }
 
 
-def render_account_summary(account_summary):
-    available_funds = account_summary.get("available_funds")
-    net_pnl = account_summary.get("net_pnl")
-    status = account_summary.get("status", "")
+# def render_account_summary(account_summary):
+#     available_funds = account_summary.get("available_funds")
+#     net_pnl = account_summary.get("net_pnl")
+#     status = account_summary.get("status", "")
 
-    pnl_class = "green" if net_pnl is not None and net_pnl >= 0 else "red"
+#     pnl_class = "green" if net_pnl is not None and net_pnl >= 0 else "red"
 
-    st.markdown(
-        f"""
-        <div class="strategy-card" style="margin-top:0.8rem;">
-            <div class="card-kicker">UPSTOX ACCOUNT</div>
-            <div class="levels-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));">
-                <div>
-                    <div class="level-label">Available Funds</div>
-                    <div class="level-value">{money_text(available_funds)}</div>
-                </div>
-                <div>
-                    <div class="level-label">Net P&L</div>
-                    <div class="level-value {pnl_class}">{money_text(net_pnl)}</div>
-                </div>
-                <div>
-                    <div class="level-label">Status</div>
-                    <div class="level-value" style="font-size:1rem;">{status}</div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+#     st.markdown(
+#         f"""
+#         <div class="strategy-card" style="margin-top:0.8rem;">
+#             <div class="card-kicker">UPSTOX ACCOUNT</div>
+#             <div class="levels-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));">
+#                 <div>
+#                     <div class="level-label">Available Funds</div>
+#                     <div class="level-value">{money_text(available_funds)}</div>
+#                 </div>
+#                 <div>
+#                     <div class="level-label">Net P&L</div>
+#                     <div class="level-value {pnl_class}">{money_text(net_pnl)}</div>
+#                 </div>
+#                 <div>
+#                     <div class="level-label">Status</div>
+#                     <div class="level-value" style="font-size:1rem;">{status}</div>
+#                 </div>
+#             </div>
+#         </div>
+#         """,
+#         unsafe_allow_html=True,
+#     )
 
 
 def render_strategy(symbol, df_atm, df_nearby, df_chain, last_refresh):
@@ -1109,10 +1109,10 @@ st.markdown(
 
 refresh = st.button("Refresh Data")
 
-if "account_summary" not in st.session_state or refresh:
-    st.session_state.account_summary = get_upstox_account_summary()
+# if "account_summary" not in st.session_state or refresh:
+#     st.session_state.account_summary = get_upstox_account_summary()
 
-render_account_summary(st.session_state.account_summary)
+# render_account_summary(st.session_state.account_summary)
 
 if "selected_symbol" not in st.session_state or st.session_state.selected_symbol != selected_symbol:
     st.session_state.selected_symbol = selected_symbol
