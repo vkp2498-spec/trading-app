@@ -207,7 +207,16 @@ def run_signal_check():
     gtt_order_id = state.get("gtt_order_id")
 
     if gtt_order_id and is_gtt_still_active(gtt_order_id):
-        log(f"Existing GTT still active: {gtt_order_id}. No new order.")
+        log(
+            "Existing GTT still active: "
+            f"{gtt_order_id}. "
+            f"symbol={state.get('trading_symbol')}, "
+            f"direction={state.get('direction')}, "
+            f"entry={state.get('entry_price')}, "
+            f"target={state.get('target_price')}, "
+            f"stop_loss={state.get('stop_loss_price')}. "
+            "No new order."
+        )
         return
 
     if gtt_order_id:
