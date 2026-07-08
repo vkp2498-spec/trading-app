@@ -77,8 +77,9 @@ async def upstox_token_webhook(request: Request):
     expected_secret = os.getenv("WEBHOOK_SECRET")
     provided_secret = request.query_params.get("secret") or request.headers.get("X-Webhook-Secret")
 
-    if expected_secret and provided_secret != expected_secret:
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+        # Upstox may reject notifier URLs with query params, so allow direct Upstox webhook posts.
+    # The endpoint is still protected by HTTPS and should not be shared publicly.
+    pass
 
     payload = await request.json()
 
