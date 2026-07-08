@@ -13,6 +13,7 @@ import requests
 import urllib3.util.connection as urllib3_cn
 
 from strategy_core import get_index_recommendation, now_ist
+from trade_journal import record_closed_trade
 
 
 def allowed_gai_family():
@@ -382,7 +383,22 @@ def handle_existing_state(symbol, state):
             }
 
             result, payload = place_market_order(instrument, "SELL", qty)
-            log(f"{symbol} {exit_reason} exit MARKET SELL placed: result={result} payload={payload}")
+            sell_order_id = result.get("data", {}).get("order_id")
+            exit_price = ltp
+
+            if sell_order_id:
+                sell_details = wait_for_order_complete(sell_order_id)
+                exit_price = (
+                    to_float(sell_details.get("average_price"))
+                    or to_float(sell_details.get("price"))
+                    or ltp
+                )
+
+            journal_row = record_closed_trade(state, exit_price, exit_reason)
+            log(
+                f"{symbol} {exit_reason} exit MARKET SELL placed: result={result} "
+                f"payload={payload} journal={journal_row}"
+            )
             clear_state(symbol)
 
         return True
@@ -453,7 +469,22 @@ def run_squareoff():
 
             try:
                 result, payload = place_market_order(instrument, "SELL", qty)
-                log(f"{symbol} bot squareoff MARKET SELL placed: result={result} payload={payload}")
+                sell_order_id = result.get("data", {}).get("order_id")
+                exit_price = position_ltp(position)
+
+                if sell_order_id:
+                    sell_details = wait_for_order_complete(sell_order_id)
+                    exit_price = (
+                        to_float(sell_details.get("average_price"))
+                        or to_float(sell_details.get("price"))
+                        or exit_price
+                    )
+
+                journal_row = record_closed_trade(state, exit_price, "SQUAREOFF")
+                log(
+                    f"{symbol} bot squareoff MARKET SELL placed: result={result} "
+                    f"payload={payload} journal={journal_row}"
+                )
             except Exception as e:
                 log(f"{symbol} bot squareoff failed: {e}")
         else:
