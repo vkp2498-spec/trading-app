@@ -499,8 +499,8 @@ def process_symbol(symbol):
     instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
-    expected_target = round(float(expected_entry_price) * 1.20, 0)
-    expected_stop_loss = round(float(expected_entry_price) * 0.90, 0)
+    expected_target = round(float(expected_entry_price) * 1.1, 0)
+    expected_stop_loss = round(float(expected_entry_price) * 0.925, 0)
 
     log(
         f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={instrument['lot_size']} "
