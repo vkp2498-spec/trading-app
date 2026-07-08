@@ -326,8 +326,8 @@ def market_window_ok():
 
 
 def save_open_position_state(symbol, order_id, instrument, direction, confidence, score, entry_price):
-    target_price = round(float(entry_price) * 1.20, 0)
-    stop_loss_price = round(float(entry_price) * 0.90, 0)
+    target_price = round(float(entry_price) * 1.10, 0)
+    stop_loss_price = round(float(entry_price) * 0.925, 0)
 
     state = {
         "date": now_ist().strftime("%Y-%m-%d"),
