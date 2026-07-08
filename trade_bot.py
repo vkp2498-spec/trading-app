@@ -9,6 +9,10 @@ from pathlib import Path
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+from analysis_journal import record_analysis
+from llm_decision import get_llm_decision
+from market_technicals import get_technical_analysis
+
 import requests
 import urllib3.util.connection as urllib3_cn
 
@@ -326,9 +330,19 @@ def market_window_ok():
     return time(9, 30) <= now <= time(15, 15)
 
 
-def save_open_position_state(symbol, order_id, instrument, direction, confidence, score, entry_price):
-    target_price = round(float(entry_price) * 1.10, 0)
-    stop_loss_price = round(float(entry_price) * 0.925, 0)
+def save_open_position_state(
+    symbol,
+    order_id,
+    instrument,
+    direction,
+    confidence,
+    score,
+    entry_price,
+    target_price=None,
+    stop_loss_price=None,
+    ):
+    target_price = round(float(target_price), 0) if target_price else round(float(entry_price) * 1.10, 0)
+    stop_loss_price = round(float(stop_loss_price), 0) if stop_loss_price else round(float(entry_price) * 0.925, 0)
 
     state = {
         "date": now_ist().strftime("%Y-%m-%d"),
@@ -431,16 +445,18 @@ def handle_existing_state(symbol, state):
                 "lot_size": int(state.get("quantity", 0)),
             }
 
-            save_open_position_state(
-                symbol=symbol,
-                order_id=buy_order_id,
-                instrument=instrument,
-                direction=state.get("direction"),
-                confidence=state.get("confidence"),
-                score=state.get("score"),
-                entry_price=entry_price,
-            )
-            return True
+        save_open_position_state(
+            symbol=symbol,
+            order_id=order_id,
+            instrument=instrument,
+            direction=direction,
+            confidence=confidence,
+            score=score,
+            entry_price=entry_price,
+            target_price=expected_target,
+            stop_loss_price=expected_stop_loss,
+        )
+        return True
 
         log(f"{symbol} BUY order still pending. No new order.")
         return True
@@ -533,6 +549,62 @@ def process_symbol(symbol):
     expected_target = round(float(expected_entry_price) * 1.1, 0)
     expected_stop_loss = round(float(expected_entry_price) * 0.925, 0)
 
+    option_summary = {
+    "bias": direction,
+    "confidence": confidence,
+    "score": score,
+    "strike": atm["strike"],
+    "expiry": atm["expiry"],
+    "entry_price": round(float(expected_entry_price), 2),
+    "target_price": expected_target,
+    "stop_loss_price": expected_stop_loss,
+    "reasons": rec.get("reasons", []),
+    }
+
+    try:
+        technicals = get_technical_analysis(symbol)
+    except Exception as e:
+        log(f"{symbol} technical analysis failed: {e}")
+        technicals = {
+            "four_hour": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
+            "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
+        }
+
+    llm_decision = get_llm_decision(symbol, option_summary, technicals)
+    record_analysis(symbol, option_summary, technicals, llm_decision)
+
+    log(
+        f"{symbol} analysis: option={option_summary} "
+        f"4h={technicals.get('four_hour')} "
+        f"15m={technicals.get('fifteen_min')} "
+        f"llm={llm_decision}"
+    )
+
+    if not llm_decision.get("execute_trade"):
+        log(f"{symbol} no trade: LLM/rule decision rejected trade. reason={llm_decision.get('reason')}")
+        return
+
+    if llm_decision.get("decision") != direction:
+        log(
+            f"{symbol} no trade: LLM decision {llm_decision.get('decision')} "
+            f"does not match option-chain direction {direction}."
+        )
+        return
+
+    llm_target = llm_decision.get("target_price")
+    llm_stop_loss = llm_decision.get("stop_loss_price")
+
+    if llm_target and llm_stop_loss:
+        expected_target = round(float(llm_target), 0)
+        expected_stop_loss = round(float(llm_stop_loss), 0)
+
+    if expected_target <= float(expected_entry_price) or expected_stop_loss >= float(expected_entry_price):
+        log(
+            f"{symbol} no trade: invalid target/stop from LLM. "
+            f"entry={expected_entry_price} target={expected_target} stop={expected_stop_loss}"
+        )
+        return
+
     log(
         f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={instrument['lot_size']} "
         f"expected_entry={expected_entry_price} expected_target={expected_target} "
@@ -590,6 +662,8 @@ def process_symbol(symbol):
         confidence=confidence,
         score=score,
         entry_price=entry_price,
+        target_price=expected_target,
+        stop_loss_price=expected_stop_loss,
     )
 
 
