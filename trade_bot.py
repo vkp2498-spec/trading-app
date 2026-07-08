@@ -359,6 +359,9 @@ def save_open_position_state(
         "stop_loss_price": stop_loss_price,
         "status": "POSITION_OPEN",
         "created_at": now_ist().isoformat(),
+        "highest_ltp": round(float(entry_price), 2),
+        "trailing_stop_active": False,
+        "trailing_stop_reason": "",
     }
 
     write_state(symbol, state)
@@ -369,6 +372,19 @@ def save_open_position_state(
         f"target={target_price} stop_loss={stop_loss_price}"
     )
 
+def run_position_monitor():
+    for symbol in SYMBOLS:
+        try:
+            state = read_state(symbol)
+
+            if not state:
+                log(f"{symbol} monitor: no open bot state.")
+                continue
+
+            handle_existing_state(symbol, state)
+
+        except Exception as e:
+            log(f"{symbol} monitor ERROR: {e}")
 
 def handle_existing_state(symbol, state):
     instrument_key = state.get("instrument_key")
@@ -380,6 +396,7 @@ def handle_existing_state(symbol, state):
     if position:
         ltp = position_ltp(position)
         qty = position_quantity(position)
+        state = apply_trailing_stop(symbol, state, ltp)
         target_price = float(state.get("target_price"))
         stop_loss_price = float(state.get("stop_loss_price"))
 
@@ -465,6 +482,57 @@ def handle_existing_state(symbol, state):
     clear_state(symbol)
     return False
 
+def apply_trailing_stop(symbol, state, ltp):
+    if ltp is None:
+        return state
+
+    entry_price = float(state.get("entry_price") or 0)
+    current_stop = float(state.get("stop_loss_price") or 0)
+    current_high = float(state.get("highest_ltp") or entry_price)
+
+    if entry_price <= 0:
+        return state
+
+    highest_ltp = max(current_high, float(ltp))
+    profit_pct = (highest_ltp - entry_price) / entry_price
+
+    new_stop = current_stop
+    reason = None
+
+    # Below 5% profit, keep original stop loss.
+    if profit_pct < 0.05:
+        new_stop = current_stop
+
+    # Once profit reaches 5%, protect capital near breakeven.
+    elif profit_pct < 0.10:
+        new_stop = max(current_stop, round(entry_price * 1.01, 0))
+        reason = "Trail activated: profit above 5%, stop moved near breakeven"
+
+    # Once profit reaches 10%, trail 5% below highest premium.
+    elif profit_pct < 0.20:
+        new_stop = max(current_stop, round(highest_ltp * 0.95, 0))
+        reason = "Trail tightened: profit above 10%, stop moved to 5% below high"
+
+    # Once profit reaches 20%, trail 4% below highest premium.
+    else:
+        new_stop = max(current_stop, round(highest_ltp * 0.96, 0))
+        reason = "Trail tightened: profit above 20%, stop moved to 4% below high"
+
+    state["highest_ltp"] = round(highest_ltp, 2)
+
+    if new_stop > current_stop:
+        state["stop_loss_price"] = round(new_stop, 0)
+        state["trailing_stop_active"] = True
+        state["trailing_stop_reason"] = reason
+        write_state(symbol, state)
+
+        log(
+            f"{symbol} trailing stop updated: entry={entry_price} "
+            f"ltp={ltp} highest={highest_ltp} old_stop={current_stop} "
+            f"new_stop={new_stop} reason={reason}"
+        )
+
+    return state
 
 def run_squareoff():
     for symbol in SYMBOLS:
@@ -515,9 +583,9 @@ def process_symbol(symbol):
     if state and handle_existing_state(symbol, state):
         return
 
-    if max_trades_reached(symbol):
-        log(f"{symbol} daily trade limit reached: {trade_count_for(symbol)}/{MAX_TRADES_PER_SYMBOL_PER_DAY}. No new order.")
-        return
+    # if max_trades_reached(symbol):
+    #     log(f"{symbol} daily trade limit reached: {trade_count_for(symbol)}/{MAX_TRADES_PER_SYMBOL_PER_DAY}. No new order.")
+    #     return
 
     rec = get_index_recommendation(symbol)
     direction = rec["direction"]
@@ -684,6 +752,8 @@ def main():
 
     if "--squareoff" in sys.argv:
         run_squareoff()
+    elif "--monitor" in sys.argv:
+        run_position_monitor()
     else:
         run_signal_check()
 
