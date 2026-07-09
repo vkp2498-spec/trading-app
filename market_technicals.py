@@ -201,7 +201,7 @@ def get_technical_analysis(symbol):
     if len(df_15) < 25:
         df_15 = fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=5)
 
-    df_30 = fetch_v3_historical_minutes(instrument_key, minutes=30, lookback_days=15)
+    df_30 = fetch_v3_historical_minutes(instrument_key, minutes=30, lookback_days=100)
     df_4h = resample_ohlc(df_30, "4h")
 
     return {
