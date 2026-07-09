@@ -15,6 +15,7 @@ from post_market_review import build_review, summarize, ask_llm_for_insights
 from strategy_core import now_ist
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
@@ -536,135 +537,135 @@ with main_tab:
 
     st.markdown("### Live Cockpit")
 
-top1, top2, top3, top4 = st.columns(4)
+    top1, top2, top3, top4 = st.columns(4)
 
-live_pnl_total = 0.0
-if not live_df.empty:
-    live_pnl_total = live_df["live_pnl"].fillna(0).sum()
+    live_pnl_total = 0.0
+    if not live_df.empty:
+        live_pnl_total = live_df["live_pnl"].fillna(0).sum()
 
-top1.metric("Last Bot Log", last_run_time)
-top2.metric("Open Bot Trades", len(live_df))
-top3.metric("Live Bot P&L", money(live_pnl_total))
-top4.metric("Upstox Live Data", "OK" if not live_error else "Check")
+    top1.metric("Last Bot Log", last_run_time)
+    top2.metric("Open Bot Trades", len(live_df))
+    top3.metric("Live Bot P&L", money(live_pnl_total))
+    top4.metric("Upstox Live Data", "OK" if not live_error else "Check")
 
-if live_error:
-    st.warning(live_error)
+    if live_error:
+        st.warning(live_error)
 
-status_cols = st.columns(2)
+    status_cols = st.columns(2)
 
-for idx, symbol in enumerate(SYMBOLS):
-    item = bot_status[symbol]
-    cls = status_class(item["status"])
+    for idx, symbol in enumerate(SYMBOLS):
+        item = bot_status[symbol]
+        cls = status_class(item["status"])
 
-    with status_cols[idx]:
-        st.markdown(
-            f"""
-            <div class="status-card">
-                <div class="small-label">{symbol}</div>
-                <div class="big-value {cls}">{item["status"]}</div>
-                <div class="muted">Last update: {item["last_time"]}</div>
-                <br>
-                <div class="small-label">Signal</div>
-                <div>{item["signal"]} | Confidence: {item["confidence"]} | Option score: {item["option_score"]}</div>
-                <br>
-                <div class="small-label">Overall</div>
-                <div>Score: {item["weighted_score"]} | Grade: {item["weighted_grade"]}</div>
-                <br>
-                <div class="small-label">ATM Option Flow</div>
-                <div>{item["atm_option_flow"]}</div>
-                <br>
-                <div class="small-label">Reason</div>
-                <div class="muted">{item["reason"]}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        with status_cols[idx]:
+            st.markdown(
+                f"""
+                <div class="status-card">
+                    <div class="small-label">{symbol}</div>
+                    <div class="big-value {cls}">{item["status"]}</div>
+                    <div class="muted">Last update: {item["last_time"]}</div>
+                    <br>
+                    <div class="small-label">Signal</div>
+                    <div>{item["signal"]} | Confidence: {item["confidence"]} | Option score: {item["option_score"]}</div>
+                    <br>
+                    <div class="small-label">Overall</div>
+                    <div>Score: {item["weighted_score"]} | Grade: {item["weighted_grade"]}</div>
+                    <br>
+                    <div class="small-label">ATM Option Flow</div>
+                    <div>{item["atm_option_flow"]}</div>
+                    <br>
+                    <div class="small-label">Reason</div>
+                    <div class="muted">{item["reason"]}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("### Live Bot Trades")
+
+    if live_df.empty:
+        st.info("No open bot-tracked positions right now.")
+    else:
+        show_live = live_df.copy()
+        show_live["live_pnl_text"] = show_live["live_pnl"].apply(
+            lambda x: money(x) if pd.notna(x) else "N/A"
         )
-
-st.markdown("### Live Bot Trades")
-
-if live_df.empty:
-    st.info("No open bot-tracked positions right now.")
-else:
-    show_live = live_df.copy()
-    show_live["live_pnl_text"] = show_live["live_pnl"].apply(lambda x: money(x) if pd.notna(x) else "N/A")
-    show_live = show_live[
-        [
-            "symbol",
-            "trading_symbol",
-            "state_status",
-            "quantity",
-            "broker_quantity",
-            "entry_price",
-            "ltp",
-            "target_price",
-            "stop_loss_price",
-            "highest_ltp",
-            "live_pnl_text",
-            "created_at",
+        show_live = show_live[
+            [
+                "symbol",
+                "trading_symbol",
+                "state_status",
+                "quantity",
+                "broker_quantity",
+                "entry_price",
+                "ltp",
+                "target_price",
+                "stop_loss_price",
+                "highest_ltp",
+                "live_pnl_text",
+                "created_at",
+            ]
         ]
-    ]
 
-    st.dataframe(show_live, use_container_width=True, hide_index=True)
+        st.dataframe(show_live, use_container_width=True, hide_index=True)
 
-st.divider()
+    st.divider()
 
-if not TRADE_HISTORY_FILE.exists():
-    st.info("No closed trades recorded yet.")
-    st.stop()
+    if not TRADE_HISTORY_FILE.exists():
+        st.info("No closed trades recorded yet.")
+    else:
+        df = pd.read_csv(TRADE_HISTORY_FILE)
 
-df = pd.read_csv(TRADE_HISTORY_FILE)
+        if df.empty:
+            st.info("No closed trades recorded yet.")
+        else:
+            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+            df["gross_pnl"] = pd.to_numeric(df["gross_pnl"], errors="coerce").fillna(0)
+            df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
 
-if df.empty:
-    st.info("No closed trades recorded yet.")
-    st.stop()
+            today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+            today_df = df[df["trade_date"] == today]
 
-df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-df["gross_pnl"] = pd.to_numeric(df["gross_pnl"], errors="coerce").fillna(0)
-df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+            st.markdown("### Today")
 
-today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-today_df = df[df["trade_date"] == today]
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Closed Trades", len(today_df))
+            c2.metric("Closed P&L", money(today_df["gross_pnl"].sum()))
+            c3.metric("Win %", f"{win_percent(today_df)}%")
+            c4.metric("NIFTY P&L", money(pnl_for(today_df, "NIFTY")))
+            c5.metric("BANKNIFTY P&L", money(pnl_for(today_df, "BANKNIFTY")))
 
-st.markdown("### Today")
+            st.markdown("### Cumulative")
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Closed Trades", len(today_df))
-c2.metric("Closed P&L", money(today_df["gross_pnl"].sum()))
-c3.metric("Win %", f"{win_percent(today_df)}%")
-c4.metric("NIFTY P&L", money(pnl_for(today_df, "NIFTY")))
-c5.metric("BANKNIFTY P&L", money(pnl_for(today_df, "BANKNIFTY")))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Total Trades", len(df))
+            c2.metric("Total P&L", money(df["gross_pnl"].sum()))
+            c3.metric("Win %", f"{win_percent(df)}%")
+            c4.metric("NIFTY Total", money(pnl_for(df, "NIFTY")))
+            c5.metric("BANKNIFTY Total", money(pnl_for(df, "BANKNIFTY")))
 
-st.markdown("### Cumulative")
+            daily = df.groupby("trade_date", as_index=False)["gross_pnl"].sum()
+            daily["cumulative_pnl"] = daily["gross_pnl"].cumsum()
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Total Trades", len(df))
-c2.metric("Total P&L", money(df["gross_pnl"].sum()))
-c3.metric("Win %", f"{win_percent(df)}%")
-c4.metric("NIFTY Total", money(pnl_for(df, "NIFTY")))
-c5.metric("BANKNIFTY Total", money(pnl_for(df, "BANKNIFTY")))
+            left, right = st.columns(2)
 
-daily = df.groupby("trade_date", as_index=False)["gross_pnl"].sum()
-daily["cumulative_pnl"] = daily["gross_pnl"].cumsum()
+            with left:
+                st.markdown("### Daily P&L")
+                st.bar_chart(daily.set_index("trade_date")["gross_pnl"])
 
-left, right = st.columns(2)
+            with right:
+                st.markdown("### Cumulative Equity Curve")
+                st.line_chart(daily.set_index("trade_date")["cumulative_pnl"])
 
-with left:
-    st.markdown("### Daily P&L")
-    st.bar_chart(daily.set_index("trade_date")["gross_pnl"])
+            st.markdown("### Symbol P&L")
+            symbol_pnl = df.groupby("symbol", as_index=False)["gross_pnl"].sum()
+            st.bar_chart(symbol_pnl.set_index("symbol")["gross_pnl"])
 
-with right:
-    st.markdown("### Cumulative Equity Curve")
-    st.line_chart(daily.set_index("trade_date")["cumulative_pnl"])
+            st.markdown("### Today's Closed Trades")
+            st.dataframe(today_df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
 
-st.markdown("### Symbol P&L")
-symbol_pnl = df.groupby("symbol", as_index=False)["gross_pnl"].sum()
-st.bar_chart(symbol_pnl.set_index("symbol")["gross_pnl"])
-
-st.markdown("### Today's Closed Trades")
-st.dataframe(today_df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
-
-st.markdown("### All Closed Trades")
-st.dataframe(df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
+            st.markdown("### All Closed Trades")
+            st.dataframe(df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
 
 with review_tab:
     render_post_market_review_tab()
