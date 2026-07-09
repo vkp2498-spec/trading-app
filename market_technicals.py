@@ -54,7 +54,7 @@ def _parse_candles(payload):
     df = df.set_index("timestamp")
     return df
 
-def fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=85):
+def fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=60):
     to_date = now_ist().date()
     from_date = to_date - timedelta(days=lookback_days)
 
@@ -216,7 +216,7 @@ def get_technical_analysis(symbol):
     if len(df_15) < 25:
         df_15 = fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=5)
 
-    df_4h = fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=85)
+    df_4h = fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=60)
 
     return {
         "four_hour": analyze_latest(df_4h, "4H"),
