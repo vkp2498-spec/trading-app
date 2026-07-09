@@ -200,7 +200,20 @@ def analyze_latest(df, timeframe):
         }
 
     df = add_indicators(df)
-    last = df.dropna().iloc[-1]
+
+    valid = df.dropna(subset=["close", "pivot", "ma20", "bb_upper", "bb_lower", "r1", "s1"])
+
+    if valid.empty:
+        return {
+            "timeframe": timeframe,
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "target": None,
+            "stop_loss": None,
+            "reasons": ["Not enough valid indicator rows after calculations"],
+        }
+
+    last = valid.iloc[-1]
     close = float(last["close"])
     pivot = float(last["pivot"])
     ma20 = float(last["ma20"])
@@ -213,13 +226,15 @@ def analyze_latest(df, timeframe):
     volume_ratio = float(last.get("volume_ratio", 0) or 0) if volume_ma20 else 0
 
     vwap = float(last.get("vwap")) if pd.notna(last.get("vwap")) else None
-    prev_vwap_value = df["vwap"].dropna().iloc[-2] if "vwap" in df and len(df["vwap"].dropna()) >= 2 else None
+    vwap_series = df["vwap"].dropna() if "vwap" in df.columns else pd.Series(dtype=float)
+    prev_vwap_value = vwap_series.iloc[-2] if len(vwap_series) >= 2 else None
     prev_vwap = float(prev_vwap_value) if prev_vwap_value is not None else vwap
 
     vwap_slope = None
     if vwap is not None and prev_vwap is not None:
         vwap_slope = round(vwap - prev_vwap, 4)
-    prev_close = float(df["close"].dropna().iloc[-2]) if len(df.dropna()) >= 2 else close
+    close_series = df["close"].dropna()
+    prev_close = float(close_series.iloc[-2]) if len(close_series) >= 2 else close
     recent_closes = df["close"].dropna().tail(4)
     recent_avg = float(recent_closes.mean()) if len(recent_closes) else close
 
