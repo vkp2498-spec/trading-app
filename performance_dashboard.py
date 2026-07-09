@@ -1,21 +1,121 @@
+from collections import deque
 from pathlib import Path
 import ast
+import json
+import os
 import re
 
 import pandas as pd
+import requests
 import streamlit as st
 
 BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
+UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
-st.set_page_config(page_title="Bot Performance", page_icon="📈", layout="wide")
-st.title("Bot Performance Dashboard")
+st.set_page_config(page_title="Trading Bot Dashboard", layout="wide")
 
-if st.button("Refresh"):
-    st.rerun()
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: linear-gradient(135deg, #07111f 0%, #0c1728 45%, #101827 100%);
+        color: #f8fafc;
+    }
+    [data-testid="stHeader"] {
+        background: rgba(7, 17, 31, 0.85);
+    }
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+        max-width: 1320px;
+    }
+    .dash-title {
+        font-size: 34px;
+        font-weight: 800;
+        color: #f8fafc;
+        margin-bottom: 4px;
+    }
+    .dash-subtitle {
+        color: #94a3b8;
+        font-size: 15px;
+        margin-bottom: 20px;
+    }
+    .status-card {
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        background: rgba(15, 23, 42, 0.88);
+        border-radius: 14px;
+        padding: 18px;
+        min-height: 220px;
+        box-shadow: 0 18px 45px rgba(0, 0, 0, 0.22);
+    }
+    .live-card {
+        border: 1px solid rgba(34, 197, 94, 0.25);
+        background: rgba(6, 78, 59, 0.28);
+        border-radius: 14px;
+        padding: 18px;
+        box-shadow: 0 18px 45px rgba(0, 0, 0, 0.18);
+    }
+    .small-label {
+        color: #94a3b8;
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .big-value {
+        color: #f8fafc;
+        font-size: 26px;
+        font-weight: 800;
+        margin-top: 3px;
+    }
+    .muted {
+        color: #94a3b8;
+        font-size: 13px;
+    }
+    .positive {
+        color: #22c55e;
+        font-weight: 800;
+    }
+    .negative {
+        color: #ef4444;
+        font-weight: 800;
+    }
+    .neutral {
+        color: #eab308;
+        font-weight: 800;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(15, 23, 42, 0.78);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 12px;
+        padding: 14px;
+    }
+    div[data-testid="stDataFrame"] {
+        border-radius: 12px;
+        overflow: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def load_env():
+    if not ENV_FILE.exists():
+        return
+
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def safe_literal_dict(text):
@@ -25,6 +125,13 @@ def safe_literal_dict(text):
         return {}
 
 
+def read_last_lines(path, max_lines=2500):
+    if not path.exists():
+        return []
+    with path.open("r", errors="ignore") as f:
+        return list(deque(f, maxlen=max_lines))
+
+
 def extract_between(line, start, end):
     if start not in line:
         return ""
@@ -32,6 +139,156 @@ def extract_between(line, start, end):
     if end and end in part:
         part = part.split(end, 1)[0]
     return part.strip()
+
+
+def money(value):
+    try:
+        return f"₹{float(value):,.2f}"
+    except Exception:
+        return "N/A"
+
+
+def number(value):
+    try:
+        return f"{float(value):,.2f}"
+    except Exception:
+        return "N/A"
+
+
+def status_class(status):
+    status = str(status).upper()
+    if status in {"OPEN", "BOUGHT", "APPROVED", "TARGET HIT"}:
+        return "positive"
+    if status in {"REJECTED", "STOP LOSS HIT", "ERROR"}:
+        return "negative"
+    return "neutral"
+
+
+def state_file(symbol):
+    return BASE_DIR / f"trade_state_{symbol}.json"
+
+
+def read_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def upstox_headers():
+    token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    if not token:
+        return None
+
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def get_upstox_positions():
+    headers = upstox_headers()
+    if not headers:
+        return [], "UPSTOX_ACCESS_TOKEN not set"
+
+    try:
+        response = requests.get(UPSTOX_POSITIONS_URL, headers=headers, timeout=12)
+        if response.status_code >= 300:
+            return [], f"Upstox positions failed {response.status_code}: {response.text[:250]}"
+        return response.json().get("data", []) or [], None
+    except Exception as e:
+        return [], str(e)
+
+
+def position_quantity(position):
+    for key in ["quantity", "net_quantity"]:
+        if position.get(key) is not None:
+            try:
+                return int(float(position.get(key)))
+            except Exception:
+                pass
+
+    buy_qty = float(position.get("day_buy_quantity") or 0)
+    sell_qty = float(position.get("day_sell_quantity") or 0)
+    return int(buy_qty - sell_qty)
+
+
+def position_ltp(position):
+    for key in ["last_price", "ltp", "close_price"]:
+        if position.get(key) is not None:
+            try:
+                return float(position.get(key))
+            except Exception:
+                pass
+    return None
+
+
+def position_avg_price(position):
+    for key in ["average_price", "buy_price", "day_buy_price", "avg_price"]:
+        if position.get(key) is not None:
+            try:
+                value = float(position.get(key))
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    return None
+
+
+def find_position_by_instrument(positions, instrument_key):
+    for pos in positions:
+        pos_key = pos.get("instrument_token") or pos.get("instrument_key")
+        if pos_key == instrument_key:
+            return pos
+    return None
+
+
+def get_live_bot_positions():
+    positions, error = get_upstox_positions()
+    rows = []
+
+    for symbol in SYMBOLS:
+        state = read_json(state_file(symbol), {})
+        if not state or not state.get("instrument_key"):
+            continue
+
+        pos = find_position_by_instrument(positions, state.get("instrument_key"))
+        qty = int(float(state.get("quantity") or 0))
+        entry = float(state.get("entry_price") or 0)
+        ltp = None
+        actual_qty = 0
+
+        if pos:
+            actual_qty = position_quantity(pos)
+            ltp = position_ltp(pos)
+            broker_entry = position_avg_price(pos)
+            if broker_entry:
+                entry = broker_entry
+
+        live_pnl = None
+        if ltp is not None and entry > 0:
+            live_pnl = round((ltp - entry) * qty, 2)
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "trading_symbol": state.get("trading_symbol", ""),
+                "state_status": state.get("status", "OPEN"),
+                "quantity": qty,
+                "broker_quantity": actual_qty,
+                "entry_price": entry,
+                "ltp": ltp,
+                "target_price": state.get("target_price", ""),
+                "stop_loss_price": state.get("stop_loss_price", ""),
+                "highest_ltp": state.get("highest_ltp", ""),
+                "live_pnl": live_pnl,
+                "created_at": state.get("created_at", ""),
+            }
+        )
+
+    return pd.DataFrame(rows), error
 
 
 def parse_latest_bot_status():
@@ -53,12 +310,8 @@ def parse_latest_bot_status():
 
     last_run_time = "N/A"
 
-    if not LOG_FILE.exists():
-        return last_run_time, status
-
-    lines = LOG_FILE.read_text(errors="ignore").splitlines()[-2000:]
-
-    for line in lines:
+    for line in read_last_lines(LOG_FILE):
+        line = line.strip()
         ts_match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \|", line)
         if ts_match:
             last_run_time = ts_match.group(1)
@@ -84,12 +337,20 @@ def parse_latest_bot_status():
                 status[symbol]["status"] = "REJECTED"
                 status[symbol]["reason"] = line.split(f"{symbol} no trade:", 1)[1].strip()
 
+            if f"{symbol} ERROR:" in line:
+                status[symbol]["status"] = "ERROR"
+                status[symbol]["reason"] = line.split(f"{symbol} ERROR:", 1)[1].strip()
+
             if f"{symbol} MARKET BUY placed" in line:
                 status[symbol]["status"] = "BOUGHT"
 
             if f"{symbol} POSITION OPEN:" in line:
                 status[symbol]["status"] = "OPEN"
                 status[symbol]["position"] = line.split(f"{symbol} POSITION OPEN:", 1)[1].strip()
+
+            if f"{symbol} open position active:" in line:
+                status[symbol]["status"] = "OPEN"
+                status[symbol]["position"] = line.split(f"{symbol} open position active:", 1)[1].strip()
 
             if f"{symbol} TARGET exit" in line:
                 status[symbol]["status"] = "TARGET HIT"
@@ -123,43 +384,107 @@ def parse_latest_bot_status():
                 llm = safe_literal_dict(llm_text)
 
                 if llm:
-                    if llm.get("execute_trade"):
-                        status[symbol]["status"] = "APPROVED"
-                    else:
-                        status[symbol]["status"] = "REJECTED"
+                    status[symbol]["status"] = "APPROVED" if llm.get("execute_trade") else "REJECTED"
                     status[symbol]["reason"] = llm.get("reason", status[symbol]["reason"])
 
     return last_run_time, status
 
 
+def win_percent(data):
+    if data.empty:
+        return 0.0
+    return round((data["gross_pnl"] > 0).mean() * 100, 1)
+
+
+def pnl_for(data, symbol):
+    return round(data[data["symbol"] == symbol]["gross_pnl"].sum(), 2)
+
+
+load_env()
+
+st.markdown('<div class="dash-title">Trading Bot Performance</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="dash-subtitle">Live status, open trade P&L, and closed trade performance</div>',
+    unsafe_allow_html=True,
+)
+
+if st.button("Refresh Dashboard", use_container_width=True):
+    st.rerun()
+
 last_run_time, bot_status = parse_latest_bot_status()
+live_df, live_error = get_live_bot_positions()
 
-st.subheader("Live Bot Status")
-st.caption(f"Last log time: {last_run_time}")
+st.markdown("### Live Cockpit")
 
-cols = st.columns(2)
+top1, top2, top3, top4 = st.columns(4)
+
+live_pnl_total = 0.0
+if not live_df.empty:
+    live_pnl_total = live_df["live_pnl"].fillna(0).sum()
+
+top1.metric("Last Bot Log", last_run_time)
+top2.metric("Open Bot Trades", len(live_df))
+top3.metric("Live Bot P&L", money(live_pnl_total))
+top4.metric("Upstox Live Data", "OK" if not live_error else "Check")
+
+if live_error:
+    st.warning(live_error)
+
+status_cols = st.columns(2)
 
 for idx, symbol in enumerate(SYMBOLS):
     item = bot_status[symbol]
+    cls = status_class(item["status"])
 
-    with cols[idx]:
-        st.markdown(f"### {symbol}")
+    with status_cols[idx]:
+        st.markdown(
+            f"""
+            <div class="status-card">
+                <div class="small-label">{symbol}</div>
+                <div class="big-value {cls}">{item["status"]}</div>
+                <div class="muted">Last update: {item["last_time"]}</div>
+                <br>
+                <div class="small-label">Signal</div>
+                <div>{item["signal"]} | Confidence: {item["confidence"]} | Option score: {item["option_score"]}</div>
+                <br>
+                <div class="small-label">Overall</div>
+                <div>Score: {item["weighted_score"]} | Grade: {item["weighted_grade"]}</div>
+                <br>
+                <div class="small-label">ATM Option Flow</div>
+                <div>{item["atm_option_flow"]}</div>
+                <br>
+                <div class="small-label">Reason</div>
+                <div class="muted">{item["reason"]}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Status", item["status"])
-        c2.metric("Signal", item["signal"])
-        c3.metric("Confidence", item["confidence"])
+st.markdown("### Live Bot Trades")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Option Score", item["option_score"])
-        c2.metric("Overall Score", item["weighted_score"])
-        c3.metric("Grade", item["weighted_grade"])
+if live_df.empty:
+    st.info("No open bot-tracked positions right now.")
+else:
+    show_live = live_df.copy()
+    show_live["live_pnl_text"] = show_live["live_pnl"].apply(lambda x: money(x) if pd.notna(x) else "N/A")
+    show_live = show_live[
+        [
+            "symbol",
+            "trading_symbol",
+            "state_status",
+            "quantity",
+            "broker_quantity",
+            "entry_price",
+            "ltp",
+            "target_price",
+            "stop_loss_price",
+            "highest_ltp",
+            "live_pnl_text",
+            "created_at",
+        ]
+    ]
 
-        st.write("**ATM Option Flow:**", item["atm_option_flow"])
-        st.write("**Latest Reason:**", item["reason"])
-
-        if item["position"] != "N/A":
-            st.write("**Position:**", item["position"])
+    st.dataframe(show_live, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -180,50 +505,43 @@ df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
 today = pd.Timestamp.now(tz="Asia/Kolkata").date()
 today_df = df[df["trade_date"] == today]
 
-
-def win_percent(data):
-    if data.empty:
-        return 0.0
-    return round((data["gross_pnl"] > 0).mean() * 100, 1)
-
-
-def pnl_for(data, symbol):
-    return round(data[data["symbol"] == symbol]["gross_pnl"].sum(), 2)
-
-
-st.subheader("Today")
+st.markdown("### Today")
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Trades", len(today_df))
-c2.metric("Net P&L", f"₹{today_df['gross_pnl'].sum():.2f}")
+c1.metric("Closed Trades", len(today_df))
+c2.metric("Closed P&L", money(today_df["gross_pnl"].sum()))
 c3.metric("Win %", f"{win_percent(today_df)}%")
-c4.metric("NIFTY P&L", f"₹{pnl_for(today_df, 'NIFTY'):.2f}")
-c5.metric("BANKNIFTY P&L", f"₹{pnl_for(today_df, 'BANKNIFTY'):.2f}")
+c4.metric("NIFTY P&L", money(pnl_for(today_df, "NIFTY")))
+c5.metric("BANKNIFTY P&L", money(pnl_for(today_df, "BANKNIFTY")))
 
-st.subheader("Cumulative")
+st.markdown("### Cumulative")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Total Trades", len(df))
-c2.metric("Total P&L", f"₹{df['gross_pnl'].sum():.2f}")
+c2.metric("Total P&L", money(df["gross_pnl"].sum()))
 c3.metric("Win %", f"{win_percent(df)}%")
-c4.metric("NIFTY Total", f"₹{pnl_for(df, 'NIFTY'):.2f}")
-c5.metric("BANKNIFTY Total", f"₹{pnl_for(df, 'BANKNIFTY'):.2f}")
+c4.metric("NIFTY Total", money(pnl_for(df, "NIFTY")))
+c5.metric("BANKNIFTY Total", money(pnl_for(df, "BANKNIFTY")))
 
 daily = df.groupby("trade_date", as_index=False)["gross_pnl"].sum()
 daily["cumulative_pnl"] = daily["gross_pnl"].cumsum()
 
-st.subheader("Daily P&L")
-st.bar_chart(daily.set_index("trade_date")["gross_pnl"])
+left, right = st.columns(2)
 
-st.subheader("Cumulative Equity Curve")
-st.line_chart(daily.set_index("trade_date")["cumulative_pnl"])
+with left:
+    st.markdown("### Daily P&L")
+    st.bar_chart(daily.set_index("trade_date")["gross_pnl"])
 
-st.subheader("Symbol P&L")
+with right:
+    st.markdown("### Cumulative Equity Curve")
+    st.line_chart(daily.set_index("trade_date")["cumulative_pnl"])
+
+st.markdown("### Symbol P&L")
 symbol_pnl = df.groupby("symbol", as_index=False)["gross_pnl"].sum()
 st.bar_chart(symbol_pnl.set_index("symbol")["gross_pnl"])
 
-st.subheader("Today's Trades")
-st.dataframe(today_df.sort_values("exit_time", ascending=False), use_container_width=True)
+st.markdown("### Today's Closed Trades")
+st.dataframe(today_df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
 
-st.subheader("All Closed Trades")
-st.dataframe(df.sort_values("exit_time", ascending=False), use_container_width=True)
+st.markdown("### All Closed Trades")
+st.dataframe(df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
