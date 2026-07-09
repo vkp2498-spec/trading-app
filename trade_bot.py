@@ -13,6 +13,9 @@ from analysis_journal import record_analysis
 from llm_decision import get_llm_decision
 from market_technicals import convert_index_levels_to_option_premium, get_technical_analysis
 
+from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
+from signal_score import weighted_alignment_score
+
 import requests
 import urllib3.util.connection as urllib3_cn
 
@@ -588,6 +591,7 @@ def process_symbol(symbol):
     #     return
 
     rec = get_index_recommendation(symbol)
+    record_option_chain_snapshot(symbol, rec)
     direction = rec["direction"]
     confidence = rec["confidence"]
     score = rec["score"]
@@ -628,6 +632,8 @@ def process_symbol(symbol):
     "stop_loss_price": expected_stop_loss,
     "reasons": rec.get("reasons", []),
     }
+    
+    
 
     try:
         technicals = get_technical_analysis(symbol)
@@ -653,6 +659,12 @@ def process_symbol(symbol):
             "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
         }
 
+    option_trend = get_option_chain_trend(symbol, direction)
+    weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
+
+    option_summary["option_chain_trend"] = option_trend
+    option_summary["weighted_alignment"] = weighted_score
+
     llm_decision = get_llm_decision(symbol, option_summary, technicals)
     record_analysis(symbol, option_summary, technicals, llm_decision)
 
@@ -660,6 +672,8 @@ def process_symbol(symbol):
         f"{symbol} analysis: option={option_summary} "
         f"4h={technicals.get('four_hour')} "
         f"15m={technicals.get('fifteen_min')} "
+        f"5m={technicals.get('five_min')} "
+        f"weighted={weighted_score} "
         f"llm={llm_decision}"
     )
 
@@ -694,9 +708,22 @@ def process_symbol(symbol):
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
 
+    if weighted_score["grade"] == "SKIP":
+        log(f"{symbol} no trade: weighted score too low: {weighted_score}")
+        return
+
+    if weighted_score["grade"] == "CAUTIOUS_TRADE":
+        expected_target = round(float(expected_entry_price) * 1.06, 0)
+        expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+        log(
+            f"{symbol} cautious trade sizing levels applied: "
+            f"target={expected_target} stop_loss={expected_stop_loss}"
+        )
+
     if not live:
         log(f"{symbol} DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
         return
+    
 
     result, payload = place_market_order(
         instrument=instrument,

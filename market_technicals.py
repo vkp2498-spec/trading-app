@@ -177,6 +177,14 @@ def add_indicators(df):
     out["s1"] = 2 * out["pivot"] - prev["high"]
     out["r2"] = out["pivot"] + (prev["high"] - prev["low"])
     out["s2"] = out["pivot"] - (prev["high"] - prev["low"])
+
+    typical_price = (out["high"] + out["low"] + out["close"]) / 3
+    cumulative_volume = out["volume"].replace(0, pd.NA).fillna(0).cumsum()
+    cumulative_pv = (typical_price * out["volume"]).cumsum()
+
+    out["vwap"] = cumulative_pv / cumulative_volume.replace(0, pd.NA)
+    out["volume_ma20"] = out["volume"].rolling(20).mean()
+    out["volume_ratio"] = out["volume"] / out["volume_ma20"]
     return out
 
 
@@ -200,6 +208,17 @@ def analyze_latest(df, timeframe):
     lower = float(last["bb_lower"])
     r1 = float(last["r1"])
     s1 = float(last["s1"])
+    volume = float(last.get("volume", 0) or 0)
+    volume_ma20 = float(last.get("volume_ma20", 0) or 0)
+    volume_ratio = float(last.get("volume_ratio", 0) or 0) if volume_ma20 else 0
+
+    vwap = float(last.get("vwap")) if pd.notna(last.get("vwap")) else None
+    prev_vwap_value = df["vwap"].dropna().iloc[-2] if "vwap" in df and len(df["vwap"].dropna()) >= 2 else None
+    prev_vwap = float(prev_vwap_value) if prev_vwap_value is not None else vwap
+
+    vwap_slope = None
+    if vwap is not None and prev_vwap is not None:
+        vwap_slope = round(vwap - prev_vwap, 4)
     prev_close = float(df["close"].dropna().iloc[-2]) if len(df.dropna()) >= 2 else close
     recent_closes = df["close"].dropna().tail(4)
     recent_avg = float(recent_closes.mean()) if len(recent_closes) else close
@@ -234,6 +253,24 @@ def analyze_latest(df, timeframe):
     elif close < ma20:
         momentum_score -= 1
         momentum_reasons.append("Latest close is below middle band")
+
+    volume_confirmed = volume_ma20 > 0 and volume > volume_ma20
+    vwap_bias = "NEUTRAL"
+
+    if vwap is not None:
+        if close > vwap and (vwap_slope is None or vwap_slope >= 0):
+            vwap_bias = "BULLISH"
+            momentum_score += 1
+            momentum_reasons.append("Close is above VWAP and VWAP is flat/up")
+        elif close < vwap and (vwap_slope is None or vwap_slope <= 0):
+            vwap_bias = "BEARISH"
+            momentum_score -= 1
+            momentum_reasons.append("Close is below VWAP and VWAP is flat/down")
+
+    if volume_confirmed:
+        momentum_reasons.append("Volume is above 20-period average")
+    else:
+        momentum_reasons.append("Volume is not above 20-period average")
 
     score = 0
     reasons = []
@@ -297,6 +334,13 @@ def analyze_latest(df, timeframe):
         "recent_avg_close": round(recent_avg, 2),
         "momentum_score": momentum_score,
         "momentum_reasons": momentum_reasons,
+        "volume": round(volume, 2),
+        "volume_ma20": round(volume_ma20, 2),
+        "volume_ratio": round(volume_ratio, 2),
+        "volume_confirmed": bool(volume_confirmed),
+        "vwap": round(vwap, 2) if vwap is not None else None,
+        "vwap_slope": vwap_slope,
+        "vwap_bias": vwap_bias,
     }
 
 
@@ -309,7 +353,12 @@ def get_technical_analysis(symbol):
 
     df_4h = fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=60)
 
+    df_5 = fetch_v3_intraday_minutes(instrument_key, minutes=5)
+    if len(df_5) < 25:
+        df_5 = fetch_v3_historical_minutes(instrument_key, minutes=5, lookback_days=5)
+
     return {
         "four_hour": analyze_latest(df_4h, "4H"),
         "fifteen_min": analyze_latest(df_15, "15M"),
+        "five_min": analyze_latest(df_5, "5M"),
     }

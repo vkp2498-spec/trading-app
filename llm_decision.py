@@ -122,6 +122,13 @@ def get_llm_decision(symbol, option_summary, technicals):
             "Use option-chain target/stop as default option premium levels.",
             "Use option_target_price and option_stop_loss_price from technical analysis only when they support the option-chain direction.",
             "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
+            "Use weighted_alignment score as important context.",
+            "Scores >= 80 can be considered normal trade candidates.",
+            "Scores 60 to 79 are cautious trade candidates only if risk is controlled.",
+            "Scores below 60 should normally be rejected.",
+            "Volume confirmation on 5M strengthens breakout quality.",
+            "VWAP alignment strengthens intraday trend quality.",
+            "Option-chain trend over recent snapshots is more reliable than one snapshot alone.",
                     ],
     }
 

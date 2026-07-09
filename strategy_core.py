@@ -290,6 +290,19 @@ def get_index_recommendation(symbol):
     direction, confidence, score, reasons = option_chain_signal(atm)
     levels = option_chain_target_stoploss(df_nearby, atm["strike"], direction)
     prices = expected_atm_option_prices(atm, levels, direction, confidence, score)
+    total_ce_oi = float(df_chain["CE_oi"].fillna(0).sum())
+    total_pe_oi = float(df_chain["PE_oi"].fillna(0).sum())
+    total_ce_volume = float(df_chain["CE_volume"].fillna(0).sum())
+    total_pe_volume = float(df_chain["PE_volume"].fillna(0).sum())
+
+    chain_totals = {
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+        "pcr_oi": round(total_pe_oi / total_ce_oi, 4) if total_ce_oi else None,
+        "total_ce_volume": total_ce_volume,
+        "total_pe_volume": total_pe_volume,
+        "pcr_volume": round(total_pe_volume / total_ce_volume, 4) if total_ce_volume else None,
+    }
 
     return {
         "symbol": symbol,
@@ -300,6 +313,7 @@ def get_index_recommendation(symbol):
         "atm": atm.to_dict(),
         "levels": levels,
         "prices": prices,
+        "chain_totals": chain_totals
     }
 
 
