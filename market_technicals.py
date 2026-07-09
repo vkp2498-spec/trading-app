@@ -54,6 +54,21 @@ def _parse_candles(payload):
     df = df.set_index("timestamp")
     return df
 
+def fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=85):
+    to_date = now_ist().date()
+    from_date = to_date - timedelta(days=lookback_days)
+
+    url = (
+        f"{UPSTOX_BASE}/v3/historical-candle/"
+        f"{instrument_key}/hours/{hours}/{to_date}/{from_date}"
+    )
+
+    response = requests.get(url, headers=upstox_headers(), timeout=30)
+    if response.status_code >= 300:
+        raise RuntimeError(f"Upstox hourly candle API failed {response.status_code}: {response.text[:500]}")
+
+    return _parse_candles(response.json())
+
 
 def fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=7):
     to_date = now_ist().date()
@@ -201,8 +216,7 @@ def get_technical_analysis(symbol):
     if len(df_15) < 25:
         df_15 = fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=5)
 
-    df_30 = fetch_v3_historical_minutes(instrument_key, minutes=30, lookback_days=100)
-    df_4h = resample_ohlc(df_30, "4h")
+    df_4h = fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=85)
 
     return {
         "four_hour": analyze_latest(df_4h, "4H"),
