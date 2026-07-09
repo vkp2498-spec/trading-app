@@ -111,6 +111,55 @@ def resample_ohlc(df, rule):
     )
     return out.dropna()
 
+def convert_index_levels_to_option_premium(analysis, option_side, option_entry_price, delta=0.5):
+    """
+    Converts index-level technical target/stop into approximate option premium target/stop.
+    option_side: CE or PE
+    """
+    if not analysis or analysis.get("bias") == "NEUTRAL":
+        return analysis
+
+    close = analysis.get("close")
+    index_target = analysis.get("target")
+    index_stop = analysis.get("stop_loss")
+
+    if close is None or index_target is None or index_stop is None or option_entry_price is None:
+        return analysis
+
+    close = float(close)
+    index_target = float(index_target)
+    index_stop = float(index_stop)
+    entry = float(option_entry_price)
+
+    if option_side == "CE":
+        target_move = index_target - close
+        stop_move = index_stop - close
+    elif option_side == "PE":
+        target_move = close - index_target
+        stop_move = close - index_stop
+    else:
+        return analysis
+
+    premium_target = round(entry + (target_move * delta), 0)
+    premium_stop = round(entry + (stop_move * delta), 0)
+
+    # Keep only sensible option-buying levels.
+    if premium_target <= entry:
+        premium_target = None
+    if premium_stop >= entry:
+        premium_stop = None
+
+    updated = dict(analysis)
+    updated["option_delta_used"] = delta
+    updated["option_entry_price"] = round(entry, 2)
+    updated["option_target_price"] = premium_target
+    updated["option_stop_loss_price"] = premium_stop
+    updated["option_conversion_reason"] = (
+        f"Converted index target/stop to option premium using delta={delta}"
+    )
+
+    return updated
+
 
 def add_indicators(df):
     if df.empty:

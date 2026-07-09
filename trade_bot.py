@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from analysis_journal import record_analysis
 from llm_decision import get_llm_decision
-from market_technicals import get_technical_analysis
+from market_technicals import convert_index_levels_to_option_premium, get_technical_analysis
 
 import requests
 import urllib3.util.connection as urllib3_cn
@@ -631,6 +631,21 @@ def process_symbol(symbol):
 
     try:
         technicals = get_technical_analysis(symbol)
+        option_side = "CE" if direction == "BULLISH" else "PE"
+
+        technicals["four_hour"] = convert_index_levels_to_option_premium(
+        technicals.get("four_hour", {}),
+        option_side=option_side,
+        option_entry_price=expected_entry_price,
+        delta=0.5,
+    )
+
+        technicals["fifteen_min"] = convert_index_levels_to_option_premium(
+            technicals.get("fifteen_min", {}),
+            option_side=option_side,
+            option_entry_price=expected_entry_price,
+            delta=0.5,
+        )
     except Exception as e:
         log(f"{symbol} technical analysis failed: {e}")
         technicals = {
