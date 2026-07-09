@@ -724,29 +724,29 @@ def process_symbol(symbol):
     )
 
     if weighted_score["grade"] == "SKIP":
-    score_value = float(weighted_score.get("score") or 0)
-    fifteen = technicals.get("fifteen_min", {}) or {}
-    five = technicals.get("five_min", {}) or {}
-    atm_flow = technicals.get("atm_option_flow", {}) or {}
+        score_value = float(weighted_score.get("score") or 0)
+        fifteen = technicals.get("fifteen_min", {}) or {}
+        five = technicals.get("five_min", {}) or {}
+        atm_flow = technicals.get("atm_option_flow", {}) or {}
 
-    cautious_override = (
-        score_value >= 55
-        and fifteen.get("bias") != opposite_direction(direction)
-        and five.get("bias") != opposite_direction(direction)
-        and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
-        and float(atm_flow.get("close") or 0) >= float(atm_flow.get("vwap") or 999999)
-    )
-
-    if cautious_override:
-        expected_target = round(float(expected_entry_price) * 1.06, 0)
-        expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
-        log(
-            f"{symbol} cautious override allowed despite SKIP: "
-            f"score={score_value} target={expected_target} stop_loss={expected_stop_loss}"
+        cautious_override = (
+            score_value >= 55
+            and fifteen.get("bias") != opposite_direction(direction)
+            and five.get("bias") != opposite_direction(direction)
+            and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
+            and float(atm_flow.get("close") or 0) >= float(atm_flow.get("vwap") or 999999)
         )
-    else:
-        log(f"{symbol} no trade: weighted score too low: {weighted_score}")
-        return
+
+        if cautious_override:
+            expected_target = round(float(expected_entry_price) * 1.06, 0)
+            expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+            log(
+                f"{symbol} cautious override allowed despite SKIP: "
+                f"score={score_value} target={expected_target} stop_loss={expected_stop_loss}"
+            )
+        else:
+            log(f"{symbol} no trade: weighted score too low: {weighted_score}")
+            return
 
     if not live:
         log(f"{symbol} DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
