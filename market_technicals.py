@@ -233,8 +233,12 @@ def analyze_latest(df, timeframe):
         stop_loss = round(max(s1, lower), 2)
     elif score <= -2:
         bias = "BEARISH"
-        target = round(s1, 2)
-        stop_loss = round(min(r1, upper), 2)
+
+        bearish_targets = [level for level in [s1, lower] if level < close]
+        bearish_stops = [level for level in [r1, ma20, upper] if level > close]
+
+        target = round(max(bearish_targets), 2) if bearish_targets else round(close * 0.995, 2)
+        stop_loss = round(min(bearish_stops), 2) if bearish_stops else round(close * 1.005, 2)
     else:
         bias = "NEUTRAL"
         target = None
