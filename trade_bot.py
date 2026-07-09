@@ -620,11 +620,7 @@ def process_symbol(symbol):
         return
 
     instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
-    atm_option_flow = get_option_volume_vwap_analysis(
-    instrument["instrument_key"],
-    side_label=f"{instrument['trading_symbol']} {option_type}",
-)
-    technicals["atm_option_flow"] = atm_option_flow
+    
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
     expected_target = round(float(expected_entry_price) * 1.1, 0)
@@ -667,6 +663,12 @@ def process_symbol(symbol):
             "four_hour": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
             "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
         }
+
+    atm_option_flow = get_option_volume_vwap_analysis(
+    instrument["instrument_key"],
+    side_label=f"{instrument['trading_symbol']} {option_type}",
+)
+    technicals["atm_option_flow"] = atm_option_flow
 
     option_trend = get_option_chain_trend(symbol, direction)
     weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
