@@ -666,7 +666,7 @@ def process_symbol(symbol):
 
     atm_option_flow = get_option_volume_vwap_analysis(
     instrument["instrument_key"],
-    side_label=f"{instrument['trading_symbol']} {option_type}",
+    side_label=instrument["trading_symbol"],
 )
     technicals["atm_option_flow"] = atm_option_flow
 

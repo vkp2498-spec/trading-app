@@ -64,10 +64,14 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     option_flow = technicals.get("atm_option_flow", {}) or {}
 
     vwap_component = 0
-    if option_flow.get("bias") == "BULLISH":
+    if option_flow.get("bias") == "BULLISH" and option_flow.get("volume_confirmed"):
         vwap_component = 5
+    elif option_flow.get("bias") == "BULLISH":
+        vwap_component = 3
     elif option_flow.get("bias") == "NEUTRAL":
-        vwap_component = 2.5
+        vwap_component = 1.5
+    else:
+        vwap_component = 0
 
     reasons.append(f"ATM option VWAP/volume component={vwap_component:.1f}/5")
 
