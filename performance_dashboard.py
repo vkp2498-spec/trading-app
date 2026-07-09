@@ -9,6 +9,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from datetime import time
+
+from post_market_review import build_review, summarize, ask_llm_for_insights
+from strategy_core import now_ist
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
@@ -104,6 +109,118 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+POST_MARKET_REVIEW_TIME = time(15, 30)
+
+
+def render_post_market_review_tab():
+    st.markdown("### Post-Market X-Ray")
+    st.caption("Review rejected signals, missed opportunities, blocker reasons, and LLM insights.")
+
+    today_text = now_ist().strftime("%Y-%m-%d")
+    current_time = now_ist().time()
+
+    review_date = st.date_input("Review date", value=now_ist().date())
+    review_date_text = review_date.strftime("%Y-%m-%d")
+
+    if review_date_text == today_text and current_time < POST_MARKET_REVIEW_TIME:
+        st.warning("Market is still active. Please wait until after 3:30 PM IST for post-trade analysis.")
+        return
+
+    use_llm = st.checkbox("Include LLM insight", value=True)
+
+    if st.button("Run Post-Market X-Ray", use_container_width=True):
+        with st.spinner("Analyzing signals, rejected trades, missed opportunities, and blockers..."):
+            review_df = build_review(review_date_text)
+            summary = summarize(review_df, review_date_text)
+
+            DATA_DIR.mkdir(exist_ok=True)
+            csv_file = DATA_DIR / f"post_market_review_{review_date_text}.csv"
+            summary_file = DATA_DIR / f"post_market_summary_{review_date_text}.json"
+            llm_file = DATA_DIR / f"post_market_llm_insights_{review_date_text}.txt"
+
+            review_df.to_csv(csv_file, index=False)
+            summary_file.write_text(json.dumps(summary, indent=2, sort_keys=True))
+
+            llm_insights = None
+            if use_llm:
+                llm_insights = ask_llm_for_insights(summary)
+                llm_file.write_text(llm_insights)
+
+            st.session_state["post_market_review_df"] = review_df
+            st.session_state["post_market_summary"] = summary
+            st.session_state["post_market_llm_insights"] = llm_insights
+            st.session_state["post_market_files"] = {
+                "csv": str(csv_file),
+                "summary": str(summary_file),
+                "llm": str(llm_file) if use_llm else None,
+            }
+
+    summary = st.session_state.get("post_market_summary")
+    review_df = st.session_state.get("post_market_review_df")
+    llm_insights = st.session_state.get("post_market_llm_insights")
+    files = st.session_state.get("post_market_files", {})
+
+    if not summary:
+        st.info("Click the button after market close to generate today’s review.")
+        return
+
+    st.success("Post-market review generated.")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Checks", summary.get("total_analysis_rows", 0))
+    c2.metric("Directional", summary.get("directional_signals", 0))
+    c3.metric("Rejected", summary.get("rejected_signals", 0))
+    c4.metric("Missed Profit", money(summary.get("missed_expected_profit_total", 0)))
+    c5.metric("Max Possible", money(summary.get("max_possible_profit_total", 0)))
+
+    st.markdown("### Outcome Summary")
+    outcome_counts = summary.get("outcome_counts", {})
+    if outcome_counts:
+        st.dataframe(
+            pd.DataFrame(
+                [{"Outcome": key, "Count": value} for key, value in outcome_counts.items()]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("### Main Blockers")
+    blocker_counts = summary.get("blocker_counts", {})
+    if blocker_counts:
+        blocker_df = pd.DataFrame(
+            [{"Blocker": key, "Count": value} for key, value in blocker_counts.items()]
+        )
+        st.bar_chart(blocker_df.set_index("Blocker")["Count"])
+
+    st.markdown("### Symbol View")
+    by_symbol = summary.get("by_symbol", {})
+    if by_symbol:
+        st.dataframe(
+            pd.DataFrame(
+                [{"Symbol": symbol, **values} for symbol, values in by_symbol.items()]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("### Top Missed Opportunities")
+    missed = summary.get("top_missed_opportunities", [])
+    if missed:
+        st.dataframe(pd.DataFrame(missed), use_container_width=True, hide_index=True)
+    else:
+        st.info("No missed target-hitting opportunities found.")
+
+    if llm_insights:
+        st.markdown("### LLM Insight")
+        st.write(llm_insights)
+
+    if review_df is not None and not review_df.empty:
+        with st.expander("Full Review Data"):
+            st.dataframe(review_df, use_container_width=True, hide_index=True)
+
+    with st.expander("Generated Files"):
+        st.write(files)
 
 
 def load_env():
@@ -402,19 +519,22 @@ def pnl_for(data, symbol):
 
 load_env()
 
-st.markdown('<div class="dash-title">Trading Bot Performance</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="dash-subtitle">Live status, open trade P&L, and closed trade performance</div>',
-    unsafe_allow_html=True,
-)
+main_tab, review_tab = st.tabs(["Live Dashboard", "Post-Market X-Ray"])
 
-if st.button("Refresh Dashboard", use_container_width=True):
-    st.rerun()
+with main_tab:
+    st.markdown('<div class="dash-title">Trading Bot Performance</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">Live status, open trade P&L, and closed trade performance</div>',
+        unsafe_allow_html=True,
+    )
 
-last_run_time, bot_status = parse_latest_bot_status()
-live_df, live_error = get_live_bot_positions()
+    if st.button("Refresh Dashboard", use_container_width=True):
+        st.rerun()
 
-st.markdown("### Live Cockpit")
+    last_run_time, bot_status = parse_latest_bot_status()
+    live_df, live_error = get_live_bot_positions()
+
+    st.markdown("### Live Cockpit")
 
 top1, top2, top3, top4 = st.columns(4)
 
@@ -545,3 +665,6 @@ st.dataframe(today_df.sort_values("exit_time", ascending=False), use_container_w
 
 st.markdown("### All Closed Trades")
 st.dataframe(df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
+
+with review_tab:
+    render_post_market_review_tab()
