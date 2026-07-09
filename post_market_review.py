@@ -149,6 +149,20 @@ def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
     max_high = float(candles["high"].max())
     min_low = float(candles["low"].min())
 
+    quantity = 65
+    if entry >= 500:
+        quantity = 30
+
+    expected_target_profit = round((target - entry) * quantity, 2)
+    expected_stop_loss_loss = round((stop - entry) * quantity, 2)
+    max_possible_profit = round((max_high - entry) * quantity, 2)
+    max_possible_loss = round((min_low - entry) * quantity, 2)
+
+    if outcome == "MISSED_WINNER":
+        missed_expected_profit = expected_target_profit
+    else:
+        missed_expected_profit = 0
+
     return {
         "missed_trade_outcome": outcome,
         "outcome_time": outcome_time,
@@ -156,6 +170,11 @@ def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
         "min_low_after_signal": round(min_low, 2),
         "max_favorable_pct": round(((max_high - entry) / entry) * 100, 2),
         "max_adverse_pct": round(((min_low - entry) / entry) * 100, 2),
+        "expected_target_profit": expected_target_profit,
+        "expected_stop_loss_loss": expected_stop_loss_loss,
+        "max_possible_profit": max_possible_profit,
+        "max_possible_loss": max_possible_loss,
+        "missed_expected_profit": missed_expected_profit,
     }
 
 
@@ -326,6 +345,16 @@ def summarize(review_df, date_text):
         .to_dict()
     )
 
+    missed_expected_profit_total = round(
+    pd.to_numeric(review_df.get("missed_expected_profit"), errors="coerce").fillna(0).sum(),
+    2,
+)
+
+    max_possible_profit_total = round(
+        pd.to_numeric(review_df.get("max_possible_profit"), errors="coerce").fillna(0).sum(),
+        2,
+    )
+
     by_symbol = {}
     for symbol, part in review_df.groupby("symbol"):
         by_symbol[symbol] = {
@@ -355,6 +384,8 @@ def summarize(review_df, date_text):
         "outcome_counts": outcome_counts,
         "blocker_counts": dict(sorted(blocker_counts.items(), key=lambda x: x[1], reverse=True)),
         "by_symbol": by_symbol,
+        "missed_expected_profit_total": missed_expected_profit_total,
+        "max_possible_profit_total": max_possible_profit_total,
         "top_missed_opportunities": missed[
             [
                 "timestamp",
@@ -366,6 +397,9 @@ def summarize(review_df, date_text):
                 "stop_loss_price",
                 "weighted_score",
                 "max_favorable_pct",
+                "expected_target_profit",
+                "max_possible_profit",
+                "missed_expected_profit",
                 "llm_reason",
             ]
         ].head(5).to_dict(orient="records")
