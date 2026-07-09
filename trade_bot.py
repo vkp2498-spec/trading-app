@@ -11,7 +11,11 @@ from zoneinfo import ZoneInfo
 
 from analysis_journal import record_analysis
 from llm_decision import get_llm_decision
-from market_technicals import convert_index_levels_to_option_premium, get_technical_analysis
+from market_technicals import (
+    get_technical_analysis,
+    convert_index_levels_to_option_premium,
+    get_option_volume_vwap_analysis,
+)
 
 from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
 from signal_score import weighted_alignment_score
@@ -616,6 +620,11 @@ def process_symbol(symbol):
         return
 
     instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
+    atm_option_flow = get_option_volume_vwap_analysis(
+    instrument["instrument_key"],
+    side_label=f"{instrument['trading_symbol']} {option_type}",
+)
+    technicals["atm_option_flow"] = atm_option_flow
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
     expected_target = round(float(expected_entry_price) * 1.1, 0)
@@ -675,6 +684,7 @@ def process_symbol(symbol):
         f"5m={technicals.get('five_min')} "
         f"weighted={weighted_score} "
         f"llm={llm_decision}"
+        f"atm_option_flow={technicals.get('atm_option_flow')} "
     )
 
     if not llm_decision.get("execute_trade"):

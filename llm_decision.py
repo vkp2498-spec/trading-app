@@ -129,6 +129,9 @@ def get_llm_decision(symbol, option_summary, technicals):
             "Volume confirmation on 5M strengthens breakout quality.",
             "VWAP alignment strengthens intraday trend quality.",
             "Option-chain trend over recent snapshots is more reliable than one snapshot alone.",
+            "ATM option volume and VWAP are more important than index volume/VWAP for NIFTY/BANKNIFTY option entries.",
+            "ATM option premium above VWAP with above-average volume strengthens a long option trade.",
+            "ATM option premium below VWAP with weak volume reduces confidence.",
                     ],
     }
 

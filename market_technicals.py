@@ -95,6 +95,81 @@ def fetch_v3_intraday_minutes(instrument_key, minutes=15):
 
     return _parse_candles(response.json())
 
+def get_option_volume_vwap_analysis(instrument_key, side_label="OPTION"):
+    try:
+        df_5 = fetch_v3_intraday_minutes(instrument_key, minutes=5)
+        if len(df_5) < 25:
+            df_5 = fetch_v3_historical_minutes(instrument_key, minutes=5, lookback_days=5)
+
+        df_5 = add_indicators(df_5)
+        valid = df_5.dropna(subset=["close"])
+
+        if valid.empty:
+            return {
+                "label": side_label,
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "reasons": ["No valid option candle data"],
+            }
+
+        last = valid.iloc[-1]
+
+        close = float(last.get("close") or 0)
+        volume = float(last.get("volume") or 0)
+        volume_ma20 = float(last.get("volume_ma20") or 0)
+        volume_ratio = float(last.get("volume_ratio") or 0) if volume_ma20 else 0
+
+        vwap = float(last.get("vwap")) if pd.notna(last.get("vwap")) else None
+        vwap_series = df_5["vwap"].dropna() if "vwap" in df_5.columns else pd.Series(dtype=float)
+        prev_vwap = float(vwap_series.iloc[-2]) if len(vwap_series) >= 2 else vwap
+        vwap_slope = round(vwap - prev_vwap, 4) if vwap is not None and prev_vwap is not None else None
+
+        volume_confirmed = volume_ma20 > 0 and volume > volume_ma20
+
+        score = 0
+        reasons = []
+
+        if volume_confirmed:
+            score += 1
+            reasons.append("ATM option volume is above 20-period average")
+        else:
+            reasons.append("ATM option volume is not above 20-period average")
+
+        if vwap is not None and close > vwap and (vwap_slope is None or vwap_slope >= 0):
+            score += 1
+            reasons.append("ATM option premium is above VWAP and VWAP is flat/up")
+        elif vwap is not None and close < vwap and (vwap_slope is None or vwap_slope <= 0):
+            score -= 1
+            reasons.append("ATM option premium is below VWAP and VWAP is flat/down")
+        else:
+            reasons.append("ATM option VWAP is neutral/unavailable")
+
+        bias = "BULLISH" if score >= 1 else "BEARISH" if score <= -1 else "NEUTRAL"
+        confidence = "HIGH" if abs(score) >= 2 else "MEDIUM" if abs(score) == 1 else "LOW"
+
+        return {
+            "label": side_label,
+            "bias": bias,
+            "confidence": confidence,
+            "score": score,
+            "close": round(close, 2),
+            "volume": round(volume, 2),
+            "volume_ma20": round(volume_ma20, 2),
+            "volume_ratio": round(volume_ratio, 2),
+            "volume_confirmed": bool(volume_confirmed),
+            "vwap": round(vwap, 2) if vwap is not None else None,
+            "vwap_slope": vwap_slope,
+            "reasons": reasons,
+        }
+
+    except Exception as e:
+        return {
+            "label": side_label,
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "reasons": [f"Option volume/VWAP analysis failed: {e}"],
+        }
+
 
 def resample_ohlc(df, rule):
     if df.empty:
