@@ -685,7 +685,7 @@ def process_symbol(symbol):
         f"15m={technicals.get('fifteen_min')} "
         f"5m={technicals.get('five_min')} "
         f"weighted={weighted_score} "
-        f"llm={llm_decision}"
+        f"llm={llm_decision} "
         f"atm_option_flow={technicals.get('atm_option_flow')} "
     )
 
