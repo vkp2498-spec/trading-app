@@ -200,6 +200,40 @@ def analyze_latest(df, timeframe):
     lower = float(last["bb_lower"])
     r1 = float(last["r1"])
     s1 = float(last["s1"])
+    prev_close = float(df["close"].dropna().iloc[-2]) if len(df.dropna()) >= 2 else close
+    recent_closes = df["close"].dropna().tail(4)
+    recent_avg = float(recent_closes.mean()) if len(recent_closes) else close
+
+    momentum_score = 0
+    momentum_reasons = []
+
+    if close > prev_close:
+        momentum_score += 1
+        momentum_reasons.append("Latest close is above previous close")
+    elif close < prev_close:
+        momentum_score -= 1
+        momentum_reasons.append("Latest close is below previous close")
+
+    if close > recent_avg:
+        momentum_score += 1
+        momentum_reasons.append("Latest close is above recent 4-candle average")
+    elif close < recent_avg:
+        momentum_score -= 1
+        momentum_reasons.append("Latest close is below recent 4-candle average")
+
+    if close > pivot:
+        momentum_score += 1
+        momentum_reasons.append("Latest close is above pivot")
+    elif close < pivot:
+        momentum_score -= 1
+        momentum_reasons.append("Latest close is below pivot")
+
+    if close > ma20:
+        momentum_score += 1
+        momentum_reasons.append("Latest close is above middle band")
+    elif close < ma20:
+        momentum_score -= 1
+        momentum_reasons.append("Latest close is below middle band")
 
     score = 0
     reasons = []
@@ -259,6 +293,10 @@ def analyze_latest(df, timeframe):
         "target": target,
         "stop_loss": stop_loss,
         "reasons": reasons,
+        "prev_close": round(prev_close, 2),
+        "recent_avg_close": round(recent_avg, 2),
+        "momentum_score": momentum_score,
+        "momentum_reasons": momentum_reasons,
     }
 
 

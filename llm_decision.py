@@ -20,26 +20,60 @@ def llm_enabled():
 def build_rule_based_fallback(option_summary, technicals):
     option_bias = option_summary.get("bias")
     option_confidence = option_summary.get("confidence")
-    four_bias = technicals.get("four_hour", {}).get("bias")
-    fifteen_bias = technicals.get("fifteen_min", {}).get("bias")
+
+    four = technicals.get("four_hour", {})
+    fifteen = technicals.get("fifteen_min", {})
+
+    four_bias = four.get("bias")
+    four_confidence = four.get("confidence")
+    fifteen_bias = fifteen.get("bias")
+    fifteen_momentum = int(fifteen.get("momentum_score") or 0)
 
     if option_confidence != "HIGH":
         return {**DEFAULT_DECISION, "reason": "Option chain confidence is not HIGH"}
 
-    if option_bias in {"BULLISH", "BEARISH"} and four_bias == option_bias and fifteen_bias in {option_bias, "NEUTRAL"}:
+    if option_bias not in {"BULLISH", "BEARISH"}:
+        return {**DEFAULT_DECISION, "reason": "Option chain is not directional"}
+
+    if fifteen_bias not in {option_bias, "NEUTRAL"}:
+        return {
+            **DEFAULT_DECISION,
+            "reason": f"15M candle is opposite to option chain: option={option_bias}, 15M={fifteen_bias}",
+        }
+
+    four_conflicts = (
+        four_confidence in {"MEDIUM", "HIGH"}
+        and four_bias in {"BULLISH", "BEARISH"}
+        and four_bias != option_bias
+    )
+
+    if four_conflicts:
+        if fifteen_bias == option_bias and fifteen_momentum >= 3:
+            return {
+                "execute_trade": True,
+                "decision": option_bias,
+                "confidence": "MEDIUM",
+                "target_price": option_summary.get("target_price"),
+                "stop_loss_price": option_summary.get("stop_loss_price"),
+                "reason": "Cautious reversal trade: option chain is HIGH and 15M strongly confirms despite 4H conflict.",
+            }
+
+        return {
+            **DEFAULT_DECISION,
+            "reason": f"4H conflicts with option chain and 15M confirmation is not strong enough. 15M momentum={fifteen_momentum}",
+        }
+
+    if fifteen_bias in {option_bias, "NEUTRAL"}:
         return {
             "execute_trade": True,
             "decision": option_bias,
-            "confidence": "MEDIUM",
+            "confidence": "HIGH" if fifteen_bias == option_bias else "MEDIUM",
             "target_price": option_summary.get("target_price"),
             "stop_loss_price": option_summary.get("stop_loss_price"),
-            "reason": "Rule fallback: option chain and 4H candle agree; 15M is not opposite.",
+            "reason": "Option chain is HIGH confidence and technicals do not strongly conflict.",
         }
 
-    return {
-        **DEFAULT_DECISION,
-        "reason": "Rule fallback: option chain and candle signals do not align.",
-    }
+    return {**DEFAULT_DECISION, "reason": "No valid trade setup"}
 
 
 def get_llm_decision(symbol, option_summary, technicals):
@@ -79,12 +113,16 @@ def get_llm_decision(symbol, option_summary, technicals):
         "option_chain": option_summary,
         "technical_analysis": technicals,
         "rules": [
-            "Return execute_trade=false if signals conflict strongly.",
-            "Return execute_trade=false if 15M is opposite to option chain.",
-            "Prefer option-chain target/stop_loss for option premium trade.",
-            "Do not invent prices. Use provided target_price and stop_loss_price unless improving conservatively.",
-            "This is intraday options buying. Stop loss must be below entry premium and target above entry premium.",
-        ],
+            "Option-chain HIGH confidence is mandatory for any trade.",
+            "Reject if 15M bias is opposite to option-chain direction.",
+            "4H conflict is a risk penalty, not automatic rejection.",
+            "If 4H conflicts but 15M momentum_score is >= 3 in option-chain direction, a cautious trade may be allowed.",
+            "If 4H conflicts and 15M is neutral/low momentum, reject.",
+            "Prefer smaller target and tighter stop when 4H conflicts.",
+            "Use option-chain target/stop as default option premium levels.",
+            "Use option_target_price and option_stop_loss_price from technical analysis only when they support the option-chain direction.",
+            "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
+                    ],
     }
 
     response = client.responses.create(
