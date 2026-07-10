@@ -517,50 +517,69 @@ def apply_trailing_stop(symbol, state, ltp):
         return state
 
     entry_price = float(state.get("entry_price") or 0)
+    target_price = float(state.get("target_price") or 0)
     current_stop = float(state.get("stop_loss_price") or 0)
     current_high = float(state.get("highest_ltp") or entry_price)
 
-    if entry_price <= 0:
+    if entry_price <= 0 or target_price <= entry_price:
         return state
 
-    highest_ltp = max(current_high, float(ltp))
-    profit_pct = (highest_ltp - entry_price) / entry_price
+    ltp = float(ltp)
+    highest_ltp = max(current_high, ltp)
+
+    target_gap = target_price - entry_price
+    profit_from_entry = highest_ltp - entry_price
+    target_progress = profit_from_entry / target_gap if target_gap > 0 else 0
 
     new_stop = current_stop
     reason = None
 
-    # Below 5% profit, keep original stop loss.
-    if profit_pct < 0.05:
-        new_stop = current_stop
+    # Once trade reaches 25% of expected target, reduce risk.
+    if target_progress >= 0.25:
+        new_stop = max(new_stop, round(entry_price * 0.99, 0))
+        reason = "Trail activated: 25% target progress, risk reduced"
 
-    # Once profit reaches 5%, protect capital near breakeven.
-    elif profit_pct < 0.10:
-        new_stop = max(current_stop, round(entry_price * 1.01, 0))
-        reason = "Trail activated: profit above 5%, stop moved near breakeven"
+    # Once trade reaches 40% of expected target, move to breakeven.
+    if target_progress >= 0.40:
+        new_stop = max(new_stop, round(entry_price, 0))
+        reason = "Trail tightened: 40% target progress, stop moved to breakeven"
 
-    # Once profit reaches 10%, trail 5% below highest premium.
-    elif profit_pct < 0.20:
-        new_stop = max(current_stop, round(highest_ltp * 0.95, 0))
-        reason = "Trail tightened: profit above 10%, stop moved to 5% below high"
+    # Once trade reaches 60% of expected target, lock 30% of expected profit.
+    if target_progress >= 0.60:
+        new_stop = max(new_stop, round(entry_price + target_gap * 0.30, 0))
+        reason = "Trail tightened: 60% target progress, locked 30% of expected profit"
 
-    # Once profit reaches 20%, trail 4% below highest premium.
-    else:
-        new_stop = max(current_stop, round(highest_ltp * 0.96, 0))
-        reason = "Trail tightened: profit above 20%, stop moved to 4% below high"
+    # Once trade reaches 75% of expected target, lock 50% of expected profit.
+    if target_progress >= 0.75:
+        new_stop = max(new_stop, round(entry_price + target_gap * 0.50, 0))
+        reason = "Trail tightened: 75% target progress, locked 50% of expected profit"
 
-    state["highest_ltp"] = round(highest_ltp, 2)
+    # Once trade reaches 90% of expected target, lock 70% of expected profit.
+    if target_progress >= 0.90:
+        new_stop = max(new_stop, round(entry_price + target_gap * 0.70, 0))
+        reason = "Trail tightened: 90% target progress, locked 70% of expected profit"
+
+    state_changed = False
+
+    if highest_ltp > current_high:
+        state["highest_ltp"] = round(highest_ltp, 2)
+        state_changed = True
 
     if new_stop > current_stop:
         state["stop_loss_price"] = round(new_stop, 0)
         state["trailing_stop_active"] = True
         state["trailing_stop_reason"] = reason
-        write_state(symbol, state)
+        state_changed = True
 
         log(
             f"{symbol} trailing stop updated: entry={entry_price} "
-            f"ltp={ltp} highest={highest_ltp} old_stop={current_stop} "
-            f"new_stop={new_stop} reason={reason}"
+            f"ltp={ltp} highest={highest_ltp} target={target_price} "
+            f"progress={round(target_progress * 100, 1)}% "
+            f"old_stop={current_stop} new_stop={new_stop} reason={reason}"
         )
+
+    if state_changed:
+        write_state(symbol, state)
 
     return state
 
