@@ -606,6 +606,23 @@ def run_squareoff():
 
         clear_state(symbol)
 
+def cautious_override_allowed(direction, weighted_score, technicals):
+    score_value = float(weighted_score.get("score") or 0)
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    five = technicals.get("five_min", {}) or {}
+    atm_flow = technicals.get("atm_option_flow", {}) or {}
+
+    atm_close = float(atm_flow.get("close") or 0)
+    atm_vwap = float(atm_flow.get("vwap") or 999999)
+
+    return (
+        score_value >= 55
+        and fifteen.get("bias") != opposite_direction(direction)
+        and five.get("bias") != opposite_direction(direction)
+        and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
+        and atm_close >= atm_vwap
+    )
+
 
 def process_symbol(symbol):
     state = read_state(symbol)
@@ -694,11 +711,41 @@ def process_symbol(symbol):
 )
     technicals["atm_option_flow"] = atm_option_flow
 
-    option_trend = get_option_chain_trend(symbol, direction)
-    weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
-
     option_summary["option_chain_trend"] = option_trend
     option_summary["weighted_alignment"] = weighted_score
+
+    cautious_override = False
+
+    if weighted_score["grade"] == "SKIP":
+        if cautious_override_allowed(direction, weighted_score, technicals):
+            cautious_override = True
+            expected_target = round(float(expected_entry_price) * 1.06, 0)
+            expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+
+            option_summary["target_price"] = expected_target
+            option_summary["stop_loss_price"] = expected_stop_loss
+            option_summary["cautious_override"] = True
+            option_summary["cautious_override_reason"] = (
+                "Weighted score was SKIP, but short-term filters and ATM option VWAP allowed cautious trade."
+            )
+
+            log(
+                f"{symbol} cautious override allowed before LLM: "
+                f"score={weighted_score.get('score')} target={expected_target} "
+                f"stop_loss={expected_stop_loss}"
+            )
+        else:
+            llm_decision = {
+                "execute_trade": False,
+                "decision": "NO_TRADE",
+                "confidence": "LOW",
+                "target_price": None,
+                "stop_loss_price": None,
+                "reason": f"Weighted score too low before LLM: {weighted_score}",
+            }
+            record_analysis(symbol, option_summary, technicals, llm_decision)
+            log(f"{symbol} no trade: weighted score too low before LLM: {weighted_score}")
+            return
 
     llm_decision = get_llm_decision(symbol, option_summary, technicals)
     record_analysis(symbol, option_summary, technicals, llm_decision)
@@ -744,30 +791,30 @@ def process_symbol(symbol):
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
 
-    if weighted_score["grade"] == "SKIP":
-        score_value = float(weighted_score.get("score") or 0)
-        fifteen = technicals.get("fifteen_min", {}) or {}
-        five = technicals.get("five_min", {}) or {}
-        atm_flow = technicals.get("atm_option_flow", {}) or {}
+    # if weighted_score["grade"] == "SKIP":
+    #     score_value = float(weighted_score.get("score") or 0)
+    #     fifteen = technicals.get("fifteen_min", {}) or {}
+    #     five = technicals.get("five_min", {}) or {}
+    #     atm_flow = technicals.get("atm_option_flow", {}) or {}
 
-        cautious_override = (
-            score_value >= 55
-            and fifteen.get("bias") != opposite_direction(direction)
-            and five.get("bias") != opposite_direction(direction)
-            and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
-            and float(atm_flow.get("close") or 0) >= float(atm_flow.get("vwap") or 999999)
-        )
+    #     cautious_override = (
+    #         score_value >= 55
+    #         and fifteen.get("bias") != opposite_direction(direction)
+    #         and five.get("bias") != opposite_direction(direction)
+    #         and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
+    #         and float(atm_flow.get("close") or 0) >= float(atm_flow.get("vwap") or 999999)
+    #     )
 
-        if cautious_override:
-            expected_target = round(float(expected_entry_price) * 1.06, 0)
-            expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
-            log(
-                f"{symbol} cautious override allowed despite SKIP: "
-                f"score={score_value} target={expected_target} stop_loss={expected_stop_loss}"
-            )
-        else:
-            log(f"{symbol} no trade: weighted score too low: {weighted_score}")
-            return
+    #     if cautious_override:
+    #         expected_target = round(float(expected_entry_price) * 1.06, 0)
+    #         expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+    #         log(
+    #             f"{symbol} cautious override allowed despite SKIP: "
+    #             f"score={score_value} target={expected_target} stop_loss={expected_stop_loss}"
+    #         )
+    #     else:
+    #         log(f"{symbol} no trade: weighted score too low: {weighted_score}")
+    #         return
 
     if not live:
         log(f"{symbol} DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
