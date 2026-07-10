@@ -40,6 +40,13 @@ INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
+
+# Change only these values next time.
+LOT_MULTIPLIERS = {
+    "NIFTY": 8,
+    "BANKNIFTY": 2,
+}
+
 MAX_TRADES_PER_SYMBOL_PER_DAY = 2
 
 SYMBOL_CONFIG = {
@@ -177,6 +184,13 @@ def upstox_request(method, url, **kwargs):
 
 def opposite_direction(direction):
     return "BEARISH" if direction == "BULLISH" else "BULLISH"
+
+def lot_multiplier_for(symbol):
+    return int(LOT_MULTIPLIERS.get(symbol, 1))
+
+
+def order_quantity_for(symbol, instrument):
+    return int(instrument["lot_size"]) * lot_multiplier_for(symbol)
 
 
 def place_market_order(instrument, transaction_type, quantity):
@@ -348,9 +362,10 @@ def save_open_position_state(
     confidence,
     score,
     entry_price,
+    quantity,
     target_price=None,
     stop_loss_price=None,
-    ):
+):
     target_price = round(float(target_price), 0) if target_price else round(float(entry_price) * 1.10, 0)
     stop_loss_price = round(float(stop_loss_price), 0) if stop_loss_price else round(float(entry_price) * 0.925, 0)
 
@@ -360,7 +375,9 @@ def save_open_position_state(
         "buy_order_id": order_id,
         "instrument_key": instrument["instrument_key"],
         "trading_symbol": instrument["trading_symbol"],
-        "quantity": int(instrument["lot_size"]),
+        "quantity": int(quantity),
+        "lot_size": int(instrument["lot_size"]),
+        "lot_multiplier": lot_multiplier_for(symbol),
         "direction": direction,
         "confidence": confidence,
         "score": score,
@@ -378,7 +395,7 @@ def save_open_position_state(
 
     log(
         f"{symbol} POSITION OPEN: symbol={instrument['trading_symbol']} "
-        f"qty={instrument['lot_size']} entry={state['entry_price']} "
+        f"qty={quantity} lots={lot_multiplier_for(symbol)} entry={state['entry_price']} "
         f"target={target_price} stop_loss={stop_loss_price}"
     )
 
@@ -623,7 +640,8 @@ def process_symbol(symbol):
         return
 
     instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
-    
+    order_quantity = order_quantity_for(symbol, instrument)
+
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
     expected_target = round(float(expected_entry_price) * 1.1, 0)
@@ -718,7 +736,7 @@ def process_symbol(symbol):
         return
 
     log(
-        f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={instrument['lot_size']} "
+        f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={order_quantity} lots={lot_multiplier_for(symbol)} "
         f"expected_entry={expected_entry_price} expected_target={expected_target} "
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
@@ -756,7 +774,7 @@ def process_symbol(symbol):
     result, payload = place_market_order(
         instrument=instrument,
         transaction_type="BUY",
-        quantity=instrument["lot_size"],
+        quantity=order_quantity,
     )
 
     order_id = result.get("data", {}).get("order_id")
@@ -777,7 +795,9 @@ def process_symbol(symbol):
             "buy_order_id": order_id,
             "instrument_key": instrument["instrument_key"],
             "trading_symbol": instrument["trading_symbol"],
-            "quantity": int(instrument["lot_size"]),
+            "quantity": int(order_quantity),
+            "lot_size": int(instrument["lot_size"]),
+            "lot_multiplier": lot_multiplier_for(symbol),
             "direction": direction,
             "confidence": confidence,
             "score": score,
@@ -793,15 +813,18 @@ def process_symbol(symbol):
     entry_price = entry_price or expected_entry_price
 
     save_open_position_state(
-        symbol=symbol,
-        order_id=order_id,
-        instrument=instrument,
-        direction=direction,
-        confidence=confidence,
-        score=score,
-        entry_price=entry_price,
-        target_price=expected_target,
-        stop_loss_price=expected_stop_loss,
+        save_open_position_state(
+            symbol=symbol,
+            order_id=order_id,
+            instrument=instrument,
+            direction=direction,
+            confidence=confidence,
+            score=score,
+            entry_price=entry_price,
+            quantity=order_quantity,
+            target_price=expected_target,
+            stop_loss_price=expected_stop_loss,
+        )
     )
 
 
