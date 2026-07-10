@@ -450,40 +450,25 @@ def render_live_trade_cards(live_df):
 
         reason = row.get("trailing_stop_reason") or "Trailing will activate after enough target progress."
 
-        html = f"""
+                html = f"""
 <div class="live-card">
-    <div class="small-label">{row.get("symbol", "")}</div>
-    <div class="big-value">{row.get("trading_symbol", "")}</div>
-    <div class="muted">Qty: {row.get("quantity", "")} | Broker Qty: {row.get("broker_quantity", "")}</div>
-    <br>
-
-    <div class="small-label">Live P&L</div>
-    <div class="big-value {pnl_class}">{money(pnl)}</div>
-    <br>
-
-    <div class="small-label">Trade Levels</div>
-    <div>
-        Entry: <b>{number(row.get("entry_price"))}</b> |
-        LTP: <b>{number(row.get("ltp"))}</b> |
-        Target: <b>{number(row.get("target_price"))}</b>
-    </div>
-    <div>
-        Stop Loss: <b>{number(row.get("stop_loss_price"))}</b> |
-        Highest LTP: <b>{number(row.get("highest_ltp"))}</b>
-    </div>
-    <br>
-
-    <div class="small-label">Risk View</div>
-    <div>
-        Target Progress: <b>{progress_text}</b> |
-        Reward Left: <b>{money(row.get("reward_left"))}</b> |
-        Risk To Stop: <b>{money(row.get("risk_to_stop"))}</b>
-    </div>
-    <br>
-
-    <div class="small-label">Trailing Stop</div>
-    <div class="{trailing_class}">{trailing_text}</div>
-    <div class="muted">{reason}</div>
+<div class="small-label">{row.get("symbol", "")}</div>
+<div class="big-value">{row.get("trading_symbol", "")}</div>
+<div class="muted">Qty: {row.get("quantity", "")} | Broker Qty: {row.get("broker_quantity", "")}</div>
+<br>
+<div class="small-label">Live P&L</div>
+<div class="big-value {pnl_class}">{money(pnl)}</div>
+<br>
+<div class="small-label">Trade Levels</div>
+<div>Entry: <b>{number(row.get("entry_price"))}</b> | LTP: <b>{number(row.get("ltp"))}</b> | Target: <b>{number(row.get("target_price"))}</b></div>
+<div>Stop Loss: <b>{number(row.get("stop_loss_price"))}</b> | Highest LTP: <b>{number(row.get("highest_ltp"))}</b></div>
+<br>
+<div class="small-label">Risk View</div>
+<div>Target Progress: <b>{progress_text}</b> | Reward Left: <b>{money(row.get("reward_left"))}</b> | Risk To Stop: <b>{money(row.get("risk_to_stop"))}</b></div>
+<br>
+<div class="small-label">Trailing Stop</div>
+<div class="{trailing_class}">{trailing_text}</div>
+<div class="muted">{reason}</div>
 </div>
 """
 
