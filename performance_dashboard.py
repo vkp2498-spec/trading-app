@@ -233,7 +233,7 @@ def load_env():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
 def safe_literal_dict(text):
@@ -662,7 +662,7 @@ with main_tab:
                 unsafe_allow_html=True,
             )
 
-        st.markdown("### Live Bot Trades")
+    st.markdown("### Live Bot Trades")
     render_live_trade_cards(live_df)
 
     st.divider()
