@@ -131,11 +131,16 @@ def get_llm_decision(symbol, option_summary, technicals):
             "Option-chain trend over recent snapshots is more reliable than one snapshot alone.",
             "ATM option volume and VWAP are more important than index volume/VWAP for NIFTY/BANKNIFTY option entries.",
             "ATM option premium above VWAP with above-average volume strengthens a long option trade.",
-            "ATM option premium below VWAP with weak volume reduces confidence.",
+            "ATM option premium below VWAP reduces confidence even when volume is strong; below-VWAP option premium means buyers are not yet in control."
             "CAUTIOUS_TRADE weighted grade with option-chain HIGH, 15M aligned, and 5M aligned is allowed even if 4H is neutral or low confidence.",
             "Do not reject only because 4H confidence is LOW or 4H bias is NEUTRAL.",
             "Reject 4H only when it has MEDIUM or HIGH confidence and is opposite to option-chain direction.",
             "ATM option flow below VWAP is a risk penalty, but not automatic rejection when 15M and 5M are aligned.",
+            "When cautious_trade is true, evaluate it as an already risk-reduced setup with smaller target and tighter stop.",
+            "If cautious_trade is true and option-chain is HIGH, 15M is aligned, and 5M is aligned, do not reject only because 4H is NEUTRAL or LOW confidence.",
+            "Volume confirmation means volume_confirmed=true in atm_option_flow. Do not call volume weak when volume_confirmed is true.",
+            "ATM option below VWAP is a significant risk penalty. If ATM option is below VWAP, cautious trade can still be rejected unless other signals are very strong.",
+            "When rejecting, state the actual blocker precisely: for example ATM option below VWAP, 4H opposite, 15M opposite, 5M opposite, or weighted score too low.",
                     ],
     }
 
