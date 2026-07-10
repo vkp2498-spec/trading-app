@@ -623,7 +623,15 @@ def should_exit_on_sentiment_change(symbol, state, ltp):
 
     try:
         result = get_index_recommendation(symbol)
-        df_atm = result[0]
+
+        if isinstance(result, dict):
+            df_atm = result.get("df_atm") or result.get("atm") or result.get("atm_df")
+        else:
+            df_atm = result[0]
+
+        if df_atm is None or df_atm.empty:
+            return False, "sentiment check skipped: no ATM data"
+
         atm = df_atm.iloc[0]
 
         new_direction, new_confidence, new_score, new_reasons = option_chain_signal(atm)
