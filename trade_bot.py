@@ -4,6 +4,7 @@ import json
 import gzip
 import time as time_module
 import socket
+from unittest import result
 import urllib.request
 from pathlib import Path
 from datetime import datetime, time
@@ -621,7 +622,8 @@ def should_exit_on_sentiment_change(symbol, state, ltp):
         return False, ""
 
     try:
-        df_atm, df_nearby, df_chain, last_refresh = get_index_recommendation(symbol)
+        result = get_index_recommendation(symbol)
+        df_atm = result[0]
         atm = df_atm.iloc[0]
 
         new_direction, new_confidence, new_score, new_reasons = option_chain_signal(atm)
