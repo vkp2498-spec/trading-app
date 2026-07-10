@@ -483,24 +483,27 @@ def handle_existing_state(symbol, state):
                 log(f"{symbol} BUY complete but entry price not found. Keeping state.")
                 return True
 
+            quantity = int(state.get("quantity") or position_quantity(position) or 0)
+
             instrument = {
                 "instrument_key": instrument_key,
                 "trading_symbol": state.get("trading_symbol"),
-                "lot_size": int(state.get("quantity", 0)),
+                "lot_size": int(state.get("lot_size") or quantity),
             }
 
-        save_open_position_state(
-            symbol=symbol,
-            order_id=order_id,
-            instrument=instrument,
-            direction=direction,
-            confidence=confidence,
-            score=score,
-            entry_price=entry_price,
-            target_price=expected_target,
-            stop_loss_price=expected_stop_loss,
-        )
-        return True
+            save_open_position_state(
+                symbol=symbol,
+                order_id=buy_order_id,
+                instrument=instrument,
+                direction=state.get("direction"),
+                confidence=state.get("confidence"),
+                score=state.get("score"),
+                entry_price=entry_price,
+                quantity=quantity,
+                target_price=state.get("target_price"),
+                stop_loss_price=state.get("stop_loss_price"),
+            )
+            return True
 
         log(f"{symbol} BUY order still pending. No new order.")
         return True
@@ -798,6 +801,8 @@ def process_symbol(symbol):
             "quantity": int(order_quantity),
             "lot_size": int(instrument["lot_size"]),
             "lot_multiplier": lot_multiplier_for(symbol),
+            "target_price": expected_target,
+            "stop_loss_price": expected_stop_loss,
             "direction": direction,
             "confidence": confidence,
             "score": score,
@@ -813,18 +818,16 @@ def process_symbol(symbol):
     entry_price = entry_price or expected_entry_price
 
     save_open_position_state(
-        save_open_position_state(
-            symbol=symbol,
-            order_id=order_id,
-            instrument=instrument,
-            direction=direction,
-            confidence=confidence,
-            score=score,
-            entry_price=entry_price,
-            quantity=order_quantity,
-            target_price=expected_target,
-            stop_loss_price=expected_stop_loss,
-        )
+    symbol=symbol,
+    order_id=order_id,
+    instrument=instrument,
+    direction=direction,
+    confidence=confidence,
+    score=score,
+    entry_price=entry_price,
+    quantity=order_quantity,
+    target_price=expected_target,
+    stop_loss_price=expected_stop_loss,
     )
 
 
