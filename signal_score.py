@@ -29,19 +29,35 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
             "reasons": ["Option chain is not directional"],
         }
 
+    weights = {
+        "option_chain": 35,
+        "fifteen_min": 25,
+        "four_hour": 10,
+        "five_min": 15,
+        "atm_option_flow": 15,
+    }
+
     reasons = []
 
     option_conf = confidence_multiplier(option_summary.get("confidence"))
-    option_component = 40 * option_conf
-    reasons.append(f"Option-chain component={option_component:.1f}/40")
+    option_component = weights["option_chain"] * option_conf
+    reasons.append(f"Option-chain component={option_component:.1f}/{weights['option_chain']}")
 
     fifteen = technicals.get("fifteen_min", {}) or {}
-    fifteen_component = 25 * direction_score(fifteen.get("bias"), direction) * confidence_multiplier(fifteen.get("confidence"))
-    reasons.append(f"15M component={fifteen_component:.1f}/25")
+    fifteen_component = (
+        weights["fifteen_min"]
+        * direction_score(fifteen.get("bias"), direction)
+        * confidence_multiplier(fifteen.get("confidence"))
+    )
+    reasons.append(f"15M component={fifteen_component:.1f}/{weights['fifteen_min']}")
 
     four = technicals.get("four_hour", {}) or {}
-    four_component = 20 * direction_score(four.get("bias"), direction) * confidence_multiplier(four.get("confidence"))
-    reasons.append(f"4H component={four_component:.1f}/20")
+    four_component = (
+        weights["four_hour"]
+        * direction_score(four.get("bias"), direction)
+        * confidence_multiplier(four.get("confidence"))
+    )
+    reasons.append(f"4H component={four_component:.1f}/{weights['four_hour']}")
 
     five = technicals.get("five_min", {}) or {}
     momentum_score = float(five.get("momentum_score") or 0)
@@ -50,30 +66,30 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
 
     momentum_component = 0
     if momentum_score >= 3:
-        momentum_component = 10
+        momentum_component = weights["five_min"]
     elif momentum_score >= 1:
-        momentum_component = 6
+        momentum_component = weights["five_min"] * 0.65
     elif momentum_score >= 0:
-        momentum_component = 3
+        momentum_component = weights["five_min"] * 0.30
 
     if five.get("volume_confirmed"):
-        momentum_component = min(10, momentum_component + 2)
+        momentum_component = min(weights["five_min"], momentum_component + 2)
 
-    reasons.append(f"5M momentum/volume component={momentum_component:.1f}/10")
+    reasons.append(f"5M momentum/volume component={momentum_component:.1f}/{weights['five_min']}")
 
     option_flow = technicals.get("atm_option_flow", {}) or {}
 
-    vwap_component = 0
+    flow_component = 0
     if option_flow.get("bias") == "BULLISH" and option_flow.get("volume_confirmed"):
-        vwap_component = 5
+        flow_component = weights["atm_option_flow"]
     elif option_flow.get("bias") == "BULLISH":
-        vwap_component = 3
+        flow_component = weights["atm_option_flow"] * 0.70
     elif option_flow.get("bias") == "NEUTRAL":
-        vwap_component = 1.5
+        flow_component = weights["atm_option_flow"] * 0.30
     else:
-        vwap_component = 0
+        flow_component = 0
 
-    reasons.append(f"ATM option VWAP/volume component={vwap_component:.1f}/5")
+    reasons.append(f"ATM option VWAP/volume component={flow_component:.1f}/{weights['atm_option_flow']}")
 
     trend_bonus = 0
     if option_chain_trend.get("bias") == direction:
@@ -83,12 +99,12 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
         trend_bonus = -10
         reasons.append("Option-chain trend conflicts direction (-10 penalty)")
 
-    total = option_component + fifteen_component + four_component + momentum_component + vwap_component + trend_bonus
+    total = option_component + fifteen_component + four_component + momentum_component + flow_component + trend_bonus
     total = max(0, min(100, round(total, 1)))
 
     if total >= 80:
         grade = "TRADE"
-    elif total >= 60:
+    elif total >= 65:
         grade = "CAUTIOUS_TRADE"
     else:
         grade = "SKIP"

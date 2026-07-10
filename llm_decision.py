@@ -169,8 +169,8 @@ def get_llm_decision(symbol, option_summary, technicals):
 
     "Use weighted_alignment score as important context.",
     "Scores >= 80 can be considered normal trade candidates.",
-    "Scores 60 to 79 with CAUTIOUS_TRADE grade should generally execute if option-chain is HIGH and 15M/5M are aligned, using smaller target and tighter stop.",
-    "Scores below 60 should normally be rejected.",
+    "Scores 65 to 79 with CAUTIOUS_TRADE grade should generally execute only if option-chain is HIGH and 15M/5M are aligned, using smaller target and tighter stop.",
+    "Scores below 65 should normally be rejected unless the bot explicitly marks cautious_override true.",
 
     "When cautious_trade is true, evaluate it as an already risk-reduced setup with smaller target and tighter stop.",
     "If cautious_trade is true and option-chain is HIGH, 15M is aligned, and 5M is aligned, do not reject only because 4H is NEUTRAL or LOW confidence.",
@@ -187,6 +187,12 @@ def get_llm_decision(symbol, option_summary, technicals):
     "Use option-chain target/stop as default option premium levels.",
     "Use option_target_price and option_stop_loss_price from technical analysis only when they support the option-chain direction.",
     "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
+
+    "NIFTY requires stronger confirmation than BANKNIFTY.",
+    "CAUTIOUS_TRADE requires symbol minimum score: NIFTY >= 70, BANKNIFTY >= 65.",
+    "ATM option flow has higher importance after recent losses; opposite ATM option flow should be treated as a serious blocker.",
+    "Do not approve a cautious trade when ATM option flow is opposite to trade direction.",
+    "Prefer trades where ATM option premium is above VWAP or ATM option flow is at least neutral with strong 15M and 5M alignment.",
 
     "When rejecting, state the actual blocker precisely: ATM option below VWAP, 4H opposite, 15M opposite, 5M opposite, weighted score too low, or option-chain confidence not HIGH.",
 ],

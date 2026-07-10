@@ -44,9 +44,16 @@ SYMBOLS = ["NIFTY", "BANKNIFTY"]
 
 # Change only these values next time.
 LOT_MULTIPLIERS = {
-    "NIFTY": 1,
-    "BANKNIFTY": 1,
+    "NIFTY": 8,
+    "BANKNIFTY": 2,
 }
+
+MIN_SCORE_BY_SYMBOL = {
+    "NIFTY": 70,
+    "BANKNIFTY": 65,
+}
+
+LLM_RESCUE_SCORE = 50
 
 MAX_TRADES_PER_SYMBOL_PER_DAY = 2
 
@@ -713,7 +720,7 @@ def cautious_override_allowed(direction, weighted_score, technicals):
     atm_vwap = float(atm_flow.get("vwap") or 999999)
 
     return (
-        score_value >= 55
+        score_value >= LLM_RESCUE_SCORE
         and fifteen.get("bias") != opposite_direction(direction)
         and five.get("bias") != opposite_direction(direction)
         and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
@@ -816,8 +823,11 @@ def process_symbol(symbol):
 
     cautious_override = False
 
+    score_value = float(weighted_score.get("score") or 0)
+    symbol_min_score = MIN_SCORE_BY_SYMBOL.get(symbol, 65)
+
     if weighted_score["grade"] == "SKIP":
-        if cautious_override_allowed(direction, weighted_score, technicals):
+        if score_value >= LLM_RESCUE_SCORE and cautious_override_allowed(direction, weighted_score, technicals):
             cautious_override = True
             expected_target = round(float(expected_entry_price) * 1.06, 0)
             expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
@@ -852,6 +862,19 @@ def process_symbol(symbol):
         option_summary["target_price"] = expected_target
         option_summary["stop_loss_price"] = expected_stop_loss
         option_summary["cautious_trade"] = True
+
+    if weighted_score["grade"] == "CAUTIOUS_TRADE" and score_value < symbol_min_score:
+        llm_decision = {
+            "execute_trade": False,
+            "decision": "NO_TRADE",
+            "confidence": "LOW",
+            "target_price": None,
+            "stop_loss_price": None,
+            "reason": f"{symbol} score {score_value} is below symbol minimum {symbol_min_score}",
+        }
+        record_analysis(symbol, option_summary, technicals, llm_decision)
+        log(f"{symbol} no trade: score below symbol minimum. score={score_value}, required={symbol_min_score}")
+        return
 
     llm_decision = get_llm_decision(symbol, option_summary, technicals)
     record_analysis(symbol, option_summary, technicals, llm_decision)
