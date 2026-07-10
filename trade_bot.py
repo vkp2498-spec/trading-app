@@ -44,8 +44,8 @@ SYMBOLS = ["NIFTY", "BANKNIFTY"]
 
 # Change only these values next time.
 LOT_MULTIPLIERS = {
-    "NIFTY": 8,
-    "BANKNIFTY": 2,
+    "NIFTY": 1,
+    "BANKNIFTY": 1,
 }
 
 MIN_SCORE_BY_SYMBOL = {
