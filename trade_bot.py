@@ -23,7 +23,7 @@ from signal_score import weighted_alignment_score
 import requests
 import urllib3.util.connection as urllib3_cn
 
-from strategy_core import get_index_recommendation, now_ist
+from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from trade_journal import record_closed_trade
 
 
@@ -433,8 +433,14 @@ def handle_existing_state(symbol, state):
             f"target={target_price} stop_loss={stop_loss_price}"
         )
 
-        if ltp is not None and (ltp >= target_price or ltp <= stop_loss_price):
-            exit_reason = "TARGET" if ltp >= target_price else "STOP_LOSS"
+        sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(symbol, state, ltp)
+
+        if ltp is not None and (ltp >= target_price or ltp <= stop_loss_price or sentiment_exit):
+            if sentiment_exit:
+                exit_reason = "SENTIMENT_EXIT"
+                log(f"{symbol} sentiment exit triggered: {sentiment_reason}")
+            else:
+                exit_reason = "TARGET" if ltp >= target_price else "STOP_LOSS"
             instrument = {
                 "instrument_key": instrument_key,
                 "trading_symbol": state.get("trading_symbol"),
@@ -582,6 +588,61 @@ def apply_trailing_stop(symbol, state, ltp):
         write_state(symbol, state)
 
     return state
+
+def minutes_since_created(state):
+    try:
+        created_at = datetime.fromisoformat(state.get("created_at"))
+        return (now_ist() - created_at).total_seconds() / 60
+    except Exception:
+        return 999
+
+
+def should_exit_on_sentiment_change(symbol, state, ltp):
+    if ltp is None:
+        return False, ""
+
+    direction = state.get("direction")
+    entry_price = float(state.get("entry_price") or 0)
+    target_price = float(state.get("target_price") or 0)
+
+    if direction not in {"BULLISH", "BEARISH"}:
+        return False, ""
+
+    if entry_price <= 0 or target_price <= entry_price:
+        return False, ""
+
+    # Give the trade some time to breathe after entry.
+    if minutes_since_created(state) < 5:
+        return False, ""
+
+    # If already near target, let target/trailing-stop logic handle it.
+    target_progress = (float(ltp) - entry_price) / (target_price - entry_price)
+    if target_progress >= 0.70:
+        return False, ""
+
+    try:
+        df_atm, df_nearby, df_chain, last_refresh = get_index_recommendation(symbol)
+        atm = df_atm.iloc[0]
+
+        new_direction, new_confidence, new_score, new_reasons = option_chain_signal(atm)
+
+        if direction == "BULLISH":
+            opposite_is_strong = new_direction == "BEARISH" and new_confidence == "HIGH" and new_score <= -4
+        else:
+            opposite_is_strong = new_direction == "BULLISH" and new_confidence == "HIGH" and new_score >= 4
+
+        if opposite_is_strong:
+            return True, (
+                f"sentiment invalidated: trade_direction={direction}, "
+                f"new_direction={new_direction}, confidence={new_confidence}, "
+                f"score={new_score}, reasons={new_reasons}"
+            )
+
+        return False, ""
+
+    except Exception as e:
+        log(f"{symbol} sentiment exit check failed: {e}")
+        return False, ""
 
 def run_squareoff():
     for symbol in SYMBOLS:
