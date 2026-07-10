@@ -375,6 +375,10 @@ def get_live_bot_positions():
         pos = find_position_by_instrument(positions, state.get("instrument_key"))
         qty = int(float(state.get("quantity") or 0))
         entry = float(state.get("entry_price") or 0)
+        target = float(state.get("target_price") or 0)
+        stop = float(state.get("stop_loss_price") or 0)
+        highest = float(state.get("highest_ltp") or entry or 0)
+
         ltp = None
         actual_qty = 0
 
@@ -386,8 +390,21 @@ def get_live_bot_positions():
                 entry = broker_entry
 
         live_pnl = None
+        target_progress = None
+        risk_to_stop = None
+        reward_left = None
+
         if ltp is not None and entry > 0:
             live_pnl = round((ltp - entry) * qty, 2)
+
+        if ltp is not None and target > entry:
+            target_progress = round(((ltp - entry) / (target - entry)) * 100, 1)
+
+        if ltp is not None and stop > 0:
+            risk_to_stop = round((ltp - stop) * qty, 2)
+
+        if ltp is not None and target > 0:
+            reward_left = round((target - ltp) * qty, 2)
 
         rows.append(
             {
@@ -398,15 +415,79 @@ def get_live_bot_positions():
                 "broker_quantity": actual_qty,
                 "entry_price": entry,
                 "ltp": ltp,
-                "target_price": state.get("target_price", ""),
-                "stop_loss_price": state.get("stop_loss_price", ""),
-                "highest_ltp": state.get("highest_ltp", ""),
+                "target_price": target,
+                "stop_loss_price": stop,
+                "highest_ltp": highest,
                 "live_pnl": live_pnl,
+                "target_progress": target_progress,
+                "risk_to_stop": risk_to_stop,
+                "reward_left": reward_left,
+                "trailing_stop_active": state.get("trailing_stop_active", False),
+                "trailing_stop_reason": state.get("trailing_stop_reason", ""),
                 "created_at": state.get("created_at", ""),
             }
         )
 
     return pd.DataFrame(rows), error
+
+def render_live_trade_cards(live_df):
+    if live_df.empty:
+        st.info("No open bot-tracked positions right now.")
+        return
+
+    cols = st.columns(2)
+
+    for idx, row in live_df.iterrows():
+        pnl = row.get("live_pnl")
+        pnl_class = "positive" if pnl and pnl > 0 else "negative" if pnl and pnl < 0 else "neutral"
+
+        trailing_active = bool(row.get("trailing_stop_active"))
+        trailing_text = "ACTIVE" if trailing_active else "WAITING"
+        trailing_class = "positive" if trailing_active else "neutral"
+
+        progress = row.get("target_progress")
+        progress_text = f"{progress}%" if pd.notna(progress) else "N/A"
+
+        with cols[idx % 2]:
+            st.markdown(
+                f"""
+                <div class="live-card">
+                    <div class="small-label">{row.get("symbol", "")}</div>
+                    <div class="big-value">{row.get("trading_symbol", "")}</div>
+                    <div class="muted">Qty: {row.get("quantity", "")} | Broker Qty: {row.get("broker_quantity", "")}</div>
+                    <br>
+
+                    <div class="small-label">Live P&L</div>
+                    <div class="big-value {pnl_class}">{money(pnl)}</div>
+                    <br>
+
+                    <div class="small-label">Trade Levels</div>
+                    <div>
+                        Entry: <b>{number(row.get("entry_price"))}</b> |
+                        LTP: <b>{number(row.get("ltp"))}</b> |
+                        Target: <b>{number(row.get("target_price"))}</b>
+                    </div>
+                    <div>
+                        Stop Loss: <b>{number(row.get("stop_loss_price"))}</b> |
+                        Highest LTP: <b>{number(row.get("highest_ltp"))}</b>
+                    </div>
+                    <br>
+
+                    <div class="small-label">Risk View</div>
+                    <div>
+                        Target Progress: <b>{progress_text}</b> |
+                        Reward Left: <b>{money(row.get("reward_left"))}</b> |
+                        Risk To Stop: <b>{money(row.get("risk_to_stop"))}</b>
+                    </div>
+                    <br>
+
+                    <div class="small-label">Trailing Stop</div>
+                    <div class="{trailing_class}">{trailing_text}</div>
+                    <div class="muted">{row.get("trailing_stop_reason") or "Trailing will activate after enough target progress."}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 def parse_latest_bot_status():
@@ -581,33 +662,8 @@ with main_tab:
                 unsafe_allow_html=True,
             )
 
-    st.markdown("### Live Bot Trades")
-
-    if live_df.empty:
-        st.info("No open bot-tracked positions right now.")
-    else:
-        show_live = live_df.copy()
-        show_live["live_pnl_text"] = show_live["live_pnl"].apply(
-            lambda x: money(x) if pd.notna(x) else "N/A"
-        )
-        show_live = show_live[
-            [
-                "symbol",
-                "trading_symbol",
-                "state_status",
-                "quantity",
-                "broker_quantity",
-                "entry_price",
-                "ltp",
-                "target_price",
-                "stop_loss_price",
-                "highest_ltp",
-                "live_pnl_text",
-                "created_at",
-            ]
-        ]
-
-        st.dataframe(show_live, use_container_width=True, hide_index=True)
+        st.markdown("### Live Bot Trades")
+    render_live_trade_cards(live_df)
 
     st.divider()
 
