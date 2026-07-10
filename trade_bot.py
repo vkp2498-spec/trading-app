@@ -711,6 +711,9 @@ def process_symbol(symbol):
 )
     technicals["atm_option_flow"] = atm_option_flow
 
+    option_trend = get_option_chain_trend(symbol, direction)
+    weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
+
     option_summary["option_chain_trend"] = option_trend
     option_summary["weighted_alignment"] = weighted_score
 
