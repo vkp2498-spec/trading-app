@@ -629,10 +629,17 @@ def should_exit_on_sentiment_change(symbol, state, ltp):
         else:
             df_atm = result[0]
 
-        if df_atm is None or df_atm.empty:
+        if df_atm is None:
             return False, "sentiment check skipped: no ATM data"
 
-        atm = df_atm.iloc[0]
+        if isinstance(df_atm, dict):
+            atm = df_atm
+        elif hasattr(df_atm, "empty"):
+            if df_atm.empty:
+                return False, "sentiment check skipped: empty ATM data"
+            atm = df_atm.iloc[0]
+        else:
+            return False, f"sentiment check skipped: unsupported ATM type {type(df_atm)}"
 
         new_direction, new_confidence, new_score, new_reasons = option_chain_signal(atm)
 
