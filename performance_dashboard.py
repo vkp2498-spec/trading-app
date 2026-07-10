@@ -450,7 +450,7 @@ def render_live_trade_cards(live_df):
 
         reason = row.get("trailing_stop_reason") or "Trailing will activate after enough target progress."
 
-                html = f"""
+        html = f"""
 <div class="live-card">
 <div class="small-label">{row.get("symbol", "")}</div>
 <div class="big-value">{row.get("trading_symbol", "")}</div>
