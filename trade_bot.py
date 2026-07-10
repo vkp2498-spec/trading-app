@@ -749,6 +749,12 @@ def process_symbol(symbol):
             record_analysis(symbol, option_summary, technicals, llm_decision)
             log(f"{symbol} no trade: weighted score too low before LLM: {weighted_score}")
             return
+    if weighted_score["grade"] == "CAUTIOUS_TRADE":
+        expected_target = round(float(expected_entry_price) * 1.06, 0)
+        expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+        option_summary["target_price"] = expected_target
+        option_summary["stop_loss_price"] = expected_stop_loss
+        option_summary["cautious_trade"] = True
 
     llm_decision = get_llm_decision(symbol, option_summary, technicals)
     record_analysis(symbol, option_summary, technicals, llm_decision)

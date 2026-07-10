@@ -124,7 +124,7 @@ def get_llm_decision(symbol, option_summary, technicals):
             "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
             "Use weighted_alignment score as important context.",
             "Scores >= 80 can be considered normal trade candidates.",
-            "Scores 60 to 79 are cautious trade candidates only if risk is controlled.",
+            "Scores 60 to 79 with CAUTIOUS_TRADE grade should generally execute if option-chain is HIGH and 15M/5M are aligned, using smaller target and tighter stop.",
             "Scores below 60 should normally be rejected.",
             "Volume confirmation on 5M strengthens breakout quality.",
             "VWAP alignment strengthens intraday trend quality.",
@@ -132,6 +132,10 @@ def get_llm_decision(symbol, option_summary, technicals):
             "ATM option volume and VWAP are more important than index volume/VWAP for NIFTY/BANKNIFTY option entries.",
             "ATM option premium above VWAP with above-average volume strengthens a long option trade.",
             "ATM option premium below VWAP with weak volume reduces confidence.",
+            "CAUTIOUS_TRADE weighted grade with option-chain HIGH, 15M aligned, and 5M aligned is allowed even if 4H is neutral or low confidence.",
+            "Do not reject only because 4H confidence is LOW or 4H bias is NEUTRAL.",
+            "Reject 4H only when it has MEDIUM or HIGH confidence and is opposite to option-chain direction.",
+            "ATM option flow below VWAP is a risk penalty, but not automatic rejection when 15M and 5M are aligned.",
                     ],
     }
 
