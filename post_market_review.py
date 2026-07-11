@@ -468,23 +468,38 @@ def summarize(review_df, date_text):
 
     by_symbol = {}
     for symbol, part in review_df.groupby("symbol"):
+        weighted_values = numeric_column(part, "weighted_score")
+        favorable_values = numeric_column(part, "max_favorable_pct")
+
         by_symbol[symbol] = {
             "total_checks": int(len(part)),
-            "directional_signals": int(part["direction"].isin(["BULLISH", "BEARISH"]).sum()),
-            "missed_winners": int((part["missed_trade_outcome"] == "MISSED_WINNER").sum()),
-            "correct_rejects": int((part["missed_trade_outcome"] == "CORRECT_REJECT").sum()),
-            "no_clear_edge": int((part["missed_trade_outcome"] == "NO_CLEAR_EDGE").sum()),
-            "avg_weighted_score": round(float(pd.to_numeric(part["weighted_score"], errors="coerce").mean()), 2)
-            if pd.to_numeric(part["weighted_score"], errors="coerce").notna().any()
+            "directional_signals": int(part["direction"].isin(["BULLISH", "BEARISH"]).sum())
+            if "direction" in part.columns
+            else 0,
+            "missed_winners": int((part["missed_trade_outcome"] == "MISSED_WINNER").sum())
+            if "missed_trade_outcome" in part.columns
+            else 0,
+            "correct_rejects": int((part["missed_trade_outcome"] == "CORRECT_REJECT").sum())
+            if "missed_trade_outcome" in part.columns
+            else 0,
+            "no_clear_edge": int((part["missed_trade_outcome"] == "NO_CLEAR_EDGE").sum())
+            if "missed_trade_outcome" in part.columns
+            else 0,
+            "avg_weighted_score": round(float(weighted_values.mean()), 2)
+            if weighted_values.notna().any()
             else None,
-            "best_favorable_pct": round(float(pd.to_numeric(part["max_favorable_pct"], errors="coerce").max()), 2)
-            if pd.to_numeric(part["max_favorable_pct"], errors="coerce").notna().any()
+            "best_favorable_pct": round(float(favorable_values.max()), 2)
+            if favorable_values.notna().any()
             else None,
         }
 
-    missed = review_df[review_df["missed_trade_outcome"] == "MISSED_WINNER"].copy()
+    if "missed_trade_outcome" in review_df.columns:
+        missed = review_df[review_df["missed_trade_outcome"] == "MISSED_WINNER"].copy()
+    else:
+        missed = pd.DataFrame()
+
     if not missed.empty:
-        missed["max_favorable_pct_num"] = pd.to_numeric(missed["max_favorable_pct"], errors="coerce")
+        missed["max_favorable_pct_num"] = numeric_column(missed, "max_favorable_pct")
         missed = missed.sort_values("max_favorable_pct_num", ascending=False)
 
     return {
