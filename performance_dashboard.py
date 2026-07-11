@@ -11,7 +11,7 @@ import streamlit as st
 
 from datetime import time
 
-from post_market_review import build_review, summarize, ask_llm_for_insights
+from post_market_review import build_review, summarize, ask_llm_for_insights, build_loss_review
 from strategy_core import now_ist
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -215,6 +215,35 @@ def render_post_market_review_tab():
     if llm_insights:
         st.markdown("### LLM Insight")
         st.write(llm_insights)
+
+        st.markdown("### Losing Trade Review")
+
+        trade_file = DATA_DIR / "trade_history.csv"
+        analysis_file = DATA_DIR / "analysis_history.csv"
+
+        if not trade_file.exists():
+            st.info("No trade history file found for losing trade review.")
+        elif not analysis_file.exists():
+            st.info("No analysis history file found for losing trade review.")
+        else:
+            trades_df = pd.read_csv(trade_file)
+            analysis_df = pd.read_csv(analysis_file)
+
+            if not trades_df.empty:
+                trades_df["trade_date"] = pd.to_datetime(trades_df["trade_date"], errors="coerce").dt.date.astype(str)
+                trades_df = trades_df[trades_df["trade_date"] == review_date_text]
+
+            if not analysis_df.empty:
+                analysis_df["created_at"] = pd.to_datetime(analysis_df["timestamp"], errors="coerce")
+                analysis_df["review_date"] = analysis_df["created_at"].dt.date.astype(str)
+                analysis_df = analysis_df[analysis_df["review_date"] == review_date_text]
+
+            loss_reviews = build_loss_review(trades_df, analysis_df)
+
+            if not loss_reviews:
+                st.success("No losing trades found for this review date.")
+            else:
+                st.dataframe(pd.DataFrame(loss_reviews), use_container_width=True, hide_index=True)
 
     if review_df is not None and not review_df.empty:
         with st.expander("Full Review Data"):

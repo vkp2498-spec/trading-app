@@ -31,7 +31,113 @@ def safe_float(value, default=None):
         return float(value)
     except Exception:
         return default
+    
+def classify_losing_trade(row):
+    pnl = float(row.get("gross_pnl", 0) or 0)
+    entry = float(row.get("entry_price", 0) or 0)
+    exit_price = float(row.get("exit_price", 0) or 0)
+    target = float(row.get("target_price", 0) or 0)
+    stop = float(row.get("stop_loss_price", 0) or 0)
 
+    if pnl >= 0 or entry <= 0:
+        return None
+
+    loss_pct = ((exit_price - entry) / entry) * 100
+    target_gap = target - entry if target > entry else 0
+    stop_gap = entry - stop if stop > 0 else 0
+
+    notes = []
+
+    if stop_gap / entry > 0.08:
+        notes.append("Stop loss was wider than 8% of entry premium")
+
+    if loss_pct <= -7:
+        notes.append("Loss exceeded 7% of entry premium")
+
+    if target_gap / entry >= 0.08:
+        notes.append("Target required strong follow-through")
+
+    if not notes:
+        notes.append("Loss appears mainly due to failed follow-through")
+
+    return {
+        "loss_pct": round(loss_pct, 2),
+        "classification": " | ".join(notes),
+    }
+
+def build_loss_review(trades_df, analysis_df):
+    if trades_df.empty:
+        return []
+
+    losses = trades_df[trades_df["gross_pnl"].astype(float) < 0].copy()
+    if losses.empty:
+        return []
+
+    reviews = []
+
+    for _, trade in losses.iterrows():
+        symbol = trade.get("symbol")
+        entry_time = str(trade.get("entry_time", ""))
+
+        matching = analysis_df[analysis_df["symbol"] == symbol].copy() if not analysis_df.empty else analysis_df
+
+        entry_analysis = {}
+        if not matching.empty and "created_at" in matching.columns:
+            matching["created_at_dt"] = pd.to_datetime(matching["created_at"], errors="coerce")
+            trade_entry_dt = pd.to_datetime(entry_time, errors="coerce")
+
+            before = matching[matching["created_at_dt"] <= trade_entry_dt]
+            if not before.empty:
+                entry_analysis = before.sort_values("created_at_dt").iloc[-1].to_dict()
+
+        loss_info = classify_losing_trade(trade)
+
+        reviews.append({
+            "symbol": symbol,
+            "trading_symbol": trade.get("trading_symbol"),
+            "entry_time": entry_time,
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "target_price": trade.get("target_price"),
+            "stop_loss_price": trade.get("stop_loss_price"),
+            "gross_pnl": trade.get("gross_pnl"),
+            "exit_reason": trade.get("exit_reason"),
+            "loss_pct": loss_info["loss_pct"] if loss_info else None,
+            "loss_classification": loss_info["classification"] if loss_info else "",
+            "entry_weighted_score": entry_analysis.get("weighted_score", ""),
+            "entry_weighted_grade": entry_analysis.get("weighted_grade", ""),
+            "entry_llm_reason": entry_analysis.get("llm_reason", ""),
+            "entry_atm_option_bias": entry_analysis.get("atm_option_bias", ""),
+            "entry_atm_option_above_vwap": entry_analysis.get("atm_option_above_vwap", ""),
+            "suggestion": suggest_loss_improvement(trade, entry_analysis, loss_info),
+        })
+
+    return reviews
+
+def suggest_loss_improvement(trade, analysis, loss_info):
+    suggestions = []
+
+    atm_bias = str(analysis.get("atm_option_bias", ""))
+    above_vwap = str(analysis.get("atm_option_above_vwap", ""))
+
+    if atm_bias == "BEARISH" or above_vwap == "False":
+        suggestions.append("Avoid entry when ATM option flow is weak or below VWAP.")
+
+    score = float(analysis.get("weighted_score") or 0)
+    if score < 70 and trade.get("symbol") == "NIFTY":
+        suggestions.append("For NIFTY, require weighted score >= 70.")
+
+    exit_reason = str(trade.get("exit_reason", ""))
+    if exit_reason == "STOP_LOSS":
+        suggestions.append("Review whether trailing stop or sentiment exit could have reduced the loss earlier.")
+
+    if loss_info and loss_info.get("loss_pct", 0) <= -7:
+        suggestions.append("Consider tighter stop for cautious trades.")
+
+    if not suggestions:
+        suggestions.append("No obvious rule issue; likely normal losing trade within strategy risk.")
+
+    return " ".join(suggestions)
 
 def read_analysis(date_text):
     if not ANALYSIS_FILE.exists():
