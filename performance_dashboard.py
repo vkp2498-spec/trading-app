@@ -132,8 +132,31 @@ def render_post_market_review_tab():
 
     if st.button("Run Post-Market X-Ray", use_container_width=True):
         with st.spinner("Analyzing signals, rejected trades, missed opportunities, and blockers..."):
-            review_df = build_review(review_date_text)
-            summary = summarize(review_df, review_date_text)
+            try:
+                review_df = build_review(review_date_text)
+                review_mode = "Full review with market-data fetch"
+            except Exception as e:
+                st.warning(f"Full X-Ray failed, switching to offline saved-data review. Reason: {e}")
+                review_df = pd.DataFrame()
+                review_mode = "Offline saved-data review"
+
+            if review_df.empty:
+                summary = {
+                    "review_date": review_date_text,
+                    "review_mode": review_mode,
+                    "total_analysis_rows": 0,
+                    "directional_signals": 0,
+                    "rejected_signals": 0,
+                    "missed_expected_profit_total": 0,
+                    "max_possible_profit_total": 0,
+                    "outcome_counts": {},
+                    "blocker_counts": {},
+                    "by_symbol": {},
+                    "top_missed_opportunities": [],
+                }
+            else:
+                summary = summarize(review_df, review_date_text)
+                summary["review_mode"] = review_mode
 
             DATA_DIR.mkdir(exist_ok=True)
             csv_file = DATA_DIR / f"post_market_review_{review_date_text}.csv"
@@ -167,6 +190,7 @@ def render_post_market_review_tab():
         return
 
     st.success("Post-market review generated.")
+    st.caption(f"Review mode: {summary.get('review_mode', 'N/A')}")
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Checks", summary.get("total_analysis_rows", 0))
