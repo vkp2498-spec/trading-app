@@ -27,6 +27,8 @@ import urllib3.util.connection as urllib3_cn
 from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from trade_journal import record_closed_trade
 
+from whatsapp_alerts import send_trade_closed_alert
+
 
 def allowed_gai_family():
     return socket.AF_INET
@@ -467,6 +469,7 @@ def handle_existing_state(symbol, state):
                 )
 
             journal_row = record_closed_trade(state, exit_price, exit_reason)
+            send_trade_closed_alert(journal_row)
             log(
                 f"{symbol} {exit_reason} exit MARKET SELL placed: result={result} "
                 f"payload={payload} journal={journal_row}"
@@ -699,6 +702,7 @@ def run_squareoff():
                     )
 
                 journal_row = record_closed_trade(state, exit_price, "SQUAREOFF")
+                send_trade_closed_alert(journal_row)
                 log(
                     f"{symbol} bot squareoff MARKET SELL placed: result={result} "
                     f"payload={payload} journal={journal_row}"
