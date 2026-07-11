@@ -428,6 +428,11 @@ def build_review(date_text):
 
     return pd.DataFrame(rows)
 
+def numeric_column(df, column_name):
+    if column_name not in df.columns:
+        return pd.Series([0] * len(df), index=df.index, dtype="float64")
+    return pd.to_numeric(df[column_name], errors="coerce").fillna(0)
+
 
 def summarize(review_df, date_text):
     if review_df.empty:
@@ -452,12 +457,12 @@ def summarize(review_df, date_text):
     )
 
     missed_expected_profit_total = round(
-    pd.to_numeric(review_df.get("missed_expected_profit"), errors="coerce").fillna(0).sum(),
+    numeric_column(review_df, "missed_expected_profit").sum(),
     2,
-)
+    )
 
     max_possible_profit_total = round(
-        pd.to_numeric(review_df.get("max_possible_profit"), errors="coerce").fillna(0).sum(),
+        numeric_column(review_df, "max_possible_profit").sum(),
         2,
     )
 
