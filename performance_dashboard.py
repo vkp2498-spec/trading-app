@@ -15,6 +15,7 @@ from post_market_review import build_review, summarize, ask_llm_for_insights, bu
 from strategy_core import now_ist
 
 BASE_DIR = Path(__file__).resolve().parent
+APP_ICON = BASE_DIR / "assets" / "app_icon.jpg"
 DATA_DIR = BASE_DIR / "data"
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
@@ -23,7 +24,19 @@ LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
-st.set_page_config(page_title="Trading Bot Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Trading Bot Dashboard",
+    page_icon=str(APP_ICON) if APP_ICON.exists() else "📈",
+    layout="wide",
+)
+
+st.markdown(
+    """
+    <link rel="apple-touch-icon" href="/app/static/app_icon.jpg">
+    <link rel="icon" type="image/jpeg" href="/app/static/app_icon.jpg">
+    """,
+    unsafe_allow_html=True,
+)
 
 
 st.markdown(
