@@ -15,7 +15,7 @@ from post_market_review import build_review, summarize, ask_llm_for_insights, bu
 from strategy_core import now_ist
 
 BASE_DIR = Path(__file__).resolve().parent
-APP_ICON = BASE_DIR / "assets" / "app_icon.jpg"
+APP_ICON = BASE_DIR / "assets" / "vamsi_icon_v2.jpg"
 DATA_DIR = BASE_DIR / "data"
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
@@ -32,8 +32,8 @@ st.set_page_config(
 
 st.markdown(
     """
-    <link rel="apple-touch-icon" href="/app/static/app_icon.jpg">
-    <link rel="icon" type="image/jpeg" href="/app/static/app_icon.jpg">
+    <link rel="apple-touch-icon" sizes="180x180" href="/app/static/vamsi_icon_v2.jpg?v=2">
+    <link rel="icon" type="image/jpeg" href="/app/static/vamsi_icon_v2.jpg?v=2">
     """,
     unsafe_allow_html=True,
 )
