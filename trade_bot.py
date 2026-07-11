@@ -789,12 +789,12 @@ def process_symbol(symbol):
         technicals = get_technical_analysis(symbol)
         option_side = "CE" if direction == "BULLISH" else "PE"
 
-        technicals["four_hour"] = convert_index_levels_to_option_premium(
-        technicals.get("four_hour", {}),
+        technicals["two_hour"] = convert_index_levels_to_option_premium(
+        technicals.get("two_hour", {}),
         option_side=option_side,
         option_entry_price=expected_entry_price,
         delta=0.5,
-    )
+        )
 
         technicals["fifteen_min"] = convert_index_levels_to_option_premium(
             technicals.get("fifteen_min", {}),
@@ -805,7 +805,7 @@ def process_symbol(symbol):
     except Exception as e:
         log(f"{symbol} technical analysis failed: {e}")
         technicals = {
-            "four_hour": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
+            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
             "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
         }
 
@@ -881,7 +881,7 @@ def process_symbol(symbol):
 
     log(
         f"{symbol} analysis: option={option_summary} "
-        f"4h={technicals.get('four_hour')} "
+        f"2h={technicals.get('two_hour')} "
         f"15m={technicals.get('fifteen_min')} "
         f"5m={technicals.get('five_min')} "
         f"weighted={weighted_score} "

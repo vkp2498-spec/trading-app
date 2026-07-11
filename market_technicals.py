@@ -441,14 +441,14 @@ def get_technical_analysis(symbol):
     if len(df_15) < 25:
         df_15 = fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=5)
 
-    df_4h = fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=60)
+    df_2h = fetch_v3_historical_hours(instrument_key, hours=2, lookback_days=45)
 
     df_5 = fetch_v3_intraday_minutes(instrument_key, minutes=5)
     if len(df_5) < 25:
         df_5 = fetch_v3_historical_minutes(instrument_key, minutes=5, lookback_days=5)
 
     return {
-        "four_hour": analyze_latest(df_4h, "4H"),
+        "two_hour": analyze_latest(df_2h, "2H"),
         "fifteen_min": analyze_latest(df_15, "15M"),
         "five_min": analyze_latest(df_5, "5M"),
     }

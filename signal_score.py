@@ -32,7 +32,7 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     weights = {
         "option_chain": 35,
         "fifteen_min": 25,
-        "four_hour": 10,
+        "two_hour": 10,
         "five_min": 15,
         "atm_option_flow": 15,
     }
@@ -51,13 +51,13 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     )
     reasons.append(f"15M component={fifteen_component:.1f}/{weights['fifteen_min']}")
 
-    four = technicals.get("four_hour", {}) or {}
-    four_component = (
-        weights["four_hour"]
-        * direction_score(four.get("bias"), direction)
-        * confidence_multiplier(four.get("confidence"))
+    two = technicals.get("two_hour", {}) or {}
+    two_component = (
+        weights["two_hour"]
+        * direction_score(two.get("bias"), direction)
+        * confidence_multiplier(two.get("confidence"))
     )
-    reasons.append(f"4H component={four_component:.1f}/{weights['four_hour']}")
+    reasons.append(f"2H component={two_component:.1f}/{weights['two_hour']}")
 
     five = technicals.get("five_min", {}) or {}
     momentum_score = float(five.get("momentum_score") or 0)
@@ -99,7 +99,7 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
         trend_bonus = -10
         reasons.append("Option-chain trend conflicts direction (-10 penalty)")
 
-    total = option_component + fifteen_component + four_component + momentum_component + flow_component + trend_bonus
+    total = option_component + fifteen_component + two_component + momentum_component + flow_component + trend_bonus
     total = max(0, min(100, round(total, 1)))
 
     if total >= 80:

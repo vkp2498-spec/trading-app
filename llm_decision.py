@@ -21,11 +21,11 @@ def build_rule_based_fallback(option_summary, technicals):
     option_bias = option_summary.get("bias")
     option_confidence = option_summary.get("confidence")
 
-    four = technicals.get("four_hour", {})
+    two = technicals.get("two_hour", {})
     fifteen = technicals.get("fifteen_min", {})
 
-    four_bias = four.get("bias")
-    four_confidence = four.get("confidence")
+    two_bias = two.get("bias")
+    two_confidence = two.get("confidence")
     fifteen_bias = fifteen.get("bias")
     fifteen_momentum = int(fifteen.get("momentum_score") or 0)
 
@@ -41,13 +41,13 @@ def build_rule_based_fallback(option_summary, technicals):
             "reason": f"15M candle is opposite to option chain: option={option_bias}, 15M={fifteen_bias}",
         }
 
-    four_conflicts = (
-        four_confidence in {"MEDIUM", "HIGH"}
-        and four_bias in {"BULLISH", "BEARISH"}
-        and four_bias != option_bias
+    two_conflicts = (
+        two_confidence in {"MEDIUM", "HIGH"}
+        and two_bias in {"BULLISH", "BEARISH"}
+        and two_bias != option_bias
     )
 
-    if four_conflicts:
+    if two_conflicts:
         if fifteen_bias == option_bias and fifteen_momentum >= 3:
             return {
                 "execute_trade": True,
@@ -55,12 +55,12 @@ def build_rule_based_fallback(option_summary, technicals):
                 "confidence": "MEDIUM",
                 "target_price": option_summary.get("target_price"),
                 "stop_loss_price": option_summary.get("stop_loss_price"),
-                "reason": "Cautious reversal trade: option chain is HIGH and 15M strongly confirms despite 4H conflict.",
+                "reason": "Cautious reversal trade: option chain is HIGH and 15M strongly confirms despite 2H conflict.",
             }
 
         return {
             **DEFAULT_DECISION,
-            "reason": f"4H conflicts with option chain and 15M confirmation is not strong enough. 15M momentum={fifteen_momentum}",
+            "reason": f"2H conflicts with option chain and 15M confirmation is not strong enough. 15M momentum={fifteen_momentum}",
         }
 
     if fifteen_bias in {option_bias, "NEUTRAL"}:
@@ -76,7 +76,7 @@ def build_rule_based_fallback(option_summary, technicals):
     return {**DEFAULT_DECISION, "reason": "No valid trade setup"}
 
 def compact_decision_context(symbol, option_summary, technicals):
-    four = technicals.get("four_hour", {}) or {}
+    two = technicals.get("two_hour", {}) or {}
     fifteen = technicals.get("fifteen_min", {}) or {}
     five = technicals.get("five_min", {}) or {}
     atm = technicals.get("atm_option_flow", {}) or {}
@@ -99,8 +99,8 @@ def compact_decision_context(symbol, option_summary, technicals):
         "cautious_trade": bool(option_summary.get("cautious_trade")),
         "option_chain_trend_bias": trend.get("bias"),
         "option_chain_trend_aligns": trend.get("aligns_with_option_signal"),
-        "four_hour_bias": four.get("bias"),
-        "four_hour_confidence": four.get("confidence"),
+        "two_hour_bias": two.get("bias"),
+        "two_hour_confidence": two.get("confidence"),
         "fifteen_min_bias": fifteen.get("bias"),
         "fifteen_min_confidence": fifteen.get("confidence"),
         "fifteen_min_momentum": fifteen.get("momentum_score"),
@@ -163,9 +163,9 @@ def get_llm_decision(symbol, option_summary, technicals):
     "Option-chain HIGH confidence is mandatory for any trade.",
     "Reject if 15M bias is opposite to option-chain direction.",
     "Reject if 5M bias is opposite to option-chain direction.",
-    "4H conflict is a risk penalty, not automatic rejection.",
-    "Reject 4H only when it has MEDIUM or HIGH confidence and is opposite to option-chain direction.",
-    "Do not reject only because 4H confidence is LOW or 4H bias is NEUTRAL.",
+    "2H conflict is a risk penalty, not automatic rejection.",
+    "Reject 2H only when it has MEDIUM or HIGH confidence and is opposite to option-chain direction.",
+    "Do not reject only because 2H confidence is LOW or 2H bias is NEUTRAL.",
 
     "Use weighted_alignment score as important context.",
     "Scores >= 80 can be considered normal trade candidates.",
@@ -173,7 +173,7 @@ def get_llm_decision(symbol, option_summary, technicals):
     "Scores below 65 should normally be rejected unless the bot explicitly marks cautious_override true.",
 
     "When cautious_trade is true, evaluate it as an already risk-reduced setup with smaller target and tighter stop.",
-    "If cautious_trade is true and option-chain is HIGH, 15M is aligned, and 5M is aligned, do not reject only because 4H is NEUTRAL or LOW confidence.",
+    "If cautious_trade is true and option-chain is HIGH, 15M is aligned, and 5M is aligned, do not reject only because 2H is NEUTRAL or LOW confidence.",
 
     "ATM option volume and VWAP are more important than index volume/VWAP for NIFTY/BANKNIFTY option entries.",
     "ATM option premium above VWAP with above-average volume strengthens a long option trade.",
@@ -194,7 +194,7 @@ def get_llm_decision(symbol, option_summary, technicals):
     "Do not approve a cautious trade when ATM option flow is opposite to trade direction.",
     "Prefer trades where ATM option premium is above VWAP or ATM option flow is at least neutral with strong 15M and 5M alignment.",
 
-    "When rejecting, state the actual blocker precisely: ATM option below VWAP, 4H opposite, 15M opposite, 5M opposite, weighted score too low, or option-chain confidence not HIGH.",
+    "When rejecting, state the actual blocker precisely: ATM option below VWAP, 2H opposite, 15M opposite, 5M opposite, weighted score too low, or option-chain confidence not HIGH.",
 ],
     }
 
