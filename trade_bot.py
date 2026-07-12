@@ -404,7 +404,7 @@ def find_index_option_instrument(symbol, expiry_text, strike, option_type):
 
 def market_window_ok():
     now = now_ist().time()
-    return time(9, 30) <= now <= time(15, 15)
+    return time(9, 20) <= now <= time(15, 15)
 
 
 def save_open_position_state(
