@@ -7,3 +7,4 @@ __pycache__/
 daily_trade_count.json
 trade_state_*.json
 upstox_complete.json.gz
+data/
