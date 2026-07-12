@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
+import csv
 
 from analysis_journal import record_analysis
 from llm_decision import get_llm_decision
@@ -41,6 +42,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
+TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 
@@ -136,6 +138,47 @@ def write_state(symbol, state):
 
 def clear_state(symbol):
     write_state(symbol, {})
+
+def today_realized_pnl():
+    today = now_ist().strftime("%Y-%m-%d")
+
+    if not TRADE_HISTORY_FILE.exists():
+        return 0.0
+
+    total = 0.0
+
+    try:
+        with TRADE_HISTORY_FILE.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                if str(row.get("trade_date")) != today:
+                    continue
+
+                total += to_float(row.get("gross_pnl"))
+
+    except Exception as e:
+        log(f"Could not read today's realized P&L: {e}")
+        return 0.0
+
+    return round(total, 2)
+
+
+def daily_profit_target():
+    return to_float(os.getenv("DAILY_PROFIT_TARGET"), 0)
+
+
+def after_profit_target_mode():
+    return os.getenv("AFTER_PROFIT_TARGET_MODE", "paper").strip().lower()
+
+
+def daily_profit_target_reached():
+    target = daily_profit_target()
+
+    if target <= 0:
+        return False
+
+    return today_realized_pnl() >= target
 
 
 def read_trade_count():
@@ -742,6 +785,13 @@ def process_symbol(symbol):
     #     log(f"{symbol} daily trade limit reached: {trade_count_for(symbol)}/{MAX_TRADES_PER_SYMBOL_PER_DAY}. No new order.")
     #     return
 
+    if daily_profit_target_reached() and after_profit_target_mode() == "stop":
+        log(
+            f"{symbol} no trade: daily profit target reached. "
+            f"today_pnl={today_realized_pnl()} target={daily_profit_target()} mode=stop"
+        )
+        return
+
     rec = get_index_recommendation(symbol)
     record_option_chain_snapshot(symbol, rec)
     direction = rec["direction"]
@@ -923,6 +973,15 @@ def process_symbol(symbol):
         f"expected_entry={expected_entry_price} expected_target={expected_target} "
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
+
+    if daily_profit_target_reached():
+        log(
+            f"{symbol} PAPER ONLY after daily profit target: "
+            f"today_pnl={today_realized_pnl()} target={daily_profit_target()} "
+            f"would_buy={instrument['trading_symbol']} qty={order_quantity} "
+            f"entry={expected_entry_price} target={expected_target} stop_loss={expected_stop_loss}"
+        )
+        return
 
     # if weighted_score["grade"] == "SKIP":
     #     score_value = float(weighted_score.get("score") or 0)
