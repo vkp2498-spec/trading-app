@@ -191,6 +191,33 @@ def daily_profit_target_reached():
     return today_realized_pnl() >= target
 
 
+def daily_max_loss():
+    return to_float(os.getenv("DAILY_MAX_LOSS"), 0)
+
+
+def after_max_loss_mode():
+    return os.getenv("AFTER_MAX_LOSS_MODE", "paper").strip().lower()
+
+
+def daily_max_loss_reached():
+    max_loss = daily_max_loss()
+
+    if max_loss <= 0:
+        return False
+
+    return today_realized_pnl() <= -abs(max_loss)
+
+
+def risk_limit_mode():
+    if daily_profit_target_reached():
+        return "profit_target", after_profit_target_mode()
+
+    if daily_max_loss_reached():
+        return "max_loss", after_max_loss_mode()
+
+    return None, None
+
+
 def read_trade_count():
     today = now_ist().strftime("%Y-%m-%d")
     data = read_json(TRADE_COUNT_FILE, {"date": today, "counts": {}})
@@ -797,10 +824,13 @@ def process_symbol(symbol):
     #     log(f"{symbol} daily trade limit reached: {trade_count_for(symbol)}/{MAX_TRADES_PER_SYMBOL_PER_DAY}. No new order.")
     #     return
 
-    if daily_profit_target_reached() and after_profit_target_mode() == "stop":
+    risk_reason, risk_mode = risk_limit_mode()
+
+    if risk_mode == "stop":
         log(
-            f"{symbol} no trade: daily profit target reached. "
-            f"today_pnl={today_realized_pnl()} target={daily_profit_target()} mode=stop"
+            f"{symbol} no trade: daily risk limit reached. "
+            f"reason={risk_reason} today_pnl={today_realized_pnl()} "
+            f"profit_target={daily_profit_target()} max_loss={daily_max_loss()} mode=stop"
         )
         return
 
@@ -986,10 +1016,13 @@ def process_symbol(symbol):
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
 
-    if daily_profit_target_reached():
+    risk_reason, risk_mode = risk_limit_mode()
+
+    if risk_mode == "paper":
         log(
-            f"{symbol} PAPER ONLY after daily profit target: "
-            f"today_pnl={today_realized_pnl()} target={daily_profit_target()} "
+            f"{symbol} PAPER ONLY after daily risk limit: "
+            f"reason={risk_reason} today_pnl={today_realized_pnl()} "
+            f"profit_target={daily_profit_target()} max_loss={daily_max_loss()} "
             f"would_buy={instrument['trading_symbol']} qty={order_quantity} "
             f"entry={expected_entry_price} target={expected_target} stop_loss={expected_stop_loss}"
         )
