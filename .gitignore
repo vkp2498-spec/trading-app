@@ -4,6 +4,7 @@ logs/
 venv/
 __pycache__/
 *.pyc
+AuthKey_*.p8
 daily_trade_count.json
 trade_state_*.json
 upstox_complete.json.gz

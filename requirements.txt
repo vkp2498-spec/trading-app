@@ -5,4 +5,6 @@ pillow
 requests
 fastapi 
 uvicorn
+httpx[http2]
+PyJWT[crypto]
 openai

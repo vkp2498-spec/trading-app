@@ -29,6 +29,16 @@ from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from trade_journal import record_closed_trade
 
 from whatsapp_alerts import send_trade_closed_alert
+from apns_push import send_trade_closed_notification
+
+
+def send_apple_closed_trade_alert(journal_row):
+    """Never allow a notification failure to interrupt trading cleanup."""
+    try:
+        result = send_trade_closed_notification(journal_row)
+        log(f"Apple trade-close notification result: {result}")
+    except Exception as error:
+        log(f"Apple trade-close notification failed: {error}")
 
 
 def allowed_gai_family():
@@ -513,6 +523,7 @@ def handle_existing_state(symbol, state):
 
             journal_row = record_closed_trade(state, exit_price, exit_reason)
             send_trade_closed_alert(journal_row)
+            send_apple_closed_trade_alert(journal_row)
             log(
                 f"{symbol} {exit_reason} exit MARKET SELL placed: result={result} "
                 f"payload={payload} journal={journal_row}"
@@ -746,6 +757,7 @@ def run_squareoff():
 
                 journal_row = record_closed_trade(state, exit_price, "SQUAREOFF")
                 send_trade_closed_alert(journal_row)
+                send_apple_closed_trade_alert(journal_row)
                 log(
                     f"{symbol} bot squareoff MARKET SELL placed: result={result} "
                     f"payload={payload} journal={journal_row}"

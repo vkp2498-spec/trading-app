@@ -9,8 +9,15 @@ from fastapi import HTTPException
 from fastapi import status
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.security import HTTPBearer
+from pydantic import BaseModel
 
+from apns_push import apns_is_configured
+from apns_push import register_device
+from apns_push import registered_device_count
+from apns_push import send_test_notification
+from apns_push import unregister_device
 from dashboard_data import build_health_snapshot
+from dashboard_data import build_trade_performance
 from dashboard_data import load_env
 
 
@@ -47,6 +54,10 @@ app = FastAPI(
 bearer_scheme = HTTPBearer(
     auto_error=False
 )
+
+
+class NotificationDevice(BaseModel):
+    deviceToken: str
 
 
 def require_mobile_token(
@@ -145,3 +156,77 @@ def dashboard():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Dashboard data is temporarily unavailable",
         )
+
+
+@app.get(
+    "/api/v1/watch-summary",
+    dependencies=[Depends(require_mobile_token)],
+)
+def watch_summary():
+    """Return only the two values needed by the Apple Watch app."""
+    performance = build_trade_performance()
+    recent_trades = performance.get("recentTrades", [])
+    latest_trade = recent_trades[0] if recent_trades else None
+
+    return {
+        "profile": TRADING_PROFILE,
+        "serverTime": datetime.now(IST).isoformat(),
+        "latestTrade": latest_trade,
+        "todayPnL": performance.get("today", {}).get("closedPnL", 0.0),
+    }
+
+
+@app.post(
+    "/api/v1/notifications/devices",
+    dependencies=[Depends(require_mobile_token)],
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def add_notification_device(device: NotificationDevice):
+    try:
+        register_device(device.deviceToken)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from error
+
+
+@app.delete(
+    "/api/v1/notifications/devices",
+    dependencies=[Depends(require_mobile_token)],
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_notification_device(device: NotificationDevice):
+    try:
+        unregister_device(device.deviceToken)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from error
+
+
+@app.get(
+    "/api/v1/notifications/status",
+    dependencies=[Depends(require_mobile_token)],
+)
+def notification_status():
+    return {
+        "profile": TRADING_PROFILE,
+        "configured": apns_is_configured(),
+        "registeredDevices": registered_device_count(),
+    }
+
+
+@app.post(
+    "/api/v1/notifications/test",
+    dependencies=[Depends(require_mobile_token)],
+)
+def test_notification():
+    if not apns_is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="APNs is not configured",
+        )
+
+    return send_test_notification()
