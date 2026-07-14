@@ -221,6 +221,49 @@ def compact_decision_context(symbol, option_summary, technicals):
     }
 
 
+def llm_factual_issues(decision, decision_context):
+    reason = str(decision.get("reason") or "").lower()
+    issues = []
+
+    if decision_context.get("atm_option_above_vwap") is True and "below vwap" in reason:
+        issues.append("LLM said the selected option was below VWAP when it was above VWAP")
+
+    if (
+        decision_context.get("option_chain_confidence") == "HIGH"
+        and "option-chain confidence is low" in reason
+    ):
+        issues.append("LLM changed HIGH option-chain confidence to LOW")
+
+    if decision_context.get("atm_option_volume_confirmed") is True and (
+        "volume is not confirmed" in reason or "volume_confirmed=false" in reason
+    ):
+        issues.append("LLM said option volume was unconfirmed when it was confirmed")
+
+    if decision_context.get("fifteen_min_aligns") is True and "15m is opposite" in reason:
+        issues.append("LLM called an aligned 15M signal opposite")
+
+    if decision_context.get("five_min_aligns") is True and "5m is opposite" in reason:
+        issues.append("LLM called an aligned 5M signal opposite")
+
+    return issues
+
+
+def reconcile_llm_decision(decision, decision_context, option_summary, technicals):
+    issues = llm_factual_issues(decision, decision_context)
+    if not issues:
+        return decision
+
+    fallback = build_rule_based_fallback(option_summary, technicals)
+    fallback_reason = fallback.get("reason") or "Rule-based fallback applied"
+    return {
+        **fallback,
+        "reason": (
+            f"LLM factual inconsistency detected: {'; '.join(issues)}. "
+            f"Deterministic fallback used: {fallback_reason}"
+        ),
+    }
+
+
 def get_llm_decision(symbol, option_summary, technicals):
     if not llm_enabled():
         return build_rule_based_fallback(option_summary, technicals)
@@ -343,6 +386,12 @@ def get_llm_decision(symbol, option_summary, technicals):
     )
 
     try:
-        return json.loads(response.output_text)
+        decision = json.loads(response.output_text)
+        return reconcile_llm_decision(
+            decision,
+            decision_context,
+            option_summary,
+            technicals,
+        )
     except Exception:
         return {**DEFAULT_DECISION, "reason": f"Could not parse LLM response: {response.output_text[:300]}"}
