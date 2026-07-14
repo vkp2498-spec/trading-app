@@ -257,15 +257,31 @@ def basis_component(current_basis, previous_basis, spot_price):
     return round(component, 2), f"Futures basis change={change_bps:.2f} bps"
 
 
-def atm_component(atm_flow):
+def atm_component(atm_flow, underlying_direction):
     bias = atm_flow.get("bias")
     confirmed = bool(atm_flow.get("volume_confirmed"))
+
+    if underlying_direction not in {"BULLISH", "BEARISH"}:
+        return 0.0, "Selected option premium has no directional underlying signal"
+
+    direction_sign = 1.0 if underlying_direction == "BULLISH" else -1.0
+    option_type = "CE" if underlying_direction == "BULLISH" else "PE"
+
     if bias == "BULLISH" and confirmed:
-        return 10.0, "Selected option premium is above VWAP with confirmed volume"
+        return (
+            10.0 * direction_sign,
+            f"Selected {option_type} premium strengthens the {underlying_direction.lower()} view with confirmed volume",
+        )
     if bias == "BULLISH":
-        return 6.0, "Selected option premium is strengthening without volume confirmation"
+        return (
+            6.0 * direction_sign,
+            f"Selected {option_type} premium strengthens the {underlying_direction.lower()} view without volume confirmation",
+        )
     if bias == "BEARISH":
-        return -10.0, "Selected option premium is weakening"
+        return (
+            -10.0 * direction_sign,
+            f"Selected {option_type} premium is weakening against the {underlying_direction.lower()} view",
+        )
     return 0.0, "Selected option premium flow is neutral"
 
 
@@ -391,7 +407,10 @@ def get_institutional_footprint(symbol, recommendation, atm_flow):
     basis_score, basis_reason = basis_component(current_basis, previous_basis, spot_price)
     reasons.append(basis_reason)
 
-    selected_option_score, selected_option_reason = atm_component(atm_flow or {})
+    selected_option_score, selected_option_reason = atm_component(
+        atm_flow or {},
+        recommendation.get("direction"),
+    )
     reasons.append(selected_option_reason)
 
     vix_score, vix_reason = vix_component(current_vix, previous_vix)
