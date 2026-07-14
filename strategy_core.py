@@ -131,6 +131,22 @@ def fetch_upstox_option_chain(symbol, nearby=5):
         call_greeks = call.get("option_greeks", {}) or {}
         put_greeks = put.get("option_greeks", {}) or {}
 
+        call_oi = call_md.get("oi")
+        call_previous_oi = call_md.get("prev_oi")
+        put_oi = put_md.get("oi")
+        put_previous_oi = put_md.get("prev_oi")
+
+        call_change_oi = (
+            float(call_oi) - float(call_previous_oi)
+            if call_oi is not None and call_previous_oi is not None
+            else 0
+        )
+        put_change_oi = (
+            float(put_oi) - float(put_previous_oi)
+            if put_oi is not None and put_previous_oi is not None
+            else 0
+        )
+
         rows.append({
             "timestamp": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
@@ -139,18 +155,26 @@ def fetch_upstox_option_chain(symbol, nearby=5):
             "strike": item.get("strike_price"),
 
             "CE_ltp": call_md.get("ltp"),
-            "CE_oi": call_md.get("oi"),
-            "CE_previous_oi": None,
-            "CE_change_oi": call_md.get("oi") or 0,
-            "CE_change_oi_pct": None,
+            "CE_oi": call_oi,
+            "CE_previous_oi": call_previous_oi,
+            "CE_change_oi": call_change_oi,
+            "CE_change_oi_pct": (
+                round(call_change_oi / float(call_previous_oi) * 100, 2)
+                if call_previous_oi
+                else None
+            ),
             "CE_volume": call_md.get("volume"),
             "CE_iv": call_greeks.get("iv"),
 
             "PE_ltp": put_md.get("ltp"),
-            "PE_oi": put_md.get("oi"),
-            "PE_previous_oi": None,
-            "PE_change_oi": put_md.get("oi") or 0,
-            "PE_change_oi_pct": None,
+            "PE_oi": put_oi,
+            "PE_previous_oi": put_previous_oi,
+            "PE_change_oi": put_change_oi,
+            "PE_change_oi_pct": (
+                round(put_change_oi / float(put_previous_oi) * 100, 2)
+                if put_previous_oi
+                else None
+            ),
             "PE_volume": put_md.get("volume"),
             "PE_iv": put_greeks.get("iv"),
         })
@@ -162,8 +186,10 @@ def fetch_upstox_option_chain(symbol, nearby=5):
 
     numeric_cols = [
         "spot", "strike",
-        "CE_ltp", "CE_oi", "CE_change_oi", "CE_volume", "CE_iv",
-        "PE_ltp", "PE_oi", "PE_change_oi", "PE_volume", "PE_iv",
+        "CE_ltp", "CE_oi", "CE_previous_oi", "CE_change_oi",
+        "CE_change_oi_pct", "CE_volume", "CE_iv",
+        "PE_ltp", "PE_oi", "PE_previous_oi", "PE_change_oi",
+        "PE_change_oi_pct", "PE_volume", "PE_iv",
     ]
 
     for col in numeric_cols:

@@ -35,6 +35,12 @@ def build_rule_based_fallback(option_summary, technicals):
     if option_bias not in {"BULLISH", "BEARISH"}:
         return {**DEFAULT_DECISION, "reason": "Option chain is not directional"}
 
+    aligned_fifteen_momentum = (
+        fifteen_momentum
+        if option_bias == "BULLISH"
+        else -fifteen_momentum
+    )
+
     if fifteen_bias not in {option_bias, "NEUTRAL"}:
         return {
             **DEFAULT_DECISION,
@@ -48,7 +54,7 @@ def build_rule_based_fallback(option_summary, technicals):
     )
 
     if two_conflicts:
-        if fifteen_bias == option_bias and fifteen_momentum >= 3:
+        if fifteen_bias == option_bias and aligned_fifteen_momentum >= 3:
             return {
                 "execute_trade": True,
                 "decision": option_bias,
@@ -60,7 +66,10 @@ def build_rule_based_fallback(option_summary, technicals):
 
         return {
             **DEFAULT_DECISION,
-            "reason": f"2H conflicts with option chain and 15M confirmation is not strong enough. 15M momentum={fifteen_momentum}",
+            "reason": (
+                "2H conflicts with option chain and 15M confirmation is not "
+                f"strong enough. Direction-adjusted 15M momentum={aligned_fifteen_momentum}"
+            ),
         }
 
     if fifteen_bias in {option_bias, "NEUTRAL"}:
