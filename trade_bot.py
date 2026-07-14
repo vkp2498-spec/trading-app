@@ -56,8 +56,8 @@ TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 
-# Change only these values next time.
-LOT_MULTIPLIERS = {
+# Used only when the corresponding environment variable is not set.
+DEFAULT_LOT_MULTIPLIERS = {
     "NIFTY": 1,
     "BANKNIFTY": 1,
 }
@@ -276,7 +276,26 @@ def opposite_direction(direction):
     return "BEARISH" if direction == "BULLISH" else "BULLISH"
 
 def lot_multiplier_for(symbol):
-    return int(LOT_MULTIPLIERS.get(symbol, 1))
+    default_lots = int(DEFAULT_LOT_MULTIPLIERS.get(symbol, 1))
+    env_key = f"{symbol}_LOTS"
+    raw_value = os.getenv(env_key)
+
+    if raw_value is None or not raw_value.strip():
+        return default_lots
+
+    try:
+        lots = int(raw_value.strip())
+    except ValueError as error:
+        raise RuntimeError(
+            f"{env_key} must be a whole number greater than or equal to 1"
+        ) from error
+
+    if lots < 1:
+        raise RuntimeError(
+            f"{env_key} must be greater than or equal to 1; received {lots}"
+        )
+
+    return lots
 
 
 def order_quantity_for(symbol, instrument):
