@@ -249,11 +249,33 @@ def llm_factual_issues(decision, decision_context):
 
 
 def reconcile_llm_decision(decision, decision_context, option_summary, technicals):
+    fallback = build_rule_based_fallback(option_summary, technicals)
     issues = llm_factual_issues(decision, decision_context)
+
+    # Deterministic rules are the safety boundary. The LLM cannot approve a
+    # setup rejected by those rules, regardless of its narrative.
+    if not fallback.get("execute_trade"):
+        return {
+            **fallback,
+            "reason": f"Deterministic safety gate: {fallback.get('reason')}",
+        }
+
+    weighted_grade = (option_summary.get("weighted_alignment", {}) or {}).get("grade")
+
+    # A fully qualified TRADE setup is already authorized by objective inputs.
+    # The LLM remains advisory here and cannot invent a semantic CE/PE conflict.
+    if weighted_grade == "TRADE":
+        return {
+            **fallback,
+            "reason": (
+                "Deterministic TRADE-grade setup approved. "
+                f"Rule engine: {fallback.get('reason')}"
+            ),
+        }
+
     if not issues:
         return decision
 
-    fallback = build_rule_based_fallback(option_summary, technicals)
     fallback_reason = fallback.get("reason") or "Rule-based fallback applied"
     return {
         **fallback,
