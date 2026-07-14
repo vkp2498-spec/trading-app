@@ -54,6 +54,15 @@ def _parse_candles(payload):
     df = df.set_index("timestamp")
     return df
 
+
+def merge_candles(*frames):
+    valid_frames = [frame for frame in frames if frame is not None and not frame.empty]
+    if not valid_frames:
+        return pd.DataFrame()
+
+    merged = pd.concat(valid_frames).sort_index()
+    return merged[~merged.index.duplicated(keep="last")]
+
 def fetch_v3_historical_hours(instrument_key, hours=4, lookback_days=60):
     to_date = now_ist().date()
     from_date = to_date - timedelta(days=lookback_days)
@@ -97,9 +106,16 @@ def fetch_v3_intraday_minutes(instrument_key, minutes=15):
 
 def get_option_volume_vwap_analysis(instrument_key, side_label="OPTION"):
     try:
-        df_5 = fetch_v3_intraday_minutes(instrument_key, minutes=5)
-        if len(df_5) < 25:
-            df_5 = fetch_v3_historical_minutes(instrument_key, minutes=5, lookback_days=5)
+        df_5_intraday = fetch_v3_intraday_minutes(instrument_key, minutes=5)
+        df_5 = df_5_intraday
+
+        if len(df_5_intraday) < 25:
+            df_5_historical = fetch_v3_historical_minutes(
+                instrument_key,
+                minutes=5,
+                lookback_days=5,
+            )
+            df_5 = merge_candles(df_5_historical, df_5_intraday)
 
         df_5 = add_indicators(df_5)
         valid = df_5.dropna(subset=["close"])
@@ -152,6 +168,7 @@ def get_option_volume_vwap_analysis(instrument_key, side_label="OPTION"):
             "bias": bias,
             "confidence": confidence,
             "score": score,
+            "candle_time": last.name.isoformat(),
             "close": round(close, 2),
             "volume": round(volume, 2),
             "volume_ma20": round(volume_ma20, 2),
@@ -171,11 +188,11 @@ def get_option_volume_vwap_analysis(instrument_key, side_label="OPTION"):
         }
 
 
-def resample_ohlc(df, rule):
+def resample_ohlc(df, rule, **resample_kwargs):
     if df.empty:
         return df
 
-    out = df.resample(rule).agg(
+    out = df.resample(rule, **resample_kwargs).agg(
         {
             "open": "first",
             "high": "max",
@@ -254,10 +271,11 @@ def add_indicators(df):
     out["s2"] = out["pivot"] - (prev["high"] - prev["low"])
 
     typical_price = (out["high"] + out["low"] + out["close"]) / 3
-    cumulative_volume = out["volume"].replace(0, pd.NA).fillna(0).cumsum()
-    cumulative_pv = (typical_price * out["volume"]).cumsum()
+    session = pd.Series(out.index.date, index=out.index)
+    session_volume = out["volume"].groupby(session).cumsum()
+    session_pv = (typical_price * out["volume"]).groupby(session).cumsum()
 
-    out["vwap"] = cumulative_pv / cumulative_volume.replace(0, pd.NA)
+    out["vwap"] = session_pv / session_volume.replace(0, pd.NA)
     out["volume_ma20"] = out["volume"].rolling(20).mean()
     out["volume_ratio"] = out["volume"] / out["volume_ma20"]
     return out
@@ -412,6 +430,7 @@ def analyze_latest(df, timeframe):
         "bias": bias,
         "confidence": confidence,
         "score": score,
+        "candle_time": last.name.isoformat(),
         "close": round(close, 2),
         "pivot": round(pivot, 2),
         "middle_band": round(ma20, 2),
@@ -437,15 +456,40 @@ def analyze_latest(df, timeframe):
 def get_technical_analysis(symbol):
     instrument_key = INDEX_KEYS[symbol]
 
-    df_15 = fetch_v3_intraday_minutes(instrument_key, minutes=15)
-    if len(df_15) < 25:
-        df_15 = fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=5)
+    df_15_intraday = fetch_v3_intraday_minutes(instrument_key, minutes=15)
+    df_15 = df_15_intraday
 
-    df_2h = fetch_v3_historical_hours(instrument_key, hours=2, lookback_days=45)
+    if len(df_15_intraday) < 25:
+        df_15_historical = fetch_v3_historical_minutes(
+            instrument_key,
+            minutes=15,
+            lookback_days=5,
+        )
+        df_15 = merge_candles(df_15_historical, df_15_intraday)
 
-    df_5 = fetch_v3_intraday_minutes(instrument_key, minutes=5)
-    if len(df_5) < 25:
-        df_5 = fetch_v3_historical_minutes(instrument_key, minutes=5, lookback_days=5)
+    df_2h_historical = fetch_v3_historical_hours(
+        instrument_key,
+        hours=2,
+        lookback_days=45,
+    )
+    df_2h_intraday = resample_ohlc(
+        df_15_intraday,
+        "2h",
+        origin="start_day",
+        offset="1h15min",
+    )
+    df_2h = merge_candles(df_2h_historical, df_2h_intraday)
+
+    df_5_intraday = fetch_v3_intraday_minutes(instrument_key, minutes=5)
+    df_5 = df_5_intraday
+
+    if len(df_5_intraday) < 25:
+        df_5_historical = fetch_v3_historical_minutes(
+            instrument_key,
+            minutes=5,
+            lookback_days=5,
+        )
+        df_5 = merge_candles(df_5_historical, df_5_intraday)
 
     return {
         "two_hour": analyze_latest(df_2h, "2H"),
