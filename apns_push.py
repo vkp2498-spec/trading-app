@@ -271,6 +271,8 @@ def send_trade_closed_notification(journal_row: dict[str, Any]) -> dict[str, int
 
 def send_test_notification() -> dict[str, int]:
     profile = os.getenv("TRADING_PROFILE", "Trading").strip() or "Trading"
+    trade_pnl = 1250.0
+    day_pnl = 4860.0
     payload = {
         "aps": {
             "alert": {
@@ -282,6 +284,10 @@ def send_test_notification() -> dict[str, int]:
             "thread-id": f"hk-trading-{profile.lower()}",
         },
         "profile": profile,
+        "symbol": "TEST",
+        "tradePnL": trade_pnl,
+        "dayPnL": day_pnl,
+        "exitTime": datetime.now(timezone.utc).isoformat(),
         "isTest": True,
     }
     return _send_payload(payload)
