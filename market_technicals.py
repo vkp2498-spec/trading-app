@@ -259,7 +259,7 @@ def add_indicators(df):
 
     out = df.copy()
     out["ma20"] = out["close"].rolling(20).mean()
-    out["std20"] = out["close"].rolling(20).std()
+    out["std20"] = out["close"].rolling(20).std(ddof=0)
     out["bb_upper"] = out["ma20"] + 2 * out["std20"]
     out["bb_lower"] = out["ma20"] - 2 * out["std20"]
 
@@ -408,8 +408,12 @@ def analyze_latest(df, timeframe):
 
     if score >= 2:
         bias = "BULLISH"
-        target = round(r1, 2)
-        stop_loss = round(max(s1, lower), 2)
+
+        bullish_targets = [level for level in [r1, upper] if level > close]
+        bullish_stops = [level for level in [s1, ma20, lower] if level < close]
+
+        target = round(min(bullish_targets), 2) if bullish_targets else round(close * 1.005, 2)
+        stop_loss = round(max(bullish_stops), 2) if bullish_stops else round(close * 0.995, 2)
     elif score <= -2:
         bias = "BEARISH"
 
@@ -433,6 +437,7 @@ def analyze_latest(df, timeframe):
         "candle_time": last.name.isoformat(),
         "close": round(close, 2),
         "pivot": round(pivot, 2),
+        "pivot_type": "previous_timeframe_candle",
         "middle_band": round(ma20, 2),
         "upper_band": round(upper, 2),
         "lower_band": round(lower, 2),

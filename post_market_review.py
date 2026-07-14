@@ -291,7 +291,7 @@ def classify_blocker(raw):
 
     weighted = option_summary.get("weighted_alignment", {}) or {}
     atm_flow = technicals.get("atm_option_flow", {}) or {}
-    four = technicals.get("four_hour", {}) or {}
+    two = technicals.get("two_hour", {}) or technicals.get("four_hour", {}) or {}
     fifteen = technicals.get("fifteen_min", {}) or {}
     five = technicals.get("five_min", {}) or {}
 
@@ -302,9 +302,9 @@ def classify_blocker(raw):
     if weighted.get("grade") == "SKIP":
         blockers.append("WEIGHTED_SCORE_LOW")
 
-    if four.get("bias") in {"BULLISH", "BEARISH"} and direction in {"BULLISH", "BEARISH"}:
-        if four.get("bias") != direction:
-            blockers.append("4H_CONFLICT")
+    if two.get("bias") in {"BULLISH", "BEARISH"} and direction in {"BULLISH", "BEARISH"}:
+        if two.get("bias") != direction:
+            blockers.append("2H_CONFLICT")
 
     if fifteen.get("bias") in {"NEUTRAL", None, ""}:
         blockers.append("15M_NEUTRAL_OR_WEAK")
@@ -404,8 +404,8 @@ def build_review(date_text):
                 "stop_loss_price": stop_loss_price,
                 "weighted_score": weighted.get("score"),
                 "weighted_grade": weighted.get("grade"),
-                "four_hour_bias": row.get("four_hour_bias"),
-                "four_hour_confidence": row.get("four_hour_confidence"),
+                "two_hour_bias": row.get("two_hour_bias") or row.get("four_hour_bias"),
+                "two_hour_confidence": row.get("two_hour_confidence") or row.get("four_hour_confidence"),
                 "fifteen_min_bias": row.get("fifteen_min_bias"),
                 "fifteen_min_confidence": row.get("fifteen_min_confidence"),
                 "five_min_bias": (technicals.get("five_min", {}) or {}).get("bias"),

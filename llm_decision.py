@@ -23,11 +23,17 @@ def build_rule_based_fallback(option_summary, technicals):
 
     two = technicals.get("two_hour", {})
     fifteen = technicals.get("fifteen_min", {})
+    five = technicals.get("five_min", {})
+    atm = technicals.get("atm_option_flow", {})
+    weighted = option_summary.get("weighted_alignment", {}) or {}
 
     two_bias = two.get("bias")
     two_confidence = two.get("confidence")
     fifteen_bias = fifteen.get("bias")
     fifteen_momentum = int(fifteen.get("momentum_score") or 0)
+    five_bias = five.get("bias")
+    weighted_grade = weighted.get("grade")
+    weighted_score = float(weighted.get("score") or 0)
 
     if option_confidence != "HIGH":
         return {**DEFAULT_DECISION, "reason": "Option chain confidence is not HIGH"}
@@ -47,6 +53,34 @@ def build_rule_based_fallback(option_summary, technicals):
             "reason": f"15M candle is opposite to option chain: option={option_bias}, 15M={fifteen_bias}",
         }
 
+    if five_bias not in {option_bias, "NEUTRAL"}:
+        return {
+            **DEFAULT_DECISION,
+            "reason": f"5M candle is opposite to option chain: option={option_bias}, 5M={five_bias}",
+        }
+
+    if weighted_grade == "SKIP" and not option_summary.get("cautious_override"):
+        return {
+            **DEFAULT_DECISION,
+            "reason": f"Weighted score is below the trade threshold: {weighted_score}",
+        }
+
+    atm_close = atm.get("close")
+    atm_vwap = atm.get("vwap")
+    atm_below_vwap = (
+        atm_close is not None
+        and atm_vwap is not None
+        and float(atm_close) < float(atm_vwap)
+    )
+
+    if weighted_grade == "CAUTIOUS_TRADE" and (
+        five_bias != option_bias or atm.get("bias") == "BEARISH" or atm_below_vwap
+    ):
+        return {
+            **DEFAULT_DECISION,
+            "reason": "Cautious setup lacks aligned 5M and supportive ATM option premium flow.",
+        }
+
     two_conflicts = (
         two_confidence in {"MEDIUM", "HIGH"}
         and two_bias in {"BULLISH", "BEARISH"}
@@ -54,7 +88,12 @@ def build_rule_based_fallback(option_summary, technicals):
     )
 
     if two_conflicts:
-        if fifteen_bias == option_bias and aligned_fifteen_momentum >= 3:
+        if (
+            fifteen_bias == option_bias
+            and aligned_fifteen_momentum >= 3
+            and five_bias == option_bias
+            and not atm_below_vwap
+        ):
             return {
                 "execute_trade": True,
                 "decision": option_bias,
@@ -72,7 +111,7 @@ def build_rule_based_fallback(option_summary, technicals):
             ),
         }
 
-    if fifteen_bias in {option_bias, "NEUTRAL"}:
+    if fifteen_bias in {option_bias, "NEUTRAL"} and five_bias in {option_bias, "NEUTRAL"}:
         return {
             "execute_trade": True,
             "decision": option_bias,
@@ -106,16 +145,34 @@ def compact_decision_context(symbol, option_summary, technicals):
         "weighted_score": weighted.get("score"),
         "weighted_grade": weighted.get("grade"),
         "cautious_trade": bool(option_summary.get("cautious_trade")),
+        "cautious_override": bool(option_summary.get("cautious_override")),
         "option_chain_trend_bias": trend.get("bias"),
         "option_chain_trend_aligns": trend.get("aligns_with_option_signal"),
         "two_hour_bias": two.get("bias"),
         "two_hour_confidence": two.get("confidence"),
+        "two_hour_score": two.get("score"),
+        "two_hour_pivot": two.get("pivot"),
+        "two_hour_middle_band": two.get("middle_band"),
+        "two_hour_upper_band": two.get("upper_band"),
+        "two_hour_lower_band": two.get("lower_band"),
+        "two_hour_option_target_price": two.get("option_target_price"),
+        "two_hour_option_stop_loss_price": two.get("option_stop_loss_price"),
         "fifteen_min_bias": fifteen.get("bias"),
         "fifteen_min_confidence": fifteen.get("confidence"),
         "fifteen_min_momentum": fifteen.get("momentum_score"),
+        "fifteen_min_pivot": fifteen.get("pivot"),
+        "fifteen_min_middle_band": fifteen.get("middle_band"),
+        "fifteen_min_upper_band": fifteen.get("upper_band"),
+        "fifteen_min_lower_band": fifteen.get("lower_band"),
+        "fifteen_min_option_target_price": fifteen.get("option_target_price"),
+        "fifteen_min_option_stop_loss_price": fifteen.get("option_stop_loss_price"),
         "five_min_bias": five.get("bias"),
         "five_min_confidence": five.get("confidence"),
         "five_min_momentum": five.get("momentum_score"),
+        "five_min_pivot": five.get("pivot"),
+        "five_min_middle_band": five.get("middle_band"),
+        "five_min_upper_band": five.get("upper_band"),
+        "five_min_lower_band": five.get("lower_band"),
         "atm_option_contract": atm.get("label"),
         "atm_option_premium_bias": atm.get("bias"),
         "atm_option_supports_long_entry": atm.get("bias") == "BULLISH",
@@ -202,8 +259,8 @@ def get_llm_decision(symbol, option_summary, technicals):
     "Volume confirmation means volume_confirmed=true in atm_option_flow. Do not call volume weak when volume_confirmed is true.",
     "Option-chain trend over recent snapshots is more reliable than one snapshot alone.",
 
-    "Use option-chain target/stop as default option premium levels.",
-    "Use option_target_price and option_stop_loss_price from technical analysis only when they support the option-chain direction.",
+    "Pivot and Bollinger fields are supporting technical context; converted technical option levels may be used to assess whether the default risk levels are realistic.",
+    "The bot owns execution prices deterministically. Return the supplied target_price and stop_loss_price unchanged when approving a trade.",
     "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
 
     "NIFTY requires stronger confirmation than BANKNIFTY.",

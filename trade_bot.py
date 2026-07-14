@@ -69,7 +69,10 @@ MIN_SCORE_BY_SYMBOL = {
 
 LLM_RESCUE_SCORE = 50
 
-MAX_TRADES_PER_SYMBOL_PER_DAY = 2
+DEFAULT_NORMAL_TARGET_PERCENT = 10.0
+DEFAULT_NORMAL_STOP_PERCENT = 7.5
+DEFAULT_CAUTIOUS_TARGET_PERCENT = 6.0
+DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
 
 SYMBOL_CONFIG = {
     "NIFTY": {
@@ -124,6 +127,33 @@ def to_int(value, default=0):
         return default
 
 
+def configured_percent(env_key, default):
+    value = to_float(os.getenv(env_key), default)
+    if value <= 0 or value >= 100:
+        raise RuntimeError(f"{env_key} must be greater than 0 and less than 100")
+    return value
+
+
+def risk_percentages(cautious=False):
+    if cautious:
+        return (
+            configured_percent("CAUTIOUS_TARGET_PERCENT", DEFAULT_CAUTIOUS_TARGET_PERCENT),
+            configured_percent("CAUTIOUS_STOP_PERCENT", DEFAULT_CAUTIOUS_STOP_PERCENT),
+        )
+
+    return (
+        configured_percent("NORMAL_TARGET_PERCENT", DEFAULT_NORMAL_TARGET_PERCENT),
+        configured_percent("NORMAL_STOP_PERCENT", DEFAULT_NORMAL_STOP_PERCENT),
+    )
+
+
+def option_levels_from_fill(entry_price, target_percent, stop_percent):
+    entry = float(entry_price)
+    target = round(entry * (1 + float(target_percent) / 100), 0)
+    stop = round(max(entry * (1 - float(stop_percent) / 100), 0), 0)
+    return target, stop
+
+
 def read_json(path, default):
     if not path.exists():
         return default
@@ -174,6 +204,31 @@ def today_realized_pnl():
     return round(total, 2)
 
 
+def bot_unrealized_pnl():
+    states = [read_state(symbol) for symbol in SYMBOLS]
+    tracked = {
+        state.get("instrument_key"): state
+        for state in states
+        if state.get("instrument_key") and state.get("status") in {"POSITION_OPEN", "EXIT_PENDING"}
+    }
+    if not tracked:
+        return 0.0
+
+    total = 0.0
+    for position in get_open_positions():
+        instrument_key = position.get("instrument_token") or position.get("instrument_key")
+        state = tracked.get(instrument_key)
+        if not state:
+            continue
+        quantity = max(position_quantity(position), 0)
+        ltp = position_ltp(position)
+        entry = to_float(state.get("entry_price"))
+        if quantity > 0 and ltp is not None and entry > 0:
+            total += (float(ltp) - entry) * quantity
+
+    return round(total, 2)
+
+
 def daily_profit_target():
     return to_float(os.getenv("DAILY_PROFIT_TARGET"), 0)
 
@@ -205,7 +260,13 @@ def daily_max_loss_reached():
     if max_loss <= 0:
         return False
 
-    return today_realized_pnl() <= -abs(max_loss)
+    try:
+        risk_pnl = today_realized_pnl() + bot_unrealized_pnl()
+    except Exception as error:
+        log(f"Could not include unrealized bot P&L in max-loss check: {error}")
+        risk_pnl = today_realized_pnl()
+
+    return risk_pnl <= -abs(max_loss)
 
 
 def risk_limit_mode():
@@ -246,10 +307,6 @@ def increment_trade_count(symbol):
     counts[symbol] = int(counts.get(symbol, 0)) + 1
     write_trade_count(data)
     return counts[symbol]
-
-
-def max_trades_reached(symbol):
-    return trade_count_for(symbol) >= MAX_TRADES_PER_SYMBOL_PER_DAY
 
 
 def upstox_headers():
@@ -474,9 +531,26 @@ def save_open_position_state(
     quantity,
     target_price=None,
     stop_loss_price=None,
+    target_percent=None,
+    stop_percent=None,
 ):
-    target_price = round(float(target_price), 0) if target_price else round(float(entry_price) * 1.10, 0)
-    stop_loss_price = round(float(stop_loss_price), 0) if stop_loss_price else round(float(entry_price) * 0.925, 0)
+    if target_percent is not None and stop_percent is not None:
+        target_price, stop_loss_price = option_levels_from_fill(
+            entry_price,
+            target_percent,
+            stop_percent,
+        )
+    else:
+        if target_price is None or stop_loss_price is None:
+            target_percent, stop_percent = risk_percentages(cautious=False)
+            target_price, stop_loss_price = option_levels_from_fill(
+                entry_price,
+                target_percent,
+                stop_percent,
+            )
+        else:
+            target_price = round(float(target_price), 0)
+            stop_loss_price = round(float(stop_loss_price), 0)
 
     state = {
         "date": now_ist().strftime("%Y-%m-%d"),
@@ -490,9 +564,11 @@ def save_open_position_state(
         "direction": direction,
         "confidence": confidence,
         "score": score,
-        "entry_price": round(float(entry_price), 0),
+        "entry_price": round(float(entry_price), 2),
         "target_price": target_price,
         "stop_loss_price": stop_loss_price,
+        "target_percent": target_percent,
+        "stop_percent": stop_percent,
         "status": "POSITION_OPEN",
         "created_at": now_ist().isoformat(),
         "highest_ltp": round(float(entry_price), 2),
@@ -507,6 +583,71 @@ def save_open_position_state(
         f"qty={quantity} lots={lot_multiplier_for(symbol)} entry={state['entry_price']} "
         f"target={target_price} stop_loss={stop_loss_price}"
     )
+
+
+def order_status(order_details):
+    return str((order_details or {}).get("status", "")).strip().lower()
+
+
+def order_is_complete(order_details):
+    return order_status(order_details) in {"complete", "completed", "traded"}
+
+
+def order_is_rejected(order_details):
+    return order_status(order_details) in {"rejected", "cancelled", "canceled"}
+
+
+def complete_exit(symbol, state, order_details, fallback_price, exit_reason, result=None, payload=None):
+    exit_price = (
+        to_float((order_details or {}).get("average_price"))
+        or to_float((order_details or {}).get("price"))
+        or to_float(fallback_price)
+    )
+    if exit_price <= 0:
+        raise RuntimeError(f"{symbol} exit completed but no valid fill price was returned")
+
+    journal_row = record_closed_trade(state, exit_price, exit_reason)
+    send_trade_closed_alert(journal_row)
+    send_apple_closed_trade_alert(journal_row)
+    log(
+        f"{symbol} {exit_reason} exit confirmed COMPLETE: result={result} "
+        f"payload={payload} journal={journal_row}"
+    )
+    clear_state(symbol)
+    return journal_row
+
+
+def monitor_pending_exit(symbol, state):
+    exit_order_id = state.get("exit_order_id")
+    if not exit_order_id:
+        state["status"] = "POSITION_OPEN"
+        write_state(symbol, state)
+        return False
+
+    details = wait_for_order_complete(exit_order_id, attempts=1, delay_seconds=0)
+    status = order_status(details)
+    log(f"{symbol} pending SELL check: order_id={exit_order_id} status={status}")
+
+    if order_is_complete(details):
+        complete_exit(
+            symbol,
+            state,
+            details,
+            state.get("exit_fallback_price"),
+            state.get("exit_reason") or "EXIT",
+        )
+        return True
+
+    if order_is_rejected(details):
+        state["status"] = "POSITION_OPEN"
+        state.pop("exit_order_id", None)
+        state.pop("exit_reason", None)
+        state.pop("exit_fallback_price", None)
+        write_state(symbol, state)
+        log(f"{symbol} SELL was {status}; position state retained for retry.")
+        return False
+
+    return True
 
 def run_position_monitor():
     for symbol in SYMBOLS:
@@ -526,6 +667,11 @@ def handle_existing_state(symbol, state):
     instrument_key = state.get("instrument_key")
     if not instrument_key:
         return False
+
+    if state.get("status") == "EXIT_PENDING":
+        if monitor_pending_exit(symbol, state):
+            return True
+        state = read_state(symbol)
 
     position = find_matching_position(instrument_key)
 
@@ -557,24 +703,22 @@ def handle_existing_state(symbol, state):
 
             result, payload = place_market_order(instrument, "SELL", qty)
             sell_order_id = result.get("data", {}).get("order_id")
-            exit_price = ltp
+            if not sell_order_id:
+                raise RuntimeError(f"{symbol} SELL placed but no order_id returned: {result}")
 
-            if sell_order_id:
-                sell_details = wait_for_order_complete(sell_order_id)
-                exit_price = (
-                    to_float(sell_details.get("average_price"))
-                    or to_float(sell_details.get("price"))
-                    or ltp
+            sell_details = wait_for_order_complete(sell_order_id)
+            if order_is_complete(sell_details):
+                complete_exit(symbol, state, sell_details, ltp, exit_reason, result, payload)
+            else:
+                state["status"] = "EXIT_PENDING"
+                state["exit_order_id"] = sell_order_id
+                state["exit_reason"] = exit_reason
+                state["exit_fallback_price"] = ltp
+                write_state(symbol, state)
+                log(
+                    f"{symbol} SELL not complete; state retained as EXIT_PENDING. "
+                    f"order_id={sell_order_id} status={order_status(sell_details)}"
                 )
-
-            journal_row = record_closed_trade(state, exit_price, exit_reason)
-            send_trade_closed_alert(journal_row)
-            send_apple_closed_trade_alert(journal_row)
-            log(
-                f"{symbol} {exit_reason} exit MARKET SELL placed: result={result} "
-                f"payload={payload} journal={journal_row}"
-            )
-            clear_state(symbol)
 
         return True
 
@@ -619,6 +763,8 @@ def handle_existing_state(symbol, state):
                 quantity=quantity,
                 target_price=state.get("target_price"),
                 stop_loss_price=state.get("stop_loss_price"),
+                target_percent=state.get("target_percent"),
+                stop_percent=state.get("stop_percent"),
             )
             return True
 
@@ -779,6 +925,10 @@ def run_squareoff():
             log(f"{symbol} no bot state found for squareoff.")
             continue
 
+        if state.get("status") == "EXIT_PENDING":
+            monitor_pending_exit(symbol, state)
+            continue
+
         position = find_matching_position(state["instrument_key"])
 
         if position:
@@ -791,29 +941,36 @@ def run_squareoff():
             try:
                 result, payload = place_market_order(instrument, "SELL", qty)
                 sell_order_id = result.get("data", {}).get("order_id")
-                exit_price = position_ltp(position)
+                if not sell_order_id:
+                    raise RuntimeError(f"{symbol} squareoff SELL returned no order_id: {result}")
 
-                if sell_order_id:
-                    sell_details = wait_for_order_complete(sell_order_id)
-                    exit_price = (
-                        to_float(sell_details.get("average_price"))
-                        or to_float(sell_details.get("price"))
-                        or exit_price
+                fallback_price = position_ltp(position)
+                sell_details = wait_for_order_complete(sell_order_id)
+                if order_is_complete(sell_details):
+                    complete_exit(
+                        symbol,
+                        state,
+                        sell_details,
+                        fallback_price,
+                        "SQUAREOFF",
+                        result,
+                        payload,
                     )
-
-                journal_row = record_closed_trade(state, exit_price, "SQUAREOFF")
-                send_trade_closed_alert(journal_row)
-                send_apple_closed_trade_alert(journal_row)
-                log(
-                    f"{symbol} bot squareoff MARKET SELL placed: result={result} "
-                    f"payload={payload} journal={journal_row}"
-                )
+                else:
+                    state["status"] = "EXIT_PENDING"
+                    state["exit_order_id"] = sell_order_id
+                    state["exit_reason"] = "SQUAREOFF"
+                    state["exit_fallback_price"] = fallback_price
+                    write_state(symbol, state)
+                    log(
+                        f"{symbol} squareoff SELL pending; state retained. "
+                        f"order_id={sell_order_id} status={order_status(sell_details)}"
+                    )
             except Exception as e:
                 log(f"{symbol} bot squareoff failed: {e}")
         else:
             log(f"{symbol} no matching bot position found for squareoff.")
-
-        clear_state(symbol)
+            clear_state(symbol)
 
 def cautious_override_allowed(direction, weighted_score, technicals):
     score_value = float(weighted_score.get("score") or 0)
@@ -838,10 +995,6 @@ def process_symbol(symbol):
 
     if state and handle_existing_state(symbol, state):
         return
-
-    # if max_trades_reached(symbol):
-    #     log(f"{symbol} daily trade limit reached: {trade_count_for(symbol)}/{MAX_TRADES_PER_SYMBOL_PER_DAY}. No new order.")
-    #     return
 
     risk_reason, risk_mode = risk_limit_mode()
 
@@ -883,8 +1036,12 @@ def process_symbol(symbol):
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
-    expected_target = round(float(expected_entry_price) * 1.1, 0)
-    expected_stop_loss = round(float(expected_entry_price) * 0.925, 0)
+    selected_target_percent, selected_stop_percent = risk_percentages(cautious=False)
+    expected_target, expected_stop_loss = option_levels_from_fill(
+        expected_entry_price,
+        selected_target_percent,
+        selected_stop_percent,
+    )
 
     option_summary = {
     "bias": direction,
@@ -930,7 +1087,7 @@ def process_symbol(symbol):
 )
     technicals["atm_option_flow"] = atm_option_flow
 
-    option_trend = get_option_chain_trend(symbol, direction)
+    option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
     weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
 
     option_summary["option_chain_trend"] = option_trend
@@ -944,8 +1101,12 @@ def process_symbol(symbol):
     if weighted_score["grade"] == "SKIP":
         if score_value >= LLM_RESCUE_SCORE and cautious_override_allowed(direction, weighted_score, technicals):
             cautious_override = True
-            expected_target = round(float(expected_entry_price) * 1.06, 0)
-            expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+            selected_target_percent, selected_stop_percent = risk_percentages(cautious=True)
+            expected_target, expected_stop_loss = option_levels_from_fill(
+                expected_entry_price,
+                selected_target_percent,
+                selected_stop_percent,
+            )
 
             option_summary["target_price"] = expected_target
             option_summary["stop_loss_price"] = expected_stop_loss
@@ -972,8 +1133,12 @@ def process_symbol(symbol):
             log(f"{symbol} no trade: weighted score too low before LLM: {weighted_score}")
             return
     if weighted_score["grade"] == "CAUTIOUS_TRADE":
-        expected_target = round(float(expected_entry_price) * 1.06, 0)
-        expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
+        selected_target_percent, selected_stop_percent = risk_percentages(cautious=True)
+        expected_target, expected_stop_loss = option_levels_from_fill(
+            expected_entry_price,
+            selected_target_percent,
+            selected_stop_percent,
+        )
         option_summary["target_price"] = expected_target
         option_summary["stop_loss_price"] = expected_stop_loss
         option_summary["cautious_trade"] = True
@@ -1017,10 +1182,12 @@ def process_symbol(symbol):
 
     llm_target = llm_decision.get("target_price")
     llm_stop_loss = llm_decision.get("stop_loss_price")
-
-    if llm_target and llm_stop_loss:
-        expected_target = round(float(llm_target), 0)
-        expected_stop_loss = round(float(llm_stop_loss), 0)
+    if llm_target is not None or llm_stop_loss is not None:
+        log(
+            f"{symbol} LLM price output is advisory only; deterministic risk levels retained. "
+            f"llm_target={llm_target} llm_stop={llm_stop_loss} "
+            f"target={expected_target} stop={expected_stop_loss}"
+        )
 
     if expected_target <= float(expected_entry_price) or expected_stop_loss >= float(expected_entry_price):
         log(
@@ -1047,31 +1214,6 @@ def process_symbol(symbol):
         )
         return
 
-    # if weighted_score["grade"] == "SKIP":
-    #     score_value = float(weighted_score.get("score") or 0)
-    #     fifteen = technicals.get("fifteen_min", {}) or {}
-    #     five = technicals.get("five_min", {}) or {}
-    #     atm_flow = technicals.get("atm_option_flow", {}) or {}
-
-    #     cautious_override = (
-    #         score_value >= 55
-    #         and fifteen.get("bias") != opposite_direction(direction)
-    #         and five.get("bias") != opposite_direction(direction)
-    #         and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
-    #         and float(atm_flow.get("close") or 0) >= float(atm_flow.get("vwap") or 999999)
-    #     )
-
-    #     if cautious_override:
-    #         expected_target = round(float(expected_entry_price) * 1.06, 0)
-    #         expected_stop_loss = round(float(expected_entry_price) * 0.95, 0)
-    #         log(
-    #             f"{symbol} cautious override allowed despite SKIP: "
-    #             f"score={score_value} target={expected_target} stop_loss={expected_stop_loss}"
-    #         )
-    #     else:
-    #         log(f"{symbol} no trade: weighted score too low: {weighted_score}")
-    #         return
-
     if not live:
         log(f"{symbol} DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
         return
@@ -1088,7 +1230,7 @@ def process_symbol(symbol):
         raise RuntimeError(f"{symbol} market BUY placed but no order_id returned: {result}")
 
     count = increment_trade_count(symbol)
-    log(f"{symbol} daily trade count updated: {count}/{MAX_TRADES_PER_SYMBOL_PER_DAY}")
+    log(f"{symbol} daily trade count updated: {count}")
     log(f"{symbol} MARKET BUY placed: order_id={order_id} payload={payload}")
 
     order_details = wait_for_order_complete(order_id)
@@ -1106,6 +1248,8 @@ def process_symbol(symbol):
             "lot_multiplier": lot_multiplier_for(symbol),
             "target_price": expected_target,
             "stop_loss_price": expected_stop_loss,
+            "target_percent": selected_target_percent,
+            "stop_percent": selected_stop_percent,
             "direction": direction,
             "confidence": confidence,
             "score": score,
@@ -1131,6 +1275,8 @@ def process_symbol(symbol):
     quantity=order_quantity,
     target_price=expected_target,
     stop_loss_price=expected_stop_loss,
+    target_percent=selected_target_percent,
+    stop_percent=selected_stop_percent,
     )
 
 

@@ -300,11 +300,16 @@ def expected_atm_option_prices(atm, levels, direction, confidence, signal_score)
     if entry_price is None:
         return {"trade_side": trade_side, "entry_price": None, "target_price": None, "stop_loss_price": None}
 
+    target_percent = float(os.getenv("NORMAL_TARGET_PERCENT", "10"))
+    stop_percent = float(os.getenv("NORMAL_STOP_PERCENT", "7.5"))
+    if not 0 < target_percent < 100 or not 0 < stop_percent < 100:
+        raise RuntimeError("NORMAL_TARGET_PERCENT and NORMAL_STOP_PERCENT must be between 0 and 100")
+
     return {
         "trade_side": trade_side,
         "entry_price": round(entry_price, 0),
-        "target_price": round(entry_price * 1.20, 0),
-        "stop_loss_price": round(max(entry_price * 0.90, 0), 0),
+        "target_price": round(entry_price * (1 + target_percent / 100), 0),
+        "stop_loss_price": round(max(entry_price * (1 - stop_percent / 100), 0), 0),
     }
 
 

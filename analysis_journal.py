@@ -13,6 +13,8 @@ COLUMNS = [
     "symbol",
     "option_chain_bias",
     "option_chain_confidence",
+    "two_hour_bias",
+    "two_hour_confidence",
     "four_hour_bias",
     "four_hour_confidence",
     "fifteen_min_bias",
@@ -31,6 +33,21 @@ def ensure_file():
     if not ANALYSIS_FILE.exists():
         with ANALYSIS_FILE.open("w", newline="") as f:
             csv.DictWriter(f, fieldnames=COLUMNS).writeheader()
+        return
+
+    with ANALYSIS_FILE.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        rows = list(reader)
+
+    if existing_fields != COLUMNS:
+        migrated_rows = [{column: row.get(column, "") for column in COLUMNS} for row in rows]
+        temp_file = ANALYSIS_FILE.with_suffix(".tmp")
+        with temp_file.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer.writeheader()
+            writer.writerows(migrated_rows)
+        temp_file.replace(ANALYSIS_FILE)
 
 
 def record_analysis(symbol, option_summary, technicals, llm_decision):
@@ -41,6 +58,8 @@ def record_analysis(symbol, option_summary, technicals, llm_decision):
         "symbol": symbol,
         "option_chain_bias": option_summary.get("bias"),
         "option_chain_confidence": option_summary.get("confidence"),
+        "two_hour_bias": technicals.get("two_hour", {}).get("bias"),
+        "two_hour_confidence": technicals.get("two_hour", {}).get("confidence"),
         "four_hour_bias": technicals.get("four_hour", {}).get("bias"),
         "four_hour_confidence": technicals.get("four_hour", {}).get("confidence"),
         "fifteen_min_bias": technicals.get("fifteen_min", {}).get("bias"),

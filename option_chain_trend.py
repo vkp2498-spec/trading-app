@@ -12,6 +12,7 @@ TREND_FILE = DATA_DIR / "option_chain_trend.csv"
 COLUMNS = [
     "timestamp",
     "symbol",
+    "expiry",
     "bias",
     "confidence",
     "score",
@@ -29,6 +30,21 @@ def ensure_file():
     if not TREND_FILE.exists():
         with TREND_FILE.open("w", newline="") as f:
             csv.DictWriter(f, fieldnames=COLUMNS).writeheader()
+        return
+
+    with TREND_FILE.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        rows = list(reader)
+
+    if existing_fields != COLUMNS:
+        migrated_rows = [{column: row.get(column, "") for column in COLUMNS} for row in rows]
+        temp_file = TREND_FILE.with_suffix(".tmp")
+        with temp_file.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer.writeheader()
+            writer.writerows(migrated_rows)
+        temp_file.replace(TREND_FILE)
 
 
 def record_option_chain_snapshot(symbol, rec):
@@ -38,6 +54,7 @@ def record_option_chain_snapshot(symbol, rec):
     row = {
         "timestamp": now_ist().isoformat(),
         "symbol": symbol,
+        "expiry": (rec.get("atm", {}) or {}).get("expiry"),
         "bias": rec.get("direction"),
         "confidence": rec.get("confidence"),
         "score": rec.get("score"),
@@ -55,7 +72,7 @@ def record_option_chain_snapshot(symbol, rec):
     return row
 
 
-def get_option_chain_trend(symbol, direction, lookback=5):
+def get_option_chain_trend(symbol, direction, expiry=None, lookback=5):
     ensure_file()
 
     df = pd.read_csv(TREND_FILE)
@@ -66,7 +83,12 @@ def get_option_chain_trend(symbol, direction, lookback=5):
             "reasons": ["Not enough option-chain trend history"],
         }
 
-    df = df[df["symbol"] == symbol].tail(lookback).copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    today = now_ist().date()
+    df = df[(df["symbol"] == symbol) & (df["timestamp"].dt.date == today)].copy()
+    if expiry is not None and "expiry" in df.columns:
+        df = df[df["expiry"].astype(str) == str(expiry)]
+    df = df.tail(lookback).copy()
     df["pcr_oi"] = pd.to_numeric(df["pcr_oi"], errors="coerce")
     df["score"] = pd.to_numeric(df["score"], errors="coerce")
 
