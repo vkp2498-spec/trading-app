@@ -99,7 +99,43 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
         trend_bonus = -10
         reasons.append("Option-chain trend conflicts direction (-10 penalty)")
 
-    total = option_component + fifteen_component + two_component + momentum_component + flow_component + trend_bonus
+    institutional = technicals.get("institutional_flow", {}) or {}
+    institutional_bias = institutional.get("bias")
+    institutional_confidence = institutional.get("confidence")
+    institutional_adjustment = 0
+
+    if institutional_bias == direction:
+        institutional_adjustment = {
+            "HIGH": 10,
+            "MEDIUM": 6,
+            "LOW": 3,
+        }.get(institutional_confidence, 0)
+        reasons.append(
+            f"Institutional footprint aligns ({institutional_confidence}) "
+            f"(+{institutional_adjustment} bonus)"
+        )
+    elif institutional_bias in {"BULLISH", "BEARISH"}:
+        institutional_adjustment = {
+            "HIGH": -15,
+            "MEDIUM": -10,
+            "LOW": -5,
+        }.get(institutional_confidence, 0)
+        reasons.append(
+            f"Institutional footprint conflicts ({institutional_confidence}) "
+            f"({institutional_adjustment} penalty)"
+        )
+    else:
+        reasons.append("Institutional footprint is neutral (no adjustment)")
+
+    total = (
+        option_component
+        + fifteen_component
+        + two_component
+        + momentum_component
+        + flow_component
+        + trend_bonus
+        + institutional_adjustment
+    )
     total = max(0, min(100, round(total, 1)))
 
     if total >= 80:

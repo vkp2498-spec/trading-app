@@ -25,6 +25,7 @@ def build_rule_based_fallback(option_summary, technicals):
     fifteen = technicals.get("fifteen_min", {})
     five = technicals.get("five_min", {})
     atm = technicals.get("atm_option_flow", {})
+    institutional = technicals.get("institutional_flow", {}) or {}
     weighted = option_summary.get("weighted_alignment", {}) or {}
 
     two_bias = two.get("bias")
@@ -35,11 +36,27 @@ def build_rule_based_fallback(option_summary, technicals):
     weighted_grade = weighted.get("grade")
     weighted_score = float(weighted.get("score") or 0)
 
+    institutional_conflicts = (
+        institutional.get("confidence") == "HIGH"
+        and institutional.get("bias") in {"BULLISH", "BEARISH"}
+        and institutional.get("bias") != option_bias
+    )
+
     if option_confidence != "HIGH":
         return {**DEFAULT_DECISION, "reason": "Option chain confidence is not HIGH"}
 
     if option_bias not in {"BULLISH", "BEARISH"}:
         return {**DEFAULT_DECISION, "reason": "Option chain is not directional"}
+
+    if institutional_conflicts:
+        return {
+            **DEFAULT_DECISION,
+            "reason": (
+                "High-confidence institutional footprint conflicts with the "
+                f"option-chain direction: option={option_bias}, "
+                f"institutional={institutional.get('bias')}"
+            ),
+        }
 
     aligned_fifteen_momentum = (
         fifteen_momentum
@@ -130,13 +147,17 @@ def compact_decision_context(symbol, option_summary, technicals):
     atm = technicals.get("atm_option_flow", {}) or {}
     weighted = option_summary.get("weighted_alignment", {}) or {}
     trend = option_summary.get("option_chain_trend", {}) or {}
+    institutional = technicals.get("institutional_flow", {}) or {}
+    direction = option_summary.get("bias")
 
     atm_close = atm.get("close")
     atm_vwap = atm.get("vwap")
 
     return {
         "symbol": symbol,
-        "direction": option_summary.get("bias"),
+        "direction": direction,
+        "trade_action": "BUY_OPTION",
+        "selected_option_type": "CE" if direction == "BULLISH" else "PE" if direction == "BEARISH" else None,
         "option_chain_confidence": option_summary.get("confidence"),
         "option_chain_score": option_summary.get("score"),
         "entry_price": option_summary.get("entry_price"),
@@ -149,6 +170,7 @@ def compact_decision_context(symbol, option_summary, technicals):
         "option_chain_trend_bias": trend.get("bias"),
         "option_chain_trend_aligns": trend.get("aligns_with_option_signal"),
         "two_hour_bias": two.get("bias"),
+        "two_hour_aligns": two.get("bias") in {direction, "NEUTRAL", None},
         "two_hour_confidence": two.get("confidence"),
         "two_hour_score": two.get("score"),
         "two_hour_pivot": two.get("pivot"),
@@ -158,6 +180,7 @@ def compact_decision_context(symbol, option_summary, technicals):
         "two_hour_option_target_price": two.get("option_target_price"),
         "two_hour_option_stop_loss_price": two.get("option_stop_loss_price"),
         "fifteen_min_bias": fifteen.get("bias"),
+        "fifteen_min_aligns": fifteen.get("bias") in {direction, "NEUTRAL", None},
         "fifteen_min_confidence": fifteen.get("confidence"),
         "fifteen_min_momentum": fifteen.get("momentum_score"),
         "fifteen_min_pivot": fifteen.get("pivot"),
@@ -167,6 +190,7 @@ def compact_decision_context(symbol, option_summary, technicals):
         "fifteen_min_option_target_price": fifteen.get("option_target_price"),
         "fifteen_min_option_stop_loss_price": fifteen.get("option_stop_loss_price"),
         "five_min_bias": five.get("bias"),
+        "five_min_aligns": five.get("bias") in {direction, "NEUTRAL", None},
         "five_min_confidence": five.get("confidence"),
         "five_min_momentum": five.get("momentum_score"),
         "five_min_pivot": five.get("pivot"),
@@ -185,6 +209,15 @@ def compact_decision_context(symbol, option_summary, technicals):
         ),
         "atm_option_volume_confirmed": bool(atm.get("volume_confirmed")),
         "atm_option_volume_ratio": atm.get("volume_ratio"),
+        "institutional_footprint_bias": institutional.get("bias"),
+        "institutional_footprint_confidence": institutional.get("confidence"),
+        "institutional_footprint_score": institutional.get("score"),
+        "institutional_footprint_aligns": institutional.get("bias") in {direction, "NEUTRAL", None},
+        "institutional_futures_component": institutional.get("futures_component"),
+        "institutional_options_component": institutional.get("options_component"),
+        "institutional_basis_component": institutional.get("basis_component"),
+        "institutional_persistence_component": institutional.get("persistence_component"),
+        "institutional_reasons": (institutional.get("reasons") or [])[:6],
     }
 
 
@@ -258,6 +291,16 @@ def get_llm_decision(symbol, option_summary, technicals):
 
     "Volume confirmation means volume_confirmed=true in atm_option_flow. Do not call volume weak when volume_confirmed is true.",
     "Option-chain trend over recent snapshots is more reliable than one snapshot alone.",
+
+    "Institutional footprint is inferred from futures price/OI, nearby-strike option OI, basis, VIX, and persistence. It does not prove that FIIs caused the move.",
+    "Daily FII positioning is supporting context only and must never independently authorize an intraday trade.",
+    "An aligned MEDIUM or HIGH institutional footprint strengthens an existing setup.",
+    "A HIGH-confidence opposite institutional footprint is a serious blocker.",
+    "A NEUTRAL or LOW-confidence institutional footprint is not a blocker by itself.",
+    "Use institutional_footprint_aligns directly and do not invent institutional activity from missing fields.",
+
+    "Buying a PE is still a long-option purchase that expresses a BEARISH underlying view; do not confuse selected-option premium direction with underlying direction.",
+    "Use the explicit two_hour_aligns, fifteen_min_aligns, and five_min_aligns fields when describing agreement.",
 
     "Pivot and Bollinger fields are supporting technical context; converted technical option levels may be used to assess whether the default risk levels are realistic.",
     "The bot owns execution prices deterministically. Return the supplied target_price and stop_loss_price unchanged when approving a trade.",

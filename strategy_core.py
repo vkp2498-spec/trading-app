@@ -326,6 +326,15 @@ def get_index_recommendation(symbol):
     total_ce_volume = float(df_chain["CE_volume"].fillna(0).sum())
     total_pe_volume = float(df_chain["PE_volume"].fillna(0).sum())
 
+    nearby_flow = {
+        "ce_oi": float(df_nearby["CE_oi"].fillna(0).sum()),
+        "pe_oi": float(df_nearby["PE_oi"].fillna(0).sum()),
+        "ce_change_oi": float(df_nearby["CE_change_oi"].fillna(0).sum()),
+        "pe_change_oi": float(df_nearby["PE_change_oi"].fillna(0).sum()),
+        "ce_volume": float(df_nearby["CE_volume"].fillna(0).sum()),
+        "pe_volume": float(df_nearby["PE_volume"].fillna(0).sum()),
+    }
+
     chain_totals = {
         "total_ce_oi": total_ce_oi,
         "total_pe_oi": total_pe_oi,
@@ -344,7 +353,8 @@ def get_index_recommendation(symbol):
         "atm": atm.to_dict(),
         "levels": levels,
         "prices": prices,
-        "chain_totals": chain_totals
+        "chain_totals": chain_totals,
+        "nearby_flow": nearby_flow,
     }
 
 

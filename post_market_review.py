@@ -294,6 +294,7 @@ def classify_blocker(raw):
     two = technicals.get("two_hour", {}) or technicals.get("four_hour", {}) or {}
     fifteen = technicals.get("fifteen_min", {}) or {}
     five = technicals.get("five_min", {}) or {}
+    institutional = technicals.get("institutional_flow", {}) or {}
 
     direction = option_summary.get("bias")
 
@@ -314,6 +315,13 @@ def classify_blocker(raw):
     if five.get("bias") in {"BULLISH", "BEARISH"} and direction in {"BULLISH", "BEARISH"}:
         if five.get("bias") != direction:
             blockers.append("5M_CONFLICT")
+
+    if (
+        institutional.get("confidence") == "HIGH"
+        and institutional.get("bias") in {"BULLISH", "BEARISH"}
+        and institutional.get("bias") != direction
+    ):
+        blockers.append("INSTITUTIONAL_FLOW_CONFLICT")
 
     if atm_flow:
         if atm_flow.get("bias") in {"BEARISH", "NEUTRAL"}:
@@ -352,6 +360,7 @@ def build_review(date_text):
         stop_loss_price = option_summary.get("stop_loss_price")
         weighted = option_summary.get("weighted_alignment", {}) or {}
         atm_flow = technicals.get("atm_option_flow", {}) or {}
+        institutional = technicals.get("institutional_flow", {}) or {}
 
         signal_ts = row.get("timestamp")
         candles = pd.DataFrame()
@@ -415,6 +424,10 @@ def build_review(date_text):
                 "atm_option_vwap": atm_flow.get("vwap"),
                 "atm_option_volume_ratio": atm_flow.get("volume_ratio"),
                 "atm_option_volume_confirmed": atm_flow.get("volume_confirmed"),
+                "institutional_bias": institutional.get("bias"),
+                "institutional_confidence": institutional.get("confidence"),
+                "institutional_score": institutional.get("score"),
+                "institutional_persistence": institutional.get("persistence_component"),
                 "llm_execute_trade": llm_decision.get("execute_trade"),
                 "llm_confidence": llm_decision.get("confidence"),
                 "llm_reason": llm_decision.get("reason"),

@@ -12,6 +12,10 @@ from zoneinfo import ZoneInfo
 import csv
 
 from analysis_journal import record_analysis
+from institutional_flow import (
+    get_institutional_footprint,
+    neutral_institutional_footprint,
+)
 from llm_decision import get_llm_decision
 from market_technicals import (
     get_technical_analysis,
@@ -977,6 +981,7 @@ def cautious_override_allowed(direction, weighted_score, technicals):
     fifteen = technicals.get("fifteen_min", {}) or {}
     five = technicals.get("five_min", {}) or {}
     atm_flow = technicals.get("atm_option_flow", {}) or {}
+    institutional = technicals.get("institutional_flow", {}) or {}
 
     atm_close = float(atm_flow.get("close") or 0)
     atm_vwap = float(atm_flow.get("vwap") or 999999)
@@ -987,7 +992,30 @@ def cautious_override_allowed(direction, weighted_score, technicals):
         and five.get("bias") != opposite_direction(direction)
         and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
         and atm_close >= atm_vwap
+        and not (
+            institutional.get("confidence") == "HIGH"
+            and institutional.get("bias") in {"BULLISH", "BEARISH"}
+            and institutional.get("bias") != direction
+        )
     )
+
+
+def collect_institutional_footprint(symbol, recommendation, atm_option_flow=None):
+    try:
+        footprint = get_institutional_footprint(
+            symbol,
+            recommendation,
+            atm_option_flow or {},
+        )
+        log(
+            f"{symbol} institutional footprint: bias={footprint.get('bias')} "
+            f"confidence={footprint.get('confidence')} score={footprint.get('score')} "
+            f"reasons={footprint.get('reasons')}"
+        )
+        return footprint
+    except Exception as error:
+        log(f"{symbol} institutional footprint unavailable: {error}")
+        return neutral_institutional_footprint(str(error))
 
 
 def process_symbol(symbol):
@@ -1017,10 +1045,12 @@ def process_symbol(symbol):
     log(f"{symbol} signal: {direction}, confidence={confidence}, score={score}, strike={atm['strike']}, expiry={atm['expiry']}")
 
     if direction not in {"BULLISH", "BEARISH"}:
+        collect_institutional_footprint(symbol, rec)
         log(f"{symbol} no trade: neutral signal.")
         return
 
     if confidence != "HIGH" or abs(score) < 4:
+        collect_institutional_footprint(symbol, rec)
         log(f"{symbol} no trade: signal is not strong HIGH confidence.")
         return
 
@@ -1086,6 +1116,11 @@ def process_symbol(symbol):
     side_label=instrument["trading_symbol"],
 )
     technicals["atm_option_flow"] = atm_option_flow
+    technicals["institutional_flow"] = collect_institutional_footprint(
+        symbol,
+        rec,
+        atm_option_flow,
+    )
 
     option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
     weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
@@ -1167,6 +1202,7 @@ def process_symbol(symbol):
         f"weighted={weighted_score} "
         f"llm={llm_decision} "
         f"atm_option_flow={technicals.get('atm_option_flow')} "
+        f"institutional_flow={technicals.get('institutional_flow')} "
     )
 
     if not llm_decision.get("execute_trade"):
