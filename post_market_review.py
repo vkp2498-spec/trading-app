@@ -447,6 +447,264 @@ def numeric_column(df, column_name):
     return pd.to_numeric(df[column_name], errors="coerce").fillna(0)
 
 
+def replay_reason_category(reason, decision=None):
+    """Convert a replay decision reason into a stable audit category."""
+    decision_text = str(decision or "").upper()
+    reason_text = str(reason or "").lower()
+
+    if decision_text == "TRADE":
+        return "TRADE"
+    if decision_text == "PAPER_MODE":
+        return "DAILY_LIMIT"
+    if decision_text == "ERROR":
+        return "DATA_ERROR"
+    if "weighted score rejected" in reason_text or "below nifty minimum" in reason_text or "below banknifty minimum" in reason_text:
+        return "WEIGHTED_SCORE_LOW"
+    if "minimum reward/risk" in reason_text or "reward/risk" in reason_text:
+        return "TECHNICAL_RR_TOO_LOW"
+    if (
+        "too far above analyzed" in reason_text
+        or "above analyzed entry" in reason_text
+        or "entry extension" in reason_text
+    ):
+        return "ENTRY_TOO_EXTENDED"
+    if "no reachable technical target" in reason_text or "no reachable target" in reason_text:
+        return "NO_REACHABLE_TARGET"
+    if "existing simulated position" in reason_text:
+        return "EXISTING_POSITION"
+    if "signal reset" in reason_text or "cooldown" in reason_text:
+        return "REENTRY_GUARD"
+    if "one lot exceeds risk budget" in reason_text:
+        return "RISK_BUDGET"
+    if "signal is not directional" in reason_text:
+        return "NOT_DIRECTIONAL"
+    if "option-chain signal is not strong" in reason_text or "missing expected option entry" in reason_text:
+        return "OPTION_SIGNAL_WEAK"
+    if "deterministic decision rejected" in reason_text:
+        return "DETERMINISTIC_REJECT"
+    return "OTHER"
+
+
+def _audit_timestamp(series):
+    return pd.to_datetime(series, errors="coerce", utc=True)
+
+
+def enrich_replay_decisions(decisions_df, review_df):
+    """Attach rejection categories and observed post-signal outcomes to replay decisions."""
+    if decisions_df is None or decisions_df.empty:
+        return pd.DataFrame()
+
+    decisions = decisions_df.copy()
+    decisions["rejection_category"] = decisions.apply(
+        lambda row: replay_reason_category(row.get("reason"), row.get("decision")),
+        axis=1,
+    )
+    decisions["_audit_time"] = _audit_timestamp(decisions.get("signal_time"))
+
+    if review_df is None or review_df.empty:
+        return decisions.drop(columns=["_audit_time"], errors="ignore")
+
+    review = review_df.copy()
+    review["_audit_time"] = _audit_timestamp(review.get("timestamp"))
+    outcome_columns = [
+        "symbol",
+        "_audit_time",
+        "missed_trade_outcome",
+        "missed_expected_profit",
+        "max_favorable_pct",
+        "max_adverse_pct",
+        "candle_fetch_error",
+    ]
+    outcome_columns = [column for column in outcome_columns if column in review.columns]
+    review = review[outcome_columns].drop_duplicates(["symbol", "_audit_time"], keep="last")
+    decisions = decisions.merge(review, on=["symbol", "_audit_time"], how="left")
+    return decisions.drop(columns=["_audit_time"], errors="ignore")
+
+
+def build_rejection_quality(decisions_df, review_df):
+    """Summarize whether each revised rejection rule avoided losses or missed winners."""
+    decisions = enrich_replay_decisions(decisions_df, review_df)
+    if decisions.empty:
+        return pd.DataFrame()
+
+    rejected = decisions[decisions["decision"].astype(str).str.upper() != "TRADE"].copy()
+    if rejected.empty:
+        return pd.DataFrame()
+
+    rejected["missed_trade_outcome"] = rejected.get(
+        "missed_trade_outcome", pd.Series(index=rejected.index, dtype="object")
+    ).fillna("UNKNOWN")
+    rejected["missed_expected_profit"] = numeric_column(
+        rejected, "missed_expected_profit"
+    )
+
+    rows = []
+    for category, part in rejected.groupby("rejection_category", dropna=False):
+        correct = int((part["missed_trade_outcome"] == "CORRECT_REJECT").sum())
+        missed = int((part["missed_trade_outcome"] == "MISSED_WINNER").sum())
+        no_edge = int((part["missed_trade_outcome"] == "NO_CLEAR_EDGE").sum())
+        decisive = correct + missed
+        precision = round((correct / decisive) * 100, 1) if decisive else None
+        rows.append(
+            {
+                "rule": str(category),
+                "checks": int(len(part)),
+                "correct_rejects": correct,
+                "missed_winners": missed,
+                "no_clear_edge": no_edge,
+                "rejection_precision_pct": precision,
+                "raw_missed_signal_value": round(float(part["missed_expected_profit"].sum()), 2),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values(
+        ["checks", "rule"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+
+def build_decision_funnel(review_df, decisions_df):
+    """Build a compact stage-by-stage view of the revised decision pipeline."""
+    decisions = enrich_replay_decisions(decisions_df, review_df)
+    total_checks = (
+        int(len(decisions))
+        if not decisions.empty
+        else int(len(review_df)) if review_df is not None else 0
+    )
+
+    if review_df is None or review_df.empty:
+        strong_signals = 0
+    else:
+        direction = review_df.get("direction", pd.Series(index=review_df.index, dtype="object"))
+        confidence = review_df.get("option_confidence", pd.Series(index=review_df.index, dtype="object"))
+        strong_signals = int(
+            (direction.isin(["BULLISH", "BEARISH"]) & confidence.eq("HIGH")).sum()
+        )
+
+    if decisions.empty:
+        passed_weighted = 0
+        passed_feasibility = 0
+        simulated_trades = 0
+    else:
+        initial_blocks = {"NOT_DIRECTIONAL", "OPTION_SIGNAL_WEAK", "WEIGHTED_SCORE_LOW"}
+        feasibility_blocks = {
+            "TECHNICAL_RR_TOO_LOW",
+            "ENTRY_TOO_EXTENDED",
+            "NO_REACHABLE_TARGET",
+            "RISK_BUDGET",
+        }
+        eligible = decisions[~decisions["rejection_category"].isin(initial_blocks)]
+        passed_weighted = int(len(eligible))
+        passed_feasibility = int(
+            (~eligible["rejection_category"].isin(feasibility_blocks)).sum()
+        )
+        simulated_trades = int(decisions["decision"].astype(str).str.upper().eq("TRADE").sum())
+
+    return pd.DataFrame(
+        [
+            {"stage": "Analysis checks", "count": total_checks},
+            {"stage": "Strong directional signals", "count": strong_signals},
+            {"stage": "Passed weighted score", "count": passed_weighted},
+            {"stage": "Passed entry feasibility", "count": passed_feasibility},
+            {"stage": "Revised replay trades", "count": simulated_trades},
+        ]
+    )
+
+
+def build_symbol_audit(review_df, decisions_df, replay_trades_df, actual_trades_df):
+    decisions = enrich_replay_decisions(decisions_df, review_df)
+    rows = []
+
+    for symbol in SYMBOLS:
+        review_part = review_df[review_df["symbol"] == symbol] if review_df is not None and not review_df.empty else pd.DataFrame()
+        decision_part = decisions[decisions["symbol"] == symbol] if not decisions.empty else pd.DataFrame()
+        replay_part = replay_trades_df[replay_trades_df["symbol"] == symbol] if replay_trades_df is not None and not replay_trades_df.empty else pd.DataFrame()
+        actual_part = actual_trades_df[actual_trades_df["symbol"] == symbol] if actual_trades_df is not None and not actual_trades_df.empty else pd.DataFrame()
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "checks": int(len(review_part)),
+                "revised_trades": int(len(replay_part)),
+                "actual_trades": int(len(actual_part)),
+                "actual_pnl": round(float(numeric_column(actual_part, "gross_pnl").sum()), 2),
+                "replay_pnl": round(float(numeric_column(replay_part, "gross_pnl").sum()), 2),
+                "correct_rejects": int((decision_part.get("missed_trade_outcome") == "CORRECT_REJECT").sum()) if "missed_trade_outcome" in decision_part else 0,
+                "missed_winners": int((decision_part.get("missed_trade_outcome") == "MISSED_WINNER").sum()) if "missed_trade_outcome" in decision_part else 0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_trade_forensics(actual_trades_df, review_df, decisions_df):
+    """Match actual trades with the nearest saved signal and revised replay decision."""
+    if actual_trades_df is None or actual_trades_df.empty:
+        return pd.DataFrame()
+
+    review = review_df.copy() if review_df is not None else pd.DataFrame()
+    decisions = enrich_replay_decisions(decisions_df, review_df)
+    if not review.empty:
+        review["_match_time"] = _audit_timestamp(review.get("timestamp"))
+    if not decisions.empty:
+        decisions["_match_time"] = _audit_timestamp(decisions.get("signal_time"))
+
+    rows = []
+    for _, trade in actual_trades_df.iterrows():
+        symbol = trade.get("symbol")
+        entry_time = pd.to_datetime(trade.get("entry_time"), errors="coerce", utc=True)
+        signal = {}
+        revised = {}
+
+        if pd.notna(entry_time) and not review.empty:
+            candidates = review[(review["symbol"] == symbol) & (review["_match_time"] <= entry_time)].copy()
+            if not candidates.empty:
+                candidates["_gap"] = entry_time - candidates["_match_time"]
+                nearest = candidates.sort_values("_gap").iloc[0]
+                if nearest["_gap"] <= pd.Timedelta(minutes=15):
+                    signal = nearest.to_dict()
+
+        if pd.notna(entry_time) and not decisions.empty:
+            candidates = decisions[(decisions["symbol"] == symbol) & (decisions["_match_time"] <= entry_time)].copy()
+            if not candidates.empty:
+                candidates["_gap"] = entry_time - candidates["_match_time"]
+                nearest = candidates.sort_values("_gap").iloc[0]
+                if nearest["_gap"] <= pd.Timedelta(minutes=15):
+                    revised = nearest.to_dict()
+
+        actual_entry = safe_float(trade.get("entry_price"))
+        expected_entry = safe_float(signal.get("entry_price"))
+        entry_slippage_pct = None
+        if actual_entry and expected_entry:
+            entry_slippage_pct = round(((actual_entry - expected_entry) / expected_entry) * 100, 2)
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "trading_symbol": trade.get("trading_symbol"),
+                "entry_time": trade.get("entry_time"),
+                "exit_time": trade.get("exit_time"),
+                "actual_entry": actual_entry,
+                "expected_entry": expected_entry,
+                "entry_slippage_pct": entry_slippage_pct,
+                "exit_price": safe_float(trade.get("exit_price")),
+                "target_price": safe_float(trade.get("target_price")),
+                "stop_loss_price": safe_float(trade.get("stop_loss_price")),
+                "gross_pnl": safe_float(trade.get("gross_pnl"), 0),
+                "exit_reason": trade.get("exit_reason"),
+                "entry_weighted_score": signal.get("weighted_score"),
+                "entry_weighted_grade": signal.get("weighted_grade"),
+                "atm_option_flow": signal.get("atm_option_flow_bias"),
+                "atm_option_vwap": signal.get("atm_option_vwap"),
+                "atm_option_volume_ratio": signal.get("atm_option_volume_ratio"),
+                "revised_decision": revised.get("decision"),
+                "revised_category": revised.get("rejection_category"),
+                "revised_reason": revised.get("reason"),
+                "analysis_matched": bool(signal),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def summarize(review_df, date_text):
     if review_df.empty:
         return {

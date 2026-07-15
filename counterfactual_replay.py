@@ -1,7 +1,7 @@
 import argparse
 import json
 import re
-from datetime import datetime, time
+from datetime import time
 from pathlib import Path
 
 import pandas as pd
@@ -12,7 +12,7 @@ from market_technicals import (
     fetch_v3_historical_minutes,
     fetch_v3_intraday_minutes,
 )
-from post_market_review import parse_raw_json, read_analysis
+from post_market_review import parse_raw_json, read_analysis, replay_reason_category
 from signal_score import weighted_alignment_score
 from strategy_core import now_ist
 from trade_bot import (
@@ -435,6 +435,11 @@ def replay_day(date_text):
 
     decisions_df = pd.DataFrame(decisions)
     trades_df = pd.DataFrame(trades)
+    if not decisions_df.empty:
+        decisions_df["rejection_category"] = decisions_df.apply(
+            lambda row: replay_reason_category(row.get("reason"), row.get("decision")),
+            axis=1,
+        )
     total_pnl = round(float(trades_df["gross_pnl"].sum()), 2) if not trades_df.empty else 0.0
     wins = int((trades_df["gross_pnl"] > 0).sum()) if not trades_df.empty else 0
     losses = int((trades_df["gross_pnl"] < 0).sum()) if not trades_df.empty else 0
@@ -449,6 +454,19 @@ def replay_day(date_text):
         "by_symbol": (
             trades_df.groupby("symbol")["gross_pnl"].agg(["count", "sum"]).round(2).to_dict("index")
             if not trades_df.empty
+            else {}
+        ),
+        "decision_counts": (
+            decisions_df["decision"].value_counts().to_dict()
+            if not decisions_df.empty
+            else {}
+        ),
+        "rejection_counts": (
+            decisions_df.loc[
+                decisions_df["decision"].astype(str).str.upper() != "TRADE",
+                "rejection_category",
+            ].value_counts().to_dict()
+            if not decisions_df.empty
             else {}
         ),
         "assumptions": [

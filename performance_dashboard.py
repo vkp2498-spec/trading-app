@@ -11,7 +11,16 @@ import streamlit as st
 
 from datetime import time
 
-from post_market_review import build_review, summarize, ask_llm_for_insights, build_loss_review
+from post_market_review import (
+    ask_llm_for_insights,
+    build_decision_funnel,
+    build_rejection_quality,
+    build_review,
+    build_symbol_audit,
+    build_trade_forensics,
+    enrich_replay_decisions,
+    summarize,
+)
 from strategy_core import now_ist
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -119,6 +128,44 @@ st.markdown(
         border-radius: 12px;
         overflow: hidden;
     }
+    .xray-verdict {
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-left: 4px solid #22c55e;
+        background: rgba(15, 23, 42, 0.86);
+        border-radius: 8px;
+        padding: 16px;
+        margin: 8px 0 16px 0;
+    }
+    .xray-verdict-title {
+        color: #f8fafc;
+        font-size: 19px;
+        font-weight: 800;
+    }
+    .xray-verdict-copy {
+        color: #cbd5e1;
+        font-size: 14px;
+        margin-top: 4px;
+    }
+    .xray-section-note {
+        color: #94a3b8;
+        font-size: 13px;
+        margin-top: -8px;
+        margin-bottom: 12px;
+    }
+    @media (max-width: 768px) {
+        .block-container {
+            padding: 0.8rem 0.75rem 1.5rem 0.75rem;
+        }
+        .dash-title {
+            font-size: 28px;
+        }
+        .xray-verdict-title {
+            font-size: 17px;
+        }
+        div[data-testid="stMetric"] {
+            padding: 11px;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -127,9 +174,104 @@ st.markdown(
 POST_MARKET_REVIEW_TIME = time(15, 30)
 
 
+def read_csv_if_present(path):
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def actual_trades_for_date(date_text):
+    trades = read_csv_if_present(TRADE_HISTORY_FILE)
+    if trades.empty or "trade_date" not in trades.columns:
+        return pd.DataFrame()
+    trade_dates = pd.to_datetime(trades["trade_date"], errors="coerce").dt.date.astype(str)
+    trades = trades[trade_dates == date_text].copy()
+    if "gross_pnl" in trades.columns:
+        trades["gross_pnl"] = pd.to_numeric(trades["gross_pnl"], errors="coerce").fillna(0)
+    return trades
+
+
+def load_saved_replay(date_text):
+    decisions = read_csv_if_present(DATA_DIR / f"counterfactual_decisions_{date_text}.csv")
+    trades = read_csv_if_present(DATA_DIR / f"counterfactual_trades_{date_text}.csv")
+    summary_path = DATA_DIR / f"counterfactual_summary_{date_text}.json"
+    summary = read_json(summary_path, {})
+    return decisions, trades, summary
+
+
+def save_replay_artifacts(date_text, decisions, trades, summary):
+    decisions_file = DATA_DIR / f"counterfactual_decisions_{date_text}.csv"
+    trades_file = DATA_DIR / f"counterfactual_trades_{date_text}.csv"
+    summary_file = DATA_DIR / f"counterfactual_summary_{date_text}.json"
+    decisions.to_csv(decisions_file, index=False)
+    trades.to_csv(trades_file, index=False)
+    summary_file.write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
+    return decisions_file, trades_file, summary_file
+
+
+def xray_overview(actual_trades, replay_trades, quality):
+    actual_pnl = float(pd.to_numeric(actual_trades.get("gross_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    replay_pnl = float(pd.to_numeric(replay_trades.get("gross_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    correct = int(quality["correct_rejects"].sum()) if not quality.empty else 0
+    missed = int(quality["missed_winners"].sum()) if not quality.empty else 0
+    decisive = correct + missed
+    precision = round((correct / decisive) * 100, 1) if decisive else None
+    return {
+        "actual_trades": int(len(actual_trades)),
+        "actual_pnl": round(actual_pnl, 2),
+        "replay_trades": int(len(replay_trades)),
+        "replay_pnl": round(replay_pnl, 2),
+        "pnl_delta": round(replay_pnl - actual_pnl, 2),
+        "correct_rejects": correct,
+        "missed_winners": missed,
+        "rejection_precision_pct": precision,
+    }
+
+
+def render_xray_trade_forensics(forensics):
+    if forensics.empty:
+        st.info("No actual closed trades were recorded for this date.")
+        return
+
+    for _, row in forensics.sort_values("entry_time").iterrows():
+        pnl = float(row.get("gross_pnl") or 0)
+        with st.container(border=True):
+            st.markdown(f"#### {row.get('symbol', '')} | {row.get('trading_symbol', '')}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Actual P&L", money(pnl))
+            c2.metric("Entry / Exit", f"{number(row.get('actual_entry'))} / {number(row.get('exit_price'))}")
+            c3.metric("Exit Reason", str(row.get("exit_reason") or "N/A"))
+            revised = str(row.get("revised_decision") or "NO MATCH")
+            c4.metric("Revised Rule", revised)
+
+            detail1, detail2 = st.columns(2)
+            with detail1:
+                st.markdown("**Entry evidence**")
+                st.write(
+                    f"Score {number(row.get('entry_weighted_score'))} | "
+                    f"Grade {row.get('entry_weighted_grade') or 'N/A'} | "
+                    f"ATM flow {row.get('atm_option_flow') or 'N/A'}"
+                )
+                st.caption(
+                    f"Expected entry {number(row.get('expected_entry'))}; "
+                    f"actual entry {number(row.get('actual_entry'))}; "
+                    f"slippage {number(row.get('entry_slippage_pct'))}%"
+                )
+            with detail2:
+                st.markdown("**Revised-rule verdict**")
+                st.write(str(row.get("revised_category") or "No revised decision matched"))
+                st.caption(str(row.get("revised_reason") or "No replay reason available."))
+
+
 def render_post_market_review_tab():
-    st.markdown("### Post-Market X-Ray")
-    st.caption("Review rejected signals, missed opportunities, blocker reasons, and LLM insights.")
+    st.markdown('<div class="dash-title">Post-Market X-Ray</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">Actual results, revised-rule replay, rejection quality, and trade-level evidence</div>',
+        unsafe_allow_html=True,
+    )
 
     today_text = now_ist().strftime("%Y-%m-%d")
     current_time = now_ist().time()
@@ -143,19 +285,32 @@ def render_post_market_review_tab():
 
     use_llm = st.checkbox("Include LLM insight", value=True)
 
-    if st.button("Run Post-Market X-Ray", use_container_width=True):
-        with st.spinner("Analyzing signals, rejected trades, missed opportunities, and blockers..."):
+    if st.button("Run Market Debrief", use_container_width=True, type="primary"):
+        with st.spinner("Rebuilding the day from saved signals and five-minute option candles..."):
+            DATA_DIR.mkdir(exist_ok=True)
+            saved_review_file = DATA_DIR / f"post_market_review_{review_date_text}.csv"
+            saved_review = read_csv_if_present(saved_review_file)
             try:
-                review_df = build_review(review_date_text)
-                review_mode = "Full review with market-data fetch"
+                if review_date_text != today_text and not saved_review.empty:
+                    review_df = saved_review
+                    review_mode = "Saved completed market review"
+                else:
+                    review_df = build_review(review_date_text)
+                    review_mode = "Full review with market-data fetch"
+                    if not saved_review.empty and "candle_fetch_error" in review_df.columns:
+                        directional = review_df.get("direction", pd.Series(dtype="object")).isin(["BULLISH", "BEARISH"])
+                        failed = review_df["candle_fetch_error"].fillna("").astype(str).str.strip().ne("")
+                        if directional.any() and failed[directional].all():
+                            review_df = saved_review
+                            review_mode = "Saved completed market review"
             except Exception as e:
-                st.warning(f"Full X-Ray failed, switching to offline saved-data review. Reason: {e}")
-                review_df = pd.DataFrame()
+                review_df = read_csv_if_present(saved_review_file)
                 review_mode = "Offline saved-data review"
+                st.warning(f"Live market-data review was unavailable. Saved evidence is being used. Reason: {e}")
 
             if review_df.empty:
                 summary = {
-                    "review_date": review_date_text,
+                    "date": review_date_text,
                     "review_mode": review_mode,
                     "total_analysis_rows": 0,
                     "directional_signals": 0,
@@ -171,122 +326,263 @@ def render_post_market_review_tab():
                 summary = summarize(review_df, review_date_text)
                 summary["review_mode"] = review_mode
 
-            DATA_DIR.mkdir(exist_ok=True)
             csv_file = DATA_DIR / f"post_market_review_{review_date_text}.csv"
             summary_file = DATA_DIR / f"post_market_summary_{review_date_text}.json"
             llm_file = DATA_DIR / f"post_market_llm_insights_{review_date_text}.txt"
 
             review_df.to_csv(csv_file, index=False)
-            summary_file.write_text(json.dumps(summary, indent=2, sort_keys=True))
+            summary_file.write_text(json.dumps(summary, indent=2, sort_keys=True, default=str))
+
+            replay_error = None
+            try:
+                from counterfactual_replay import replay_day
+
+                replay_decisions, replay_trades, replay_summary = replay_day(review_date_text)
+                replay_mode = "Fresh revised-rule replay"
+                replay_files = save_replay_artifacts(
+                    review_date_text,
+                    replay_decisions,
+                    replay_trades,
+                    replay_summary,
+                )
+            except Exception as error:
+                replay_error = str(error)
+                replay_decisions, replay_trades, replay_summary = load_saved_replay(review_date_text)
+                replay_mode = "Saved revised-rule replay"
+                replay_files = (
+                    DATA_DIR / f"counterfactual_decisions_{review_date_text}.csv",
+                    DATA_DIR / f"counterfactual_trades_{review_date_text}.csv",
+                    DATA_DIR / f"counterfactual_summary_{review_date_text}.json",
+                )
+
+            actual_trades = actual_trades_for_date(review_date_text)
+            rejection_quality = build_rejection_quality(replay_decisions, review_df)
+            decision_funnel = build_decision_funnel(review_df, replay_decisions)
+            symbol_audit = build_symbol_audit(
+                review_df,
+                replay_decisions,
+                replay_trades,
+                actual_trades,
+            )
+            forensics = build_trade_forensics(actual_trades, review_df, replay_decisions)
+            overview = xray_overview(actual_trades, replay_trades, rejection_quality)
 
             llm_insights = None
             if use_llm:
-                llm_insights = ask_llm_for_insights(summary)
+                llm_payload = {
+                    **summary,
+                    "actual_vs_revised_replay": overview,
+                    "revised_rejection_quality": rejection_quality.to_dict(orient="records"),
+                    "symbol_audit": symbol_audit.to_dict(orient="records"),
+                    "replay_summary": replay_summary,
+                    "instruction": (
+                        "Prioritize actual P&L, replay P&L, rejection precision, and trade forensics. "
+                        "Treat raw missed-signal value as overlapping diagnostic evidence, not realizable profit."
+                    ),
+                }
+                try:
+                    llm_insights = ask_llm_for_insights(llm_payload)
+                except Exception as error:
+                    llm_insights = f"LLM review unavailable: {error}"
                 llm_file.write_text(llm_insights)
 
+            st.session_state["post_market_xray_date"] = review_date_text
             st.session_state["post_market_review_df"] = review_df
             st.session_state["post_market_summary"] = summary
             st.session_state["post_market_llm_insights"] = llm_insights
+            st.session_state["post_market_replay_decisions"] = replay_decisions
+            st.session_state["post_market_replay_trades"] = replay_trades
+            st.session_state["post_market_replay_summary"] = replay_summary
+            st.session_state["post_market_rejection_quality"] = rejection_quality
+            st.session_state["post_market_decision_funnel"] = decision_funnel
+            st.session_state["post_market_symbol_audit"] = symbol_audit
+            st.session_state["post_market_forensics"] = forensics
+            st.session_state["post_market_overview"] = overview
+            st.session_state["post_market_replay_mode"] = replay_mode
+            st.session_state["post_market_replay_error"] = replay_error
             st.session_state["post_market_files"] = {
                 "csv": str(csv_file),
                 "summary": str(summary_file),
                 "llm": str(llm_file) if use_llm else None,
+                "replay_decisions": str(replay_files[0]),
+                "replay_trades": str(replay_files[1]),
+                "replay_summary": str(replay_files[2]),
             }
+
+    if st.session_state.get("post_market_xray_date") != review_date_text:
+        st.info("Run the market debrief to build this date's evidence pack.")
+        return
 
     summary = st.session_state.get("post_market_summary")
     review_df = st.session_state.get("post_market_review_df")
     llm_insights = st.session_state.get("post_market_llm_insights")
+    replay_decisions = st.session_state.get("post_market_replay_decisions", pd.DataFrame())
+    replay_trades = st.session_state.get("post_market_replay_trades", pd.DataFrame())
+    replay_summary = st.session_state.get("post_market_replay_summary", {})
+    rejection_quality = st.session_state.get("post_market_rejection_quality", pd.DataFrame())
+    decision_funnel = st.session_state.get("post_market_decision_funnel", pd.DataFrame())
+    symbol_audit = st.session_state.get("post_market_symbol_audit", pd.DataFrame())
+    forensics = st.session_state.get("post_market_forensics", pd.DataFrame())
+    overview = st.session_state.get("post_market_overview", {})
+    replay_mode = st.session_state.get("post_market_replay_mode", "N/A")
+    replay_error = st.session_state.get("post_market_replay_error")
     files = st.session_state.get("post_market_files", {})
 
     if not summary:
-        st.info("Click the button after market close to generate today’s review.")
+        st.info("Run the market debrief after market close to generate the review.")
         return
 
-    st.success("Post-market review generated.")
-    st.caption(f"Review mode: {summary.get('review_mode', 'N/A')}")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Checks", summary.get("total_analysis_rows", 0))
-    c2.metric("Directional", summary.get("directional_signals", 0))
-    c3.metric("Rejected", summary.get("rejected_signals", 0))
-    c4.metric("Missed Profit", money(summary.get("missed_expected_profit_total", 0)))
-    c5.metric("Max Possible", money(summary.get("max_possible_profit_total", 0)))
-
-    st.markdown("### Outcome Summary")
-    outcome_counts = summary.get("outcome_counts", {})
-    if outcome_counts:
-        st.dataframe(
-            pd.DataFrame(
-                [{"Outcome": key, "Count": value} for key, value in outcome_counts.items()]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown("### Main Blockers")
-    blocker_counts = summary.get("blocker_counts", {})
-    if blocker_counts:
-        blocker_df = pd.DataFrame(
-            [{"Blocker": key, "Count": value} for key, value in blocker_counts.items()]
-        )
-        st.bar_chart(blocker_df.set_index("Blocker")["Count"])
-
-    st.markdown("### Symbol View")
-    by_symbol = summary.get("by_symbol", {})
-    if by_symbol:
-        st.dataframe(
-            pd.DataFrame(
-                [{"Symbol": symbol, **values} for symbol, values in by_symbol.items()]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown("### Top Missed Opportunities")
-    missed = summary.get("top_missed_opportunities", [])
-    if missed:
-        st.dataframe(pd.DataFrame(missed), use_container_width=True, hide_index=True)
+    actual_pnl = float(overview.get("actual_pnl", 0) or 0)
+    replay_pnl = float(overview.get("replay_pnl", 0) or 0)
+    pnl_delta = float(overview.get("pnl_delta", 0) or 0)
+    if pnl_delta > 0:
+        verdict_title = "Revised rules reduced simulated loss exposure"
+        verdict_copy = f"The conservative replay improved the day's gross result by {money(pnl_delta)} versus the actual trades."
+    elif pnl_delta < 0:
+        verdict_title = "Actual execution outperformed the revised replay"
+        verdict_copy = f"The revised replay trailed actual gross P&L by {money(abs(pnl_delta))}. Keep the comparison under observation before changing rules."
     else:
-        st.info("No missed target-hitting opportunities found.")
+        verdict_title = "No measurable replay advantage for this date"
+        verdict_copy = "Actual and revised replay results are equal, or the replay produced no executable setup."
 
-    if llm_insights:
-        st.markdown("### LLM Insight")
-        st.write(llm_insights)
+    st.markdown(
+        f'<div class="xray-verdict"><div class="xray-verdict-title">{verdict_title}</div>'
+        f'<div class="xray-verdict-copy">{verdict_copy}</div></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Review: {summary.get('review_mode', 'N/A')} | Replay: {replay_mode}. "
+        "Replay values exclude brokerage, taxes, spread, slippage, and market impact."
+    )
+    if replay_error:
+        st.warning(f"Fresh replay was unavailable; saved replay evidence is shown. Reason: {replay_error}")
 
-        st.markdown("### Losing Trade Review")
+    brief_tab, audit_tab, forensic_tab, replay_tab = st.tabs(
+        ["Daily Brief", "Decision Audit", "Trade Forensics", "Replay"]
+    )
 
-        trade_file = DATA_DIR / "trade_history.csv"
-        analysis_file = DATA_DIR / "analysis_history.csv"
+    with brief_tab:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Actual Gross P&L", money(actual_pnl))
+        c2.metric("Revised Replay P&L", money(replay_pnl))
+        c3.metric("Replay Delta", money(pnl_delta))
+        c4.metric(
+            "Trades Actual / Replay",
+            f"{overview.get('actual_trades', 0)} / {overview.get('replay_trades', 0)}",
+        )
+        precision = overview.get("rejection_precision_pct")
+        c5.metric("Rejection Precision", f"{precision:.1f}%" if precision is not None else "N/A")
 
-        if not trade_file.exists():
-            st.info("No trade history file found for losing trade review.")
-        elif not analysis_file.exists():
-            st.info("No analysis history file found for losing trade review.")
+        st.markdown("### Decision Funnel")
+        st.markdown('<div class="xray-section-note">How many checks survived each revised-rule gate.</div>', unsafe_allow_html=True)
+        if not decision_funnel.empty:
+            funnel = decision_funnel.copy()
+            first_count = float(funnel.iloc[0]["count"] or 0)
+            funnel["share_of_checks"] = funnel["count"].apply(
+                lambda value: f"{(float(value) / first_count) * 100:.1f}%" if first_count else "0.0%"
+            )
+            st.dataframe(funnel, use_container_width=True, hide_index=True)
+
+        st.markdown("### Symbol Comparison")
+        if not symbol_audit.empty:
+            st.dataframe(symbol_audit, use_container_width=True, hide_index=True)
+
+        st.markdown("### Evidence Quality")
+        candle_errors = 0
+        if review_df is not None and not review_df.empty and "candle_fetch_error" in review_df.columns:
+            errors = review_df["candle_fetch_error"].fillna("").astype(str).str.strip()
+            candle_errors = int(errors.ne("").sum())
+        matched_trades = int(forensics.get("analysis_matched", pd.Series(dtype=bool)).fillna(False).sum()) if not forensics.empty else 0
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Analysis Rows", summary.get("total_analysis_rows", 0))
+        q2.metric("Replay Decisions", len(replay_decisions))
+        q3.metric("Candle Errors", candle_errors)
+        q4.metric("Trades Matched", f"{matched_trades}/{len(forensics)}")
+
+        if llm_insights:
+            st.markdown("### Independent Review")
+            st.write(llm_insights)
+
+    with audit_tab:
+        st.markdown("### Rejection Quality Matrix")
+        st.markdown(
+            '<div class="xray-section-note">Correct rejects versus missed winners by revised rule. Precision excludes no-clear-edge observations.</div>',
+            unsafe_allow_html=True,
+        )
+        if rejection_quality.empty:
+            st.info("No revised rejection evidence is available.")
         else:
-            trades_df = pd.read_csv(trade_file)
-            analysis_df = pd.read_csv(analysis_file)
+            display_quality = rejection_quality.rename(
+                columns={
+                    "rule": "Rule",
+                    "checks": "Checks",
+                    "correct_rejects": "Correct Rejects",
+                    "missed_winners": "Missed Winners",
+                    "no_clear_edge": "No Clear Edge",
+                    "rejection_precision_pct": "Precision %",
+                    "raw_missed_signal_value": "Raw Missed Signal Value",
+                }
+            )
+            st.dataframe(display_quality, use_container_width=True, hide_index=True)
+            chart = rejection_quality.set_index("rule")[["correct_rejects", "missed_winners", "no_clear_edge"]]
+            st.bar_chart(chart)
 
-            if not trades_df.empty:
-                trades_df["trade_date"] = pd.to_datetime(trades_df["trade_date"], errors="coerce").dt.date.astype(str)
-                trades_df = trades_df[trades_df["trade_date"] == review_date_text]
+        outcome_counts = summary.get("outcome_counts", {})
+        if outcome_counts:
+            st.markdown("### Observed Signal Outcomes")
+            st.dataframe(
+                pd.DataFrame([{"Outcome": key, "Count": value} for key, value in outcome_counts.items()]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-            if not analysis_df.empty:
-                analysis_df["created_at"] = pd.to_datetime(analysis_df["timestamp"], errors="coerce")
-                analysis_df["review_date"] = analysis_df["created_at"].dt.date.astype(str)
-                analysis_df = analysis_df[analysis_df["review_date"] == review_date_text]
+        raw_missed = summary.get("missed_expected_profit_total", 0)
+        st.info(
+            f"Raw missed signal value: {money(raw_missed)}. This is a diagnostic total across overlapping signals "
+            "using the review's assumed quantity; it is not realizable portfolio profit."
+        )
+        enriched = enrich_replay_decisions(replay_decisions, review_df)
+        if not enriched.empty:
+            with st.expander("Full Revised Decision Ledger"):
+                st.dataframe(enriched, use_container_width=True, hide_index=True)
 
-            loss_reviews = build_loss_review(trades_df, analysis_df)
+    with forensic_tab:
+        st.markdown("### Actual Trade Forensics")
+        st.markdown(
+            '<div class="xray-section-note">Each closed trade matched to its entry evidence and the revised rule verdict.</div>',
+            unsafe_allow_html=True,
+        )
+        render_xray_trade_forensics(forensics)
 
-            if not loss_reviews:
-                st.success("No losing trades found for this review date.")
-            else:
-                st.dataframe(pd.DataFrame(loss_reviews), use_container_width=True, hide_index=True)
+    with replay_tab:
+        st.markdown("### Revised-Rule Counterfactual")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Simulated Trades", replay_summary.get("simulated_trades", len(replay_trades)))
+        r2.metric("Wins / Losses", f"{replay_summary.get('wins', 0)} / {replay_summary.get('losses', 0)}")
+        r3.metric("Win Rate", f"{float(replay_summary.get('win_percent', 0) or 0):.1f}%")
+        r4.metric("Estimated Gross P&L", money(replay_summary.get("estimated_gross_pnl", replay_pnl)))
+
+        if replay_trades.empty:
+            st.info("No trades qualified under the revised rules for this date.")
+        else:
+            st.dataframe(replay_trades, use_container_width=True, hide_index=True)
+
+        if not replay_decisions.empty:
+            st.markdown("### Replay Decision Mix")
+            decision_mix = replay_decisions["decision"].fillna("UNKNOWN").value_counts()
+            st.bar_chart(decision_mix)
+
+        assumptions = replay_summary.get("assumptions", [])
+        if assumptions:
+            with st.expander("Replay Assumptions"):
+                for assumption in assumptions:
+                    st.write(f"- {assumption}")
 
     if review_df is not None and not review_df.empty:
-        with st.expander("Full Review Data"):
+        with st.expander("Full Original Review Data"):
             st.dataframe(review_df, use_container_width=True, hide_index=True)
 
-    with st.expander("Generated Files"):
+    with st.expander("Generated Evidence Files"):
         st.write(files)
 
 
@@ -327,6 +623,8 @@ def extract_between(line, start, end):
 
 def money(value):
     try:
+        if pd.isna(value):
+            return "N/A"
         return f"₹{float(value):,.2f}"
     except Exception:
         return "N/A"
@@ -334,6 +632,8 @@ def money(value):
 
 def number(value):
     try:
+        if pd.isna(value):
+            return "N/A"
         return f"{float(value):,.2f}"
     except Exception:
         return "N/A"
