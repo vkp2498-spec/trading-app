@@ -148,6 +148,7 @@ def compact_decision_context(symbol, option_summary, technicals):
     weighted = option_summary.get("weighted_alignment", {}) or {}
     trend = option_summary.get("option_chain_trend", {}) or {}
     institutional = technicals.get("institutional_flow", {}) or {}
+    feasibility = technicals.get("trade_feasibility", {}) or {}
     direction = option_summary.get("bias")
 
     atm_close = atm.get("close")
@@ -218,6 +219,12 @@ def compact_decision_context(symbol, option_summary, technicals):
         "institutional_basis_component": institutional.get("basis_component"),
         "institutional_persistence_component": institutional.get("persistence_component"),
         "institutional_reasons": (institutional.get("reasons") or [])[:6],
+        "technical_feasibility_allowed": feasibility.get("allowed"),
+        "technical_reward_risk": feasibility.get("technical_reward_risk"),
+        "technical_headroom_percent": feasibility.get("technical_headroom_percent"),
+        "technical_limiting_timeframe": feasibility.get("limiting_timeframe"),
+        "entry_extension_percent": feasibility.get("entry_extension_percent"),
+        "technical_feasibility_reasons": feasibility.get("reasons", []),
     }
 
 
@@ -368,6 +375,8 @@ def get_llm_decision(symbol, option_summary, technicals):
     "Use the explicit two_hour_aligns, fifteen_min_aligns, and five_min_aligns fields when describing agreement.",
 
     "Pivot and Bollinger fields are supporting technical context; converted technical option levels may be used to assess whether the default risk levels are realistic.",
+    "technical_feasibility_allowed must be true. The deterministic bot rejects the setup before this call otherwise.",
+    "Use technical_reward_risk, technical_headroom_percent, and technical_limiting_timeframe when explaining whether sufficient reachable reward remains.",
     "The bot owns execution prices deterministically. Return the supplied target_price and stop_loss_price unchanged when approving a trade.",
     "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
 

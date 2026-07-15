@@ -80,16 +80,27 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     option_flow = technicals.get("atm_option_flow", {}) or {}
 
     flow_component = 0
-    if option_flow.get("bias") == "BULLISH" and option_flow.get("volume_confirmed"):
-        flow_component = weights["atm_option_flow"]
-    elif option_flow.get("bias") == "BULLISH":
-        flow_component = weights["atm_option_flow"] * 0.70
-    elif option_flow.get("bias") == "NEUTRAL":
-        flow_component = weights["atm_option_flow"] * 0.30
-    else:
-        flow_component = 0
+    flow_bias = option_flow.get("bias")
+    volume_ratio = float(option_flow.get("volume_ratio") or 0)
 
-    reasons.append(f"ATM option VWAP/volume component={flow_component:.1f}/{weights['atm_option_flow']}")
+    # Volume confirmation is graded. A ratio barely above 1.0 should not earn
+    # the same score as an option trading at 1.5x or 2x its recent volume.
+    if flow_bias == "BULLISH":
+        if volume_ratio >= 1.50:
+            flow_component = weights["atm_option_flow"]
+        elif volume_ratio >= 1.20:
+            flow_component = weights["atm_option_flow"] * 0.80
+        elif volume_ratio >= 1.00:
+            flow_component = weights["atm_option_flow"] * 0.50
+        else:
+            flow_component = weights["atm_option_flow"] * 0.35
+    elif flow_bias == "NEUTRAL":
+        flow_component = weights["atm_option_flow"] * (0.25 if volume_ratio >= 1.20 else 0.10)
+
+    reasons.append(
+        f"ATM option VWAP/volume component={flow_component:.1f}/{weights['atm_option_flow']} "
+        f"(volume_ratio={volume_ratio:.2f})"
+    )
 
     trend_bonus = 0
     if option_chain_trend.get("bias") == direction:

@@ -77,6 +77,10 @@ DEFAULT_NORMAL_TARGET_PERCENT = 10.0
 DEFAULT_NORMAL_STOP_PERCENT = 7.5
 DEFAULT_CAUTIOUS_TARGET_PERCENT = 6.0
 DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
+DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
+DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
+DEFAULT_RISK_SLOTS_PER_DAY = 3
+DEFAULT_MIN_REENTRY_MINUTES = 30
 
 SYMBOL_CONFIG = {
     "NIFTY": {
@@ -95,6 +99,10 @@ UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exc
 
 def state_file(symbol):
     return BASE_DIR / f"trade_state_{symbol}.json"
+
+
+def reentry_guard_file(symbol):
+    return BASE_DIR / f"reentry_guard_{symbol}.json"
 
 
 def load_env():
@@ -158,6 +166,109 @@ def option_levels_from_fill(entry_price, target_percent, stop_percent):
     return target, stop
 
 
+def configured_non_negative_float(env_key, default):
+    value = to_float(os.getenv(env_key), default)
+    if value < 0:
+        raise RuntimeError(f"{env_key} must be greater than or equal to 0")
+    return value
+
+
+def evaluate_trade_feasibility(
+    direction,
+    entry_price,
+    proposed_target,
+    stop_loss,
+    technicals,
+):
+    entry = float(entry_price)
+    target = float(proposed_target)
+    stop = float(stop_loss)
+    min_rr = configured_non_negative_float(
+        "MIN_TECHNICAL_REWARD_RISK",
+        DEFAULT_MIN_TECHNICAL_REWARD_RISK,
+    )
+    max_extension = configured_non_negative_float(
+        "MAX_ENTRY_EXTENSION_PERCENT",
+        DEFAULT_MAX_ENTRY_EXTENSION_PERCENT,
+    )
+
+    result = {
+        "allowed": False,
+        "direction": direction,
+        "entry_price": round(entry, 2),
+        "proposed_target_price": round(target, 2),
+        "stop_loss_price": round(stop, 2),
+        "minimum_reward_risk": round(min_rr, 2),
+        "reasons": [],
+    }
+
+    risk = entry - stop
+    if risk <= 0:
+        result["reasons"].append("Stop loss does not define positive option-premium risk")
+        return result
+
+    option_flow = technicals.get("atm_option_flow", {}) or {}
+    completed_candle_close = to_float(option_flow.get("close"), 0)
+    if completed_candle_close > 0:
+        entry_extension = ((entry - completed_candle_close) / completed_candle_close) * 100
+        result["entry_extension_percent"] = round(entry_extension, 2)
+        result["maximum_entry_extension_percent"] = round(max_extension, 2)
+        if entry_extension > max_extension:
+            result["reasons"].append(
+                f"Expected entry is {entry_extension:.2f}% above the completed ATM option candle; "
+                f"maximum is {max_extension:.2f}%"
+            )
+            return result
+
+    target_candidates = []
+    for timeframe_key, label in (("five_min", "5M"), ("fifteen_min", "15M")):
+        analysis = technicals.get(timeframe_key, {}) or {}
+        technical_target = to_float(analysis.get("option_target_price"), 0)
+        if analysis.get("bias") == direction and technical_target > entry:
+            target_candidates.append((technical_target, label))
+
+    result["technical_target_candidates"] = [
+        {"timeframe": label, "target_price": round(value, 2)}
+        for value, label in target_candidates
+    ]
+    if not target_candidates:
+        result["reasons"].append(
+            "No aligned 5M or 15M option-premium target is available"
+        )
+        return result
+
+    reachable_target, limiting_timeframe = min(target_candidates, key=lambda item: item[0])
+    adjusted_target = min(target, reachable_target)
+    reward = adjusted_target - entry
+    reward_risk = reward / risk if risk > 0 else 0
+
+    result.update(
+        {
+            "limiting_timeframe": limiting_timeframe,
+            "reachable_target_price": round(reachable_target, 2),
+            "adjusted_target_price": round(adjusted_target, 2),
+            "technical_reward": round(reward, 2),
+            "option_risk": round(risk, 2),
+            "technical_reward_risk": round(reward_risk, 2),
+            "technical_headroom_percent": round((reward / entry) * 100, 2),
+        }
+    )
+
+    if reward <= 0 or reward_risk < min_rr:
+        result["reasons"].append(
+            f"Technical reward/risk {reward_risk:.2f} is below required {min_rr:.2f}; "
+            f"{limiting_timeframe} target={reachable_target:.2f}"
+        )
+        return result
+
+    result["allowed"] = True
+    result["reasons"].append(
+        f"Technical reward/risk {reward_risk:.2f} passes {min_rr:.2f}; "
+        f"target capped by {limiting_timeframe} at {adjusted_target:.2f}"
+    )
+    return result
+
+
 def read_json(path, default):
     if not path.exists():
         return default
@@ -182,6 +293,93 @@ def write_state(symbol, state):
 
 def clear_state(symbol):
     write_state(symbol, {})
+
+
+def read_reentry_guard(symbol):
+    guard = read_json(reentry_guard_file(symbol), {})
+    if guard.get("date") != now_ist().strftime("%Y-%m-%d"):
+        return {}
+    return guard
+
+
+def write_reentry_guard(symbol, guard):
+    write_json(reentry_guard_file(symbol), guard)
+
+
+def clear_reentry_guard(symbol):
+    write_reentry_guard(symbol, {})
+
+
+def register_losing_exit_guard(symbol, state, journal_row, exit_reason):
+    if exit_reason not in {"STOP_LOSS", "SENTIMENT_EXIT"}:
+        return
+    if to_float(journal_row.get("gross_pnl")) >= 0:
+        return
+
+    try:
+        write_reentry_guard(
+            symbol,
+            {
+                "date": now_ist().strftime("%Y-%m-%d"),
+                "blocked_direction": state.get("direction"),
+                "trading_symbol": state.get("trading_symbol"),
+                "stopped_at": now_ist().isoformat(),
+                "exit_reason": exit_reason,
+                "reset_seen": False,
+            },
+        )
+        log(
+            f"{symbol} re-entry guard armed after losing {exit_reason}: "
+            f"direction={state.get('direction')}; signal reset required"
+        )
+    except Exception as error:
+        log(f"{symbol} could not persist re-entry guard: {error}")
+
+
+def observe_signal_reset(symbol, direction):
+    guard = read_reentry_guard(symbol)
+    blocked_direction = guard.get("blocked_direction")
+    if not blocked_direction or guard.get("reset_seen"):
+        return
+
+    if direction != blocked_direction:
+        guard["reset_seen"] = True
+        guard["reset_at"] = now_ist().isoformat()
+        guard["reset_direction"] = direction
+        write_reentry_guard(symbol, guard)
+        log(
+            f"{symbol} re-entry guard reset observed: "
+            f"blocked_direction={blocked_direction} new_signal={direction}"
+        )
+
+
+def reentry_block_reason(symbol, direction):
+    guard = read_reentry_guard(symbol)
+    if guard.get("blocked_direction") != direction:
+        return ""
+
+    if not guard.get("reset_seen"):
+        return (
+            f"same-direction re-entry blocked after {guard.get('exit_reason')} at "
+            f"{guard.get('stopped_at')}; wait for a neutral/opposite signal reset"
+        )
+
+    cooldown_minutes = configured_non_negative_float(
+        "MIN_REENTRY_MINUTES",
+        DEFAULT_MIN_REENTRY_MINUTES,
+    )
+    try:
+        stopped_at = datetime.fromisoformat(guard.get("stopped_at"))
+        elapsed_minutes = (now_ist() - stopped_at).total_seconds() / 60
+    except Exception:
+        elapsed_minutes = 0
+
+    if elapsed_minutes < cooldown_minutes:
+        return (
+            f"same-direction re-entry cooldown active after {guard.get('exit_reason')}; "
+            f"elapsed={elapsed_minutes:.1f}m required={cooldown_minutes:.1f}m"
+        )
+    return ""
 
 def today_realized_pnl():
     today = now_ist().strftime("%Y-%m-%d")
@@ -252,6 +450,20 @@ def daily_profit_target_reached():
 
 def daily_max_loss():
     return to_float(os.getenv("DAILY_MAX_LOSS"), 0)
+
+
+def max_risk_per_trade(symbol):
+    symbol_value = to_float(os.getenv(f"{symbol}_MAX_RISK_PER_TRADE"), 0)
+    if symbol_value > 0:
+        return symbol_value
+
+    global_value = to_float(os.getenv("MAX_RISK_PER_TRADE"), 0)
+    if global_value > 0:
+        return global_value
+
+    max_loss = daily_max_loss()
+    slots = max(to_int(os.getenv("RISK_SLOTS_PER_DAY"), DEFAULT_RISK_SLOTS_PER_DAY), 1)
+    return max_loss / slots if max_loss > 0 else 0
 
 
 def after_max_loss_mode():
@@ -359,8 +571,22 @@ def lot_multiplier_for(symbol):
     return lots
 
 
-def order_quantity_for(symbol, instrument):
-    return int(instrument["lot_size"]) * lot_multiplier_for(symbol)
+def order_quantity_for(symbol, instrument, entry_price=None, stop_loss_price=None):
+    lot_size = int(instrument["lot_size"])
+    configured_lots = lot_multiplier_for(symbol)
+    risk_budget = max_risk_per_trade(symbol)
+
+    if risk_budget <= 0 or entry_price is None or stop_loss_price is None:
+        return lot_size * configured_lots
+
+    risk_per_unit = float(entry_price) - float(stop_loss_price)
+    if risk_per_unit <= 0:
+        return 0
+
+    risk_per_lot = risk_per_unit * lot_size
+    affordable_lots = int(risk_budget // risk_per_lot)
+    actual_lots = min(configured_lots, affordable_lots)
+    return lot_size * max(actual_lots, 0)
 
 
 def place_market_order(instrument, transaction_type, quantity):
@@ -539,11 +765,16 @@ def save_open_position_state(
     stop_percent=None,
 ):
     if target_percent is not None and stop_percent is not None:
-        target_price, stop_loss_price = option_levels_from_fill(
+        percent_target, percent_stop = option_levels_from_fill(
             entry_price,
             target_percent,
             stop_percent,
         )
+        if target_price is not None and float(target_price) > float(entry_price):
+            target_price = min(percent_target, round(float(target_price), 0))
+        else:
+            target_price = percent_target
+        stop_loss_price = percent_stop
     else:
         if target_price is None or stop_loss_price is None:
             target_percent, stop_percent = risk_percentages(cautious=False)
@@ -564,7 +795,7 @@ def save_open_position_state(
         "trading_symbol": instrument["trading_symbol"],
         "quantity": int(quantity),
         "lot_size": int(instrument["lot_size"]),
-        "lot_multiplier": lot_multiplier_for(symbol),
+        "lot_multiplier": max(int(quantity) // int(instrument["lot_size"]), 1),
         "direction": direction,
         "confidence": confidence,
         "score": score,
@@ -584,7 +815,7 @@ def save_open_position_state(
 
     log(
         f"{symbol} POSITION OPEN: symbol={instrument['trading_symbol']} "
-        f"qty={quantity} lots={lot_multiplier_for(symbol)} entry={state['entry_price']} "
+        f"qty={quantity} lots={state['lot_multiplier']} entry={state['entry_price']} "
         f"target={target_price} stop_loss={stop_loss_price}"
     )
 
@@ -611,6 +842,7 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
         raise RuntimeError(f"{symbol} exit completed but no valid fill price was returned")
 
     journal_row = record_closed_trade(state, exit_price, exit_reason)
+    register_losing_exit_guard(symbol, state, journal_row, exit_reason)
     send_trade_closed_alert(journal_row)
     send_apple_closed_trade_alert(journal_row)
     log(
@@ -770,6 +1002,7 @@ def handle_existing_state(symbol, state):
                 target_percent=state.get("target_percent"),
                 stop_percent=state.get("stop_percent"),
             )
+            clear_reentry_guard(symbol)
             return True
 
         log(f"{symbol} BUY order still pending. No new order.")
@@ -1043,6 +1276,7 @@ def process_symbol(symbol):
     prices = rec["prices"]
 
     log(f"{symbol} signal: {direction}, confidence={confidence}, score={score}, strike={atm['strike']}, expiry={atm['expiry']}")
+    observe_signal_reset(symbol, direction)
 
     if direction not in {"BULLISH", "BEARISH"}:
         collect_institutional_footprint(symbol, rec)
@@ -1054,6 +1288,11 @@ def process_symbol(symbol):
         log(f"{symbol} no trade: signal is not strong HIGH confidence.")
         return
 
+    blocked_reason = reentry_block_reason(symbol, direction)
+    if blocked_reason:
+        log(f"{symbol} no trade: {blocked_reason}")
+        return
+
     option_type = "CE" if direction == "BULLISH" else "PE"
     expected_entry_price = prices.get("entry_price")
 
@@ -1062,7 +1301,6 @@ def process_symbol(symbol):
         return
 
     instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
-    order_quantity = order_quantity_for(symbol, instrument)
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
@@ -1074,32 +1312,37 @@ def process_symbol(symbol):
     )
 
     option_summary = {
-    "bias": direction,
-    "confidence": confidence,
-    "score": score,
-    "strike": atm["strike"],
-    "expiry": atm["expiry"],
-    "entry_price": round(float(expected_entry_price), 2),
-    "target_price": expected_target,
-    "stop_loss_price": expected_stop_loss,
-    "reasons": rec.get("reasons", []),
+        "bias": direction,
+        "confidence": confidence,
+        "score": score,
+        "strike": atm["strike"],
+        "expiry": atm["expiry"],
+        "entry_price": round(float(expected_entry_price), 2),
+        "target_price": expected_target,
+        "stop_loss_price": expected_stop_loss,
+        "reasons": rec.get("reasons", []),
     }
-    
-    
 
     try:
         technicals = get_technical_analysis(symbol)
         option_side = "CE" if direction == "BULLISH" else "PE"
 
         technicals["two_hour"] = convert_index_levels_to_option_premium(
-        technicals.get("two_hour", {}),
-        option_side=option_side,
-        option_entry_price=expected_entry_price,
-        delta=0.5,
+            technicals.get("two_hour", {}),
+            option_side=option_side,
+            option_entry_price=expected_entry_price,
+            delta=0.5,
         )
 
         technicals["fifteen_min"] = convert_index_levels_to_option_premium(
             technicals.get("fifteen_min", {}),
+            option_side=option_side,
+            option_entry_price=expected_entry_price,
+            delta=0.5,
+        )
+
+        technicals["five_min"] = convert_index_levels_to_option_premium(
+            technicals.get("five_min", {}),
             option_side=option_side,
             option_entry_price=expected_entry_price,
             delta=0.5,
@@ -1112,9 +1355,9 @@ def process_symbol(symbol):
         }
 
     atm_option_flow = get_option_volume_vwap_analysis(
-    instrument["instrument_key"],
-    side_label=instrument["trading_symbol"],
-)
+        instrument["instrument_key"],
+        side_label=instrument["trading_symbol"],
+    )
     technicals["atm_option_flow"] = atm_option_flow
     technicals["institutional_flow"] = collect_institutional_footprint(
         symbol,
@@ -1191,6 +1434,33 @@ def process_symbol(symbol):
         log(f"{symbol} no trade: score below symbol minimum. score={score_value}, required={symbol_min_score}")
         return
 
+
+    feasibility = evaluate_trade_feasibility(
+        direction=direction,
+        entry_price=expected_entry_price,
+        proposed_target=expected_target,
+        stop_loss=expected_stop_loss,
+        technicals=technicals,
+    )
+    technicals["trade_feasibility"] = feasibility
+    option_summary["trade_feasibility"] = feasibility
+
+    if not feasibility.get("allowed"):
+        llm_decision = {
+            "execute_trade": False,
+            "decision": "NO_TRADE",
+            "confidence": "HIGH",
+            "target_price": None,
+            "stop_loss_price": None,
+            "reason": "Entry feasibility rejected: " + "; ".join(feasibility.get("reasons", [])),
+        }
+        record_analysis(symbol, option_summary, technicals, llm_decision)
+        log(f"{symbol} no trade: {llm_decision['reason']} feasibility={feasibility}")
+        return
+
+    expected_target = float(feasibility["adjusted_target_price"])
+    option_summary["target_price"] = expected_target
+
     llm_decision = get_llm_decision(symbol, option_summary, technicals)
     record_analysis(symbol, option_summary, technicals, llm_decision)
 
@@ -1232,8 +1502,29 @@ def process_symbol(symbol):
         )
         return
 
+
+    order_quantity = order_quantity_for(
+        symbol,
+        instrument,
+        entry_price=expected_entry_price,
+        stop_loss_price=expected_stop_loss,
+    )
+    if order_quantity <= 0:
+        risk_per_lot = (
+            (float(expected_entry_price) - float(expected_stop_loss))
+            * int(instrument["lot_size"])
+        )
+        log(
+            f"{symbol} no trade: one lot risks approximately {risk_per_lot:.2f}, "
+            f"above per-trade budget {max_risk_per_trade(symbol):.2f}"
+        )
+        return
+
+    actual_lots = order_quantity // int(instrument["lot_size"])
+
     log(
-        f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={order_quantity} lots={lot_multiplier_for(symbol)} "
+        f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={order_quantity} "
+        f"lots={actual_lots}/{lot_multiplier_for(symbol)} risk_budget={max_risk_per_trade(symbol):.2f} "
         f"expected_entry={expected_entry_price} expected_target={expected_target} "
         f"expected_stop_loss={expected_stop_loss} live={live}"
     )
@@ -1281,7 +1572,7 @@ def process_symbol(symbol):
             "trading_symbol": instrument["trading_symbol"],
             "quantity": int(order_quantity),
             "lot_size": int(instrument["lot_size"]),
-            "lot_multiplier": lot_multiplier_for(symbol),
+            "lot_multiplier": actual_lots,
             "target_price": expected_target,
             "stop_loss_price": expected_stop_loss,
             "target_percent": selected_target_percent,
@@ -1301,19 +1592,20 @@ def process_symbol(symbol):
     entry_price = entry_price or expected_entry_price
 
     save_open_position_state(
-    symbol=symbol,
-    order_id=order_id,
-    instrument=instrument,
-    direction=direction,
-    confidence=confidence,
-    score=score,
-    entry_price=entry_price,
-    quantity=order_quantity,
-    target_price=expected_target,
-    stop_loss_price=expected_stop_loss,
-    target_percent=selected_target_percent,
-    stop_percent=selected_stop_percent,
+        symbol=symbol,
+        order_id=order_id,
+        instrument=instrument,
+        direction=direction,
+        confidence=confidence,
+        score=score,
+        entry_price=entry_price,
+        quantity=order_quantity,
+        target_price=expected_target,
+        stop_loss_price=expected_stop_loss,
+        target_percent=selected_target_percent,
+        stop_percent=selected_stop_percent,
     )
+    clear_reentry_guard(symbol)
 
 
 def run_signal_check():
