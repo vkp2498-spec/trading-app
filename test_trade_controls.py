@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
 
 # The control tests do not call OpenAI. Stub the optional client so they also
 # run on a lightweight development machine without production dependencies.
@@ -14,10 +16,25 @@ openai_stub.OpenAI = object
 sys.modules.setdefault("openai", openai_stub)
 
 import trade_bot
+from counterfactual_replay import simulate_trade
 from signal_score import weighted_alignment_score
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_counterfactual_replay_uses_conservative_candle_ordering(self):
+        signal_time = pd.Timestamp("2026-07-15 10:20:00", tz="Asia/Kolkata")
+        candles = pd.DataFrame(
+            [
+                {"open": 100, "high": 111, "low": 91, "close": 105, "volume": 1},
+            ],
+            index=[pd.Timestamp("2026-07-15 10:25:00", tz="Asia/Kolkata")],
+        )
+
+        result = simulate_trade(candles, signal_time, 100, 110, 92, 65)
+
+        self.assertEqual(result["exit_reason"], "STOP_AND_TARGET_SAME_CANDLE")
+        self.assertEqual(result["gross_pnl"], -520)
+
     def test_losing_setups_are_rejected_by_feasibility_gate(self):
         first = trade_bot.evaluate_trade_feasibility(
             "BULLISH",
