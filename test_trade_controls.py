@@ -16,11 +16,40 @@ openai_stub.OpenAI = object
 sys.modules.setdefault("openai", openai_stub)
 
 import trade_bot
+import apns_push
 from counterfactual_replay import simulate_trade
 from signal_score import weighted_alignment_score
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_confirmed_entry_notification_contains_trade_plan(self):
+        position_state = {
+            "symbol": "NIFTY",
+            "trading_symbol": "NIFTY 23JUL26 25000 CE",
+            "direction": "BULLISH",
+            "quantity": 65,
+            "entry_price": 150.25,
+            "target_price": 165.0,
+            "stop_loss_price": 142.5,
+            "created_at": "2026-07-15T10:15:00+05:30",
+        }
+
+        with (
+            patch.object(apns_push, "apns_is_configured", return_value=True),
+            patch.object(apns_push, "registered_device_count", return_value=1),
+            patch.object(apns_push, "_send_payload") as send_payload,
+            patch.dict(os.environ, {"TRADING_PROFILE": "Ganesh"}, clear=False),
+        ):
+            apns_push.send_trade_entered_notification(position_state)
+
+        payload = send_payload.call_args.args[0]
+        self.assertEqual(payload["eventType"], "tradeEntered")
+        self.assertEqual(payload["profile"], "Ganesh")
+        self.assertEqual(payload["quantity"], 65)
+        self.assertIn("NIFTY 23JUL26 25000 CE", payload["aps"]["alert"]["body"])
+        self.assertIn("Target ₹165.00", payload["aps"]["alert"]["body"])
+        self.assertIn("Stop ₹142.50", payload["aps"]["alert"]["body"])
+
     def test_counterfactual_replay_uses_conservative_candle_ordering(self):
         signal_time = pd.Timestamp("2026-07-15 10:20:00", tz="Asia/Kolkata")
         candles = pd.DataFrame(

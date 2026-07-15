@@ -1,7 +1,8 @@
-"""Apple Push Notification delivery for closed-trade alerts.
+"""Apple Push Notification delivery for confirmed trade lifecycle alerts.
 
-This module is deliberately independent from order placement. It is called only
-after a closed trade has already been written to the trade journal.
+Entry alerts are sent only after a filled position is saved. Exit alerts are
+sent only after the closed trade is written to the journal. Notification
+failures remain isolated from order placement and position tracking.
 """
 
 from __future__ import annotations
@@ -154,6 +155,15 @@ def _money(value: Any) -> str:
     return f"{sign}₹{abs(number):,.2f}"
 
 
+def _price(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+
+    return f"₹{number:,.2f}"
+
+
 def _today_pnl(trade_date: str) -> float:
     if not TRADE_HISTORY_FILE.exists():
         return 0.0
@@ -261,10 +271,53 @@ def send_trade_closed_notification(journal_row: dict[str, Any]) -> dict[str, int
             "thread-id": f"hk-trading-{profile.lower()}",
         },
         "profile": profile,
+        "eventType": "tradeClosed",
         "symbol": symbol,
         "tradePnL": trade_pnl,
         "dayPnL": day_pnl,
         "exitTime": exit_time,
+    }
+    return _send_payload(payload)
+
+
+def send_trade_entered_notification(position_state: dict[str, Any]) -> dict[str, int]:
+    """Notify only after a filled BUY has been saved as an open position."""
+    if not apns_is_configured() or registered_device_count() == 0:
+        return {"sent": 0, "failed": 0}
+
+    profile = os.getenv("TRADING_PROFILE", "Trading").strip() or "Trading"
+    symbol = str(position_state.get("symbol") or "Trade")
+    trading_symbol = str(position_state.get("trading_symbol") or symbol)
+    direction = str(position_state.get("direction") or "").upper()
+    quantity = int(float(position_state.get("quantity") or 0))
+    entry_price = float(position_state.get("entry_price") or 0)
+    target_price = float(position_state.get("target_price") or 0)
+    stop_price = float(position_state.get("stop_loss_price") or 0)
+    entered_at = str(position_state.get("created_at") or datetime.now(timezone.utc).isoformat())
+
+    direction_text = f" {direction}" if direction else ""
+    payload = {
+        "aps": {
+            "alert": {
+                "title": f"{profile} • {symbol}{direction_text} entered",
+                "body": (
+                    f"{trading_symbol} • Qty {quantity} @ {_price(entry_price)}\n"
+                    f"Target {_price(target_price)}  |  Stop {_price(stop_price)}"
+                ),
+            },
+            "sound": "default",
+            "thread-id": f"hk-trading-{profile.lower()}",
+        },
+        "eventType": "tradeEntered",
+        "profile": profile,
+        "symbol": symbol,
+        "tradingSymbol": trading_symbol,
+        "direction": direction,
+        "quantity": quantity,
+        "entryPrice": entry_price,
+        "targetPrice": target_price,
+        "stopLossPrice": stop_price,
+        "enteredAt": entered_at,
     }
     return _send_payload(payload)
 
@@ -284,6 +337,7 @@ def send_test_notification() -> dict[str, int]:
             "thread-id": f"hk-trading-{profile.lower()}",
         },
         "profile": profile,
+        "eventType": "test",
         "symbol": "TEST",
         "tradePnL": trade_pnl,
         "dayPnL": day_pnl,

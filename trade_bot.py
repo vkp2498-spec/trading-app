@@ -33,7 +33,7 @@ from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from trade_journal import record_closed_trade
 
 from whatsapp_alerts import send_trade_closed_alert
-from apns_push import send_trade_closed_notification
+from apns_push import send_trade_closed_notification, send_trade_entered_notification
 
 
 def send_apple_closed_trade_alert(journal_row):
@@ -43,6 +43,15 @@ def send_apple_closed_trade_alert(journal_row):
         log(f"Apple trade-close notification result: {result}")
     except Exception as error:
         log(f"Apple trade-close notification failed: {error}")
+
+
+def send_apple_trade_entered_alert(position_state):
+    """Never allow a notification failure to interrupt position tracking."""
+    try:
+        result = send_trade_entered_notification(position_state)
+        log(f"Apple trade-entry notification result: {result}")
+    except Exception as error:
+        log(f"Apple trade-entry notification failed: {error}")
 
 
 def allowed_gai_family():
@@ -818,6 +827,7 @@ def save_open_position_state(
         f"qty={quantity} lots={state['lot_multiplier']} entry={state['entry_price']} "
         f"target={target_price} stop_loss={stop_loss_price}"
     )
+    send_apple_trade_entered_alert(state)
 
 
 def order_status(order_details):
