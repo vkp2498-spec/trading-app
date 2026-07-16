@@ -94,6 +94,57 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(position["riskToStop"], 1300)
         self.assertEqual(position["rewardLeft"], 650)
 
+    def test_mobile_dashboard_builds_strategy_category_summaries(self):
+        trades = [
+            {
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "transactionType": "SELL",
+                "positionSide": "SHORT_OPTION",
+                "grossPnL": 1000,
+            },
+            {
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "transactionType": "BUY",
+                "positionSide": "LONG_OPTION",
+                "grossPnL": -400,
+            },
+            {
+                "symbol": "STOCK_FUTURE",
+                "underlyingSymbol": "BANKNIFTY",
+                "instrumentClass": "STOCK_FUTURE",
+                "transactionType": "SELL",
+                "positionSide": "SHORT_FUTURE",
+                "grossPnL": 750,
+            },
+        ]
+
+        summaries = dashboard_data.category_performance(trades)
+        by_key = {
+            (item["symbol"], item["category"]): item
+            for item in summaries
+        }
+
+        self.assertEqual(
+            by_key[("NIFTY", "OPTION_SELL")]["tradeCount"],
+            1,
+        )
+        self.assertEqual(
+            by_key[("NIFTY", "OPTION_SELL")]["cumulativePnL"],
+            1000,
+        )
+        self.assertEqual(
+            by_key[("NIFTY", "OPTION_BUY")]["winRate"],
+            0,
+        )
+        self.assertEqual(
+            by_key[("BANKNIFTY", "STOCK_FUTURES")]["cumulativePnL"],
+            750,
+        )
+
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {
             "symbol": "NIFTY",

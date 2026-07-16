@@ -308,6 +308,12 @@ def empty_trade_performance() -> dict:
                 symbol: 0.0
                 for symbol in SYMBOLS
             },
+            "categoryPnL": {
+                "optionSell": 0.0,
+                "optionBuy": 0.0,
+                "stockFutures": 0.0,
+                "overall": 0.0,
+            },
         },
         "cumulative": {
             "totalTrades": 0,
@@ -317,6 +323,9 @@ def empty_trade_performance() -> dict:
                 symbol: 0.0
                 for symbol in SYMBOLS
             },
+            "categoryPerformance": category_performance(
+                []
+            ),
         },
         "equityCurve": [],
         "recentTrades": [],
@@ -356,6 +365,106 @@ def symbol_pnl(trades: list[dict]) -> dict:
     return {
         symbol: round(value, 2)
         for symbol, value in totals.items()
+    }
+
+
+def trade_category(trade: dict) -> str:
+    instrument_class = str(
+        trade.get("instrumentClass") or ""
+    ).upper()
+    position_side = str(
+        trade.get("positionSide") or ""
+    ).upper()
+    transaction_type = str(
+        trade.get("transactionType") or "BUY"
+    ).upper()
+
+    if "FUT" in instrument_class or "FUT" in position_side:
+        return "STOCK_FUTURES"
+
+    if transaction_type == "SELL":
+        return "OPTION_SELL"
+
+    return "OPTION_BUY"
+
+
+def category_performance(
+    trades: list[dict],
+) -> list[dict]:
+    groups = [
+        ("NIFTY", "OPTION_SELL"),
+        ("NIFTY", "OPTION_BUY"),
+        ("NIFTY", "STOCK_FUTURES"),
+        ("BANKNIFTY", "OPTION_SELL"),
+        ("BANKNIFTY", "OPTION_BUY"),
+        ("BANKNIFTY", "STOCK_FUTURES"),
+    ]
+
+    summaries = []
+
+    for symbol, category in groups:
+        matching = [
+            trade
+            for trade in trades
+            if str(
+                trade.get("underlyingSymbol")
+                or trade.get("symbol")
+                or ""
+            ).upper()
+            == symbol
+            and trade_category(trade) == category
+        ]
+
+        summaries.append(
+            {
+                "symbol": symbol,
+                "category": category,
+                "tradeCount": len(matching),
+                "winRate": calculate_win_rate(
+                    matching
+                ),
+                "cumulativePnL": round(
+                    sum(
+                        trade["grossPnL"]
+                        for trade in matching
+                    ),
+                    2,
+                ),
+            }
+        )
+
+    return summaries
+
+
+def today_category_pnl(
+    trades: list[dict],
+) -> dict:
+    option_sell = sum(
+        trade["grossPnL"]
+        for trade in trades
+        if trade_category(trade) == "OPTION_SELL"
+    )
+    option_buy = sum(
+        trade["grossPnL"]
+        for trade in trades
+        if trade_category(trade) == "OPTION_BUY"
+    )
+    stock_futures = sum(
+        trade["grossPnL"]
+        for trade in trades
+        if trade_category(trade) == "STOCK_FUTURES"
+    )
+
+    return {
+        "optionSell": round(option_sell, 2),
+        "optionBuy": round(option_buy, 2),
+        "stockFutures": round(stock_futures, 2),
+        "overall": round(
+            option_sell
+            + option_buy
+            + stock_futures,
+            2,
+        ),
     }
 
 
@@ -504,6 +613,9 @@ def build_trade_performance() -> dict:
             "symbolPnL": symbol_pnl(
                 today_trades
             ),
+            "categoryPnL": today_category_pnl(
+                today_trades
+            ),
         },
         "cumulative": {
             "totalTrades": len(trades),
@@ -518,6 +630,9 @@ def build_trade_performance() -> dict:
                 trades
             ),
             "symbolPnL": symbol_pnl(trades),
+            "categoryPerformance": category_performance(
+                trades
+            ),
         },
         "equityCurve": build_equity_curve(
             trades
