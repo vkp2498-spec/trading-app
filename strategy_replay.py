@@ -369,7 +369,11 @@ class StrategyReplay:
         )
 
     def _simulate(self, candidate, day):
-        frame = self._candles(candidate.contract, "1minute")
+        # The live strategy makes decisions every five minutes. Reusing the
+        # already-loaded 5-minute option candles avoids downloading a month of
+        # large 1-minute responses for every candidate contract and keeps the
+        # replay aligned with the actual decision interval.
+        frame = self._candles(candidate.contract, "5minute")
         day_frame = frame[frame.index.date == day]
         future = day_frame[day_frame.index > candidate.signal_time]
         cutoff = pd.Timestamp.combine(day, SQUARE_OFF).tz_localize(IST)

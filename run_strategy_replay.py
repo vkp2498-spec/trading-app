@@ -106,7 +106,7 @@ def main():
         )
         trades, decisions, coverage = engine.run()
         assumptions = [
-            "All decisions use completed candles only; entries use the next one-minute candle.",
+            "All decisions use completed candles only; entries use the next completed five-minute candle.",
             (
                 "Live portfolio mode allows one global position at a time and every trade uses one exchange lot."
                 if args.portfolio_mode == "live"
