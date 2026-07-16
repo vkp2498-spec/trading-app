@@ -394,10 +394,9 @@ def category_performance(
     groups = [
         ("NIFTY", "OPTION_SELL"),
         ("NIFTY", "OPTION_BUY"),
-        ("NIFTY", "STOCK_FUTURES"),
         ("BANKNIFTY", "OPTION_SELL"),
         ("BANKNIFTY", "OPTION_BUY"),
-        ("BANKNIFTY", "STOCK_FUTURES"),
+        ("ALL", "STOCK_FUTURES"),
     ]
 
     summaries = []
@@ -414,6 +413,12 @@ def category_performance(
             == symbol
             and trade_category(trade) == category
         ]
+
+        if category == "STOCK_FUTURES":
+            matching = [
+                trade for trade in trades
+                if trade_category(trade) == category
+            ]
 
         summaries.append(
             {

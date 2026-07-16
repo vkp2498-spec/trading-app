@@ -142,7 +142,7 @@ class TradeControlTests(unittest.TestCase):
             0,
         )
         self.assertEqual(
-            by_key[("BANKNIFTY", "STOCK_FUTURES")]["cumulativePnL"],
+            by_key[("ALL", "STOCK_FUTURES")]["cumulativePnL"],
             750,
         )
 
