@@ -4,6 +4,8 @@ import ast
 import json
 import os
 import re
+import subprocess
+import sys
 
 import pandas as pd
 import requests
@@ -30,6 +32,9 @@ ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
+BACKTEST_DIR = DATA_DIR / "backtests"
+BACKTEST_STATUS_FILE = BACKTEST_DIR / "status.json"
+BACKTEST_LATEST_FILE = BACKTEST_DIR / "latest.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
@@ -600,6 +605,87 @@ def load_env():
         os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 
+def read_backtest_json(path, default):
+    try:
+        return json.loads(Path(path).read_text()) if Path(path).exists() else default
+    except Exception:
+        return default
+
+
+def render_strategy_replay_tab():
+    st.markdown('<div class="dash-title">Strategy Replay Lab</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">Offline one-month replay using Vamsi Upstox Plus historical candles. No live orders are placed.</div>',
+        unsafe_allow_html=True,
+    )
+    status = read_backtest_json(BACKTEST_STATUS_FILE, {})
+    latest = read_backtest_json(BACKTEST_LATEST_FILE, {})
+    running = status.get("status") in {"STARTING", "RUNNING"}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Replay Status", status.get("status", "NOT RUN"))
+    c2.metric("Coverage", status.get("message", "No replay run yet"))
+    c3.metric("Latest Run", latest.get("completed_at", "N/A")[:19] if latest.get("completed_at") else "N/A")
+
+    st.caption(
+        "Live mode models one account position at a time. Independent mode is a diagnostic view: "
+        "it evaluates NIFTY, BANKNIFTY, and stock-futures tracks separately, so its category totals must not be added together."
+    )
+    mode = st.radio("Replay view", ["live", "independent"], horizontal=True, index=0)
+    include_stocks = st.checkbox("Include NIFTY 50 stock-futures fallback", value=True)
+
+    if st.button("Run One-Month Strategy Replay", type="primary", disabled=running, use_container_width=True):
+        BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = BACKTEST_DIR / "replay_process.log"
+        command = [sys.executable, str(BASE_DIR / "run_strategy_replay.py"), "--days", "22", "--portfolio-mode", mode]
+        if not include_stocks:
+            command.append("--no-stock-futures")
+        with log_path.open("a") as handle:
+            process = subprocess.Popen(
+                command,
+                cwd=str(BASE_DIR),
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        st.session_state["backtest_pid"] = process.pid
+        st.success(f"Replay started (process {process.pid}). Refresh this tab to follow progress.")
+        st.rerun()
+
+    if status.get("status") == "FAILED":
+        st.error(status.get("message", "Replay failed"))
+    if status.get("status") == "COMPLETE" and latest.get("summary"):
+        summary = latest["summary"]
+        overall = summary.get("overall", {})
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Trades", overall.get("trades", 0))
+        m2.metric("Win Rate", f"{overall.get('win_percent', 0):.1f}%")
+        m3.metric("Net P&L", money(overall.get("net_pnl", 0)))
+        m4.metric("Max Drawdown", money(overall.get("max_drawdown", 0)))
+        run_path = Path(latest.get("path", ""))
+        category_path = run_path / "category_summary.csv"
+        daily_path = run_path / "daily_summary.csv"
+        category_daily_path = run_path / "category_daily_summary.csv"
+        if category_path.exists():
+            st.markdown("### Strategy Category Summary")
+            st.dataframe(pd.read_csv(category_path), use_container_width=True, hide_index=True)
+        if daily_path.exists():
+            daily = pd.read_csv(daily_path)
+            if not daily.empty:
+                st.markdown("### Portfolio Daily P&L")
+                st.line_chart(daily.set_index("trade_date")["cumulative_net_pnl"])
+        if category_daily_path.exists():
+            category_daily = pd.read_csv(category_daily_path)
+            if not category_daily.empty:
+                st.markdown("### Category Cumulative P&L")
+                chart = category_daily.pivot(index="trade_date", columns="category", values="cumulative_net_pnl").ffill()
+                st.line_chart(chart)
+        st.caption(f"Files: {run_path}")
+
+    if st.button("Refresh Replay Status", use_container_width=True):
+        st.rerun()
+
+
 def safe_literal_dict(text):
     try:
         return ast.literal_eval(text)
@@ -971,7 +1057,7 @@ def pnl_for(data, symbol):
 
 load_env()
 
-main_tab, review_tab = st.tabs(["Live Dashboard", "Post-Market X-Ray"])
+main_tab, review_tab, replay_tab = st.tabs(["Live Dashboard", "Post-Market X-Ray", "Strategy Replay"])
 
 with main_tab:
     st.markdown('<div class="dash-title">Trading Bot Performance</div>', unsafe_allow_html=True)
@@ -1121,3 +1207,6 @@ with main_tab:
 
 with review_tab:
     render_post_market_review_tab()
+
+with replay_tab:
+    render_strategy_replay_tab()

@@ -47,6 +47,7 @@ import dashboard_data
 import trade_journal
 from counterfactual_replay import simulate_trade
 from signal_score import weighted_alignment_score
+from backtest_report import build_reports
 
 
 class TradeControlTests(unittest.TestCase):
@@ -460,6 +461,32 @@ class TradeControlTests(unittest.TestCase):
                 state = trade_bot.read_state("NIFTY")
                 self.assertEqual(state["target_price"], 108)
                 self.assertEqual(state["stop_loss_price"], 92)
+
+    def test_replay_report_writes_category_daily_cumulative_results(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            summary = build_reports(
+                [
+                    {
+                        "trade_date": "2026-07-01",
+                        "category": "NIFTY_OPTION_BUY",
+                        "gross_pnl": 1000,
+                        "estimated_costs": 50,
+                    },
+                    {
+                        "trade_date": "2026-07-02",
+                        "category": "NIFTY_OPTION_BUY",
+                        "gross_pnl": -300,
+                        "estimated_costs": 50,
+                    },
+                ],
+                [],
+                temp_dir,
+            )
+            daily = pd.read_csv(Path(temp_dir) / "category_daily_summary.csv")
+
+        rows = daily[daily["category"] == "NIFTY_OPTION_BUY"].sort_values("trade_date")
+        self.assertEqual(summary["categories"][0]["net_pnl"], 600)
+        self.assertEqual(rows.iloc[-1]["cumulative_net_pnl"], 600)
 
 
 if __name__ == "__main__":
