@@ -22,6 +22,7 @@ from market_technicals import (
     convert_index_levels_to_option_premium,
     get_option_volume_vwap_analysis,
 )
+from stock_futures_scanner import scan_stock_futures, write_scanner_status
 
 from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
 from signal_score import weighted_alignment_score
@@ -66,8 +67,11 @@ ENV_FILE = BASE_DIR / ".env"
 INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
+STOCK_SCANNER_STATUS_FILE = BASE_DIR / "data" / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
+STOCK_FUTURE_STATE = "STOCK_FUTURE"
+BOT_STATE_SLOTS = SYMBOLS + [STOCK_FUTURE_STATE]
 
 # Used only when the corresponding environment variable is not set.
 DEFAULT_LOT_MULTIPLIERS = {
@@ -442,7 +446,7 @@ def today_realized_pnl():
 
 
 def bot_unrealized_pnl():
-    states = [read_state(symbol) for symbol in SYMBOLS]
+    states = [read_state(symbol) for symbol in BOT_STATE_SLOTS]
     tracked = {
         state.get("instrument_key"): state
         for state in states
@@ -815,6 +819,25 @@ def validate_short_margin(instrument, quantity, price):
     }
 
 
+def validate_stock_future_margin(instrument, transaction_type, quantity, price):
+    required = estimate_order_margin(instrument, transaction_type, quantity, price)
+    available = available_equity_margin()
+    buffer_percent = configured_non_negative_float(
+        "STOCK_FUTURES_MARGIN_BUFFER_PERCENT",
+        20.0,
+    )
+    if buffer_percent >= 100:
+        raise RuntimeError("STOCK_FUTURES_MARGIN_BUFFER_PERCENT must be less than 100")
+    usable = available * (1 - buffer_percent / 100)
+    return {
+        "allowed": required > 0 and required <= usable,
+        "required_margin": round(required, 2),
+        "available_margin": round(available, 2),
+        "usable_margin_after_buffer": round(usable, 2),
+        "buffer_percent": round(buffer_percent, 2),
+    }
+
+
 def get_order_details(order_id):
     result = upstox_request("GET", UPSTOX_ORDER_DETAILS_URL, params={"order_id": order_id})
     data = result.get("data", {})
@@ -896,10 +919,18 @@ def position_avg_price(position, entry_transaction_type="BUY"):
 
 def ensure_instruments_file():
     if INSTRUMENT_CACHE.exists():
-        return
+        age_seconds = time_module.time() - INSTRUMENT_CACHE.stat().st_mtime
+        if age_seconds < 12 * 60 * 60:
+            return
 
-    log("Downloading Upstox instrument file...")
-    urllib.request.urlretrieve(UPSTOX_INSTRUMENTS_URL, INSTRUMENT_CACHE)
+    log("Refreshing Upstox instrument file...")
+    temporary = INSTRUMENT_CACHE.with_suffix(".download")
+    try:
+        urllib.request.urlretrieve(UPSTOX_INSTRUMENTS_URL, temporary)
+        temporary.replace(INSTRUMENT_CACHE)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def parse_expiry(expiry_text):
@@ -981,6 +1012,8 @@ def save_open_position_state(
     stop_percent=None,
     entry_transaction_type="BUY",
     protective_stop_order_id=None,
+    instrument_class="INDEX_OPTION",
+    underlying_symbol=None,
 ):
     entry_transaction_type = str(entry_transaction_type).upper()
     if target_percent is not None and stop_percent is not None:
@@ -1014,8 +1047,9 @@ def save_open_position_state(
                 transaction_type=entry_transaction_type,
             )
         else:
-            target_price = round(float(target_price), 0)
-            stop_loss_price = round(float(stop_loss_price), 0)
+            precision = 2 if instrument_class == "STOCK_FUTURE" else 0
+            target_price = round(float(target_price), precision)
+            stop_loss_price = round(float(stop_loss_price), precision)
 
     state = {
         "date": now_ist().strftime("%Y-%m-%d"),
@@ -1024,7 +1058,14 @@ def save_open_position_state(
         "buy_order_id": order_id if entry_transaction_type == "BUY" else None,
         "entry_transaction_type": entry_transaction_type,
         "exit_transaction_type": "BUY" if entry_transaction_type == "SELL" else "SELL",
-        "position_side": "SHORT_OPTION" if entry_transaction_type == "SELL" else "LONG_OPTION",
+        "position_side": (
+            "SHORT_FUTURE" if instrument_class == "STOCK_FUTURE" and entry_transaction_type == "SELL"
+            else "LONG_FUTURE" if instrument_class == "STOCK_FUTURE"
+            else "SHORT_OPTION" if entry_transaction_type == "SELL"
+            else "LONG_OPTION"
+        ),
+        "instrument_class": instrument_class,
+        "underlying_symbol": underlying_symbol or instrument.get("underlying_symbol") or symbol,
         "protective_stop_order_id": protective_stop_order_id,
         "instrument_key": instrument["instrument_key"],
         "trading_symbol": instrument["trading_symbol"],
@@ -1126,7 +1167,7 @@ def monitor_pending_exit(symbol, state):
     return True
 
 def run_position_monitor():
-    for symbol in SYMBOLS:
+    for symbol in BOT_STATE_SLOTS:
         try:
             state = read_state(symbol)
 
@@ -1139,29 +1180,37 @@ def run_position_monitor():
         except Exception as e:
             log(f"{symbol} monitor ERROR: {e}")
 
-def arm_short_protective_stop(symbol, state):
+def arm_protective_stop(symbol, state):
     instrument = {
         "instrument_key": state["instrument_key"],
         "trading_symbol": state.get("trading_symbol"),
     }
+    exit_transaction = state.get("exit_transaction_type") or (
+        "BUY" if str(state.get("entry_transaction_type") or "BUY").upper() == "SELL" else "SELL"
+    )
     result, payload = place_stop_market_order(
         instrument,
-        "BUY",
+        exit_transaction,
         int(state["quantity"]),
         float(state["stop_loss_price"]),
     )
     order_id = result.get("data", {}).get("order_id")
     if not order_id:
-        raise RuntimeError(f"protective BUY stop returned no order_id: {result}")
+        raise RuntimeError(f"protective {exit_transaction} stop returned no order_id: {result}")
     details = wait_for_order_complete(order_id, attempts=1, delay_seconds=0)
     if order_is_rejected(details):
         raise RuntimeError(
-            f"protective BUY stop was {order_status(details)}: {details}"
+            f"protective {exit_transaction} stop was {order_status(details)}: {details}"
         )
     state["protective_stop_order_id"] = order_id
     write_state(symbol, state)
-    log(f"{symbol} broker protective BUY stop armed: order_id={order_id} payload={payload}")
+    log(f"{symbol} broker protective {exit_transaction} stop armed: order_id={order_id} payload={payload}")
     return state
+
+
+def arm_short_protective_stop(symbol, state):
+    """Backward-compatible name used by existing option-selling paths."""
+    return arm_protective_stop(symbol, state)
 
 
 def protective_stop_filled(symbol, state):
@@ -1201,7 +1250,8 @@ def handle_existing_state(symbol, state):
     entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
     exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
 
-    if entry_transaction == "SELL" and protective_stop_filled(symbol, state):
+    needs_broker_stop = entry_transaction == "SELL" or state.get("instrument_class") == "STOCK_FUTURE"
+    if needs_broker_stop and protective_stop_filled(symbol, state):
         return True
 
     if state.get("status") == "EXIT_PENDING":
@@ -1213,13 +1263,13 @@ def handle_existing_state(symbol, state):
     if position:
         ltp = position_ltp(position)
         qty = abs(position_quantity(position))
-        if entry_transaction == "SELL" and not state.get("protective_stop_order_id"):
+        if needs_broker_stop and not state.get("protective_stop_order_id"):
             try:
-                state = arm_short_protective_stop(symbol, state)
+                state = arm_protective_stop(symbol, state)
             except Exception as error:
-                log(f"{symbol} CRITICAL: short has no broker stop; flattening now: {error}")
+                log(f"{symbol} CRITICAL: position has no broker stop; flattening now: {error}")
                 instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
-                result, payload = place_market_order(instrument, "BUY", qty)
+                result, payload = place_market_order(instrument, exit_transaction, qty)
                 order_id = result.get("data", {}).get("order_id")
                 details = wait_for_order_complete(order_id) if order_id else {}
                 complete_exit(symbol, state, details, ltp, "PROTECTION_FAILURE", result, payload)
@@ -1245,7 +1295,7 @@ def handle_existing_state(symbol, state):
             else:
                 exit_reason = "TARGET" if target_hit else "STOP_LOSS"
 
-            if is_short and cancel_protective_stop(symbol, state):
+            if needs_broker_stop and cancel_protective_stop(symbol, state):
                 return True
 
             instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
@@ -1293,14 +1343,16 @@ def handle_existing_state(symbol, state):
                 state.get("target_price"), state.get("stop_loss_price"),
                 state.get("target_percent"), state.get("stop_percent"),
                 entry_transaction_type=entry_transaction,
+                instrument_class=state.get("instrument_class", "INDEX_OPTION"),
+                underlying_symbol=state.get("underlying_symbol"),
             )
             state = read_state(symbol)
-            if entry_transaction == "SELL":
+            if needs_broker_stop:
                 try:
-                    arm_short_protective_stop(symbol, state)
+                    arm_protective_stop(symbol, state)
                 except Exception as error:
-                    log(f"{symbol} CRITICAL: delayed short fill has no broker stop; flattening: {error}")
-                    result, payload = place_market_order(instrument, "BUY", quantity)
+                    log(f"{symbol} CRITICAL: delayed fill has no broker stop; flattening: {error}")
+                    result, payload = place_market_order(instrument, exit_transaction, quantity)
                     exit_order_id = result.get("data", {}).get("order_id")
                     exit_details = wait_for_order_complete(exit_order_id) if exit_order_id else {}
                     complete_exit(
@@ -1317,7 +1369,7 @@ def handle_existing_state(symbol, state):
             return True
         return True
 
-    if entry_transaction == "SELL" and state.get("protective_stop_order_id"):
+    if needs_broker_stop and state.get("protective_stop_order_id"):
         if protective_stop_filled(symbol, state):
             return True
         cancel_protective_stop(symbol, state)
@@ -1333,6 +1385,7 @@ def apply_trailing_stop(symbol, state, ltp):
     target_price = float(state.get("target_price") or 0)
     current_stop = float(state.get("stop_loss_price") or 0)
     is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
+    precision = 2 if state.get("instrument_class") == "STOCK_FUTURE" else 0
     current_best = float(
         state.get("lowest_ltp" if is_short else "highest_ltp") or entry_price
     )
@@ -1351,30 +1404,30 @@ def apply_trailing_stop(symbol, state, ltp):
 
     # Once trade reaches 25% of expected target, reduce risk.
     if target_progress >= 0.25:
-        candidate = round(entry_price * (1.01 if is_short else 0.99), 0)
+        candidate = round(entry_price * (1.01 if is_short else 0.99), precision)
         new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail activated: 25% target progress, risk reduced"
 
     # Once trade reaches 40% of expected target, move to breakeven.
     if target_progress >= 0.40:
-        new_stop = min(new_stop, round(entry_price, 0)) if is_short else max(new_stop, round(entry_price, 0))
+        new_stop = min(new_stop, round(entry_price, precision)) if is_short else max(new_stop, round(entry_price, precision))
         reason = "Trail tightened: 40% target progress, stop moved to breakeven"
 
     # Once trade reaches 60% of expected target, lock 30% of expected profit.
     if target_progress >= 0.60:
-        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.30, 0)
+        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.30, precision)
         new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail tightened: 60% target progress, locked 30% of expected profit"
 
     # Once trade reaches 75% of expected target, lock 50% of expected profit.
     if target_progress >= 0.75:
-        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.50, 0)
+        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.50, precision)
         new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail tightened: 75% target progress, locked 50% of expected profit"
 
     # Once trade reaches 90% of expected target, lock 70% of expected profit.
     if target_progress >= 0.90:
-        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.70, 0)
+        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.70, precision)
         new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail tightened: 90% target progress, locked 70% of expected profit"
 
@@ -1387,7 +1440,7 @@ def apply_trailing_stop(symbol, state, ltp):
 
     stop_improved = new_stop < current_stop if is_short else new_stop > current_stop
     if stop_improved:
-        state["stop_loss_price"] = round(new_stop, 0)
+        state["stop_loss_price"] = round(new_stop, precision)
         state["trailing_stop_active"] = True
         state["trailing_stop_reason"] = reason
         state_changed = True
@@ -1401,7 +1454,7 @@ def apply_trailing_stop(symbol, state, ltp):
 
     if state_changed:
         write_state(symbol, state)
-        if stop_improved and is_short and state.get("protective_stop_order_id"):
+        if stop_improved and state.get("protective_stop_order_id"):
             try:
                 modify_stop_order(
                     state["protective_stop_order_id"],
@@ -1423,6 +1476,8 @@ def minutes_since_created(state):
 
 
 def should_exit_on_sentiment_change(symbol, state, ltp):
+    if state.get("instrument_class") == "STOCK_FUTURE":
+        return False, ""
     if ltp is None:
         return False, ""
 
@@ -1491,7 +1546,7 @@ def should_exit_on_sentiment_change(symbol, state, ltp):
         return False, ""
 
 def run_squareoff():
-    for symbol in SYMBOLS:
+    for symbol in BOT_STATE_SLOTS:
         state = read_state(symbol)
 
         if not state.get("instrument_key"):
@@ -1513,7 +1568,7 @@ def run_squareoff():
             }
 
             try:
-                if entry_transaction == "SELL" and cancel_protective_stop(symbol, state):
+                if state.get("protective_stop_order_id") and cancel_protective_stop(symbol, state):
                     continue
                 exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
                 result, payload = place_market_order(instrument, exit_transaction, qty)
@@ -1546,7 +1601,7 @@ def run_squareoff():
             except Exception as e:
                 log(f"{symbol} bot squareoff failed: {e}")
         else:
-            if entry_transaction == "SELL" and state.get("protective_stop_order_id"):
+            if state.get("protective_stop_order_id"):
                 try:
                     if protective_stop_filled(symbol, state):
                         continue
@@ -2003,12 +2058,234 @@ def execute_selected_candidate(chosen):
     return True
 
 
+def execute_stock_future_candidate(chosen):
+    symbol = STOCK_FUTURE_STATE
+    instrument = chosen["instrument"]
+    transaction_type = chosen["transaction_type"]
+    quantity = int(chosen["quantity"])
+    expected_entry = float(chosen["entry_price"])
+    target = float(chosen["target_price"])
+    stop = float(chosen["stop_loss_price"])
+    live = (
+        os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+        and os.getenv("ENABLE_STOCK_FUTURES_LIVE_TRADING", "false").lower() == "true"
+    )
+    risk_reason, risk_mode = risk_limit_mode()
+
+    log(
+        f"STOCK_FUTURE selected: {transaction_type} {instrument['trading_symbol']} "
+        f"qty={quantity} entry={expected_entry} target={target} stop={stop} "
+        f"score={chosen['signal_score']} live={live}"
+    )
+    if risk_mode == "paper":
+        log(
+            f"STOCK_FUTURE PAPER ONLY after daily risk limit: reason={risk_reason} "
+            f"would_{transaction_type.lower()}={instrument['trading_symbol']} qty={quantity} "
+            f"entry={expected_entry} target={target} stop_loss={stop}"
+        )
+        return True
+    if risk_mode == "stop":
+        log(f"STOCK_FUTURE no trade: daily risk limit reached ({risk_reason})")
+        return False
+    if not live:
+        log(
+            f"STOCK_FUTURE DRY RUN ONLY: would {transaction_type} one lot of "
+            f"{instrument['trading_symbol']}"
+        )
+        return True
+
+    result, payload = place_market_order(instrument, transaction_type, quantity)
+    order_id = result.get("data", {}).get("order_id")
+    if not order_id:
+        raise RuntimeError(f"STOCK_FUTURE {transaction_type} returned no order_id: {result}")
+    increment_trade_count(STOCK_FUTURE_STATE)
+    log(f"STOCK_FUTURE MARKET {transaction_type} placed: order_id={order_id} payload={payload}")
+    details = wait_for_order_complete(order_id)
+    if not order_is_complete(details):
+        write_state(
+            symbol,
+            {
+                "date": now_ist().strftime("%Y-%m-%d"),
+                "symbol": symbol,
+                "underlying_symbol": chosen["underlying_symbol"],
+                "instrument_class": "STOCK_FUTURE",
+                "entry_order_id": order_id,
+                "entry_transaction_type": transaction_type,
+                "exit_transaction_type": "SELL" if transaction_type == "BUY" else "BUY",
+                "instrument_key": instrument["instrument_key"],
+                "trading_symbol": instrument["trading_symbol"],
+                "quantity": quantity,
+                "lot_size": int(instrument["lot_size"]),
+                "lot_multiplier": 1,
+                "target_price": target,
+                "stop_loss_price": stop,
+                "direction": chosen["direction"],
+                "confidence": chosen["confidence"],
+                "score": chosen["signal_score"],
+                "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
+                "created_at": now_ist().isoformat(),
+            },
+        )
+        return True
+
+    position = find_matching_position_for_side(instrument["instrument_key"], transaction_type)
+    fill = position_avg_price(position, transaction_type) if position else None
+    fill = fill or to_float(details.get("average_price")) or expected_entry
+    shift = fill - expected_entry
+    target = round(target + shift, 2)
+    stop = round(stop + shift, 2)
+    save_open_position_state(
+        symbol,
+        order_id,
+        instrument,
+        chosen["direction"],
+        chosen["confidence"],
+        chosen["signal_score"],
+        fill,
+        quantity,
+        target_price=target,
+        stop_loss_price=stop,
+        entry_transaction_type=transaction_type,
+        instrument_class="STOCK_FUTURE",
+        underlying_symbol=chosen["underlying_symbol"],
+    )
+    try:
+        arm_protective_stop(symbol, read_state(symbol))
+    except Exception as error:
+        log(f"STOCK_FUTURE CRITICAL: protective stop failed; flattening immediately: {error}")
+        exit_transaction = "SELL" if transaction_type == "BUY" else "BUY"
+        emergency, emergency_payload = place_market_order(instrument, exit_transaction, quantity)
+        emergency_id = emergency.get("data", {}).get("order_id")
+        emergency_details = wait_for_order_complete(emergency_id) if emergency_id else {}
+        complete_exit(
+            symbol,
+            read_state(symbol),
+            emergency_details,
+            fill,
+            "PROTECTION_FAILURE",
+            emergency,
+            emergency_payload,
+        )
+    return True
+
+
+def run_stock_futures_fallback():
+    if os.getenv("ENABLE_STOCK_FUTURES_SCANNER", "false").lower() != "true":
+        write_scanner_status(
+            STOCK_SCANNER_STATUS_FILE,
+            enabled=False,
+            status="DISABLED",
+            message="Stock futures fallback is disabled in .env",
+        )
+        return False
+
+    ensure_instruments_file()
+    try:
+        result = scan_stock_futures(INSTRUMENT_CACHE, upstox_request, log)
+    except Exception as error:
+        write_scanner_status(
+            STOCK_SCANNER_STATUS_FILE,
+            enabled=True,
+            status="ERROR",
+            message=str(error),
+        )
+        log(f"Stock futures scanner ERROR: {error}")
+        return False
+
+    qualified = result.get("qualified", [])
+    attempts = []
+    live = (
+        os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+        and os.getenv("ENABLE_STOCK_FUTURES_LIVE_TRADING", "false").lower() == "true"
+    )
+    check_margin = live or os.getenv("CHECK_STOCK_MARGIN_IN_DRY_RUN", "false").lower() == "true"
+    risk_budget = configured_non_negative_float(
+        "STOCK_FUTURES_MAX_RISK_PER_TRADE",
+        max_risk_per_trade(STOCK_FUTURE_STATE),
+    )
+
+    for candidate in qualified:
+        risk = abs(float(candidate["entry_price"]) - float(candidate["stop_loss_price"])) * int(candidate["quantity"])
+        attempt = {
+            "underlying": candidate["underlying_symbol"],
+            "trading_symbol": candidate["instrument"]["trading_symbol"],
+            "direction": candidate["direction"],
+            "score": candidate["signal_score"],
+            "estimated_risk": round(risk, 2),
+        }
+        if risk_budget > 0 and risk > risk_budget:
+            attempt.update(status="RISK_REJECTED", reason=f"risk {risk:.2f} exceeds {risk_budget:.2f}")
+            attempts.append(attempt)
+            log(
+                f"STOCK_FUTURE {candidate['underlying_symbol']} skipped: one-lot risk "
+                f"{risk:.2f} exceeds budget {risk_budget:.2f}; trying next stock."
+            )
+            continue
+
+        if check_margin:
+            try:
+                margin = validate_stock_future_margin(
+                    candidate["instrument"],
+                    candidate["transaction_type"],
+                    candidate["quantity"],
+                    candidate["entry_price"],
+                )
+            except Exception as error:
+                attempt.update(status="MARGIN_ERROR", reason=str(error))
+                attempts.append(attempt)
+                log(
+                    f"STOCK_FUTURE {candidate['underlying_symbol']} margin check failed: "
+                    f"{error}; trying next stock."
+                )
+                continue
+            attempt["margin"] = margin
+            if not margin.get("allowed"):
+                attempt.update(status="INSUFFICIENT_FUNDS", reason="buffered margin is insufficient")
+                attempts.append(attempt)
+                log(
+                    f"STOCK_FUTURE insufficient funds for {candidate['instrument']['trading_symbol']}: "
+                    f"required={margin['required_margin']} available={margin['available_margin']} "
+                    f"usable={margin['usable_margin_after_buffer']}; trying next stock."
+                )
+                continue
+
+        attempt["status"] = "SELECTED"
+        attempts.append(attempt)
+        write_scanner_status(
+            STOCK_SCANNER_STATUS_FILE,
+            enabled=True,
+            status="SELECTED",
+            universe_count=result.get("universe_count"),
+            shortlist_count=result.get("shortlist_count"),
+            qualified_count=len(qualified),
+            selected=attempt,
+            attempts=attempts,
+            rejected=result.get("rejected", [])[:20],
+        )
+        return execute_stock_future_candidate(candidate)
+
+    status = "INSUFFICIENT_FUNDS" if any(item.get("status") == "INSUFFICIENT_FUNDS" for item in attempts) else "NO_TRADE"
+    write_scanner_status(
+        STOCK_SCANNER_STATUS_FILE,
+        enabled=True,
+        status=status,
+        universe_count=result.get("universe_count"),
+        shortlist_count=result.get("shortlist_count"),
+        qualified_count=len(qualified),
+        attempts=attempts,
+        rejected=result.get("rejected", [])[:20],
+        message="No affordable qualified stock-futures candidate was found",
+    )
+    log(f"Stock futures fallback: {status}; no order placed.")
+    return False
+
+
 def run_signal_check():
     if not market_window_ok():
         log("Outside trading window. No action.")
         return
 
-    for symbol in SYMBOLS:
+    for symbol in BOT_STATE_SLOTS:
         state = read_state(symbol)
         if state:
             try:
@@ -2016,23 +2293,23 @@ def run_signal_check():
             except Exception as error:
                 log(f"{symbol} existing-position check ERROR: {error}")
 
-    active = [symbol for symbol in SYMBOLS if read_state(symbol).get("instrument_key")]
+    active = [symbol for symbol in BOT_STATE_SLOTS if read_state(symbol).get("instrument_key")]
     if active:
-        log(f"Global one-position rule: active bot position exists in {active[0]}; no new index entry.")
+        log(f"Global one-position rule: active bot position exists in {active[0]}; no new entry.")
         return
 
     try:
-        untracked_index_positions = [
+        untracked_derivative_positions = [
             position
             for position in get_open_positions()
             if position_quantity(position) != 0
-            and any(
-                name in str(position.get("trading_symbol") or position.get("tradingsymbol") or "").upper()
-                for name in SYMBOLS
+            and (
+                str(position.get("exchange") or position.get("segment") or "").upper() in {"NSE_FO", "NFO"}
+                or str(position.get("instrument_token") or position.get("instrument_key") or "").startswith("NSE_FO|")
             )
         ]
-        if untracked_index_positions:
-            log("Global one-position rule: an untracked NIFTY/BANKNIFTY broker position exists; no bot entry.")
+        if untracked_derivative_positions:
+            log("Global one-position rule: an untracked NSE derivatives position exists; no bot entry.")
             return
     except Exception as error:
         log(f"Global broker-position precheck failed; no new entry for safety: {error}")
@@ -2049,6 +2326,7 @@ def run_signal_check():
 
     if not qualified:
         log("Global selection: no qualified NIFTY or BANKNIFTY BUY/SELL structure.")
+        run_stock_futures_fallback()
         return
 
     chosen = max(
@@ -2066,7 +2344,19 @@ def run_signal_check():
         f"Global selection: {chosen['symbol']} {chosen['transaction_type']} chosen at "
         f"score={chosen.get('weighted', {}).get('score')} from {choices}"
     )
-    execute_selected_candidate(chosen)
+    if os.getenv("ENABLE_STOCK_FUTURES_SCANNER", "false").lower() == "true":
+        write_scanner_status(
+            STOCK_SCANNER_STATUS_FILE,
+            enabled=True,
+            status="INDEX_PRIORITY",
+            message=(
+                f"Stock scan skipped because {chosen['symbol']} "
+                f"{chosen['transaction_type']} qualified first"
+            ),
+        )
+    if not execute_selected_candidate(chosen):
+        log("Selected index structure could not be executed; running stock-futures fallback.")
+        run_stock_futures_fallback()
 
 
 def main():

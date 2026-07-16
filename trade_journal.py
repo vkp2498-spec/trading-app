@@ -10,6 +10,8 @@ TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 COLUMNS = [
     "trade_date",
     "symbol",
+    "underlying_symbol",
+    "instrument_class",
     "trading_symbol",
     "direction",
     "transaction_type",
@@ -68,6 +70,8 @@ def record_closed_trade(state, exit_price, exit_reason):
     row = {
         "trade_date": now_ist().strftime("%Y-%m-%d"),
         "symbol": state.get("symbol", ""),
+        "underlying_symbol": state.get("underlying_symbol", state.get("symbol", "")),
+        "instrument_class": state.get("instrument_class", "INDEX_OPTION"),
         "trading_symbol": state.get("trading_symbol", ""),
         "direction": state.get("direction", ""),
         "transaction_type": transaction_type,

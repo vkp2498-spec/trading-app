@@ -43,6 +43,7 @@ def _parse_candles(payload):
                 "low": float(candle[3]),
                 "close": float(candle[4]),
                 "volume": float(candle[5]) if len(candle) > 5 and candle[5] is not None else 0,
+                "oi": float(candle[6]) if len(candle) > 6 and candle[6] is not None else 0,
             }
         )
 
@@ -192,15 +193,16 @@ def resample_ohlc(df, rule, **resample_kwargs):
     if df.empty:
         return df
 
-    out = df.resample(rule, **resample_kwargs).agg(
-        {
+    aggregations = {
             "open": "first",
             "high": "max",
             "low": "min",
             "close": "last",
             "volume": "sum",
-        }
-    )
+    }
+    if "oi" in df.columns:
+        aggregations["oi"] = "last"
+    out = df.resample(rule, **resample_kwargs).agg(aggregations)
     return out.dropna()
 
 def convert_index_levels_to_option_premium(
@@ -293,6 +295,16 @@ def add_indicators(df):
     out["vwap"] = session_pv / session_volume.replace(0, pd.NA)
     out["volume_ma20"] = out["volume"].rolling(20).mean()
     out["volume_ratio"] = out["volume"] / out["volume_ma20"]
+    previous_close = out["close"].shift(1)
+    true_range = pd.concat(
+        [
+            out["high"] - out["low"],
+            (out["high"] - previous_close).abs(),
+            (out["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    out["atr14"] = true_range.rolling(14).mean()
     return out
 
 
@@ -470,6 +482,9 @@ def analyze_latest(df, timeframe):
         "vwap": round(vwap, 2) if vwap is not None else None,
         "vwap_slope": vwap_slope,
         "vwap_bias": vwap_bias,
+        "atr14": round(float(last.get("atr14") or 0), 2),
+        "oi": round(float(last.get("oi") or 0), 2),
+        "previous_oi": round(float(valid.iloc[-2].get("oi") or 0), 2) if len(valid) >= 2 else 0,
     }
 
 
@@ -510,6 +525,51 @@ def get_technical_analysis(symbol):
             lookback_days=5,
         )
         df_5 = merge_candles(df_5_historical, df_5_intraday)
+
+    return {
+        "two_hour": analyze_latest(df_2h, "2H"),
+        "fifteen_min": analyze_latest(df_15, "15M"),
+        "five_min": analyze_latest(df_5, "5M"),
+    }
+
+
+def get_instrument_technical_analysis(instrument_key):
+    """Return the same 2H/15M/5M view for an equity or futures instrument."""
+    df_5_intraday = fetch_v3_intraday_minutes(instrument_key, minutes=5)
+    df_5 = df_5_intraday
+    if len(df_5_intraday) < 25:
+        df_5 = merge_candles(
+            fetch_v3_historical_minutes(instrument_key, minutes=5, lookback_days=5),
+            df_5_intraday,
+        )
+
+    df_15 = resample_ohlc(
+        df_5,
+        "15min",
+        origin="start_day",
+        offset="15min",
+    )
+    if len(df_15) < 25:
+        df_15 = merge_candles(
+            fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=5),
+            df_15,
+        )
+
+    try:
+        df_2h_historical = fetch_v3_historical_hours(
+            instrument_key,
+            hours=2,
+            lookback_days=45,
+        )
+    except Exception:
+        df_2h_historical = pd.DataFrame()
+    df_2h_intraday = resample_ohlc(
+        df_5_intraday,
+        "2h",
+        origin="start_day",
+        offset="1h15min",
+    )
+    df_2h = merge_candles(df_2h_historical, df_2h_intraday)
 
     return {
         "two_hour": analyze_latest(df_2h, "2H"),

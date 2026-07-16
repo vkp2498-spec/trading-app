@@ -29,8 +29,10 @@ DATA_DIR = BASE_DIR / "data"
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
+STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
+STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
 st.set_page_config(
@@ -738,7 +740,7 @@ def get_live_bot_positions():
     positions, error = get_upstox_positions()
     rows = []
 
-    for symbol in SYMBOLS:
+    for symbol in STATE_SLOTS:
         state = read_json(state_file(symbol), {})
         if not state or not state.get("instrument_key"):
             continue
@@ -787,6 +789,8 @@ def get_live_bot_positions():
         rows.append(
             {
                 "symbol": symbol,
+                "underlying_symbol": state.get("underlying_symbol", symbol),
+                "instrument_class": state.get("instrument_class", "INDEX_OPTION"),
                 "trading_symbol": state.get("trading_symbol", ""),
                 "state_status": state.get("status", "OPEN"),
                 "quantity": qty,
@@ -1031,6 +1035,30 @@ with main_tab:
     st.markdown("### Live Bot Trades")
     render_live_trade_cards(live_df)
 
+    scanner = read_json(STOCK_SCANNER_STATUS_FILE, {})
+    scanner_status = scanner.get("status", "NO DATA")
+    scanner_message = scanner.get("message") or (
+        f"Universe {scanner.get('universe_count', 0)} | "
+        f"Shortlist {scanner.get('shortlist_count', 0)} | "
+        f"Qualified {scanner.get('qualified_count', 0)}"
+    )
+    selected = scanner.get("selected") or {}
+    selected_text = (
+        f"{selected.get('underlying')} {selected.get('direction')} | "
+        f"Score {selected.get('score')}"
+        if selected else "No stock future selected"
+    )
+    st.markdown("### NIFTY 50 Futures Scanner")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Scanner Status", scanner_status)
+    s2.metric("Last Run", str(scanner.get("last_run", "N/A"))[:19])
+    s3.metric("Selection", selected_text)
+    st.caption(scanner_message)
+    attempts = scanner.get("attempts") or []
+    if attempts:
+        with st.expander("Scanner attempts and margin checks"):
+            st.dataframe(pd.DataFrame(attempts), use_container_width=True, hide_index=True)
+
     st.divider()
 
     if not TRADE_HISTORY_FILE.exists():
@@ -1050,21 +1078,23 @@ with main_tab:
 
             st.markdown("### Today")
 
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("Closed Trades", len(today_df))
             c2.metric("Closed P&L", money(today_df["gross_pnl"].sum()))
             c3.metric("Win %", f"{win_percent(today_df)}%")
             c4.metric("NIFTY P&L", money(pnl_for(today_df, "NIFTY")))
             c5.metric("BANKNIFTY P&L", money(pnl_for(today_df, "BANKNIFTY")))
+            c6.metric("Stock Futures P&L", money(pnl_for(today_df, "STOCK_FUTURE")))
 
             st.markdown("### Cumulative")
 
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("Total Trades", len(df))
             c2.metric("Total P&L", money(df["gross_pnl"].sum()))
             c3.metric("Win %", f"{win_percent(df)}%")
             c4.metric("NIFTY Total", money(pnl_for(df, "NIFTY")))
             c5.metric("BANKNIFTY Total", money(pnl_for(df, "BANKNIFTY")))
+            c6.metric("Stock Futures Total", money(pnl_for(df, "STOCK_FUTURE")))
 
             daily = df.groupby("trade_date", as_index=False)["gross_pnl"].sum()
             daily["cumulative_pnl"] = daily["gross_pnl"].cumsum()

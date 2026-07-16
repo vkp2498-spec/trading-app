@@ -19,8 +19,10 @@ LOG_DIR = BASE_DIR / "logs"
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
+STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
+STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
 
 UPSTOX_POSITIONS_URL = (
     "https://api.upstox.com/v2/"
@@ -361,6 +363,8 @@ def normalize_trade(row: dict) -> dict:
     return {
         "tradeDate": row.get("trade_date", ""),
         "symbol": row.get("symbol", ""),
+        "underlyingSymbol": row.get("underlying_symbol", row.get("symbol", "")),
+        "instrumentClass": row.get("instrument_class", "INDEX_OPTION"),
         "tradingSymbol": row.get(
             "trading_symbol",
             "",
@@ -703,7 +707,7 @@ def build_live_positions() -> dict:
 
     dashboard_positions = []
 
-    for symbol in SYMBOLS:
+    for symbol in STATE_SLOTS:
         state = read_json_file(
             state_file(symbol)
         )
@@ -819,6 +823,8 @@ def build_live_positions() -> dict:
         dashboard_positions.append(
             {
                 "symbol": symbol,
+                "underlyingSymbol": state.get("underlying_symbol", symbol),
+                "instrumentClass": state.get("instrument_class", "INDEX_OPTION"),
                 "tradingSymbol": state.get(
                     "trading_symbol",
                     "",
@@ -906,6 +912,14 @@ def build_health_snapshot() -> dict:
 
     trade_performance = build_trade_performance()
     live_positions = build_live_positions()
+    stock_scanner = read_json_file(
+        STOCK_SCANNER_STATUS_FILE,
+        {
+            "enabled": os.getenv("ENABLE_STOCK_FUTURES_SCANNER", "false").lower() == "true",
+            "status": "NO DATA",
+            "message": "The stock-futures scanner has not run yet",
+        },
+    )
 
     return {
         "status": "ok",
@@ -916,6 +930,7 @@ def build_health_snapshot() -> dict:
                 TRADE_HISTORY_FILE
             ),
             "botLog": file_status(LOG_FILE),
+            "stockScannerStatus": file_status(STOCK_SCANNER_STATUS_FILE),
             "environmentFilePresent": ENV_FILE.exists(),
         },
         "configuration": {
@@ -926,6 +941,7 @@ def build_health_snapshot() -> dict:
         "bot": bot_status,
         "performance": trade_performance,
         "live": live_positions,
+        "stockFuturesScanner": stock_scanner,
     }
 
 
