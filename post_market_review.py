@@ -42,9 +42,14 @@ def classify_losing_trade(row):
     if pnl >= 0 or entry <= 0:
         return None
 
-    loss_pct = ((exit_price - entry) / entry) * 100
-    target_gap = target - entry if target > entry else 0
-    stop_gap = entry - stop if stop > 0 else 0
+    is_short = str(row.get("transaction_type") or "BUY").upper() == "SELL"
+    loss_pct = (
+        ((entry - exit_price) / entry) * 100
+        if is_short
+        else ((exit_price - entry) / entry) * 100
+    )
+    target_gap = (entry - target) if is_short and target < entry else (target - entry if target > entry else 0)
+    stop_gap = (stop - entry) if is_short and stop > entry else (entry - stop if stop > 0 else 0)
 
     notes = []
 
@@ -174,7 +179,9 @@ def fetch_option_5m_after_signal(symbol, option_summary, signal_ts):
     if direction not in {"BULLISH", "BEARISH"}:
         return pd.DataFrame(), None, "No directional option signal"
 
-    option_type = "CE" if direction == "BULLISH" else "PE"
+    option_type = option_summary.get("option_type") or (
+        "CE" if direction == "BULLISH" else "PE"
+    )
     expiry = option_summary.get("expiry")
     strike = option_summary.get("strike")
 
@@ -202,7 +209,13 @@ def fetch_option_5m_after_signal(symbol, option_summary, signal_ts):
     return candles, instrument, None
 
 
-def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
+def evaluate_missed_trade(
+    candles,
+    entry_price,
+    target_price,
+    stop_loss_price,
+    transaction_type="BUY",
+):
     if candles.empty:
         return {
             "missed_trade_outcome": "NO_CANDLES",
@@ -227,6 +240,7 @@ def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
             "max_adverse_pct": None,
         }
 
+    is_short = str(transaction_type).upper() == "SELL"
     outcome = "NO_CLEAR_EDGE"
     outcome_time = None
 
@@ -234,8 +248,8 @@ def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
         high = float(candle["high"])
         low = float(candle["low"])
 
-        target_hit = high >= target
-        stop_hit = low <= stop
+        target_hit = low <= target if is_short else high >= target
+        stop_hit = high >= stop if is_short else low <= stop
 
         if target_hit and stop_hit:
             outcome = "AMBIGUOUS_TARGET_AND_STOP_SAME_CANDLE"
@@ -259,10 +273,20 @@ def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
     if entry >= 500:
         quantity = 30
 
-    expected_target_profit = round((target - entry) * quantity, 2)
-    expected_stop_loss_loss = round((stop - entry) * quantity, 2)
-    max_possible_profit = round((max_high - entry) * quantity, 2)
-    max_possible_loss = round((min_low - entry) * quantity, 2)
+    if is_short:
+        expected_target_profit = round((entry - target) * quantity, 2)
+        expected_stop_loss_loss = round((entry - stop) * quantity, 2)
+        max_possible_profit = round((entry - min_low) * quantity, 2)
+        max_possible_loss = round((entry - max_high) * quantity, 2)
+        max_favorable_pct = ((entry - min_low) / entry) * 100
+        max_adverse_pct = ((entry - max_high) / entry) * 100
+    else:
+        expected_target_profit = round((target - entry) * quantity, 2)
+        expected_stop_loss_loss = round((stop - entry) * quantity, 2)
+        max_possible_profit = round((max_high - entry) * quantity, 2)
+        max_possible_loss = round((min_low - entry) * quantity, 2)
+        max_favorable_pct = ((max_high - entry) / entry) * 100
+        max_adverse_pct = ((min_low - entry) / entry) * 100
 
     if outcome == "MISSED_WINNER":
         missed_expected_profit = expected_target_profit
@@ -274,8 +298,8 @@ def evaluate_missed_trade(candles, entry_price, target_price, stop_loss_price):
         "outcome_time": outcome_time,
         "max_high_after_signal": round(max_high, 2),
         "min_low_after_signal": round(min_low, 2),
-        "max_favorable_pct": round(((max_high - entry) / entry) * 100, 2),
-        "max_adverse_pct": round(((min_low - entry) / entry) * 100, 2),
+        "max_favorable_pct": round(max_favorable_pct, 2),
+        "max_adverse_pct": round(max_adverse_pct, 2),
         "expected_target_profit": expected_target_profit,
         "expected_stop_loss_loss": expected_stop_loss_loss,
         "max_possible_profit": max_possible_profit,
@@ -380,6 +404,7 @@ def build_review(date_text):
                     entry_price=entry_price,
                     target_price=target_price,
                     stop_loss_price=stop_loss_price,
+                    transaction_type=option_summary.get("transaction_type", "BUY"),
                 )
             except Exception as e:
                 fetch_error = str(e)

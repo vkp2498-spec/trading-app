@@ -709,8 +709,13 @@ def position_ltp(position):
     return None
 
 
-def position_avg_price(position):
-    for key in ["average_price", "buy_price", "day_buy_price", "avg_price"]:
+def position_avg_price(position, entry_transaction_type="BUY"):
+    keys = ["average_price", "avg_price"]
+    if str(entry_transaction_type).upper() == "SELL":
+        keys.extend(["sell_price", "day_sell_price"])
+    else:
+        keys.extend(["buy_price", "day_buy_price"])
+    for key in keys:
         if position.get(key) is not None:
             try:
                 value = float(position.get(key))
@@ -744,6 +749,9 @@ def get_live_bot_positions():
         target = float(state.get("target_price") or 0)
         stop = float(state.get("stop_loss_price") or 0)
         highest = float(state.get("highest_ltp") or entry or 0)
+        lowest = float(state.get("lowest_ltp") or entry or 0)
+        entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
+        is_short = entry_transaction == "SELL"
 
         ltp = None
         actual_qty = 0
@@ -751,7 +759,7 @@ def get_live_bot_positions():
         if pos:
             actual_qty = position_quantity(pos)
             ltp = position_ltp(pos)
-            broker_entry = position_avg_price(pos)
+            broker_entry = position_avg_price(pos, entry_transaction)
             if broker_entry:
                 entry = broker_entry
 
@@ -761,16 +769,20 @@ def get_live_bot_positions():
         reward_left = None
 
         if ltp is not None and entry > 0:
-            live_pnl = round((ltp - entry) * qty, 2)
+            live_pnl = round(((entry - ltp) if is_short else (ltp - entry)) * qty, 2)
 
-        if ltp is not None and target > entry:
-            target_progress = round(((ltp - entry) / (target - entry)) * 100, 1)
+        valid_target = target < entry if is_short else target > entry
+        if ltp is not None and valid_target:
+            target_progress = round(
+                (((entry - ltp) / (entry - target)) if is_short else ((ltp - entry) / (target - entry))) * 100,
+                1,
+            )
 
         if ltp is not None and stop > 0:
-            risk_to_stop = round((ltp - stop) * qty, 2)
+            risk_to_stop = round(((stop - ltp) if is_short else (ltp - stop)) * qty, 2)
 
         if ltp is not None and target > 0:
-            reward_left = round((target - ltp) * qty, 2)
+            reward_left = round(((ltp - target) if is_short else (target - ltp)) * qty, 2)
 
         rows.append(
             {
@@ -784,6 +796,8 @@ def get_live_bot_positions():
                 "target_price": target,
                 "stop_loss_price": stop,
                 "highest_ltp": highest,
+                "lowest_ltp": lowest,
+                "entry_transaction_type": entry_transaction,
                 "live_pnl": live_pnl,
                 "target_progress": target_progress,
                 "risk_to_stop": risk_to_stop,
@@ -818,7 +832,7 @@ def render_live_trade_cards(live_df):
 
         html = f"""
 <div class="live-card">
-<div class="small-label">{row.get("symbol", "")}</div>
+<div class="small-label">{row.get("symbol", "")} • {row.get("entry_transaction_type", "BUY")}</div>
 <div class="big-value">{row.get("trading_symbol", "")}</div>
 <div class="muted">Qty: {row.get("quantity", "")} | Broker Qty: {row.get("broker_quantity", "")}</div>
 <br>
@@ -827,7 +841,7 @@ def render_live_trade_cards(live_df):
 <br>
 <div class="small-label">Trade Levels</div>
 <div>Entry: <b>{number(row.get("entry_price"))}</b> | LTP: <b>{number(row.get("ltp"))}</b> | Target: <b>{number(row.get("target_price"))}</b></div>
-<div>Stop Loss: <b>{number(row.get("stop_loss_price"))}</b> | Highest LTP: <b>{number(row.get("highest_ltp"))}</b></div>
+<div>Stop Loss: <b>{number(row.get("stop_loss_price"))}</b> | Best LTP: <b>{number(row.get("lowest_ltp") if row.get("entry_transaction_type") == "SELL" else row.get("highest_ltp"))}</b></div>
 <br>
 <div class="small-label">Risk View</div>
 <div>Target Progress: <b>{progress_text}</b> | Reward Left: <b>{money(row.get("reward_left"))}</b> | Risk To Stop: <b>{money(row.get("risk_to_stop"))}</b></div>

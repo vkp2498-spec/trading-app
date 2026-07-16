@@ -15,8 +15,34 @@ openai_stub = types.ModuleType("openai")
 openai_stub.OpenAI = object
 sys.modules.setdefault("openai", openai_stub)
 
+requests_stub = types.ModuleType("requests")
+requests_stub.request = lambda *args, **kwargs: None
+requests_stub.get = lambda *args, **kwargs: None
+requests_stub.post = lambda *args, **kwargs: None
+sys.modules.setdefault("requests", requests_stub)
+
+connection_stub = types.ModuleType("urllib3.util.connection")
+connection_stub.allowed_gai_family = lambda: None
+util_stub = types.ModuleType("urllib3.util")
+util_stub.connection = connection_stub
+urllib3_stub = types.ModuleType("urllib3")
+urllib3_stub.util = util_stub
+sys.modules.setdefault("urllib3", urllib3_stub)
+sys.modules.setdefault("urllib3.util", util_stub)
+sys.modules.setdefault("urllib3.util.connection", connection_stub)
+
+httpx_stub = types.ModuleType("httpx")
+httpx_stub.HTTPError = Exception
+httpx_stub.Client = object
+sys.modules.setdefault("httpx", httpx_stub)
+
+jwt_stub = types.ModuleType("jwt")
+jwt_stub.encode = lambda *args, **kwargs: "test-token"
+sys.modules.setdefault("jwt", jwt_stub)
+
 import trade_bot
 import apns_push
+import trade_journal
 from counterfactual_replay import simulate_trade
 from signal_score import weighted_alignment_score
 
@@ -64,6 +90,57 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["exit_reason"], "STOP_AND_TARGET_SAME_CANDLE")
         self.assertEqual(result["gross_pnl"], -520)
 
+    def test_counterfactual_short_trade_profits_when_premium_reaches_lower_target(self):
+        signal_time = pd.Timestamp("2026-07-15 10:20:00", tz="Asia/Kolkata")
+        candles = pd.DataFrame(
+            [
+                {"open": 100, "high": 101, "low": 89, "close": 91, "volume": 1},
+            ],
+            index=[pd.Timestamp("2026-07-15 10:25:00", tz="Asia/Kolkata")],
+        )
+
+        result = simulate_trade(
+            candles,
+            signal_time,
+            100,
+            90,
+            108,
+            30,
+            transaction_type="SELL",
+        )
+
+        self.assertEqual(result["exit_reason"], "TARGET")
+        self.assertEqual(result["gross_pnl"], 300)
+
+    def test_global_signal_check_executes_only_highest_scoring_index_candidate(self):
+        candidates = {
+            "NIFTY": {
+                "symbol": "NIFTY",
+                "transaction_type": "BUY",
+                "weighted": {"score": 82},
+            },
+            "BANKNIFTY": {
+                "symbol": "BANKNIFTY",
+                "transaction_type": "SELL",
+                "weighted": {"score": 88},
+            },
+        }
+
+        with (
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                side_effect=lambda symbol: candidates[symbol],
+            ),
+            patch.object(trade_bot, "execute_selected_candidate") as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        execute.assert_called_once_with(candidates["BANKNIFTY"])
+
     def test_losing_setups_are_rejected_by_feasibility_gate(self):
         first = trade_bot.evaluate_trade_feasibility(
             "BULLISH",
@@ -91,7 +168,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertFalse(first["allowed"])
         self.assertEqual(first["technical_reward_risk"], 0.17)
         self.assertFalse(second["allowed"])
-        self.assertIn("2.30% above", second["reasons"][0])
+        self.assertIn("unfavorably extended by 2.30%", second["reasons"][0])
 
     def test_healthy_setup_passes_and_target_is_capped(self):
         result = trade_bot.evaluate_trade_feasibility(
@@ -113,7 +190,11 @@ class TradeControlTests(unittest.TestCase):
     def test_risk_budget_caps_configured_lots(self):
         with patch.dict(
             os.environ,
-            {"NIFTY_LOTS": "9", "MAX_RISK_PER_TRADE": "5000"},
+            {
+                "NIFTY_LOTS": "9",
+                "MAX_LOTS_PER_ENTRY": "1",
+                "MAX_RISK_PER_TRADE": "5000",
+            },
             clear=False,
         ):
             quantity = trade_bot.order_quantity_for(
@@ -123,7 +204,92 @@ class TradeControlTests(unittest.TestCase):
                 stop_loss_price=147,
             )
 
-        self.assertEqual(quantity, 390)
+        self.assertEqual(quantity, 65)
+
+    def test_short_levels_and_risk_are_side_aware(self):
+        target, stop = trade_bot.option_levels_from_fill(
+            100,
+            10,
+            7.5,
+            transaction_type="SELL",
+        )
+        self.assertEqual((target, stop), (90, 108))
+
+        with patch.dict(
+            os.environ,
+            {"BANKNIFTY_LOTS": "5", "MAX_LOTS_PER_ENTRY": "1", "MAX_RISK_PER_TRADE": "5000"},
+            clear=False,
+        ):
+            quantity = trade_bot.order_quantity_for(
+                "BANKNIFTY",
+                {"lot_size": 30},
+                entry_price=100,
+                stop_loss_price=108,
+                transaction_type="SELL",
+            )
+        self.assertEqual(quantity, 30)
+
+    def test_short_option_flow_is_normalized_for_position_scoring(self):
+        normalized = trade_bot.normalize_option_flow_for_position(
+            {
+                "bias": "NEUTRAL",
+                "close": 90,
+                "vwap": 100,
+                "vwap_slope": -0.2,
+                "volume_confirmed": True,
+            },
+            "SELL",
+        )
+        self.assertEqual(normalized["bias"], "BULLISH")
+        self.assertEqual(normalized["confidence"], "HIGH")
+        self.assertEqual(normalized["raw_premium_bias"], "NEUTRAL")
+
+    def test_buy_is_preferred_without_meaningful_short_score_advantage(self):
+        buy = {"allowed": True, "transaction_type": "BUY", "weighted": {"score": 82}}
+        sell = {"allowed": True, "transaction_type": "SELL", "weighted": {"score": 85}}
+        with patch.dict(os.environ, {"SHORT_SCORE_ADVANTAGE": "5"}, clear=False):
+            self.assertIs(trade_bot.select_trade_candidate([buy, sell]), buy)
+            sell["weighted"]["score"] = 88
+            self.assertIs(trade_bot.select_trade_candidate([buy, sell]), sell)
+
+    def test_short_trailing_stop_moves_down_as_premium_falls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(trade_bot, "BASE_DIR", Path(temp_dir)):
+                state = {
+                    "entry_transaction_type": "SELL",
+                    "entry_price": 100,
+                    "target_price": 90,
+                    "stop_loss_price": 108,
+                    "lowest_ltp": 100,
+                    "quantity": 30,
+                }
+                updated = trade_bot.apply_trailing_stop("BANKNIFTY", state, 94)
+        self.assertEqual(updated["lowest_ltp"], 94)
+        self.assertEqual(updated["stop_loss_price"], 97)
+
+    def test_short_trade_journal_calculates_profit_when_premium_falls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history = Path(temp_dir) / "trade_history.csv"
+            with (
+                patch.object(trade_journal, "DATA_DIR", Path(temp_dir)),
+                patch.object(trade_journal, "TRADE_HISTORY_FILE", history),
+            ):
+                row = trade_journal.record_closed_trade(
+                    {
+                        "symbol": "NIFTY",
+                        "trading_symbol": "NIFTY TEST PE",
+                        "direction": "BULLISH",
+                        "entry_transaction_type": "SELL",
+                        "quantity": 65,
+                        "entry_price": 100,
+                        "target_price": 90,
+                        "stop_loss_price": 108,
+                    },
+                    exit_price=90,
+                    exit_reason="TARGET",
+                )
+        self.assertEqual(row["gross_pnl"], 650)
+        self.assertEqual(row["transaction_type"], "SELL")
 
     def test_volume_ratio_is_graded(self):
         score = weighted_alignment_score(

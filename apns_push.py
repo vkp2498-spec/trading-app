@@ -289,13 +289,14 @@ def send_trade_entered_notification(position_state: dict[str, Any]) -> dict[str,
     symbol = str(position_state.get("symbol") or "Trade")
     trading_symbol = str(position_state.get("trading_symbol") or symbol)
     direction = str(position_state.get("direction") or "").upper()
+    transaction_type = str(position_state.get("entry_transaction_type") or "BUY").upper()
     quantity = int(float(position_state.get("quantity") or 0))
     entry_price = float(position_state.get("entry_price") or 0)
     target_price = float(position_state.get("target_price") or 0)
     stop_price = float(position_state.get("stop_loss_price") or 0)
     entered_at = str(position_state.get("created_at") or datetime.now(timezone.utc).isoformat())
 
-    direction_text = f" {direction}" if direction else ""
+    direction_text = f" {direction} {transaction_type}" if direction else f" {transaction_type}"
     payload = {
         "aps": {
             "alert": {
@@ -313,6 +314,7 @@ def send_trade_entered_notification(position_state: dict[str, Any]) -> dict[str,
         "symbol": symbol,
         "tradingSymbol": trading_symbol,
         "direction": direction,
+        "transactionType": transaction_type,
         "quantity": quantity,
         "entryPrice": entry_price,
         "targetPrice": target_price,

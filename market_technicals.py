@@ -203,7 +203,13 @@ def resample_ohlc(df, rule, **resample_kwargs):
     )
     return out.dropna()
 
-def convert_index_levels_to_option_premium(analysis, option_side, option_entry_price, delta=0.5):
+def convert_index_levels_to_option_premium(
+    analysis,
+    option_side,
+    option_entry_price,
+    delta=0.5,
+    transaction_type="BUY",
+):
     """
     Converts index-level technical target/stop into approximate option premium target/stop.
     option_side: CE or PE
@@ -235,17 +241,26 @@ def convert_index_levels_to_option_premium(analysis, option_side, option_entry_p
     premium_target = round(entry + (target_move * delta), 0)
     premium_stop = round(entry + (stop_move * delta), 0)
 
-    # Keep only sensible option-buying levels.
-    if premium_target <= entry:
-        premium_target = None
-    if premium_stop >= entry:
-        premium_stop = None
+    transaction_type = str(transaction_type).upper()
+    if transaction_type == "BUY":
+        if premium_target <= entry:
+            premium_target = None
+        if premium_stop >= entry:
+            premium_stop = None
+    elif transaction_type == "SELL":
+        if premium_target >= entry:
+            premium_target = None
+        if premium_stop <= entry:
+            premium_stop = None
+    else:
+        raise ValueError("transaction_type must be BUY or SELL")
 
     updated = dict(analysis)
     updated["option_delta_used"] = delta
     updated["option_entry_price"] = round(entry, 2)
     updated["option_target_price"] = premium_target
     updated["option_stop_loss_price"] = premium_stop
+    updated["option_transaction_type"] = transaction_type
     updated["option_conversion_reason"] = (
         f"Converted index target/stop to option premium using delta={delta}"
     )

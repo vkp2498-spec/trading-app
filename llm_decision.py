@@ -35,6 +35,7 @@ def build_rule_based_fallback(option_summary, technicals):
     five_bias = five.get("bias")
     weighted_grade = weighted.get("grade")
     weighted_score = float(weighted.get("score") or 0)
+    transaction_type = str(option_summary.get("transaction_type") or "BUY").upper()
 
     institutional_conflicts = (
         institutional.get("confidence") == "HIGH"
@@ -84,7 +85,7 @@ def build_rule_based_fallback(option_summary, technicals):
 
     atm_close = atm.get("close")
     atm_vwap = atm.get("vwap")
-    atm_below_vwap = (
+    atm_below_vwap = transaction_type == "BUY" and (
         atm_close is not None
         and atm_vwap is not None
         and float(atm_close) < float(atm_vwap)
@@ -157,8 +158,11 @@ def compact_decision_context(symbol, option_summary, technicals):
     return {
         "symbol": symbol,
         "direction": direction,
-        "trade_action": "BUY_OPTION",
-        "selected_option_type": "CE" if direction == "BULLISH" else "PE" if direction == "BEARISH" else None,
+        "trade_action": option_summary.get("trade_action", "BUY_OPTION"),
+        "transaction_type": option_summary.get("transaction_type", "BUY"),
+        "selected_option_type": option_summary.get("option_type") or (
+            "CE" if direction == "BULLISH" else "PE" if direction == "BEARISH" else None
+        ),
         "option_chain_confidence": option_summary.get("confidence"),
         "option_chain_score": option_summary.get("score"),
         "entry_price": option_summary.get("entry_price"),
@@ -200,8 +204,8 @@ def compact_decision_context(symbol, option_summary, technicals):
         "five_min_lower_band": five.get("lower_band"),
         "atm_option_contract": atm.get("label"),
         "atm_option_premium_bias": atm.get("bias"),
-        "atm_option_supports_long_entry": atm.get("bias") == "BULLISH",
-        "atm_option_weakens_long_entry": atm.get("bias") == "BEARISH",
+        "atm_option_supports_proposed_position": atm.get("bias") == "BULLISH",
+        "atm_option_weakens_proposed_position": atm.get("bias") == "BEARISH",
         "atm_option_confidence": atm.get("confidence"),
         "atm_option_close": atm_close,
         "atm_option_vwap": atm_vwap,
@@ -232,7 +236,11 @@ def llm_factual_issues(decision, decision_context):
     reason = str(decision.get("reason") or "").lower()
     issues = []
 
-    if decision_context.get("atm_option_above_vwap") is True and "below vwap" in reason:
+    if (
+        decision_context.get("transaction_type") == "BUY"
+        and decision_context.get("atm_option_above_vwap") is True
+        and "below vwap" in reason
+    ):
         issues.append("LLM said the selected option was below VWAP when it was above VWAP")
 
     if (
@@ -351,15 +359,14 @@ def get_llm_decision(symbol, option_summary, technicals):
 
     "ATM option volume and VWAP are more important than index volume/VWAP for NIFTY/BANKNIFTY option entries.",
     "ATM option premium bias describes the selected option contract's price trend, not the underlying index direction.",
-    "A BULLISH ATM option premium bias supports buying the selected CE or PE because that option premium is strengthening.",
-    "A BEARISH ATM option premium bias weakens or blocks a long-option entry because that selected option premium is falling.",
+    "atm_option_premium_bias is normalized for the proposed position: BULLISH supports the proposed BUY or SELL expression, while BEARISH weakens it.",
+    "For SELL_OPTION, the selected contract is the opposite option: BULLISH underlying sells PE and BEARISH underlying sells CE.",
+    "For SELL_OPTION, a falling sold premium below VWAP is normalized to supportive BULLISH position flow.",
     "Never interpret BULLISH PE premium flow as opposing a BEARISH index trade.",
     "Never interpret BULLISH CE premium flow as opposing a BULLISH index trade.",
-    "Use atm_option_supports_long_entry and atm_option_weakens_long_entry directly; do not compare atm_option_premium_bias with the underlying direction.",
-    "ATM option premium above VWAP with above-average volume strengthens a long option trade.",
-    "ATM option premium below VWAP reduces confidence even when volume is strong; below-VWAP option premium means buyers are not yet in control.",
-    "ATM option below VWAP is a significant risk penalty. If ATM option is below VWAP, cautious trade can still be rejected unless other signals are very strong.",
-    "ATM option flow below VWAP is a risk penalty, but not automatic rejection when 15M and 5M are aligned.",
+    "Use atm_option_supports_proposed_position and atm_option_weakens_proposed_position directly; do not compare atm_option_premium_bias with the underlying direction.",
+    "For BUY_OPTION, premium above VWAP with above-average volume supports entry; premium below VWAP is a risk penalty.",
+    "For SELL_OPTION, premium below a flat/down VWAP supports entry; premium above a flat/up VWAP is a risk penalty.",
 
     "Volume confirmation means volume_confirmed=true in atm_option_flow. Do not call volume weak when volume_confirmed is true.",
     "Option-chain trend over recent snapshots is more reliable than one snapshot alone.",
@@ -371,18 +378,19 @@ def get_llm_decision(symbol, option_summary, technicals):
     "A NEUTRAL or LOW-confidence institutional footprint is not a blocker by itself.",
     "Use institutional_footprint_aligns directly and do not invent institutional activity from missing fields.",
 
-    "Buying a PE is still a long-option purchase that expresses a BEARISH underlying view; do not confuse selected-option premium direction with underlying direction.",
+    "Buying PE or selling CE expresses a BEARISH underlying view; buying CE or selling PE expresses a BULLISH underlying view.",
     "Use the explicit two_hour_aligns, fifteen_min_aligns, and five_min_aligns fields when describing agreement.",
 
     "Pivot and Bollinger fields are supporting technical context; converted technical option levels may be used to assess whether the default risk levels are realistic.",
     "technical_feasibility_allowed must be true. The deterministic bot rejects the setup before this call otherwise.",
     "Use technical_reward_risk, technical_headroom_percent, and technical_limiting_timeframe when explaining whether sufficient reachable reward remains.",
     "The bot owns execution prices deterministically. Return the supplied target_price and stop_loss_price unchanged when approving a trade.",
-    "Do not invent prices. Target must be above entry premium and stop loss below entry premium.",
+    "Do not invent prices. For BUY_OPTION target must be above entry and stop below entry. For SELL_OPTION target must be below entry and stop above entry.",
+    "The deterministic bot, not the LLM, owns the decision to permit naked option selling and its margin/protective-stop checks.",
 
     "NIFTY requires stronger confirmation than BANKNIFTY.",
     "CAUTIOUS_TRADE requires symbol minimum score: NIFTY >= 70, BANKNIFTY >= 65.",
-    "ATM option premium flow has higher importance after recent losses; atm_option_weakens_long_entry=true is a serious blocker.",
+    "ATM option premium flow has higher importance after recent losses; atm_option_weakens_proposed_position=true is a serious blocker.",
     "Do not reject a trade merely because atm_option_premium_bias is BULLISH while the underlying direction is BEARISH; a strengthening selected PE supports that trade.",
     "Prefer trades where ATM option premium is above VWAP or its premium bias is at least neutral with strong 15M and 5M alignment.",
 

@@ -4,12 +4,12 @@ import json
 import gzip
 import time as time_module
 import socket
-from unittest import result
 import urllib.request
 from pathlib import Path
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import csv
+from copy import deepcopy
 
 from analysis_journal import record_analysis
 from institutional_flow import (
@@ -101,8 +101,12 @@ SYMBOL_CONFIG = {
 }
 
 UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
+UPSTOX_CANCEL_ORDER_URL = "https://api-hft.upstox.com/v2/order/cancel"
+UPSTOX_MODIFY_ORDER_URL = "https://api-hft.upstox.com/v2/order/modify"
 UPSTOX_ORDER_DETAILS_URL = "https://api.upstox.com/v2/order/details"
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
+UPSTOX_MARGIN_URL = "https://api.upstox.com/v2/charges/margin"
+UPSTOX_FUNDS_URL = "https://api.upstox.com/v2/user/get-funds-and-margin"
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 
 
@@ -168,10 +172,19 @@ def risk_percentages(cautious=False):
     )
 
 
-def option_levels_from_fill(entry_price, target_percent, stop_percent):
+def option_levels_from_fill(
+    entry_price,
+    target_percent,
+    stop_percent,
+    transaction_type="BUY",
+):
     entry = float(entry_price)
-    target = round(entry * (1 + float(target_percent) / 100), 0)
-    stop = round(max(entry * (1 - float(stop_percent) / 100), 0), 0)
+    if str(transaction_type).upper() == "SELL":
+        target = round(max(entry * (1 - float(target_percent) / 100), 0.05), 0)
+        stop = round(entry * (1 + float(stop_percent) / 100), 0)
+    else:
+        target = round(entry * (1 + float(target_percent) / 100), 0)
+        stop = round(max(entry * (1 - float(stop_percent) / 100), 0), 0)
     return target, stop
 
 
@@ -188,6 +201,7 @@ def evaluate_trade_feasibility(
     proposed_target,
     stop_loss,
     technicals,
+    transaction_type="BUY",
 ):
     entry = float(entry_price)
     target = float(proposed_target)
@@ -211,7 +225,9 @@ def evaluate_trade_feasibility(
         "reasons": [],
     }
 
-    risk = entry - stop
+    transaction_type = str(transaction_type).upper()
+    is_short = transaction_type == "SELL"
+    risk = stop - entry if is_short else entry - stop
     if risk <= 0:
         result["reasons"].append("Stop loss does not define positive option-premium risk")
         return result
@@ -219,12 +235,17 @@ def evaluate_trade_feasibility(
     option_flow = technicals.get("atm_option_flow", {}) or {}
     completed_candle_close = to_float(option_flow.get("close"), 0)
     if completed_candle_close > 0:
-        entry_extension = ((entry - completed_candle_close) / completed_candle_close) * 100
+        entry_extension = (
+            ((completed_candle_close - entry) / completed_candle_close) * 100
+            if is_short
+            else ((entry - completed_candle_close) / completed_candle_close) * 100
+        )
         result["entry_extension_percent"] = round(entry_extension, 2)
         result["maximum_entry_extension_percent"] = round(max_extension, 2)
         if entry_extension > max_extension:
             result["reasons"].append(
-                f"Expected entry is {entry_extension:.2f}% above the completed ATM option candle; "
+                f"Expected entry is unfavorably extended by {entry_extension:.2f}% versus "
+                "the completed ATM option candle; "
                 f"maximum is {max_extension:.2f}%"
             )
             return result
@@ -233,7 +254,8 @@ def evaluate_trade_feasibility(
     for timeframe_key, label in (("five_min", "5M"), ("fifteen_min", "15M")):
         analysis = technicals.get(timeframe_key, {}) or {}
         technical_target = to_float(analysis.get("option_target_price"), 0)
-        if analysis.get("bias") == direction and technical_target > entry:
+        target_is_valid = technical_target < entry if is_short else technical_target > entry
+        if analysis.get("bias") == direction and target_is_valid:
             target_candidates.append((technical_target, label))
 
     result["technical_target_candidates"] = [
@@ -246,9 +268,13 @@ def evaluate_trade_feasibility(
         )
         return result
 
-    reachable_target, limiting_timeframe = min(target_candidates, key=lambda item: item[0])
-    adjusted_target = min(target, reachable_target)
-    reward = adjusted_target - entry
+    target_selector = max if is_short else min
+    reachable_target, limiting_timeframe = target_selector(
+        target_candidates,
+        key=lambda item: item[0],
+    )
+    adjusted_target = max(target, reachable_target) if is_short else min(target, reachable_target)
+    reward = entry - adjusted_target if is_short else adjusted_target - entry
     reward_risk = reward / risk if risk > 0 else 0
 
     result.update(
@@ -431,11 +457,15 @@ def bot_unrealized_pnl():
         state = tracked.get(instrument_key)
         if not state:
             continue
-        quantity = max(position_quantity(position), 0)
+        raw_quantity = position_quantity(position)
+        quantity = abs(raw_quantity)
         ltp = position_ltp(position)
         entry = to_float(state.get("entry_price"))
         if quantity > 0 and ltp is not None and entry > 0:
-            total += (float(ltp) - entry) * quantity
+            if str(state.get("entry_transaction_type") or "BUY").upper() == "SELL":
+                total += (entry - float(ltp)) * quantity
+            else:
+                total += (float(ltp) - entry) * quantity
 
     return round(total, 2)
 
@@ -557,6 +587,75 @@ def upstox_request(method, url, **kwargs):
 def opposite_direction(direction):
     return "BEARISH" if direction == "BULLISH" else "BULLISH"
 
+
+def option_type_for(direction, transaction_type):
+    if direction == "BULLISH":
+        return "CE" if transaction_type == "BUY" else "PE"
+    if direction == "BEARISH":
+        return "PE" if transaction_type == "BUY" else "CE"
+    raise ValueError(f"Unsupported direction: {direction}")
+
+
+def entry_price_for(atm, direction, transaction_type):
+    option_type = option_type_for(direction, transaction_type)
+    return to_float(atm.get(f"{option_type}_ltp"), 0)
+
+
+def normalize_option_flow_for_position(raw_flow, transaction_type):
+    flow = dict(raw_flow or {})
+    flow["raw_premium_bias"] = flow.get("bias")
+    flow["entry_transaction_type"] = transaction_type
+    if transaction_type == "SELL":
+        close = to_float(flow.get("close"), 0)
+        vwap = to_float(flow.get("vwap"), 0)
+        slope = to_float(flow.get("vwap_slope"), 0)
+        if close > 0 and vwap > 0 and close < vwap and slope <= 0:
+            flow["bias"] = "BULLISH"
+            flow["confidence"] = "HIGH" if flow.get("volume_confirmed") else "MEDIUM"
+        elif close > 0 and vwap > 0 and close > vwap and slope >= 0:
+            flow["bias"] = "BEARISH"
+            flow["confidence"] = "HIGH" if flow.get("volume_confirmed") else "MEDIUM"
+        else:
+            flow["bias"] = {
+                "BULLISH": "BEARISH",
+                "BEARISH": "BULLISH",
+            }.get(flow.get("bias"), "NEUTRAL")
+        flow["reasons"] = [
+            "Short-option expression: falling sold premium supports the position"
+        ] + list(flow.get("reasons") or [])
+    return flow
+
+
+def short_structure_allowed(direction, technicals, raw_flow, weighted_score):
+    if os.getenv("ALLOW_NAKED_OPTION_SELLING", "false").lower() != "true":
+        return False, "ALLOW_NAKED_OPTION_SELLING is not true"
+
+    minimum_score = configured_non_negative_float("SHORT_MIN_WEIGHTED_SCORE", 80.0)
+    if float(weighted_score.get("score") or 0) < minimum_score:
+        return False, f"short structure score is below {minimum_score:.1f}"
+
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    five = technicals.get("five_min", {}) or {}
+    institutional = technicals.get("institutional_flow", {}) or {}
+    if fifteen.get("bias") != direction or five.get("bias") != direction:
+        return False, "15M and 5M must both align for a naked option sell"
+    if (
+        institutional.get("bias") == opposite_direction(direction)
+        and institutional.get("confidence") in {"MEDIUM", "HIGH"}
+    ):
+        return False, "institutional footprint conflicts with the short structure"
+
+    close = to_float(raw_flow.get("close"), 0)
+    vwap = to_float(raw_flow.get("vwap"), 0)
+    slope = to_float(raw_flow.get("vwap_slope"), 0)
+    volume_ratio = to_float(raw_flow.get("volume_ratio"), 0)
+    minimum_volume = configured_non_negative_float("SHORT_MIN_VOLUME_RATIO", 0.8)
+    if close <= 0 or vwap <= 0 or close >= vwap or slope > 0:
+        return False, "the option proposed for selling is not weakening below a flat/down VWAP"
+    if volume_ratio < minimum_volume:
+        return False, f"sold-option volume ratio is below {minimum_volume:.2f}"
+    return True, "sold option is weakening below VWAP with aligned 15M/5M direction"
+
 def lot_multiplier_for(symbol):
     default_lots = int(DEFAULT_LOT_MULTIPLIERS.get(symbol, 1))
     env_key = f"{symbol}_LOTS"
@@ -577,10 +676,17 @@ def lot_multiplier_for(symbol):
             f"{env_key} must be greater than or equal to 1; received {lots}"
         )
 
-    return lots
+    max_lots = max(to_int(os.getenv("MAX_LOTS_PER_ENTRY"), 1), 1)
+    return min(lots, max_lots)
 
 
-def order_quantity_for(symbol, instrument, entry_price=None, stop_loss_price=None):
+def order_quantity_for(
+    symbol,
+    instrument,
+    entry_price=None,
+    stop_loss_price=None,
+    transaction_type="BUY",
+):
     lot_size = int(instrument["lot_size"])
     configured_lots = lot_multiplier_for(symbol)
     risk_budget = max_risk_per_trade(symbol)
@@ -588,7 +694,11 @@ def order_quantity_for(symbol, instrument, entry_price=None, stop_loss_price=Non
     if risk_budget <= 0 or entry_price is None or stop_loss_price is None:
         return lot_size * configured_lots
 
-    risk_per_unit = float(entry_price) - float(stop_loss_price)
+    risk_per_unit = (
+        float(stop_loss_price) - float(entry_price)
+        if str(transaction_type).upper() == "SELL"
+        else float(entry_price) - float(stop_loss_price)
+    )
     if risk_per_unit <= 0:
         return 0
 
@@ -616,6 +726,93 @@ def place_market_order(instrument, transaction_type, quantity):
 
     result = upstox_request("POST", UPSTOX_PLACE_ORDER_URL, json=payload)
     return result, payload
+
+
+def place_stop_market_order(instrument, transaction_type, quantity, trigger_price):
+    payload = {
+        "quantity": int(quantity),
+        "product": "I",
+        "validity": "DAY",
+        "price": 0,
+        "tag": "index_bot_stop",
+        "instrument_token": instrument["instrument_key"],
+        "order_type": "SL-M",
+        "transaction_type": transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price": round(float(trigger_price), 1),
+        "is_amo": False,
+        "market_protection": -1,
+    }
+    result = upstox_request("POST", UPSTOX_PLACE_ORDER_URL, json=payload)
+    return result, payload
+
+
+def cancel_order(order_id):
+    return upstox_request(
+        "DELETE",
+        UPSTOX_CANCEL_ORDER_URL,
+        params={"order_id": order_id},
+    )
+
+
+def modify_stop_order(order_id, quantity, trigger_price):
+    payload = {
+        "quantity": int(quantity),
+        "validity": "DAY",
+        "price": 0,
+        "order_id": order_id,
+        "order_type": "SL-M",
+        "disclosed_quantity": 0,
+        "trigger_price": round(float(trigger_price), 1),
+        "market_protection": -1,
+    }
+    return upstox_request("PUT", UPSTOX_MODIFY_ORDER_URL, json=payload)
+
+
+def estimate_order_margin(instrument, transaction_type, quantity, price=None):
+    item = {
+        "instrument_key": instrument["instrument_key"],
+        "quantity": int(quantity),
+        "transaction_type": str(transaction_type).upper(),
+        "product": "I",
+    }
+    if price and float(price) > 0:
+        item["price"] = float(price)
+    result = upstox_request(
+        "POST",
+        UPSTOX_MARGIN_URL,
+        json={"instruments": [item]},
+    )
+    data = result.get("data", {}) or {}
+    return float(data.get("final_margin") or data.get("required_margin") or 0)
+
+
+def available_equity_margin():
+    result = upstox_request("GET", UPSTOX_FUNDS_URL, params={"segment": "SEC"})
+    data = result.get("data", {}) or {}
+    equity = data.get("equity", data) if isinstance(data, dict) else {}
+    return float(
+        equity.get("available_margin")
+        or equity.get("available_margin_for_trading")
+        or equity.get("net")
+        or 0
+    )
+
+
+def validate_short_margin(instrument, quantity, price):
+    required = estimate_order_margin(instrument, "SELL", quantity, price)
+    available = available_equity_margin()
+    buffer_percent = configured_non_negative_float("SHORT_MARGIN_BUFFER_PERCENT", 20.0)
+    if buffer_percent >= 100:
+        raise RuntimeError("SHORT_MARGIN_BUFFER_PERCENT must be less than 100")
+    usable = available * (1 - buffer_percent / 100)
+    return {
+        "allowed": required > 0 and required <= usable,
+        "required_margin": round(required, 2),
+        "available_margin": round(available, 2),
+        "usable_margin_after_buffer": round(usable, 2),
+        "buffer_percent": round(buffer_percent, 2),
+    }
 
 
 def get_order_details(order_id):
@@ -661,11 +858,16 @@ def position_quantity(position):
 
 
 def find_matching_position(instrument_key):
+    return find_matching_position_for_side(instrument_key, "BUY")
+
+
+def find_matching_position_for_side(instrument_key, entry_transaction_type="BUY"):
     for pos in get_open_positions():
         pos_key = pos.get("instrument_token") or pos.get("instrument_key")
         qty = position_quantity(pos)
 
-        if pos_key == instrument_key and qty > 0:
+        expected_sign = -1 if str(entry_transaction_type).upper() == "SELL" else 1
+        if pos_key == instrument_key and qty * expected_sign > 0:
             return pos
 
     return None
@@ -679,8 +881,13 @@ def position_ltp(position):
     return None
 
 
-def position_avg_price(position):
-    for key in ["average_price", "buy_price", "day_buy_price"]:
+def position_avg_price(position, entry_transaction_type="BUY"):
+    keys = ["average_price"]
+    if str(entry_transaction_type).upper() == "SELL":
+        keys.extend(["sell_price", "day_sell_price"])
+    else:
+        keys.extend(["buy_price", "day_buy_price"])
+    for key in keys:
         value = position.get(key)
         if value is not None:
             return float(value)
@@ -772,15 +979,28 @@ def save_open_position_state(
     stop_loss_price=None,
     target_percent=None,
     stop_percent=None,
+    entry_transaction_type="BUY",
+    protective_stop_order_id=None,
 ):
+    entry_transaction_type = str(entry_transaction_type).upper()
     if target_percent is not None and stop_percent is not None:
         percent_target, percent_stop = option_levels_from_fill(
             entry_price,
             target_percent,
             stop_percent,
+            transaction_type=entry_transaction_type,
         )
-        if target_price is not None and float(target_price) > float(entry_price):
-            target_price = min(percent_target, round(float(target_price), 0))
+        target_is_valid = (
+            float(target_price) < float(entry_price)
+            if entry_transaction_type == "SELL" and target_price is not None
+            else target_price is not None and float(target_price) > float(entry_price)
+        )
+        if target_is_valid:
+            target_price = (
+                max(percent_target, round(float(target_price), 0))
+                if entry_transaction_type == "SELL"
+                else min(percent_target, round(float(target_price), 0))
+            )
         else:
             target_price = percent_target
         stop_loss_price = percent_stop
@@ -791,6 +1011,7 @@ def save_open_position_state(
                 entry_price,
                 target_percent,
                 stop_percent,
+                transaction_type=entry_transaction_type,
             )
         else:
             target_price = round(float(target_price), 0)
@@ -799,7 +1020,12 @@ def save_open_position_state(
     state = {
         "date": now_ist().strftime("%Y-%m-%d"),
         "symbol": symbol,
-        "buy_order_id": order_id,
+        "entry_order_id": order_id,
+        "buy_order_id": order_id if entry_transaction_type == "BUY" else None,
+        "entry_transaction_type": entry_transaction_type,
+        "exit_transaction_type": "BUY" if entry_transaction_type == "SELL" else "SELL",
+        "position_side": "SHORT_OPTION" if entry_transaction_type == "SELL" else "LONG_OPTION",
+        "protective_stop_order_id": protective_stop_order_id,
         "instrument_key": instrument["instrument_key"],
         "trading_symbol": instrument["trading_symbol"],
         "quantity": int(quantity),
@@ -816,6 +1042,7 @@ def save_open_position_state(
         "status": "POSITION_OPEN",
         "created_at": now_ist().isoformat(),
         "highest_ltp": round(float(entry_price), 2),
+        "lowest_ltp": round(float(entry_price), 2),
         "trailing_stop_active": False,
         "trailing_stop_reason": "",
     }
@@ -824,7 +1051,7 @@ def save_open_position_state(
 
     log(
         f"{symbol} POSITION OPEN: symbol={instrument['trading_symbol']} "
-        f"qty={quantity} lots={state['lot_multiplier']} entry={state['entry_price']} "
+        f"action={entry_transaction_type} qty={quantity} lots={state['lot_multiplier']} entry={state['entry_price']} "
         f"target={target_price} stop_loss={stop_loss_price}"
     )
     send_apple_trade_entered_alert(state)
@@ -872,7 +1099,10 @@ def monitor_pending_exit(symbol, state):
 
     details = wait_for_order_complete(exit_order_id, attempts=1, delay_seconds=0)
     status = order_status(details)
-    log(f"{symbol} pending SELL check: order_id={exit_order_id} status={status}")
+    exit_transaction = state.get("exit_transaction_type") or (
+        "BUY" if str(state.get("entry_transaction_type") or "BUY").upper() == "SELL" else "SELL"
+    )
+    log(f"{symbol} pending {exit_transaction} check: order_id={exit_order_id} status={status}")
 
     if order_is_complete(details):
         complete_exit(
@@ -890,7 +1120,7 @@ def monitor_pending_exit(symbol, state):
         state.pop("exit_reason", None)
         state.pop("exit_fallback_price", None)
         write_state(symbol, state)
-        log(f"{symbol} SELL was {status}; position state retained for retry.")
+        log(f"{symbol} exit {exit_transaction} was {status}; position state retained for retry.")
         return False
 
     return True
@@ -909,115 +1139,188 @@ def run_position_monitor():
         except Exception as e:
             log(f"{symbol} monitor ERROR: {e}")
 
+def arm_short_protective_stop(symbol, state):
+    instrument = {
+        "instrument_key": state["instrument_key"],
+        "trading_symbol": state.get("trading_symbol"),
+    }
+    result, payload = place_stop_market_order(
+        instrument,
+        "BUY",
+        int(state["quantity"]),
+        float(state["stop_loss_price"]),
+    )
+    order_id = result.get("data", {}).get("order_id")
+    if not order_id:
+        raise RuntimeError(f"protective BUY stop returned no order_id: {result}")
+    details = wait_for_order_complete(order_id, attempts=1, delay_seconds=0)
+    if order_is_rejected(details):
+        raise RuntimeError(
+            f"protective BUY stop was {order_status(details)}: {details}"
+        )
+    state["protective_stop_order_id"] = order_id
+    write_state(symbol, state)
+    log(f"{symbol} broker protective BUY stop armed: order_id={order_id} payload={payload}")
+    return state
+
+
+def protective_stop_filled(symbol, state):
+    order_id = state.get("protective_stop_order_id")
+    if not order_id:
+        return False
+    details = get_order_details(order_id)
+    if order_is_complete(details):
+        complete_exit(symbol, state, details, state.get("stop_loss_price"), "STOP_LOSS")
+        return True
+    return False
+
+
+def cancel_protective_stop(symbol, state):
+    order_id = state.get("protective_stop_order_id")
+    if not order_id:
+        return False
+    if protective_stop_filled(symbol, state):
+        return True
+    try:
+        cancel_order(order_id)
+    except Exception:
+        if protective_stop_filled(symbol, state):
+            return True
+        raise
+    state.pop("protective_stop_order_id", None)
+    write_state(symbol, state)
+    log(f"{symbol} protective stop cancelled before active exit: order_id={order_id}")
+    return False
+
+
 def handle_existing_state(symbol, state):
     instrument_key = state.get("instrument_key")
     if not instrument_key:
         return False
+
+    entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
+    exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
+
+    if entry_transaction == "SELL" and protective_stop_filled(symbol, state):
+        return True
 
     if state.get("status") == "EXIT_PENDING":
         if monitor_pending_exit(symbol, state):
             return True
         state = read_state(symbol)
 
-    position = find_matching_position(instrument_key)
-
+    position = find_matching_position_for_side(instrument_key, entry_transaction)
     if position:
         ltp = position_ltp(position)
-        qty = position_quantity(position)
+        qty = abs(position_quantity(position))
+        if entry_transaction == "SELL" and not state.get("protective_stop_order_id"):
+            try:
+                state = arm_short_protective_stop(symbol, state)
+            except Exception as error:
+                log(f"{symbol} CRITICAL: short has no broker stop; flattening now: {error}")
+                instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
+                result, payload = place_market_order(instrument, "BUY", qty)
+                order_id = result.get("data", {}).get("order_id")
+                details = wait_for_order_complete(order_id) if order_id else {}
+                complete_exit(symbol, state, details, ltp, "PROTECTION_FAILURE", result, payload)
+                return True
         state = apply_trailing_stop(symbol, state, ltp)
         target_price = float(state.get("target_price"))
         stop_loss_price = float(state.get("stop_loss_price"))
+        is_short = entry_transaction == "SELL"
 
         log(
-            f"{symbol} open position active: {state.get('trading_symbol')} "
-            f"qty={qty} ltp={ltp} entry={state.get('entry_price')} "
-            f"target={target_price} stop_loss={stop_loss_price}"
+            f"{symbol} open {state.get('position_side', 'LONG_OPTION')} active: "
+            f"{state.get('trading_symbol')} qty={qty} ltp={ltp} "
+            f"entry={state.get('entry_price')} target={target_price} stop_loss={stop_loss_price}"
         )
 
         sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(symbol, state, ltp)
-
-        if ltp is not None and (ltp >= target_price or ltp <= stop_loss_price or sentiment_exit):
+        target_hit = ltp is not None and (ltp <= target_price if is_short else ltp >= target_price)
+        stop_hit = ltp is not None and (ltp >= stop_loss_price if is_short else ltp <= stop_loss_price)
+        if ltp is not None and (target_hit or stop_hit or sentiment_exit):
             if sentiment_exit:
                 exit_reason = "SENTIMENT_EXIT"
                 log(f"{symbol} sentiment exit triggered: {sentiment_reason}")
             else:
-                exit_reason = "TARGET" if ltp >= target_price else "STOP_LOSS"
-            instrument = {
-                "instrument_key": instrument_key,
-                "trading_symbol": state.get("trading_symbol"),
-            }
+                exit_reason = "TARGET" if target_hit else "STOP_LOSS"
 
-            result, payload = place_market_order(instrument, "SELL", qty)
-            sell_order_id = result.get("data", {}).get("order_id")
-            if not sell_order_id:
-                raise RuntimeError(f"{symbol} SELL placed but no order_id returned: {result}")
+            if is_short and cancel_protective_stop(symbol, state):
+                return True
 
-            sell_details = wait_for_order_complete(sell_order_id)
-            if order_is_complete(sell_details):
-                complete_exit(symbol, state, sell_details, ltp, exit_reason, result, payload)
+            instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
+            result, payload = place_market_order(instrument, exit_transaction, qty)
+            exit_order_id = result.get("data", {}).get("order_id")
+            if not exit_order_id:
+                raise RuntimeError(f"{symbol} {exit_transaction} exit returned no order_id: {result}")
+            exit_details = wait_for_order_complete(exit_order_id)
+            if order_is_complete(exit_details):
+                complete_exit(symbol, state, exit_details, ltp, exit_reason, result, payload)
             else:
                 state["status"] = "EXIT_PENDING"
-                state["exit_order_id"] = sell_order_id
+                state["exit_order_id"] = exit_order_id
                 state["exit_reason"] = exit_reason
                 state["exit_fallback_price"] = ltp
                 write_state(symbol, state)
-                log(
-                    f"{symbol} SELL not complete; state retained as EXIT_PENDING. "
-                    f"order_id={sell_order_id} status={order_status(sell_details)}"
-                )
-
+                log(f"{symbol} {exit_transaction} exit pending: order_id={exit_order_id}")
         return True
 
-    buy_order_id = state.get("buy_order_id")
-
-    if buy_order_id and state.get("status") == "BUY_PLACED_NOT_COMPLETE":
-        details = wait_for_order_complete(buy_order_id, attempts=1, delay_seconds=0)
-        status = str(details.get("status", "")).lower()
-
-        log(f"{symbol} pending BUY check: order_id={buy_order_id} status={status}")
-
-        if status in {"rejected", "cancelled", "canceled"}:
-            log(f"{symbol} pending BUY rejected/cancelled. Clearing state.")
+    entry_order_id = state.get("entry_order_id") or state.get("buy_order_id")
+    pending_status = f"{entry_transaction}_PLACED_NOT_COMPLETE"
+    if entry_order_id and state.get("status") in {pending_status, "BUY_PLACED_NOT_COMPLETE"}:
+        details = wait_for_order_complete(entry_order_id, attempts=1, delay_seconds=0)
+        status = order_status(details)
+        log(f"{symbol} pending {entry_transaction} check: order_id={entry_order_id} status={status}")
+        if order_is_rejected(details):
             clear_state(symbol)
             return True
-
-        if status in {"complete", "completed", "traded"}:
-            position = find_matching_position(instrument_key)
-            entry_price = position_avg_price(position) if position else None
+        if order_is_complete(details):
+            position = find_matching_position_for_side(instrument_key, entry_transaction)
+            entry_price = position_avg_price(position, entry_transaction) if position else None
             entry_price = entry_price or to_float(details.get("average_price")) or to_float(details.get("price"))
-
             if not entry_price:
-                log(f"{symbol} BUY complete but entry price not found. Keeping state.")
+                log(f"{symbol} {entry_transaction} complete but entry price not found. Keeping state.")
                 return True
-
-            quantity = int(state.get("quantity") or position_quantity(position) or 0)
-
+            quantity = int(state.get("quantity") or abs(position_quantity(position)) or 0)
             instrument = {
                 "instrument_key": instrument_key,
                 "trading_symbol": state.get("trading_symbol"),
                 "lot_size": int(state.get("lot_size") or quantity),
             }
-
             save_open_position_state(
-                symbol=symbol,
-                order_id=buy_order_id,
-                instrument=instrument,
-                direction=state.get("direction"),
-                confidence=state.get("confidence"),
-                score=state.get("score"),
-                entry_price=entry_price,
-                quantity=quantity,
-                target_price=state.get("target_price"),
-                stop_loss_price=state.get("stop_loss_price"),
-                target_percent=state.get("target_percent"),
-                stop_percent=state.get("stop_percent"),
+                symbol, entry_order_id, instrument, state.get("direction"),
+                state.get("confidence"), state.get("score"), entry_price, quantity,
+                state.get("target_price"), state.get("stop_loss_price"),
+                state.get("target_percent"), state.get("stop_percent"),
+                entry_transaction_type=entry_transaction,
             )
+            state = read_state(symbol)
+            if entry_transaction == "SELL":
+                try:
+                    arm_short_protective_stop(symbol, state)
+                except Exception as error:
+                    log(f"{symbol} CRITICAL: delayed short fill has no broker stop; flattening: {error}")
+                    result, payload = place_market_order(instrument, "BUY", quantity)
+                    exit_order_id = result.get("data", {}).get("order_id")
+                    exit_details = wait_for_order_complete(exit_order_id) if exit_order_id else {}
+                    complete_exit(
+                        symbol,
+                        read_state(symbol),
+                        exit_details,
+                        entry_price,
+                        "PROTECTION_FAILURE",
+                        result,
+                        payload,
+                    )
+                    return True
             clear_reentry_guard(symbol)
             return True
-
-        log(f"{symbol} BUY order still pending. No new order.")
         return True
 
+    if entry_transaction == "SELL" and state.get("protective_stop_order_id"):
+        if protective_stop_filled(symbol, state):
+            return True
+        cancel_protective_stop(symbol, state)
     log(f"{symbol} state exists but no matching open position found. Clearing stale state.")
     clear_state(symbol)
     return False
@@ -1029,16 +1332,18 @@ def apply_trailing_stop(symbol, state, ltp):
     entry_price = float(state.get("entry_price") or 0)
     target_price = float(state.get("target_price") or 0)
     current_stop = float(state.get("stop_loss_price") or 0)
-    current_high = float(state.get("highest_ltp") or entry_price)
+    is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
+    current_best = float(
+        state.get("lowest_ltp" if is_short else "highest_ltp") or entry_price
+    )
 
-    if entry_price <= 0 or target_price <= entry_price:
+    if entry_price <= 0 or (target_price >= entry_price if is_short else target_price <= entry_price):
         return state
 
     ltp = float(ltp)
-    highest_ltp = max(current_high, ltp)
-
-    target_gap = target_price - entry_price
-    profit_from_entry = highest_ltp - entry_price
+    best_ltp = min(current_best, ltp) if is_short else max(current_best, ltp)
+    target_gap = entry_price - target_price if is_short else target_price - entry_price
+    profit_from_entry = entry_price - best_ltp if is_short else best_ltp - entry_price
     target_progress = profit_from_entry / target_gap if target_gap > 0 else 0
 
     new_stop = current_stop
@@ -1046,36 +1351,42 @@ def apply_trailing_stop(symbol, state, ltp):
 
     # Once trade reaches 25% of expected target, reduce risk.
     if target_progress >= 0.25:
-        new_stop = max(new_stop, round(entry_price * 0.99, 0))
+        candidate = round(entry_price * (1.01 if is_short else 0.99), 0)
+        new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail activated: 25% target progress, risk reduced"
 
     # Once trade reaches 40% of expected target, move to breakeven.
     if target_progress >= 0.40:
-        new_stop = max(new_stop, round(entry_price, 0))
+        new_stop = min(new_stop, round(entry_price, 0)) if is_short else max(new_stop, round(entry_price, 0))
         reason = "Trail tightened: 40% target progress, stop moved to breakeven"
 
     # Once trade reaches 60% of expected target, lock 30% of expected profit.
     if target_progress >= 0.60:
-        new_stop = max(new_stop, round(entry_price + target_gap * 0.30, 0))
+        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.30, 0)
+        new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail tightened: 60% target progress, locked 30% of expected profit"
 
     # Once trade reaches 75% of expected target, lock 50% of expected profit.
     if target_progress >= 0.75:
-        new_stop = max(new_stop, round(entry_price + target_gap * 0.50, 0))
+        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.50, 0)
+        new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail tightened: 75% target progress, locked 50% of expected profit"
 
     # Once trade reaches 90% of expected target, lock 70% of expected profit.
     if target_progress >= 0.90:
-        new_stop = max(new_stop, round(entry_price + target_gap * 0.70, 0))
+        candidate = round(entry_price + (-target_gap if is_short else target_gap) * 0.70, 0)
+        new_stop = min(new_stop, candidate) if is_short else max(new_stop, candidate)
         reason = "Trail tightened: 90% target progress, locked 70% of expected profit"
 
     state_changed = False
 
-    if highest_ltp > current_high:
-        state["highest_ltp"] = round(highest_ltp, 2)
+    best_improved = best_ltp < current_best if is_short else best_ltp > current_best
+    if best_improved:
+        state["lowest_ltp" if is_short else "highest_ltp"] = round(best_ltp, 2)
         state_changed = True
 
-    if new_stop > current_stop:
+    stop_improved = new_stop < current_stop if is_short else new_stop > current_stop
+    if stop_improved:
         state["stop_loss_price"] = round(new_stop, 0)
         state["trailing_stop_active"] = True
         state["trailing_stop_reason"] = reason
@@ -1083,13 +1394,23 @@ def apply_trailing_stop(symbol, state, ltp):
 
         log(
             f"{symbol} trailing stop updated: entry={entry_price} "
-            f"ltp={ltp} highest={highest_ltp} target={target_price} "
+            f"ltp={ltp} best={best_ltp} target={target_price} "
             f"progress={round(target_progress * 100, 1)}% "
             f"old_stop={current_stop} new_stop={new_stop} reason={reason}"
         )
 
     if state_changed:
         write_state(symbol, state)
+        if stop_improved and is_short and state.get("protective_stop_order_id"):
+            try:
+                modify_stop_order(
+                    state["protective_stop_order_id"],
+                    int(state["quantity"]),
+                    float(state["stop_loss_price"]),
+                )
+                log(f"{symbol} broker protective stop modified to {state['stop_loss_price']}")
+            except Exception as error:
+                log(f"{symbol} protective stop modification failed; original broker stop remains: {error}")
 
     return state
 
@@ -1112,7 +1433,8 @@ def should_exit_on_sentiment_change(symbol, state, ltp):
     if direction not in {"BULLISH", "BEARISH"}:
         return False, ""
 
-    if entry_price <= 0 or target_price <= entry_price:
+    is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
+    if entry_price <= 0 or (target_price >= entry_price if is_short else target_price <= entry_price):
         return False, ""
 
     # Give the trade some time to breathe after entry.
@@ -1120,7 +1442,11 @@ def should_exit_on_sentiment_change(symbol, state, ltp):
         return False, ""
 
     # If already near target, let target/trailing-stop logic handle it.
-    target_progress = (float(ltp) - entry_price) / (target_price - entry_price)
+    target_progress = (
+        (entry_price - float(ltp)) / (entry_price - target_price)
+        if is_short
+        else (float(ltp) - entry_price) / (target_price - entry_price)
+    )
     if target_progress >= 0.70:
         return False, ""
 
@@ -1176,20 +1502,24 @@ def run_squareoff():
             monitor_pending_exit(symbol, state)
             continue
 
-        position = find_matching_position(state["instrument_key"])
+        entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
+        position = find_matching_position_for_side(state["instrument_key"], entry_transaction)
 
         if position:
-            qty = position_quantity(position)
+            qty = abs(position_quantity(position))
             instrument = {
                 "instrument_key": state["instrument_key"],
                 "trading_symbol": state.get("trading_symbol"),
             }
 
             try:
-                result, payload = place_market_order(instrument, "SELL", qty)
+                if entry_transaction == "SELL" and cancel_protective_stop(symbol, state):
+                    continue
+                exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
+                result, payload = place_market_order(instrument, exit_transaction, qty)
                 sell_order_id = result.get("data", {}).get("order_id")
                 if not sell_order_id:
-                    raise RuntimeError(f"{symbol} squareoff SELL returned no order_id: {result}")
+                    raise RuntimeError(f"{symbol} squareoff {exit_transaction} returned no order_id: {result}")
 
                 fallback_price = position_ltp(position)
                 sell_details = wait_for_order_complete(sell_order_id)
@@ -1210,12 +1540,20 @@ def run_squareoff():
                     state["exit_fallback_price"] = fallback_price
                     write_state(symbol, state)
                     log(
-                        f"{symbol} squareoff SELL pending; state retained. "
+                        f"{symbol} squareoff {exit_transaction} pending; state retained. "
                         f"order_id={sell_order_id} status={order_status(sell_details)}"
                     )
             except Exception as e:
                 log(f"{symbol} bot squareoff failed: {e}")
         else:
+            if entry_transaction == "SELL" and state.get("protective_stop_order_id"):
+                try:
+                    if protective_stop_filled(symbol, state):
+                        continue
+                    cancel_protective_stop(symbol, state)
+                except Exception as error:
+                    log(f"{symbol} could not clear protective order during squareoff: {error}")
+                    continue
             log(f"{symbol} no matching bot position found for squareoff.")
             clear_state(symbol)
 
@@ -1261,21 +1599,160 @@ def collect_institutional_footprint(symbol, recommendation, atm_option_flow=None
         return neutral_institutional_footprint(str(error))
 
 
-def process_symbol(symbol):
-    state = read_state(symbol)
+def build_trade_candidate(symbol, rec, base_technicals, institutional, option_trend, transaction_type):
+    direction = rec["direction"]
+    atm = rec["atm"]
+    option_type = option_type_for(direction, transaction_type)
+    entry_price = entry_price_for(atm, direction, transaction_type)
+    if entry_price <= 0:
+        return None, "missing option premium"
 
-    if state and handle_existing_state(symbol, state):
-        return
+    instrument = find_index_option_instrument(
+        symbol,
+        atm["expiry"],
+        atm["strike"],
+        option_type,
+    )
+    raw_flow = get_option_volume_vwap_analysis(
+        instrument["instrument_key"],
+        side_label=instrument["trading_symbol"],
+    )
+    technicals = deepcopy(base_technicals)
+    technicals["raw_atm_option_flow"] = raw_flow
+    technicals["atm_option_flow"] = normalize_option_flow_for_position(
+        raw_flow,
+        transaction_type,
+    )
+    technicals["institutional_flow"] = institutional
 
-    risk_reason, risk_mode = risk_limit_mode()
-
-    if risk_mode == "stop":
-        log(
-            f"{symbol} no trade: daily risk limit reached. "
-            f"reason={risk_reason} today_pnl={today_realized_pnl()} "
-            f"profit_target={daily_profit_target()} max_loss={daily_max_loss()} mode=stop"
+    for timeframe in ("two_hour", "fifteen_min", "five_min"):
+        technicals[timeframe] = convert_index_levels_to_option_premium(
+            technicals.get(timeframe, {}),
+            option_side=option_type,
+            option_entry_price=entry_price,
+            delta=0.5,
+            transaction_type=transaction_type,
         )
-        return
+
+    option_summary = {
+        "bias": direction,
+        "confidence": rec["confidence"],
+        "score": rec["score"],
+        "strike": atm["strike"],
+        "expiry": atm["expiry"],
+        "entry_price": round(entry_price, 2),
+        "reasons": rec.get("reasons", []),
+        "trade_action": f"{transaction_type}_OPTION",
+        "transaction_type": transaction_type,
+        "option_type": option_type,
+        "trading_symbol": instrument["trading_symbol"],
+        "option_chain_trend": option_trend,
+    }
+    weighted = weighted_alignment_score(option_summary, technicals, option_trend)
+    option_summary["weighted_alignment"] = weighted
+
+    if transaction_type == "SELL":
+        allowed, reason = short_structure_allowed(direction, technicals, raw_flow, weighted)
+        if not allowed:
+            return {
+                "allowed": False,
+                "reason": reason,
+                "transaction_type": transaction_type,
+                "instrument": instrument,
+                "technicals": technicals,
+                "option_summary": option_summary,
+                "weighted": weighted,
+            }, None
+
+    score_value = float(weighted.get("score") or 0)
+    minimum = MIN_SCORE_BY_SYMBOL.get(symbol, 65)
+    if weighted.get("grade") == "SKIP" or (
+        weighted.get("grade") == "CAUTIOUS_TRADE" and score_value < minimum
+    ):
+        return {
+            "allowed": False,
+            "reason": f"weighted score {score_value:.1f} does not qualify",
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+        }, None
+
+    cautious = weighted.get("grade") == "CAUTIOUS_TRADE"
+    target_percent, stop_percent = risk_percentages(cautious=cautious)
+    target, stop = option_levels_from_fill(
+        entry_price,
+        target_percent,
+        stop_percent,
+        transaction_type=transaction_type,
+    )
+    option_summary.update(
+        {
+            "target_price": target,
+            "stop_loss_price": stop,
+            "cautious_trade": cautious,
+        }
+    )
+    feasibility = evaluate_trade_feasibility(
+        direction,
+        entry_price,
+        target,
+        stop,
+        technicals,
+        transaction_type=transaction_type,
+    )
+    technicals["trade_feasibility"] = feasibility
+    option_summary["trade_feasibility"] = feasibility
+    if not feasibility.get("allowed"):
+        return {
+            "allowed": False,
+            "reason": "entry feasibility rejected: " + "; ".join(feasibility.get("reasons", [])),
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+        }, None
+
+    option_summary["target_price"] = float(feasibility["adjusted_target_price"])
+    return {
+        "allowed": True,
+        "reason": "qualified",
+        "transaction_type": transaction_type,
+        "instrument": instrument,
+        "entry_price": entry_price,
+        "target_price": float(feasibility["adjusted_target_price"]),
+        "stop_loss_price": float(stop),
+        "target_percent": target_percent,
+        "stop_percent": stop_percent,
+        "technicals": technicals,
+        "option_summary": option_summary,
+        "weighted": weighted,
+    }, None
+
+
+def select_trade_candidate(candidates):
+    qualified = [candidate for candidate in candidates if candidate and candidate.get("allowed")]
+    if not qualified:
+        return None
+    buy = next((item for item in qualified if item["transaction_type"] == "BUY"), None)
+    sell = next((item for item in qualified if item["transaction_type"] == "SELL"), None)
+    if not sell:
+        return buy
+    if not buy:
+        return sell
+    advantage = configured_non_negative_float("SHORT_SCORE_ADVANTAGE", 5.0)
+    sell_score = float(sell["weighted"].get("score") or 0)
+    buy_score = float(buy["weighted"].get("score") or 0)
+    return sell if sell_score >= buy_score + advantage else buy
+
+
+def evaluate_symbol_buy_or_sell(symbol):
+    risk_reason, risk_mode = risk_limit_mode()
+    if risk_mode == "stop":
+        log(f"{symbol} no trade: daily risk limit reached ({risk_reason})")
+        return False
 
     rec = get_index_recommendation(symbol)
     record_option_chain_snapshot(symbol, rec)
@@ -1283,339 +1760,247 @@ def process_symbol(symbol):
     confidence = rec["confidence"]
     score = rec["score"]
     atm = rec["atm"]
-    prices = rec["prices"]
-
-    log(f"{symbol} signal: {direction}, confidence={confidence}, score={score}, strike={atm['strike']}, expiry={atm['expiry']}")
+    log(
+        f"{symbol} signal: {direction}, confidence={confidence}, score={score}, "
+        f"strike={atm['strike']}, expiry={atm['expiry']}"
+    )
     observe_signal_reset(symbol, direction)
-
-    if direction not in {"BULLISH", "BEARISH"}:
+    if direction not in {"BULLISH", "BEARISH"} or confidence != "HIGH" or abs(score) < 4:
         collect_institutional_footprint(symbol, rec)
-        log(f"{symbol} no trade: neutral signal.")
-        return
-
-    if confidence != "HIGH" or abs(score) < 4:
-        collect_institutional_footprint(symbol, rec)
-        log(f"{symbol} no trade: signal is not strong HIGH confidence.")
-        return
-
+        log(f"{symbol} no trade: signal is not directional HIGH confidence.")
+        return False
     blocked_reason = reentry_block_reason(symbol, direction)
     if blocked_reason:
         log(f"{symbol} no trade: {blocked_reason}")
-        return
-
-    option_type = "CE" if direction == "BULLISH" else "PE"
-    expected_entry_price = prices.get("entry_price")
-
-    if not expected_entry_price:
-        log(f"{symbol} no trade: missing expected entry price.")
-        return
-
-    instrument = find_index_option_instrument(symbol, atm["expiry"], atm["strike"], option_type)
-
-    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-
-    selected_target_percent, selected_stop_percent = risk_percentages(cautious=False)
-    expected_target, expected_stop_loss = option_levels_from_fill(
-        expected_entry_price,
-        selected_target_percent,
-        selected_stop_percent,
-    )
-
-    option_summary = {
-        "bias": direction,
-        "confidence": confidence,
-        "score": score,
-        "strike": atm["strike"],
-        "expiry": atm["expiry"],
-        "entry_price": round(float(expected_entry_price), 2),
-        "target_price": expected_target,
-        "stop_loss_price": expected_stop_loss,
-        "reasons": rec.get("reasons", []),
-    }
+        return False
 
     try:
-        technicals = get_technical_analysis(symbol)
-        option_side = "CE" if direction == "BULLISH" else "PE"
-
-        technicals["two_hour"] = convert_index_levels_to_option_premium(
-            technicals.get("two_hour", {}),
-            option_side=option_side,
-            option_entry_price=expected_entry_price,
-            delta=0.5,
-        )
-
-        technicals["fifteen_min"] = convert_index_levels_to_option_premium(
-            technicals.get("fifteen_min", {}),
-            option_side=option_side,
-            option_entry_price=expected_entry_price,
-            delta=0.5,
-        )
-
-        technicals["five_min"] = convert_index_levels_to_option_premium(
-            technicals.get("five_min", {}),
-            option_side=option_side,
-            option_entry_price=expected_entry_price,
-            delta=0.5,
-        )
-    except Exception as e:
-        log(f"{symbol} technical analysis failed: {e}")
-        technicals = {
-            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
-            "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(e)]},
+        base_technicals = get_technical_analysis(symbol)
+    except Exception as error:
+        base_technicals = {
+            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(error)]},
+            "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(error)]},
+            "five_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(error)]},
         }
+        log(f"{symbol} technical analysis failed: {error}")
 
-    atm_option_flow = get_option_volume_vwap_analysis(
-        instrument["instrument_key"],
-        side_label=instrument["trading_symbol"],
-    )
-    technicals["atm_option_flow"] = atm_option_flow
-    technicals["institutional_flow"] = collect_institutional_footprint(
-        symbol,
-        rec,
-        atm_option_flow,
-    )
-
+    institutional = collect_institutional_footprint(symbol, rec)
     option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
-    weighted_score = weighted_alignment_score(option_summary, technicals, option_trend)
-
-    option_summary["option_chain_trend"] = option_trend
-    option_summary["weighted_alignment"] = weighted_score
-
-    cautious_override = False
-
-    score_value = float(weighted_score.get("score") or 0)
-    symbol_min_score = MIN_SCORE_BY_SYMBOL.get(symbol, 65)
-
-    if weighted_score["grade"] == "SKIP":
-        if score_value >= LLM_RESCUE_SCORE and cautious_override_allowed(direction, weighted_score, technicals):
-            cautious_override = True
-            selected_target_percent, selected_stop_percent = risk_percentages(cautious=True)
-            expected_target, expected_stop_loss = option_levels_from_fill(
-                expected_entry_price,
-                selected_target_percent,
-                selected_stop_percent,
+    candidates = []
+    for transaction_type in ("BUY", "SELL"):
+        try:
+            candidate, _ = build_trade_candidate(
+                symbol,
+                rec,
+                base_technicals,
+                institutional,
+                option_trend,
+                transaction_type,
             )
+            if candidate:
+                candidates.append(candidate)
+                log(
+                    f"{symbol} {transaction_type} candidate: allowed={candidate.get('allowed')} "
+                    f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
+                    f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
+                )
+        except Exception as error:
+            log(f"{symbol} {transaction_type} candidate unavailable: {error}")
 
-            option_summary["target_price"] = expected_target
-            option_summary["stop_loss_price"] = expected_stop_loss
-            option_summary["cautious_override"] = True
-            option_summary["cautious_override_reason"] = (
-                "Weighted score was SKIP, but short-term filters and ATM option VWAP allowed cautious trade."
-            )
-
-            log(
-                f"{symbol} cautious override allowed before LLM: "
-                f"score={weighted_score.get('score')} target={expected_target} "
-                f"stop_loss={expected_stop_loss}"
-            )
-        else:
-            llm_decision = {
+    preferred = select_trade_candidate(candidates)
+    if not preferred:
+        best = max(candidates, key=lambda item: float(item.get("weighted", {}).get("score") or 0), default=None)
+        if best:
+            decision = {
                 "execute_trade": False,
                 "decision": "NO_TRADE",
-                "confidence": "LOW",
+                "confidence": "HIGH",
                 "target_price": None,
                 "stop_loss_price": None,
-                "reason": f"Weighted score too low before LLM: {weighted_score}",
+                "reason": best.get("reason"),
             }
-            record_analysis(symbol, option_summary, technicals, llm_decision)
-            log(f"{symbol} no trade: weighted score too low before LLM: {weighted_score}")
-            return
-    if weighted_score["grade"] == "CAUTIOUS_TRADE":
-        selected_target_percent, selected_stop_percent = risk_percentages(cautious=True)
-        expected_target, expected_stop_loss = option_levels_from_fill(
-            expected_entry_price,
-            selected_target_percent,
-            selected_stop_percent,
-        )
-        option_summary["target_price"] = expected_target
-        option_summary["stop_loss_price"] = expected_stop_loss
-        option_summary["cautious_trade"] = True
+            record_analysis(symbol, best["option_summary"], best["technicals"], decision)
+        log(f"{symbol} no trade: neither BUY nor SELL structure passed deterministic gates.")
+        return False
 
-    if weighted_score["grade"] == "CAUTIOUS_TRADE" and score_value < symbol_min_score:
-        llm_decision = {
-            "execute_trade": False,
-            "decision": "NO_TRADE",
-            "confidence": "LOW",
-            "target_price": None,
-            "stop_loss_price": None,
-            "reason": f"{symbol} score {score_value} is below symbol minimum {symbol_min_score}",
-        }
-        record_analysis(symbol, option_summary, technicals, llm_decision)
-        log(f"{symbol} no trade: score below symbol minimum. score={score_value}, required={symbol_min_score}")
-        return
-
-
-    feasibility = evaluate_trade_feasibility(
-        direction=direction,
-        entry_price=expected_entry_price,
-        proposed_target=expected_target,
-        stop_loss=expected_stop_loss,
-        technicals=technicals,
-    )
-    technicals["trade_feasibility"] = feasibility
-    option_summary["trade_feasibility"] = feasibility
-
-    if not feasibility.get("allowed"):
-        llm_decision = {
-            "execute_trade": False,
-            "decision": "NO_TRADE",
-            "confidence": "HIGH",
-            "target_price": None,
-            "stop_loss_price": None,
-            "reason": "Entry feasibility rejected: " + "; ".join(feasibility.get("reasons", [])),
-        }
-        record_analysis(symbol, option_summary, technicals, llm_decision)
-        log(f"{symbol} no trade: {llm_decision['reason']} feasibility={feasibility}")
-        return
-
-    expected_target = float(feasibility["adjusted_target_price"])
-    option_summary["target_price"] = expected_target
-
-    llm_decision = get_llm_decision(symbol, option_summary, technicals)
-    record_analysis(symbol, option_summary, technicals, llm_decision)
-
-    log(
-        f"{symbol} analysis: option={option_summary} "
-        f"2h={technicals.get('two_hour')} "
-        f"15m={technicals.get('fifteen_min')} "
-        f"5m={technicals.get('five_min')} "
-        f"weighted={weighted_score} "
-        f"llm={llm_decision} "
-        f"atm_option_flow={technicals.get('atm_option_flow')} "
-        f"institutional_flow={technicals.get('institutional_flow')} "
+    qualified = [item for item in candidates if item and item.get("allowed")]
+    ordered = [preferred] + [item for item in qualified if item is not preferred]
+    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    check_short_margin = live or (
+        os.getenv("CHECK_SHORT_MARGIN_IN_DRY_RUN", "false").lower() == "true"
     )
 
-    if not llm_decision.get("execute_trade"):
-        log(f"{symbol} no trade: LLM/rule decision rejected trade. reason={llm_decision.get('reason')}")
-        return
-
-    if llm_decision.get("decision") != direction:
-        log(
-            f"{symbol} no trade: LLM decision {llm_decision.get('decision')} "
-            f"does not match option-chain direction {direction}."
+    for chosen in ordered:
+        transaction_type = chosen["transaction_type"]
+        instrument = chosen["instrument"]
+        quantity = order_quantity_for(
+            symbol,
+            instrument,
+            chosen["entry_price"],
+            chosen["stop_loss_price"],
+            transaction_type=transaction_type,
         )
-        return
+        if quantity <= 0:
+            log(
+                f"{symbol} {transaction_type} structure skipped: one lot exceeds "
+                "the configured per-trade risk budget."
+            )
+            continue
 
-    llm_target = llm_decision.get("target_price")
-    llm_stop_loss = llm_decision.get("stop_loss_price")
-    if llm_target is not None or llm_stop_loss is not None:
-        log(
-            f"{symbol} LLM price output is advisory only; deterministic risk levels retained. "
-            f"llm_target={llm_target} llm_stop={llm_stop_loss} "
-            f"target={expected_target} stop={expected_stop_loss}"
+        if transaction_type == "SELL" and check_short_margin:
+            try:
+                margin = validate_short_margin(
+                    instrument,
+                    quantity,
+                    chosen["entry_price"],
+                )
+            except Exception as error:
+                log(
+                    f"{symbol} SELL structure skipped: margin validation failed: {error}; "
+                    "considering the alternate qualified structure."
+                )
+                continue
+            chosen["short_margin_check"] = margin
+            log(f"{symbol} SELL candidate margin check: {margin}")
+            if not margin.get("allowed"):
+                log(
+                    f"{symbol} SELL structure skipped: insufficient buffered margin; "
+                    "considering the alternate qualified structure."
+                )
+                continue
+
+        option_summary = chosen["option_summary"]
+        technicals = chosen["technicals"]
+        llm_decision = get_llm_decision(symbol, option_summary, technicals)
+        record_analysis(symbol, option_summary, technicals, llm_decision)
+        if not llm_decision.get("execute_trade") or llm_decision.get("decision") != direction:
+            log(
+                f"{symbol} {transaction_type} structure rejected by LLM/rules: "
+                f"{llm_decision.get('reason')}; considering alternate structure."
+            )
+            continue
+
+        chosen.update(
+            {
+                "symbol": symbol,
+                "direction": direction,
+                "confidence": confidence,
+                "signal_score": score,
+                "risk_reason": risk_reason,
+                "risk_mode": risk_mode,
+                "llm_decision": llm_decision,
+            }
         )
+        return chosen
 
-    if expected_target <= float(expected_entry_price) or expected_stop_loss >= float(expected_entry_price):
-        log(
-            f"{symbol} no trade: invalid target/stop from LLM. "
-            f"entry={expected_entry_price} target={expected_target} stop={expected_stop_loss}"
-        )
-        return
+    log(f"{symbol} no trade: every qualified BUY/SELL structure was rejected.")
+    return False
 
 
-    order_quantity = order_quantity_for(
+def execute_selected_candidate(chosen):
+    symbol = chosen["symbol"]
+    direction = chosen["direction"]
+    confidence = chosen["confidence"]
+    score = chosen["signal_score"]
+    risk_reason = chosen.get("risk_reason")
+    risk_mode = chosen.get("risk_mode")
+    transaction_type = chosen["transaction_type"]
+    instrument = chosen["instrument"]
+    entry_price = chosen["entry_price"]
+    target = chosen["target_price"]
+    stop = chosen["stop_loss_price"]
+    quantity = order_quantity_for(
         symbol,
         instrument,
-        entry_price=expected_entry_price,
-        stop_loss_price=expected_stop_loss,
+        entry_price,
+        stop,
+        transaction_type=transaction_type,
     )
-    if order_quantity <= 0:
-        risk_per_lot = (
-            (float(expected_entry_price) - float(expected_stop_loss))
-            * int(instrument["lot_size"])
-        )
-        log(
-            f"{symbol} no trade: one lot risks approximately {risk_per_lot:.2f}, "
-            f"above per-trade budget {max_risk_per_trade(symbol):.2f}"
-        )
-        return
+    if quantity <= 0:
+        log(f"{symbol} no trade: one lot exceeds the configured per-trade risk budget.")
+        return False
 
-    actual_lots = order_quantity // int(instrument["lot_size"])
+    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    if transaction_type == "SELL" and live:
+        margin = validate_short_margin(instrument, quantity, entry_price)
+        log(f"{symbol} short margin check: {margin}")
+        if not margin["allowed"]:
+            log(f"{symbol} no trade: insufficient buffered margin for naked option sell.")
+            return False
 
     log(
-        f"{symbol} prepared MARKET BUY: {instrument['trading_symbol']} qty={order_quantity} "
-        f"lots={actual_lots}/{lot_multiplier_for(symbol)} risk_budget={max_risk_per_trade(symbol):.2f} "
-        f"expected_entry={expected_entry_price} expected_target={expected_target} "
-        f"expected_stop_loss={expected_stop_loss} live={live}"
+        f"{symbol} selected {transaction_type}: {instrument['trading_symbol']} qty={quantity} "
+        f"entry={entry_price} target={target} stop={stop} live={live}"
     )
-
-    risk_reason, risk_mode = risk_limit_mode()
-
     if risk_mode == "paper":
         log(
-            f"{symbol} PAPER ONLY after daily risk limit: "
-            f"reason={risk_reason} today_pnl={today_realized_pnl()} "
-            f"profit_target={daily_profit_target()} max_loss={daily_max_loss()} "
-            f"would_buy={instrument['trading_symbol']} qty={order_quantity} "
-            f"entry={expected_entry_price} target={expected_target} stop_loss={expected_stop_loss}"
+            f"{symbol} PAPER ONLY after daily risk limit: reason={risk_reason} "
+            f"would_{transaction_type.lower()}={instrument['trading_symbol']} qty={quantity} "
+            f"entry={entry_price} target={target} stop_loss={stop}"
         )
-        return
-
+        return True
     if not live:
-        log(f"{symbol} DRY RUN ONLY. Set ENABLE_LIVE_TRADING=true in .env to place real orders.")
-        return
-    
+        log(f"{symbol} DRY RUN ONLY: would {transaction_type} one lot.")
+        return True
 
-    result, payload = place_market_order(
-        instrument=instrument,
-        transaction_type="BUY",
-        quantity=order_quantity,
-    )
-
+    result, payload = place_market_order(instrument, transaction_type, quantity)
     order_id = result.get("data", {}).get("order_id")
     if not order_id:
-        raise RuntimeError(f"{symbol} market BUY placed but no order_id returned: {result}")
-
-    count = increment_trade_count(symbol)
-    log(f"{symbol} daily trade count updated: {count}")
-    log(f"{symbol} MARKET BUY placed: order_id={order_id} payload={payload}")
-
-    order_details = wait_for_order_complete(order_id)
-    order_status = str(order_details.get("status", "")).lower()
-
-    if order_status not in {"complete", "completed", "traded"}:
+        raise RuntimeError(f"{symbol} {transaction_type} returned no order_id: {result}")
+    increment_trade_count(symbol)
+    log(f"{symbol} MARKET {transaction_type} placed: order_id={order_id} payload={payload}")
+    details = wait_for_order_complete(order_id)
+    if not order_is_complete(details):
         write_state(symbol, {
             "date": now_ist().strftime("%Y-%m-%d"),
             "symbol": symbol,
-            "buy_order_id": order_id,
+            "entry_order_id": order_id,
+            "entry_transaction_type": transaction_type,
             "instrument_key": instrument["instrument_key"],
             "trading_symbol": instrument["trading_symbol"],
-            "quantity": int(order_quantity),
+            "quantity": int(quantity),
             "lot_size": int(instrument["lot_size"]),
-            "lot_multiplier": actual_lots,
-            "target_price": expected_target,
-            "stop_loss_price": expected_stop_loss,
-            "target_percent": selected_target_percent,
-            "stop_percent": selected_stop_percent,
+            "lot_multiplier": 1,
+            "target_price": target,
+            "stop_loss_price": stop,
+            "target_percent": chosen["target_percent"],
+            "stop_percent": chosen["stop_percent"],
             "direction": direction,
             "confidence": confidence,
             "score": score,
-            "status": "BUY_PLACED_NOT_COMPLETE",
+            "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
             "created_at": now_ist().isoformat(),
         })
-        log(f"{symbol} BUY order not complete yet. status={order_status}. Saved state.")
-        return
+        return True
 
-    position = find_matching_position(instrument["instrument_key"])
-    entry_price = position_avg_price(position) if position else None
-    entry_price = entry_price or to_float(order_details.get("average_price"))
-    entry_price = entry_price or expected_entry_price
-
+    position = find_matching_position_for_side(instrument["instrument_key"], transaction_type)
+    fill = position_avg_price(position, transaction_type) if position else None
+    fill = fill or to_float(details.get("average_price")) or entry_price
     save_open_position_state(
-        symbol=symbol,
-        order_id=order_id,
-        instrument=instrument,
-        direction=direction,
-        confidence=confidence,
-        score=score,
-        entry_price=entry_price,
-        quantity=order_quantity,
-        target_price=expected_target,
-        stop_loss_price=expected_stop_loss,
-        target_percent=selected_target_percent,
-        stop_percent=selected_stop_percent,
+        symbol, order_id, instrument, direction, confidence, score, fill, quantity,
+        target, stop, chosen["target_percent"], chosen["stop_percent"],
+        entry_transaction_type=transaction_type,
     )
+    if transaction_type == "SELL":
+        try:
+            arm_short_protective_stop(symbol, read_state(symbol))
+        except Exception as error:
+            log(f"{symbol} CRITICAL: protective stop failed; flattening short immediately: {error}")
+            emergency, emergency_payload = place_market_order(instrument, "BUY", quantity)
+            emergency_id = emergency.get("data", {}).get("order_id")
+            emergency_details = wait_for_order_complete(emergency_id) if emergency_id else {}
+            complete_exit(
+                symbol,
+                read_state(symbol),
+                emergency_details,
+                fill,
+                "PROTECTION_FAILURE",
+                emergency,
+                emergency_payload,
+            )
+            return True
     clear_reentry_guard(symbol)
+    return True
 
 
 def run_signal_check():
@@ -1624,10 +2009,64 @@ def run_signal_check():
         return
 
     for symbol in SYMBOLS:
+        state = read_state(symbol)
+        if state:
+            try:
+                handle_existing_state(symbol, state)
+            except Exception as error:
+                log(f"{symbol} existing-position check ERROR: {error}")
+
+    active = [symbol for symbol in SYMBOLS if read_state(symbol).get("instrument_key")]
+    if active:
+        log(f"Global one-position rule: active bot position exists in {active[0]}; no new index entry.")
+        return
+
+    try:
+        untracked_index_positions = [
+            position
+            for position in get_open_positions()
+            if position_quantity(position) != 0
+            and any(
+                name in str(position.get("trading_symbol") or position.get("tradingsymbol") or "").upper()
+                for name in SYMBOLS
+            )
+        ]
+        if untracked_index_positions:
+            log("Global one-position rule: an untracked NIFTY/BANKNIFTY broker position exists; no bot entry.")
+            return
+    except Exception as error:
+        log(f"Global broker-position precheck failed; no new entry for safety: {error}")
+        return
+
+    qualified = []
+    for symbol in SYMBOLS:
         try:
-            process_symbol(symbol)
+            candidate = evaluate_symbol_buy_or_sell(symbol)
+            if candidate:
+                qualified.append(candidate)
         except Exception as e:
             log(f"{symbol} ERROR: {e}")
+
+    if not qualified:
+        log("Global selection: no qualified NIFTY or BANKNIFTY BUY/SELL structure.")
+        return
+
+    chosen = max(
+        qualified,
+        key=lambda item: (
+            float(item.get("weighted", {}).get("score") or 0),
+            1 if item.get("transaction_type") == "BUY" else 0,
+        ),
+    )
+    choices = [
+        (item["symbol"], item["transaction_type"], item.get("weighted", {}).get("score"))
+        for item in qualified
+    ]
+    log(
+        f"Global selection: {chosen['symbol']} {chosen['transaction_type']} chosen at "
+        f"score={chosen.get('weighted', {}).get('score')} from {choices}"
+    )
+    execute_selected_candidate(chosen)
 
 
 def main():

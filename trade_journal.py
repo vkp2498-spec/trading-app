@@ -12,6 +12,8 @@ COLUMNS = [
     "symbol",
     "trading_symbol",
     "direction",
+    "transaction_type",
+    "position_side",
     "quantity",
     "entry_time",
     "entry_price",
@@ -32,6 +34,21 @@ def ensure_trade_history_file():
         with TRADE_HISTORY_FILE.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=COLUMNS)
             writer.writeheader()
+        return
+
+    with TRADE_HISTORY_FILE.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        rows = list(reader)
+
+    if existing_fields != COLUMNS:
+        migrated = [{column: row.get(column, "") for column in COLUMNS} for row in rows]
+        temporary = TRADE_HISTORY_FILE.with_suffix(".tmp")
+        with temporary.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer.writeheader()
+            writer.writerows(migrated)
+        temporary.replace(TRADE_HISTORY_FILE)
 
 
 def record_closed_trade(state, exit_price, exit_reason):
@@ -40,13 +57,24 @@ def record_closed_trade(state, exit_price, exit_reason):
     qty = int(float(state.get("quantity") or 0))
     entry_price = float(state.get("entry_price") or 0)
     exit_price = float(exit_price or 0)
-    gross_pnl = round((exit_price - entry_price) * qty, 2)
+    transaction_type = str(state.get("entry_transaction_type") or "BUY").upper()
+    pnl_per_unit = (
+        entry_price - exit_price
+        if transaction_type == "SELL"
+        else exit_price - entry_price
+    )
+    gross_pnl = round(pnl_per_unit * qty, 2)
 
     row = {
         "trade_date": now_ist().strftime("%Y-%m-%d"),
         "symbol": state.get("symbol", ""),
         "trading_symbol": state.get("trading_symbol", ""),
         "direction": state.get("direction", ""),
+        "transaction_type": transaction_type,
+        "position_side": state.get(
+            "position_side",
+            "SHORT_OPTION" if transaction_type == "SELL" else "LONG_OPTION",
+        ),
         "quantity": qty,
         "entry_time": state.get("created_at", ""),
         "entry_price": entry_price,
