@@ -366,6 +366,13 @@ def normalize_trade(row: dict) -> dict:
             "",
         ),
         "direction": row.get("direction", ""),
+        "transactionType": str(
+            row.get("transaction_type") or "BUY"
+        ).upper(),
+        "positionSide": row.get(
+            "position_side",
+            "",
+        ),
         "quantity": safe_int(row.get("quantity")),
         "entryTime": row.get("entry_time", ""),
         "entryPrice": safe_float(
@@ -630,13 +637,15 @@ def broker_position_ltp(
 
 def broker_average_price(
     position: dict,
+    entry_transaction_type: str = "BUY",
 ) -> float | None:
-    for key in [
-        "average_price",
-        "buy_price",
-        "day_buy_price",
-        "avg_price",
-    ]:
+    side_specific_keys = (
+        ["sell_price", "day_sell_price"]
+        if str(entry_transaction_type).upper() == "SELL"
+        else ["buy_price", "day_buy_price"]
+    )
+
+    for key in ["average_price", *side_specific_keys, "avg_price"]:
         value = position.get(key)
 
         if value is not None:
@@ -668,19 +677,21 @@ def calculate_target_progress(
     entry_price: float,
     last_price: float | None,
     target_price: float,
+    entry_transaction_type: str = "BUY",
 ) -> float | None:
+    is_short = str(entry_transaction_type).upper() == "SELL"
     if (
         last_price is None
         or entry_price <= 0
-        or target_price <= entry_price
+        or target_price <= 0
+        or (is_short and target_price >= entry_price)
+        or (not is_short and target_price <= entry_price)
     ):
         return None
 
-    progress = (
-        (last_price - entry_price)
-        / (target_price - entry_price)
-        * 100
-    )
+    achieved = entry_price - last_price if is_short else last_price - entry_price
+    planned = entry_price - target_price if is_short else target_price - entry_price
+    progress = achieved / planned * 100
 
     return round(progress, 1)
 
@@ -712,6 +723,11 @@ def build_live_positions() -> dict:
         quantity = safe_int(
             state.get("quantity")
         )
+        entry_transaction_type = str(
+            state.get("entry_transaction_type")
+            or "BUY"
+        ).upper()
+        is_short = entry_transaction_type == "SELL"
 
         broker_quantity = 0
         entry_price = safe_float(
@@ -732,7 +748,8 @@ def build_live_positions() -> dict:
             )
 
             broker_entry = broker_average_price(
-                broker_position
+                broker_position,
+                entry_transaction_type,
             )
 
             if broker_entry is not None:
@@ -747,7 +764,9 @@ def build_live_positions() -> dict:
         )
 
         highest_price = safe_float(
-            state.get("highest_ltp"),
+            state.get("lowest_ltp")
+            if is_short
+            else state.get("highest_ltp"),
             entry_price,
         )
 
@@ -760,7 +779,11 @@ def build_live_positions() -> dict:
             and entry_price > 0
         ):
             live_pnl = round(
-                (last_price - entry_price)
+                (
+                    entry_price - last_price
+                    if is_short
+                    else last_price - entry_price
+                )
                 * quantity,
                 2,
             )
@@ -770,8 +793,12 @@ def build_live_positions() -> dict:
             and stop_loss_price > 0
         ):
             risk_to_stop = round(
-                (last_price - stop_loss_price)
-                * quantity,
+                max(
+                    stop_loss_price - last_price
+                    if is_short
+                    else last_price - stop_loss_price,
+                    0,
+                ) * quantity,
                 2,
             )
 
@@ -780,8 +807,12 @@ def build_live_positions() -> dict:
             and target_price > 0
         ):
             reward_left = round(
-                (target_price - last_price)
-                * quantity,
+                max(
+                    last_price - target_price
+                    if is_short
+                    else target_price - last_price,
+                    0,
+                ) * quantity,
                 2,
             )
 
@@ -795,6 +826,11 @@ def build_live_positions() -> dict:
                 "direction": state.get(
                     "direction",
                     "BUY",
+                ),
+                "transactionType": entry_transaction_type,
+                "positionSide": state.get(
+                    "position_side",
+                    "SHORT_OPTION" if is_short else "LONG_OPTION",
                 ),
                 "status": state.get(
                     "status",
@@ -817,6 +853,7 @@ def build_live_positions() -> dict:
                         entry_price,
                         last_price,
                         target_price,
+                        entry_transaction_type,
                     )
                 ),
                 "riskToStop": risk_to_stop,

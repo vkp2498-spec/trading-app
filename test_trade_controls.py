@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import tempfile
 import types
@@ -42,12 +43,57 @@ sys.modules.setdefault("jwt", jwt_stub)
 
 import trade_bot
 import apns_push
+import dashboard_data
 import trade_journal
 from counterfactual_replay import simulate_trade
 from signal_score import weighted_alignment_score
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_mobile_dashboard_calculates_short_option_metrics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = {
+                "instrument_key": "NSE_FO|SHORT_TEST",
+                "trading_symbol": "NIFTY TEST PE",
+                "direction": "BULLISH",
+                "entry_transaction_type": "SELL",
+                "position_side": "SHORT_OPTION",
+                "quantity": 65,
+                "entry_price": 100,
+                "target_price": 80,
+                "stop_loss_price": 110,
+                "lowest_ltp": 88,
+                "status": "POSITION_OPEN",
+            }
+            Path(temp_dir, "trade_state_NIFTY.json").write_text(
+                json.dumps(state)
+            )
+
+            broker_positions = [{
+                "instrument_token": "NSE_FO|SHORT_TEST",
+                "quantity": -65,
+                "sell_price": 100,
+                "last_price": 90,
+            }]
+
+            with (
+                patch.object(dashboard_data, "BASE_DIR", Path(temp_dir)),
+                patch.object(
+                    dashboard_data,
+                    "fetch_upstox_positions",
+                    return_value=(broker_positions, None),
+                ),
+            ):
+                live = dashboard_data.build_live_positions()
+
+        position = live["positions"][0]
+        self.assertEqual(position["transactionType"], "SELL")
+        self.assertEqual(position["positionSide"], "SHORT_OPTION")
+        self.assertEqual(position["livePnL"], 650)
+        self.assertEqual(position["targetProgress"], 50)
+        self.assertEqual(position["riskToStop"], 1300)
+        self.assertEqual(position["rewardLeft"], 650)
+
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {
             "symbol": "NIFTY",

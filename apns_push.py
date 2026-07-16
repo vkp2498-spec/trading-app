@@ -281,7 +281,7 @@ def send_trade_closed_notification(journal_row: dict[str, Any]) -> dict[str, int
 
 
 def send_trade_entered_notification(position_state: dict[str, Any]) -> dict[str, int]:
-    """Notify only after a filled BUY has been saved as an open position."""
+    """Notify only after a filled BUY or SELL is saved as an open position."""
     if not apns_is_configured() or registered_device_count() == 0:
         return {"sent": 0, "failed": 0}
 
