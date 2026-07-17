@@ -1329,6 +1329,18 @@ def handle_existing_state(symbol, state, verbose=True):
     if needs_broker_stop and protective_stop_filled(symbol, state):
         return True
 
+    # A stop cancelled in the broker UI can remain in the local state file.
+    # Remove that stale id so the guarded arming path creates one replacement.
+    if needs_broker_stop and state.get("protective_stop_order_id"):
+        stop_details = get_order_details(state["protective_stop_order_id"])
+        if order_is_rejected(stop_details):
+            log(
+                f"{symbol} protective stop is {order_status(stop_details)}; "
+                "clearing stale stop id before re-arming"
+            )
+            state.pop("protective_stop_order_id", None)
+            write_state(symbol, state)
+
     if state.get("status") == "EXIT_PENDING":
         if monitor_pending_exit(symbol, state):
             return True
