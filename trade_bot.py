@@ -10,6 +10,12 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import csv
 from copy import deepcopy
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows development fallback
+    fcntl = None
 
 from analysis_journal import record_analysis
 from institutional_flow import (
@@ -332,6 +338,20 @@ def write_state(symbol, state):
 
 def clear_state(symbol):
     write_state(symbol, {})
+
+
+@contextmanager
+def protective_stop_lock(symbol):
+    """Serialize broker-stop creation across entry and monitor processes."""
+    lock_path = BASE_DIR / f".{symbol.lower()}_protective_stop.lock"
+    with lock_path.open("a+") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def read_reentry_guard(symbol):
@@ -1223,6 +1243,32 @@ def arm_protective_stop(symbol, state):
     return state
 
 
+def ensure_protective_stop(symbol, state):
+    """Arm exactly one broker stop even when entry and monitor overlap."""
+    if state.get("protective_stop_order_id"):
+        return state
+
+    with protective_stop_lock(symbol):
+        fresh_state = read_state(symbol)
+        if fresh_state.get("protective_stop_order_id"):
+            return fresh_state
+
+        # A pending marker without an order id is stale once this lock is
+        # acquired, because any active arming process would still hold it.
+        fresh_state["protective_stop_pending"] = True
+        write_state(symbol, fresh_state)
+        try:
+            armed_state = arm_protective_stop(symbol, fresh_state)
+            armed_state.pop("protective_stop_pending", None)
+            write_state(symbol, armed_state)
+            return armed_state
+        except Exception:
+            failed_state = read_state(symbol)
+            failed_state.pop("protective_stop_pending", None)
+            write_state(symbol, failed_state)
+            raise
+
+
 def arm_short_protective_stop(symbol, state):
     """Backward-compatible name used by existing option-selling paths."""
     return arm_protective_stop(symbol, state)
@@ -1294,7 +1340,7 @@ def handle_existing_state(symbol, state, verbose=True):
         qty = abs(position_quantity(position))
         if needs_broker_stop and not state.get("protective_stop_order_id"):
             try:
-                state = arm_protective_stop(symbol, state)
+                state = ensure_protective_stop(symbol, state)
             except Exception as error:
                 log(f"{symbol} CRITICAL: position has no broker stop; flattening now: {error}")
                 instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
@@ -1401,7 +1447,7 @@ def handle_existing_state(symbol, state, verbose=True):
             state = read_state(symbol)
             if needs_broker_stop:
                 try:
-                    arm_protective_stop(symbol, state)
+                    ensure_protective_stop(symbol, state)
                 except Exception as error:
                     log(f"{symbol} CRITICAL: delayed fill has no broker stop; flattening: {error}")
                     result, payload = place_market_order(instrument, exit_transaction, quantity)
@@ -2243,7 +2289,7 @@ def execute_stock_future_candidate(chosen):
         underlying_symbol=chosen["underlying_symbol"],
     )
     try:
-        arm_protective_stop(symbol, read_state(symbol))
+        ensure_protective_stop(symbol, read_state(symbol))
     except Exception as error:
         log(f"STOCK_FUTURE CRITICAL: protective stop failed; flattening immediately: {error}")
         exit_transaction = "SELL" if transaction_type == "BUY" else "BUY"
