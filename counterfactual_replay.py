@@ -23,8 +23,8 @@ from trade_bot import (
     evaluate_trade_feasibility,
     find_index_option_instrument,
     load_env,
-    lot_multiplier_for,
-    max_risk_per_trade,
+    max_lots_per_entry,
+    option_capital_per_entry,
     option_levels_from_fill,
     order_quantity_for,
     risk_percentages,
@@ -456,7 +456,7 @@ def replay_day(date_text):
                     **base,
                     "decision": "SKIP",
                     "reason": (
-                        f"One lot exceeds risk budget {max_risk_per_trade(symbol):.2f}"
+                        "Configured option capital is insufficient for one whole lot"
                     ),
                 }
             )
@@ -488,8 +488,8 @@ def replay_day(date_text):
             "initial_stop_loss_price": stop,
             "quantity": quantity,
             "lots": quantity // int(instrument["lot_size"]),
-            "configured_max_lots": lot_multiplier_for(symbol),
-            "risk_budget": round(max_risk_per_trade(symbol), 2),
+            "configured_max_lots": max_lots_per_entry(),
+            "option_capital_per_entry": option_capital_per_entry(),
             "revised_weighted_score": qualified["weighted_score"],
             "revised_weighted_grade": qualified["weighted_grade"],
             **outcome,

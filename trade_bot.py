@@ -39,7 +39,6 @@ import urllib3.util.connection as urllib3_cn
 from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from trade_journal import record_closed_trade
 
-from whatsapp_alerts import send_trade_closed_alert
 from apns_push import send_trade_closed_notification, send_trade_entered_notification
 
 
@@ -100,6 +99,7 @@ DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 30
+DEFAULT_OPTION_CAPITAL_PER_ENTRY = 1.0
 
 SYMBOL_CONFIG = {
     "NIFTY": {
@@ -689,28 +689,40 @@ def short_structure_allowed(direction, technicals, raw_flow, weighted_score):
         return False, f"sold-option volume ratio is below {minimum_volume:.2f}"
     return True, "sold option is weakening below VWAP with aligned 15M/5M direction"
 
-def lot_multiplier_for(symbol):
-    default_lots = int(DEFAULT_LOT_MULTIPLIERS.get(symbol, 1))
-    env_key = f"{symbol}_LOTS"
-    raw_value = os.getenv(env_key)
+def option_capital_per_entry():
+    """Return the capital allocation for one index-option entry.
 
-    if raw_value is None or not raw_value.strip():
-        return default_lots
-
+    A value of 1 is a sentinel for exactly one lot. Larger values are treated
+    as rupees and converted to whole lots using the expected option premium.
+    """
+    raw_value = os.getenv(
+        "OPTION_CAPITAL_PER_ENTRY",
+        str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
+    ).strip()
     try:
-        lots = int(raw_value.strip())
+        capital = float(raw_value)
     except ValueError as error:
         raise RuntimeError(
-            f"{env_key} must be a whole number greater than or equal to 1"
+            "OPTION_CAPITAL_PER_ENTRY must be 1 or a positive rupee amount"
         ) from error
 
-    if lots < 1:
+    if capital < 1:
         raise RuntimeError(
-            f"{env_key} must be greater than or equal to 1; received {lots}"
+            "OPTION_CAPITAL_PER_ENTRY must be 1 or greater"
         )
+    return capital
 
-    max_lots = max(to_int(os.getenv("MAX_LOTS_PER_ENTRY"), 1), 1)
-    return min(lots, max_lots)
+
+def max_lots_per_entry():
+    """Optional hard ceiling; zero means no additional lot ceiling."""
+    raw_value = os.getenv("MAX_LOTS_PER_ENTRY", "0").strip()
+    try:
+        maximum = int(raw_value)
+    except ValueError as error:
+        raise RuntimeError("MAX_LOTS_PER_ENTRY must be a whole number or 0") from error
+    if maximum < 0:
+        raise RuntimeError("MAX_LOTS_PER_ENTRY cannot be negative")
+    return maximum
 
 
 def order_quantity_for(
@@ -721,24 +733,24 @@ def order_quantity_for(
     transaction_type="BUY",
 ):
     lot_size = int(instrument["lot_size"])
-    configured_lots = lot_multiplier_for(symbol)
-    risk_budget = max_risk_per_trade(symbol)
+    capital = option_capital_per_entry()
 
-    if risk_budget <= 0 or entry_price is None or stop_loss_price is None:
-        return lot_size * configured_lots
-
-    risk_per_unit = (
-        float(stop_loss_price) - float(entry_price)
-        if str(transaction_type).upper() == "SELL"
-        else float(entry_price) - float(stop_loss_price)
-    )
-    if risk_per_unit <= 0:
+    # The only supported live entry is a long option BUY. Keep this guard so
+    # an accidental legacy caller cannot use this sizing for a short option.
+    if str(transaction_type).upper() != "BUY":
         return 0
 
-    risk_per_lot = risk_per_unit * lot_size
-    affordable_lots = int(risk_budget // risk_per_lot)
-    actual_lots = min(configured_lots, affordable_lots)
-    return lot_size * max(actual_lots, 0)
+    if capital == 1 or entry_price is None or float(entry_price) <= 0:
+        lots = 1
+    else:
+        value_per_lot = float(entry_price) * lot_size
+        lots = int(capital // value_per_lot)
+
+    maximum = max_lots_per_entry()
+    if maximum > 0:
+        lots = min(lots, maximum)
+
+    return lot_size * max(lots, 0)
 
 
 def place_market_order(instrument, transaction_type, quantity):
@@ -1184,7 +1196,6 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
 
     journal_row = record_closed_trade(state, exit_price, exit_reason)
     register_losing_exit_guard(symbol, state, journal_row, exit_reason)
-    send_trade_closed_alert(journal_row)
     send_apple_closed_trade_alert(journal_row)
     log(
         f"{symbol} {exit_reason} exit confirmed COMPLETE: result={result} "
@@ -2080,8 +2091,8 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         )
         if quantity <= 0:
             log(
-                f"{symbol} {transaction_type} structure skipped: one lot exceeds "
-                "the configured per-trade risk budget."
+                f"{symbol} {transaction_type} structure skipped: configured option "
+                "capital is insufficient for one whole lot."
             )
             continue
 
@@ -2136,7 +2147,7 @@ def execute_selected_candidate(chosen):
         transaction_type=transaction_type,
     )
     if quantity <= 0:
-        log(f"{symbol} no trade: one lot exceeds the configured per-trade risk budget.")
+        log(f"{symbol} no trade: configured option capital is insufficient for one whole lot.")
         return False
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"

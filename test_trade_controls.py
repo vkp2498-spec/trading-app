@@ -285,13 +285,12 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["adjusted_target_price"], 110)
         self.assertEqual(result["technical_reward_risk"], 1.25)
 
-    def test_risk_budget_caps_configured_lots(self):
+    def test_capital_allocation_rounds_down_to_whole_lots(self):
         with patch.dict(
             os.environ,
             {
-                "NIFTY_LOTS": "9",
-                "MAX_LOTS_PER_ENTRY": "1",
-                "MAX_RISK_PER_TRADE": "5000",
+                "OPTION_CAPITAL_PER_ENTRY": "350000",
+                "MAX_LOTS_PER_ENTRY": "0",
             },
             clear=False,
         ):
@@ -299,10 +298,23 @@ class TradeControlTests(unittest.TestCase):
                 "NIFTY",
                 {"lot_size": 65},
                 entry_price=159,
-                stop_loss_price=147,
             )
 
-        self.assertEqual(quantity, 65)
+        self.assertEqual(quantity, 2145)
+
+    def test_capital_value_one_means_one_lot(self):
+        with patch.dict(
+            os.environ,
+            {"OPTION_CAPITAL_PER_ENTRY": "1", "MAX_LOTS_PER_ENTRY": "0"},
+            clear=False,
+        ):
+            quantity = trade_bot.order_quantity_for(
+                "BANKNIFTY",
+                {"lot_size": 30},
+                entry_price=900,
+            )
+
+        self.assertEqual(quantity, 30)
 
     def test_short_levels_and_risk_are_side_aware(self):
         target, stop = trade_bot.option_levels_from_fill(
@@ -315,7 +327,7 @@ class TradeControlTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"BANKNIFTY_LOTS": "5", "MAX_LOTS_PER_ENTRY": "1", "MAX_RISK_PER_TRADE": "5000"},
+            {"OPTION_CAPITAL_PER_ENTRY": "350000", "MAX_LOTS_PER_ENTRY": "0"},
             clear=False,
         ):
             quantity = trade_bot.order_quantity_for(
@@ -325,7 +337,7 @@ class TradeControlTests(unittest.TestCase):
                 stop_loss_price=108,
                 transaction_type="SELL",
             )
-        self.assertEqual(quantity, 30)
+        self.assertEqual(quantity, 0)
 
     def test_short_option_flow_is_normalized_for_position_scoring(self):
         normalized = trade_bot.normalize_option_flow_for_position(
