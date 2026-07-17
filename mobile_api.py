@@ -19,6 +19,8 @@ from apns_push import unregister_device
 from dashboard_data import build_health_snapshot
 from dashboard_data import build_trade_performance
 from dashboard_data import load_env
+from trading_config import get_config
+from trading_config import select_profile
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -58,6 +60,10 @@ bearer_scheme = HTTPBearer(
 
 class NotificationDevice(BaseModel):
     deviceToken: str
+
+
+class CapitalProfileSelection(BaseModel):
+    profileId: str
 
 
 def require_mobile_token(
@@ -174,6 +180,35 @@ def watch_summary():
         "latestTrade": latest_trade,
         "todayPnL": performance.get("today", {}).get("closedPnL", 0.0),
     }
+
+
+@app.get(
+    "/api/v1/trading-config",
+    dependencies=[Depends(require_mobile_token)],
+)
+def trading_config():
+    """Return the active capital profile and the current selection window."""
+    return get_config()
+
+
+@app.post(
+    "/api/v1/trading-config",
+    dependencies=[Depends(require_mobile_token)],
+)
+def update_trading_config(selection: CapitalProfileSelection):
+    """Select the next trading profile during the 09:00-09:15 IST window."""
+    try:
+        return select_profile(selection.profileId)
+    except PermissionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(error),
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(error),
+        ) from error
 
 
 @app.post(

@@ -38,6 +38,7 @@ import urllib3.util.connection as urllib3_cn
 
 from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from trade_journal import record_closed_trade
+from trading_config import active_value
 
 from apns_push import send_trade_closed_notification, send_trade_entered_notification
 
@@ -548,7 +549,8 @@ def bot_unrealized_pnl():
 
 
 def daily_profit_target():
-    return to_float(os.getenv("DAILY_PROFIT_TARGET"), 0)
+    fallback = to_float(os.getenv("DAILY_PROFIT_TARGET"), 0)
+    return to_float(active_value("dailyProfitTarget", fallback), fallback)
 
 
 def after_profit_target_mode():
@@ -565,7 +567,8 @@ def daily_profit_target_reached():
 
 
 def daily_max_loss():
-    return to_float(os.getenv("DAILY_MAX_LOSS"), 0)
+    fallback = to_float(os.getenv("DAILY_MAX_LOSS"), 0)
+    return to_float(active_value("dailyMaxLoss", fallback), fallback)
 
 
 def max_risk_per_trade(symbol):
@@ -739,10 +742,11 @@ def option_capital_per_entry():
     A value of 1 is a sentinel for exactly one lot. Larger values are treated
     as rupees and converted to whole lots using the expected option premium.
     """
-    raw_value = os.getenv(
+    fallback = os.getenv(
         "OPTION_CAPITAL_PER_ENTRY",
         str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
     ).strip()
+    raw_value = str(active_value("optionCapitalPerEntry", fallback)).strip()
     try:
         capital = float(raw_value)
     except ValueError as error:
