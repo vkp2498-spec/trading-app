@@ -369,7 +369,15 @@ def symbol_pnl(trades: list[dict]) -> dict:
     }
 
     for trade in trades:
-        symbol = trade["symbol"]
+        symbol = str(
+            trade.get("underlyingSymbol")
+            or trade.get("symbol")
+            or ""
+        ).upper()
+        if "BANKNIFTY" in symbol:
+            symbol = "BANKNIFTY"
+        elif "NIFTY" in symbol:
+            symbol = "NIFTY"
 
         if symbol not in totals:
             totals[symbol] = 0.0
@@ -594,11 +602,11 @@ def build_equity_curve(
     return points
 
 
-def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int]:
+def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, float], dict[str, int]]:
     """Fetch today's realized gross P&L directly from Upstox."""
     headers = upstox_headers()
     if not headers:
-        return None, "UPSTOX_ACCESS_TOKEN is not configured", 0
+        return None, "UPSTOX_ACCESS_TOKEN is not configured", 0, {}, {}
 
     today = datetime.now(IST)
     date_text = today.strftime("%d-%m-%Y")
@@ -623,12 +631,12 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int]:
             timeout=12,
         )
         if response.status_code >= 300:
-            return None, f"Upstox P&L request failed with status {response.status_code}", 0
+            return None, f"Upstox P&L request failed with status {response.status_code}", 0, {}, {}
 
         payload = response.json()
         rows = payload.get("data", [])
         if not isinstance(rows, list):
-            return None, "Upstox P&L response contained invalid data", 0
+            return None, "Upstox P&L response contained invalid data", 0, {}, {}
 
         gross_pnl = sum(
             safe_float(row.get("sell_amount"))
@@ -636,9 +644,24 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int]:
             for row in rows
             if isinstance(row, dict)
         )
-        return round(gross_pnl, 2), None, len(rows)
+        symbol_totals = {symbol: 0.0 for symbol in SYMBOLS}
+        symbol_counts = {symbol: 0 for symbol in SYMBOLS}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("scrip_name") or "").upper()
+            symbol = "BANKNIFTY" if "BANKNIFTY" in name else "NIFTY"
+            symbol_counts[symbol] += 1
+            symbol_totals[symbol] += (
+                safe_float(row.get("sell_amount"))
+                - safe_float(row.get("buy_amount"))
+            )
+        return round(gross_pnl, 2), None, len(rows), {
+            symbol: round(value, 2)
+            for symbol, value in symbol_totals.items()
+        }, symbol_counts
     except (requests.RequestException, ValueError, TypeError) as error:
-        return None, f"Upstox P&L request failed: {type(error).__name__}", 0
+        return None, f"Upstox P&L request failed: {type(error).__name__}", 0, {}, {}
 
 
 def build_trade_performance() -> dict:
@@ -659,7 +682,7 @@ def build_trade_performance() -> dict:
         key=lambda trade: trade["exitTime"],
         reverse=True,
     )[:20]
-    upstox_today_pnl, upstox_today_error, upstox_today_count = fetch_upstox_today_pnl()
+    upstox_today_pnl, upstox_today_error, upstox_today_count, upstox_symbol_pnl, upstox_symbol_counts = fetch_upstox_today_pnl()
     today_closed_pnl = upstox_today_pnl if upstox_today_pnl is not None else 0.0
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
@@ -674,9 +697,11 @@ def build_trade_performance() -> dict:
             "winRate": calculate_win_rate(
                 today_trades
             ),
-            "symbolPnL": symbol_pnl(
-                today_trades
-            ),
+            "symbolPnL": upstox_symbol_pnl if upstox_today_pnl is not None else symbol_pnl(today_trades),
+            "symbolTrades": upstox_symbol_counts if upstox_today_pnl is not None else {
+                symbol: sum(1 for trade in today_trades if trade.get("underlyingSymbol", "").upper() == symbol)
+                for symbol in SYMBOLS
+            },
             "categoryPnL": today_categories,
         },
         "cumulative": {
