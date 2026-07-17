@@ -594,11 +594,11 @@ def build_equity_curve(
     return points
 
 
-def fetch_upstox_today_pnl() -> tuple[float | None, str | None]:
+def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int]:
     """Fetch today's realized gross P&L directly from Upstox."""
     headers = upstox_headers()
     if not headers:
-        return None, "UPSTOX_ACCESS_TOKEN is not configured"
+        return None, "UPSTOX_ACCESS_TOKEN is not configured", 0
 
     today = datetime.now(IST)
     date_text = today.strftime("%d-%m-%Y")
@@ -623,12 +623,12 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None]:
             timeout=12,
         )
         if response.status_code >= 300:
-            return None, f"Upstox P&L request failed with status {response.status_code}"
+            return None, f"Upstox P&L request failed with status {response.status_code}", 0
 
         payload = response.json()
         rows = payload.get("data", [])
         if not isinstance(rows, list):
-            return None, "Upstox P&L response contained invalid data"
+            return None, "Upstox P&L response contained invalid data", 0
 
         gross_pnl = sum(
             safe_float(row.get("sell_amount"))
@@ -636,16 +636,13 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None]:
             for row in rows
             if isinstance(row, dict)
         )
-        return round(gross_pnl, 2), None
+        return round(gross_pnl, 2), None, len(rows)
     except (requests.RequestException, ValueError, TypeError) as error:
-        return None, f"Upstox P&L request failed: {type(error).__name__}"
+        return None, f"Upstox P&L request failed: {type(error).__name__}", 0
 
 
 def build_trade_performance() -> dict:
     trades = read_trade_history()
-
-    if not trades:
-        return empty_trade_performance()
 
     today_text = datetime.now(
         IST
@@ -662,7 +659,7 @@ def build_trade_performance() -> dict:
         key=lambda trade: trade["exitTime"],
         reverse=True,
     )[:20]
-    upstox_today_pnl, upstox_today_error = fetch_upstox_today_pnl()
+    upstox_today_pnl, upstox_today_error, upstox_today_count = fetch_upstox_today_pnl()
     today_closed_pnl = upstox_today_pnl if upstox_today_pnl is not None else 0.0
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
@@ -670,7 +667,7 @@ def build_trade_performance() -> dict:
 
     return {
         "today": {
-            "closedTrades": len(today_trades),
+            "closedTrades": upstox_today_count if upstox_today_pnl is not None else len(today_trades),
             "closedPnL": today_closed_pnl,
             "closedPnLSource": "UPSTOX" if upstox_today_pnl is not None else "UNAVAILABLE",
             "closedPnLError": upstox_today_error,
