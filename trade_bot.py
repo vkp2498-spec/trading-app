@@ -2075,7 +2075,7 @@ def execute_stock_future_candidate(chosen):
     log(
         f"STOCK_FUTURE selected: {transaction_type} {instrument['trading_symbol']} "
         f"qty={quantity} entry={expected_entry} target={target} stop={stop} "
-        f"score={chosen['signal_score']} live={live}"
+        f"score={chosen['signal_score']} strategy={chosen.get('strategy', 'TREND_FOLLOWING')} live={live}"
     )
     if risk_mode == "paper":
         log(
@@ -2211,6 +2211,7 @@ def run_stock_futures_fallback():
             "trading_symbol": candidate["instrument"]["trading_symbol"],
             "direction": candidate["direction"],
             "score": candidate["signal_score"],
+            "strategy": candidate.get("strategy", "TREND_FOLLOWING"),
             "estimated_risk": round(risk, 2),
         }
         if risk_budget > 0 and risk > risk_budget:

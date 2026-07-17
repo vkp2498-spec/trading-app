@@ -463,6 +463,8 @@ def analyze_latest(df, timeframe):
         "score": score,
         "candle_time": last.name.isoformat(),
         "close": round(close, 2),
+        "high": round(float(last.get("high") or close), 2),
+        "low": round(float(last.get("low") or close), 2),
         "pivot": round(pivot, 2),
         "pivot_type": "previous_timeframe_candle",
         "middle_band": round(ma20, 2),

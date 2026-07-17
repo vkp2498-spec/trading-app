@@ -2,7 +2,7 @@ import gzip
 import json
 import math
 import os
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -205,12 +205,155 @@ def _build_levels(entry, direction, five, fifteen):
     return round(target, 2), round(stop, 2), reward / risk if risk > 0 else 0
 
 
+def _opening_reversion_window(now=None):
+    """Return true only for the requested 09:20-09:45 IST opening window."""
+    if str(os.getenv("STOCK_FUTURES_OPENING_REVERSION", "true")).lower() not in {
+        "1", "true", "yes", "on"
+    }:
+        return False
+    current = now or datetime.now(IST)
+    current_time = current.astimezone(IST).time()
+    return dt_time(9, 20) <= current_time <= dt_time(9, 45)
+
+
+def _opening_reversion_signal(five):
+    """Return the mean-reversion direction only after a band touch and rejection."""
+    high = _float(five.get("high"))
+    low = _float(five.get("low"))
+    close = _float(five.get("close"))
+    upper = _float(five.get("upper_band"))
+    lower = _float(five.get("lower_band"))
+    if min(high, low, close, upper, lower) <= 0:
+        return None, "5M candle has insufficient high/low Bollinger data"
+
+    upper_rejection = high >= upper and close < upper
+    lower_rejection = low <= lower and close > lower
+    if upper_rejection and lower_rejection:
+        return None, "5M candle touched both Bollinger bands; direction is ambiguous"
+    if upper_rejection:
+        return "BEARISH", "5M high touched upper Bollinger Band and closed back inside"
+    if lower_rejection:
+        return "BULLISH", "5M low touched lower Bollinger Band and closed back inside"
+    return None, "5M candle did not touch and reject an outer Bollinger Band"
+
+
+def _opening_reversion_levels(entry, direction, five, fifteen):
+    """Use the middle-band/pivot reversion objective with a nearby ATR stop."""
+    atr = max(_float(five.get("atr14")), entry * 0.0025)
+    if direction == "BULLISH":
+        targets = [
+            _float(five.get("middle_band")),
+            _float(five.get("pivot")),
+            _float(fifteen.get("middle_band")),
+            _float(fifteen.get("pivot")),
+        ]
+        targets = [value for value in targets if value > entry]
+        target = min(targets) if targets else entry + atr * 1.5
+        stop_candidates = [
+            _float(five.get("lower_band")),
+            _float(fifteen.get("lower_band")),
+            entry - atr,
+        ]
+        stop_candidates = [value for value in stop_candidates if 0 < value < entry]
+        stop = max(stop_candidates) if stop_candidates else entry - atr
+        reward, risk = target - entry, entry - stop
+    else:
+        targets = [
+            _float(five.get("middle_band")),
+            _float(five.get("pivot")),
+            _float(fifteen.get("middle_band")),
+            _float(fifteen.get("pivot")),
+        ]
+        targets = [value for value in targets if 0 < value < entry]
+        target = max(targets) if targets else entry - atr * 1.5
+        stop_candidates = [
+            _float(five.get("upper_band")),
+            _float(fifteen.get("upper_band")),
+            entry + atr,
+        ]
+        stop_candidates = [value for value in stop_candidates if value > entry]
+        stop = min(stop_candidates) if stop_candidates else entry + atr
+        reward, risk = entry - target, stop - entry
+    return round(target, 2), round(stop, 2), reward / risk if risk > 0 else 0
+
+
+def _evaluate_opening_reversion(prefiltered, contract, technicals):
+    five = technicals.get("five_min", {})
+    fifteen = technicals.get("fifteen_min", {})
+    two = technicals.get("two_hour", {})
+    direction, touch_reason = _opening_reversion_signal(five)
+    if direction is None:
+        return None, f"{contract['underlying_symbol']}: {touch_reason}"
+
+    if two.get("bias") not in {direction, "NEUTRAL"} and two.get("confidence") == "HIGH":
+        return None, f"{contract['underlying_symbol']}: opening reversal conflicts with strong 2H trend"
+
+    entry = _float(prefiltered.get("last_price")) or _float(five.get("close"))
+    spread = _float(prefiltered.get("spread_percent"))
+    max_spread = _float(os.getenv("STOCK_FUTURES_MAX_SPREAD_PERCENT"), 0.20)
+    if entry <= 0:
+        return None, f"{contract['underlying_symbol']}: no valid futures price"
+    if spread > max_spread:
+        return None, f"{contract['underlying_symbol']}: spread {spread:.2f}% exceeds {max_spread:.2f}%"
+
+    target, stop, reward_risk = _opening_reversion_levels(entry, direction, five, fifteen)
+    minimum_rr = _float(os.getenv("STOCK_FUTURES_OPENING_MIN_REWARD_RISK"), 1.00)
+    if reward_risk < minimum_rr:
+        return None, f"{contract['underlying_symbol']}: opening reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
+
+    volume_ratio = _float(five.get("volume_ratio"))
+    score = 55.0  # confirmed touch plus close-back-inside rejection
+    score += _aligned_component(fifteen, direction, 15, 7)
+    score += _aligned_component(two, direction, 10, 5)
+    if volume_ratio >= _float(os.getenv("STOCK_FUTURES_MIN_VOLUME_RATIO"), 1.20):
+        score += 10
+    if (direction == "BULLISH" and _int(five.get("momentum_score")) >= 1) or (
+        direction == "BEARISH" and _int(five.get("momentum_score")) <= -1
+    ):
+        score += 10
+    if spread <= max_spread:
+        score += 5
+
+    minimum_score = _float(os.getenv("STOCK_FUTURES_OPENING_MIN_SCORE"), 70)
+    if score < minimum_score:
+        return None, f"{contract['underlying_symbol']}: opening score {score:.1f} is below {minimum_score:.1f}"
+
+    return {
+        "symbol": "STOCK_FUTURE",
+        "underlying_symbol": contract["underlying_symbol"],
+        "instrument_class": "STOCK_FUTURE",
+        "instrument": contract,
+        "direction": direction,
+        "transaction_type": "BUY" if direction == "BULLISH" else "SELL",
+        "confidence": "HIGH" if score >= 90 else "MEDIUM",
+        "signal_score": round(score, 1),
+        "entry_price": round(entry, 2),
+        "target_price": target,
+        "stop_loss_price": stop,
+        "reward_risk": round(reward_risk, 2),
+        "quantity": _int(contract.get("lot_size")),
+        "technicals": technicals,
+        "reasons": [
+            f"Opening Bollinger mean-reversion: {touch_reason}",
+            "Target is the nearest middle-band/pivot reversion level",
+            "Stop is capped near the touched band using ATR protection",
+        ],
+        "spread_percent": round(spread, 3),
+        "volume_ratio": round(volume_ratio, 2),
+        "strategy": "OPENING_BOLLINGER_REVERSION",
+        "opening_reversion": True,
+    }, None
+
+
 def evaluate_contract(prefiltered):
     contract = prefiltered["contract"]
     technicals = get_instrument_technical_analysis(contract["instrument_key"])
     two = technicals.get("two_hour", {})
     fifteen = technicals.get("fifteen_min", {})
     five = technicals.get("five_min", {})
+
+    if _opening_reversion_window():
+        return _evaluate_opening_reversion(prefiltered, contract, technicals)
 
     bullish_votes = sum(item.get("bias") == "BULLISH" for item in (fifteen, five))
     bearish_votes = sum(item.get("bias") == "BEARISH" for item in (fifteen, five))

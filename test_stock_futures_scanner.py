@@ -117,6 +117,57 @@ class StockFuturesScannerTests(unittest.TestCase):
         self.assertIsNone(candidate)
         self.assertIn("direction", reason)
 
+    def test_opening_upper_band_rejection_creates_short_candidate(self):
+        analysis = {
+            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW"},
+            "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "middle_band": 99.5, "pivot": 99.5},
+            "five_min": {
+                "bias": "BULLISH", "confidence": "MEDIUM", "high": 101.2, "low": 99.8,
+                "close": 100.5, "upper_band": 101.0, "middle_band": 99.5,
+                "lower_band": 98.5, "pivot": 99.5, "atr14": 1.0,
+                "volume_ratio": 1.5, "momentum_score": -1,
+            },
+        }
+        item = {
+            "contract": {"underlying_symbol": "RELIANCE", "instrument_key": "NSE_FO|TEST", "lot_size": 500},
+            "last_price": 100.5, "spread_percent": 0.05,
+        }
+        with (
+            patch.object(scanner, "get_instrument_technical_analysis", return_value=analysis),
+            patch.object(scanner, "_opening_reversion_window", return_value=True),
+        ):
+            candidate, reason = scanner.evaluate_contract(item)
+
+        self.assertIsNone(reason)
+        self.assertEqual(candidate["transaction_type"], "SELL")
+        self.assertTrue(candidate["opening_reversion"])
+        self.assertEqual(candidate["strategy"], "OPENING_BOLLINGER_REVERSION")
+
+    def test_opening_lower_band_rejection_creates_long_candidate(self):
+        analysis = {
+            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW"},
+            "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "middle_band": 100.5, "pivot": 100.5},
+            "five_min": {
+                "bias": "BEARISH", "confidence": "MEDIUM", "high": 100.2, "low": 98.8,
+                "close": 99.5, "upper_band": 101.5, "middle_band": 100.5,
+                "lower_band": 99.0, "pivot": 100.5, "atr14": 1.0,
+                "volume_ratio": 1.5, "momentum_score": 1,
+            },
+        }
+        item = {
+            "contract": {"underlying_symbol": "TCS", "instrument_key": "NSE_FO|TEST", "lot_size": 175},
+            "last_price": 99.5, "spread_percent": 0.05,
+        }
+        with (
+            patch.object(scanner, "get_instrument_technical_analysis", return_value=analysis),
+            patch.object(scanner, "_opening_reversion_window", return_value=True),
+        ):
+            candidate, reason = scanner.evaluate_contract(item)
+
+        self.assertIsNone(reason)
+        self.assertEqual(candidate["transaction_type"], "BUY")
+        self.assertTrue(candidate["opening_reversion"])
+
 
 if __name__ == "__main__":
     unittest.main()
