@@ -1251,6 +1251,20 @@ def cancel_protective_stop(symbol, state):
         if protective_stop_filled(symbol, state):
             return True
         raise
+
+    # A cancel response only acknowledges the request. Confirm that the
+    # broker stop is actually cancelled before submitting a second exit.
+    details = wait_for_order_complete(order_id, attempts=3, delay_seconds=0.25)
+    if order_is_complete(details):
+        complete_exit(symbol, state, details, state.get("stop_loss_price"), "STOP_LOSS")
+        return True
+    if not order_is_rejected(details):
+        log(
+            f"{symbol} protective stop cancellation is still pending; "
+            f"deferring market exit order_id={order_id} status={order_status(details)}"
+        )
+        return True
+
     state.pop("protective_stop_order_id", None)
     write_state(symbol, state)
     log(f"{symbol} protective stop cancelled before active exit: order_id={order_id}")
@@ -1310,11 +1324,28 @@ def handle_existing_state(symbol, state, verbose=True):
         target_hit = ltp is not None and (ltp <= target_price if is_short else ltp >= target_price)
         stop_hit = ltp is not None and (ltp >= stop_loss_price if is_short else ltp <= stop_loss_price)
         if ltp is not None and (target_hit or stop_hit or sentiment_exit):
+            # Stock-future and short-option stops are already protected at the
+            # broker. Do not send a second market exit when the local LTP also
+            # reaches the stop; let the broker stop fill and confirm it here.
+            if stop_hit and needs_broker_stop and state.get("protective_stop_order_id"):
+                log(
+                    f"{symbol} local stop reached; waiting for broker protective stop "
+                    f"order_id={state['protective_stop_order_id']}"
+                )
+                return True
+
             if sentiment_exit:
                 exit_reason = "SENTIMENT_EXIT"
                 log(f"{symbol} sentiment exit triggered: {sentiment_reason}")
             else:
                 exit_reason = "TARGET" if target_hit else "STOP_LOSS"
+
+            # Publish the exit state before making broker calls. The separate
+            # entry and monitor cron jobs can overlap, so this prevents both
+            # processes from submitting the same exit order.
+            state["status"] = "EXIT_PENDING"
+            state["exit_reason"] = exit_reason
+            write_state(symbol, state)
 
             if needs_broker_stop and cancel_protective_stop(symbol, state):
                 return True

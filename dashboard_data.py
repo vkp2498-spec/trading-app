@@ -319,6 +319,8 @@ def empty_trade_performance() -> dict:
             "totalTrades": 0,
             "totalPnL": 0.0,
             "winRate": 0.0,
+            "averageProfitPerWinningTrade": 0.0,
+            "averageLossPerLosingTrade": 0.0,
             "symbolPnL": {
                 symbol: 0.0
                 for symbol in SYMBOLS
@@ -345,6 +347,15 @@ def calculate_win_rate(trades: list[dict]) -> float:
     return round(
         winning_trades / len(trades) * 100,
         1,
+    )
+
+
+def average_trade_results(trades: list[dict]) -> tuple[float, float]:
+    profits = [trade["grossPnL"] for trade in trades if trade["grossPnL"] > 0]
+    losses = [abs(trade["grossPnL"]) for trade in trades if trade["grossPnL"] < 0]
+    return (
+        round(sum(profits) / len(profits), 2) if profits else 0.0,
+        round(sum(losses) / len(losses), 2) if losses else 0.0,
     )
 
 
@@ -601,6 +612,7 @@ def build_trade_performance() -> dict:
         key=lambda trade: trade["exitTime"],
         reverse=True,
     )[:20]
+    average_profit, average_loss = average_trade_results(trades)
 
     return {
         "today": {
@@ -634,6 +646,8 @@ def build_trade_performance() -> dict:
             "winRate": calculate_win_rate(
                 trades
             ),
+            "averageProfitPerWinningTrade": average_profit,
+            "averageLossPerLosingTrade": average_loss,
             "symbolPnL": symbol_pnl(trades),
             "categoryPerformance": category_performance(
                 trades
