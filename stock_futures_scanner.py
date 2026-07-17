@@ -263,6 +263,26 @@ def _two_hour_target(entry, direction, two, quantity, fallback_target):
     return round(_round_target_away_from_entry(raw_target, entry, direction), 2)
 
 
+def _apply_minimum_risk_stop(entry, direction, stop, quantity):
+    """Prevent a technically valid but impractically tight futures stop."""
+    if quantity <= 0:
+        return round(stop, 2)
+    maximum_risk = _float(os.getenv("STOCK_FUTURES_MAX_RISK_PER_TRADE"), 0)
+    minimum_risk = _float(
+        os.getenv("STOCK_FUTURES_MIN_RISK_PER_TRADE"),
+        maximum_risk * 0.50,
+    )
+    if minimum_risk <= 0:
+        return round(stop, 2)
+
+    minimum_distance = minimum_risk / quantity
+    if direction == "BULLISH" and entry - stop < minimum_distance:
+        stop = entry - minimum_distance
+    elif direction == "BEARISH" and stop - entry < minimum_distance:
+        stop = entry + minimum_distance
+    return round(stop, 2)
+
+
 def _build_levels(entry, direction, five, fifteen, two=None, quantity=0):
     aligned = [
         analysis
@@ -283,11 +303,13 @@ def _build_levels(entry, direction, five, fifteen, two=None, quantity=0):
         fallback_target = min(targets) if targets else entry + atr * 1.5
         target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         stop = max(stops) if stops else entry - atr
+        stop = _apply_minimum_risk_stop(entry, direction, stop, quantity)
         reward, risk = target - entry, entry - stop
     else:
         fallback_target = max(targets) if targets else entry - atr * 1.5
         target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         stop = min(stops) if stops else entry + atr
+        stop = _apply_minimum_risk_stop(entry, direction, stop, quantity)
         reward, risk = entry - target, stop - entry
     return round(target, 2), round(stop, 2), reward / risk if risk > 0 else 0
 
@@ -343,6 +365,7 @@ def _opening_reversion_levels(entry, direction, five, fifteen, two=None, quantit
         ]
         stop_candidates = [value for value in stop_candidates if 0 < value < entry]
         stop = max(stop_candidates) if stop_candidates else entry - atr
+        stop = _apply_minimum_risk_stop(entry, direction, stop, quantity)
         target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         reward, risk = target - entry, entry - stop
     else:
@@ -361,6 +384,7 @@ def _opening_reversion_levels(entry, direction, five, fifteen, two=None, quantit
         ]
         stop_candidates = [value for value in stop_candidates if value > entry]
         stop = min(stop_candidates) if stop_candidates else entry + atr
+        stop = _apply_minimum_risk_stop(entry, direction, stop, quantity)
         target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         reward, risk = entry - target, stop - entry
     return round(target, 2), round(stop, 2), reward / risk if risk > 0 else 0
