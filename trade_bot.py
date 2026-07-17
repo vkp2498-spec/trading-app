@@ -1166,19 +1166,34 @@ def monitor_pending_exit(symbol, state):
 
     return True
 
-def run_position_monitor():
+def run_position_monitor(log_empty=True):
     for symbol in BOT_STATE_SLOTS:
         try:
             state = read_state(symbol)
 
             if not state:
-                log(f"{symbol} monitor: no open bot state.")
+                if log_empty:
+                    log(f"{symbol} monitor: no open bot state.")
                 continue
 
-            handle_existing_state(symbol, state)
+            handle_existing_state(symbol, state, verbose=log_empty)
 
         except Exception as e:
             log(f"{symbol} monitor ERROR: {e}")
+
+
+def run_position_monitor_loop():
+    """Monitor bot positions every second while the Indian market is open."""
+    log("Position monitor loop started: one-second checks enabled.")
+    while True:
+        current = now_ist().time()
+        if current > time(15, 30):
+            log("Position monitor loop stopped at 03:30 PM IST.")
+            return
+
+        if time(9, 20) <= current <= time(15, 30):
+            run_position_monitor(log_empty=False)
+        time_module.sleep(1)
 
 def arm_protective_stop(symbol, state):
     instrument = {
@@ -1242,7 +1257,7 @@ def cancel_protective_stop(symbol, state):
     return False
 
 
-def handle_existing_state(symbol, state):
+def handle_existing_state(symbol, state, verbose=True):
     instrument_key = state.get("instrument_key")
     if not instrument_key:
         return False
@@ -1279,13 +1294,19 @@ def handle_existing_state(symbol, state):
         stop_loss_price = float(state.get("stop_loss_price"))
         is_short = entry_transaction == "SELL"
 
-        log(
-            f"{symbol} open {state.get('position_side', 'LONG_OPTION')} active: "
-            f"{state.get('trading_symbol')} qty={qty} ltp={ltp} "
-            f"entry={state.get('entry_price')} target={target_price} stop_loss={stop_loss_price}"
-        )
+        if verbose:
+            log(
+                f"{symbol} open {state.get('position_side', 'LONG_OPTION')} active: "
+                f"{state.get('trading_symbol')} qty={qty} ltp={ltp} "
+                f"entry={state.get('entry_price')} target={target_price} stop_loss={stop_loss_price}"
+            )
 
-        sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(symbol, state, ltp)
+        sentiment_exit = False
+        sentiment_reason = ""
+        if sentiment_check_due(state):
+            state["last_sentiment_check_at"] = now_ist().isoformat()
+            write_state(symbol, state)
+            sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(symbol, state, ltp)
         target_hit = ltp is not None and (ltp <= target_price if is_short else ltp >= target_price)
         stop_hit = ltp is not None and (ltp >= stop_loss_price if is_short else ltp <= stop_loss_price)
         if ltp is not None and (target_hit or stop_hit or sentiment_exit):
@@ -1373,7 +1394,8 @@ def handle_existing_state(symbol, state):
         if protective_stop_filled(symbol, state):
             return True
         cancel_protective_stop(symbol, state)
-    log(f"{symbol} state exists but no matching open position found. Clearing stale state.")
+    if verbose:
+        log(f"{symbol} state exists but no matching open position found. Clearing stale state.")
     clear_state(symbol)
     return False
 
@@ -1473,6 +1495,24 @@ def minutes_since_created(state):
         return (now_ist() - created_at).total_seconds() / 60
     except Exception:
         return 999
+
+
+def sentiment_check_due(state):
+    """Throttle expensive option-chain sentiment checks inside the 1-second monitor."""
+    if state.get("instrument_class") == "STOCK_FUTURE":
+        return False
+    interval = max(
+        int(float(os.getenv("MONITOR_SENTIMENT_INTERVAL_SECONDS", "60"))),
+        1,
+    )
+    raw = state.get("last_sentiment_check_at")
+    if not raw:
+        return True
+    try:
+        last_check = datetime.fromisoformat(raw)
+        return (now_ist() - last_check).total_seconds() >= interval
+    except Exception:
+        return True
 
 
 def should_exit_on_sentiment_change(symbol, state, ltp):
@@ -1787,8 +1827,14 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
     }, None
 
 
-def select_trade_candidate(candidates):
-    qualified = [candidate for candidate in candidates if candidate and candidate.get("allowed")]
+def select_trade_candidate(candidates, allow_sell=True):
+    qualified = [
+        candidate
+        for candidate in candidates
+        if candidate
+        and candidate.get("allowed")
+        and (allow_sell or candidate.get("transaction_type") != "SELL")
+    ]
     if not qualified:
         return None
     buy = next((item for item in qualified if item["transaction_type"] == "BUY"), None)
@@ -1803,7 +1849,7 @@ def select_trade_candidate(candidates):
     return sell if sell_score >= buy_score + advantage else buy
 
 
-def evaluate_symbol_buy_or_sell(symbol):
+def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
     risk_reason, risk_mode = risk_limit_mode()
     if risk_mode == "stop":
         log(f"{symbol} no trade: daily risk limit reached ({risk_reason})")
@@ -1862,9 +1908,13 @@ def evaluate_symbol_buy_or_sell(symbol):
         except Exception as error:
             log(f"{symbol} {transaction_type} candidate unavailable: {error}")
 
-    preferred = select_trade_candidate(candidates)
+    preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
     if not preferred:
-        best = max(candidates, key=lambda item: float(item.get("weighted", {}).get("score") or 0), default=None)
+        eligible = [
+            item for item in candidates
+            if allow_option_sell or item.get("transaction_type") != "SELL"
+        ]
+        best = max(eligible, key=lambda item: float(item.get("weighted", {}).get("score") or 0), default=None)
         if best:
             decision = {
                 "execute_trade": False,
@@ -1875,10 +1925,22 @@ def evaluate_symbol_buy_or_sell(symbol):
                 "reason": best.get("reason"),
             }
             record_analysis(symbol, best["option_summary"], best["technicals"], decision)
-        log(f"{symbol} no trade: neither BUY nor SELL structure passed deterministic gates.")
+        if not allow_option_sell and any(
+            item.get("allowed") and item.get("transaction_type") == "SELL"
+            for item in candidates
+        ):
+            log(f"{symbol} no trade: option SELL blocked while another bot position is open.")
+        else:
+            log(f"{symbol} no trade: neither BUY nor SELL structure passed deterministic gates.")
         return False
 
-    qualified = [item for item in candidates if item and item.get("allowed")]
+    qualified = [
+        item
+        for item in candidates
+        if item
+        and item.get("allowed")
+        and (allow_option_sell or item.get("transaction_type") != "SELL")
+    ]
     ordered = [preferred] + [item for item in qualified if item is not preferred]
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
     check_short_margin = live or (
@@ -2295,15 +2357,31 @@ def run_signal_check():
                 log(f"{symbol} existing-position check ERROR: {error}")
 
     active = [symbol for symbol in BOT_STATE_SLOTS if read_state(symbol).get("instrument_key")]
-    if active:
-        log(f"Global one-position rule: active bot position exists in {active[0]}; no new entry.")
+    active_index = [symbol for symbol in SYMBOLS if symbol in active]
+    stock_future_active = STOCK_FUTURE_STATE in active
+    if active_index:
+        log(
+            f"Global one-position rule: active index option exists in {active_index[0]}; "
+            "no new entry."
+        )
         return
+    if stock_future_active:
+        log(
+            "Stock-futures position is active; index option BUY is allowed, "
+            "but option SELL and another stock-futures entry are blocked."
+        )
 
     try:
+        tracked_instrument_keys = {
+            read_state(symbol).get("instrument_key")
+            for symbol in BOT_STATE_SLOTS
+            if read_state(symbol).get("instrument_key")
+        }
         untracked_derivative_positions = [
             position
             for position in get_open_positions()
             if position_quantity(position) != 0
+            and (position.get("instrument_token") or position.get("instrument_key")) not in tracked_instrument_keys
             and (
                 str(position.get("exchange") or position.get("segment") or "").upper() in {"NSE_FO", "NFO"}
                 or str(position.get("instrument_token") or position.get("instrument_key") or "").startswith("NSE_FO|")
@@ -2335,7 +2413,10 @@ def run_signal_check():
     qualified = []
     for symbol in SYMBOLS:
         try:
-            candidate = evaluate_symbol_buy_or_sell(symbol)
+            if stock_future_active:
+                candidate = evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False)
+            else:
+                candidate = evaluate_symbol_buy_or_sell(symbol)
             if candidate:
                 qualified.append(candidate)
         except Exception as e:
@@ -2343,7 +2424,10 @@ def run_signal_check():
 
     if not qualified:
         log("Global selection: no qualified NIFTY or BANKNIFTY BUY/SELL structure.")
-        run_stock_futures_fallback()
+        if stock_future_active:
+            log("Stock-futures entry skipped: an existing stock-futures position is still active.")
+        else:
+            run_stock_futures_fallback()
         return
 
     chosen = max(
@@ -2382,7 +2466,7 @@ def main():
     if "--squareoff" in sys.argv:
         run_squareoff()
     elif "--monitor" in sys.argv:
-        run_position_monitor()
+        run_position_monitor_loop()
     else:
         run_signal_check()
 
