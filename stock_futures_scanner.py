@@ -244,21 +244,28 @@ def _round_target_away_from_entry(target, entry, direction):
 
 
 def _two_hour_target(entry, direction, two, quantity, fallback_target):
-    """Choose the nearest qualifying 2H Bollinger target and round it outward."""
+    """Choose the nearest valid target while preserving the minimum profit floor.
+
+    The minimum-profit objective is a candidate alongside the 2H middle/outer
+    Bollinger targets. This avoids selecting a distant band when a nearer
+    target already satisfies the configured gross-profit floor.
+    """
     minimum_profit = _float(os.getenv("STOCK_FUTURES_MIN_EXPECTED_PROFIT"), 5000)
     minimum_move = minimum_profit / quantity if quantity > 0 else 0
     if direction == "BULLISH":
         bands = [_float(two.get("middle_band")), _float(two.get("upper_band"))]
         valid = sorted(value for value in bands if value > entry)
-        qualifying = [value for value in valid if value - entry >= minimum_move]
-        raw_target = min(qualifying) if qualifying else entry + minimum_move
+        candidates = [entry + minimum_move] if minimum_move > 0 else []
+        candidates.extend(value for value in valid if value - entry >= minimum_move)
+        raw_target = min(candidates) if candidates else fallback_target
     else:
         bands = [_float(two.get("middle_band")), _float(two.get("lower_band"))]
         valid = sorted((value for value in bands if 0 < value < entry), reverse=True)
-        qualifying = [value for value in valid if entry - value >= minimum_move]
-        raw_target = max(qualifying) if qualifying else entry - minimum_move
+        candidates = [entry - minimum_move] if minimum_move > 0 else []
+        candidates.extend(value for value in valid if entry - value >= minimum_move)
+        raw_target = max(candidates) if candidates else fallback_target
 
-    if not valid and minimum_move <= 0:
+    if not raw_target:
         raw_target = fallback_target
     return round(_round_target_away_from_entry(raw_target, entry, direction), 2)
 
