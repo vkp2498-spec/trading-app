@@ -323,6 +323,50 @@ def evaluate_trade_feasibility(
     return result
 
 
+def revalidate_option_after_fill(
+    direction,
+    option_type,
+    fill_price,
+    target_percent,
+    stop_percent,
+    technicals,
+):
+    """Recalculate levels and feasibility using the actual market fill."""
+    fill = float(fill_price)
+    recalculated_technicals = deepcopy(technicals or {})
+    for timeframe in ("two_hour", "fifteen_min", "five_min"):
+        recalculated_technicals[timeframe] = convert_index_levels_to_option_premium(
+            recalculated_technicals.get(timeframe, {}),
+            option_side=option_type,
+            option_entry_price=fill,
+            delta=0.5,
+            transaction_type="BUY",
+        )
+
+    target, stop = option_levels_from_fill(
+        fill,
+        target_percent,
+        stop_percent,
+        transaction_type="BUY",
+    )
+    feasibility = evaluate_trade_feasibility(
+        direction,
+        fill,
+        target,
+        stop,
+        recalculated_technicals,
+        transaction_type="BUY",
+    )
+    recalculated_technicals["trade_feasibility"] = feasibility
+    return {
+        "allowed": bool(feasibility.get("allowed")),
+        "target_price": float(feasibility.get("adjusted_target_price") or target),
+        "stop_loss_price": float(stop),
+        "technicals": recalculated_technicals,
+        "feasibility": feasibility,
+    }
+
+
 def read_json(path, default):
     if not path.exists():
         return default
@@ -1257,8 +1301,8 @@ def run_position_monitor(log_empty=True):
 
 
 def run_position_monitor_loop():
-    """Monitor bot positions every second while the Indian market is open."""
-    log("Position monitor loop started: one-second checks enabled.")
+    """Monitor bot positions every five seconds while the Indian market is open."""
+    log("Position monitor loop started: five-second checks enabled.")
     while True:
         current = now_ist().time()
         if current > time(15, 30):
@@ -1267,7 +1311,7 @@ def run_position_monitor_loop():
 
         if time(9, 20) <= current <= time(15, 30):
             run_position_monitor(log_empty=False)
-        time_module.sleep(1)
+        time_module.sleep(5)
 
 def arm_protective_stop(symbol, state):
     instrument = {
@@ -1511,6 +1555,78 @@ def handle_existing_state(symbol, state, verbose=True):
                 underlying_symbol=state.get("underlying_symbol"),
             )
             state = read_state(symbol)
+            technical_context = state.get("technical_context") or {}
+            option_type = state.get("option_type") or option_type_for(
+                state.get("direction"), "BUY"
+            )
+            post_fill = revalidate_option_after_fill(
+                state.get("direction"),
+                option_type,
+                entry_price,
+                float(state.get("target_percent") or risk_percentages(False)[0]),
+                float(state.get("stop_percent") or risk_percentages(False)[1]),
+                technical_context,
+            )
+            state["post_fill_feasibility"] = post_fill["feasibility"]
+            if not post_fill["allowed"]:
+                reason = "; ".join(post_fill["feasibility"].get("reasons", []))
+                state["status"] = "EXIT_PENDING"
+                state["exit_reason"] = "POST_FILL_GUARDRAIL"
+                state["post_fill_guardrail_reason"] = reason
+                state["target_price"] = post_fill["target_price"]
+                state["stop_loss_price"] = post_fill["stop_loss_price"]
+                write_state(symbol, state)
+                log(
+                    f"{symbol} delayed-fill guardrail rejected position: fill={entry_price} "
+                    f"reason={reason}; flattening immediately"
+                )
+                instrument = {
+                    "instrument_key": instrument_key,
+                    "trading_symbol": state.get("trading_symbol"),
+                }
+                exit_result, exit_payload = place_market_order(
+                    instrument, "SELL", quantity
+                )
+                exit_order_id = exit_result.get("data", {}).get("order_id")
+                if not exit_order_id:
+                    raise RuntimeError(
+                        f"{symbol} delayed-fill guardrail exit returned no order_id"
+                    )
+                exit_details = wait_for_order_complete(exit_order_id)
+                if order_is_complete(exit_details):
+                    complete_exit(
+                        symbol,
+                        state,
+                        exit_details,
+                        entry_price,
+                        "POST_FILL_GUARDRAIL",
+                        exit_result,
+                        exit_payload,
+                    )
+                else:
+                    state["exit_order_id"] = exit_order_id
+                    state["exit_fallback_price"] = entry_price
+                    write_state(symbol, state)
+                    log(
+                        f"{symbol} delayed-fill guardrail exit pending: "
+                        f"order_id={exit_order_id}"
+                    )
+                return True
+
+            state.update(
+                {
+                    "target_price": post_fill["target_price"],
+                    "stop_loss_price": post_fill["stop_loss_price"],
+                    "technical_context": post_fill["technicals"],
+                }
+            )
+            write_state(symbol, state)
+            log(
+                f"{symbol} delayed-fill levels validated: fill={entry_price} "
+                f"target={post_fill['target_price']} "
+                f"stop_loss={post_fill['stop_loss_price']} "
+                f"reward_risk={post_fill['feasibility'].get('technical_reward_risk')}"
+            )
             if needs_broker_stop:
                 try:
                     ensure_protective_stop(symbol, state)
@@ -2188,6 +2304,8 @@ def execute_selected_candidate(chosen):
             "stop_loss_price": stop,
             "target_percent": chosen["target_percent"],
             "stop_percent": chosen["stop_percent"],
+            "option_type": chosen.get("option_summary", {}).get("option_type"),
+            "technical_context": chosen.get("technicals", {}),
             "direction": direction,
             "confidence": confidence,
             "score": score,
@@ -2203,6 +2321,64 @@ def execute_selected_candidate(chosen):
         symbol, order_id, instrument, direction, confidence, score, fill, quantity,
         target, stop, chosen["target_percent"], chosen["stop_percent"],
         entry_transaction_type=transaction_type,
+    )
+
+    post_fill = revalidate_option_after_fill(
+        direction,
+        chosen.get("option_summary", {}).get("option_type"),
+        fill,
+        chosen["target_percent"],
+        chosen["stop_percent"],
+        chosen.get("technicals", {}),
+    )
+    state = read_state(symbol)
+    state["post_fill_feasibility"] = post_fill["feasibility"]
+    if not post_fill["allowed"]:
+        reason = "; ".join(post_fill["feasibility"].get("reasons", []))
+        state["status"] = "EXIT_PENDING"
+        state["exit_reason"] = "POST_FILL_GUARDRAIL"
+        state["post_fill_guardrail_reason"] = reason
+        state["target_price"] = post_fill["target_price"]
+        state["stop_loss_price"] = post_fill["stop_loss_price"]
+        write_state(symbol, state)
+        log(
+            f"{symbol} post-fill guardrail rejected position: fill={fill} "
+            f"reason={reason}; flattening immediately"
+        )
+        exit_result, exit_payload = place_market_order(instrument, "SELL", quantity)
+        exit_order_id = exit_result.get("data", {}).get("order_id")
+        if not exit_order_id:
+            raise RuntimeError(f"{symbol} post-fill guardrail exit returned no order_id")
+        exit_details = wait_for_order_complete(exit_order_id)
+        if order_is_complete(exit_details):
+            complete_exit(
+                symbol,
+                state,
+                exit_details,
+                fill,
+                "POST_FILL_GUARDRAIL",
+                exit_result,
+                exit_payload,
+            )
+        else:
+            state["exit_order_id"] = exit_order_id
+            state["exit_fallback_price"] = fill
+            write_state(symbol, state)
+            log(f"{symbol} post-fill guardrail exit pending: order_id={exit_order_id}")
+        return True
+
+    state.update(
+        {
+            "target_price": post_fill["target_price"],
+            "stop_loss_price": post_fill["stop_loss_price"],
+            "technical_context": post_fill["technicals"],
+        }
+    )
+    write_state(symbol, state)
+    log(
+        f"{symbol} post-fill levels validated: fill={fill} "
+        f"target={post_fill['target_price']} stop_loss={post_fill['stop_loss_price']} "
+        f"reward_risk={post_fill['feasibility'].get('technical_reward_risk')}"
     )
     if transaction_type == "SELL":
         try:
