@@ -342,13 +342,12 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(normalized["confidence"], "HIGH")
         self.assertEqual(normalized["raw_premium_bias"], "NEUTRAL")
 
-    def test_buy_is_preferred_without_meaningful_short_score_advantage(self):
+    def test_sell_candidates_are_not_selected(self):
         buy = {"allowed": True, "transaction_type": "BUY", "weighted": {"score": 82}}
         sell = {"allowed": True, "transaction_type": "SELL", "weighted": {"score": 85}}
-        with patch.dict(os.environ, {"SHORT_SCORE_ADVANTAGE": "5"}, clear=False):
-            self.assertIs(trade_bot.select_trade_candidate([buy, sell]), buy)
-            sell["weighted"]["score"] = 88
-            self.assertIs(trade_bot.select_trade_candidate([buy, sell]), sell)
+        self.assertIs(trade_bot.select_trade_candidate([buy, sell]), buy)
+        sell["weighted"]["score"] = 120
+        self.assertIs(trade_bot.select_trade_candidate([buy, sell]), buy)
 
     def test_short_trailing_stop_moves_down_as_premium_falls(self):
         with tempfile.TemporaryDirectory() as temp_dir:

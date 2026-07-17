@@ -36,6 +36,11 @@ def build_rule_based_fallback(option_summary, technicals):
     weighted_grade = weighted.get("grade")
     weighted_score = float(weighted.get("score") or 0)
     transaction_type = str(option_summary.get("transaction_type") or "BUY").upper()
+    if transaction_type != "BUY":
+        return {
+            **DEFAULT_DECISION,
+            "reason": "Only long option buying is enabled.",
+        }
 
     institutional_conflicts = (
         institutional.get("confidence") == "HIGH"
@@ -302,6 +307,11 @@ def reconcile_llm_decision(decision, decision_context, option_summary, technical
 
 
 def get_llm_decision(symbol, option_summary, technicals):
+    if str(option_summary.get("transaction_type") or "BUY").upper() != "BUY":
+        return {
+            **DEFAULT_DECISION,
+            "reason": "Only long option buying is enabled.",
+        }
     if not llm_enabled():
         return build_rule_based_fallback(option_summary, technicals)
 

@@ -1827,6 +1827,12 @@ def collect_institutional_footprint(symbol, recommendation, atm_option_flow=None
 
 
 def build_trade_candidate(symbol, rec, base_technicals, institutional, option_trend, transaction_type):
+    if str(transaction_type).upper() != "BUY":
+        return {
+            "allowed": False,
+            "reason": "Only long option buying is enabled.",
+            "transaction_type": "BUY",
+        }, None
     direction = rec["direction"]
     atm = rec["atm"]
     option_type = option_type_for(direction, transaction_type)
@@ -1965,23 +1971,16 @@ def select_trade_candidate(candidates, allow_sell=True):
         for candidate in candidates
         if candidate
         and candidate.get("allowed")
-        and (allow_sell or candidate.get("transaction_type") != "SELL")
+        and candidate.get("transaction_type") == "BUY"
     ]
-    if not qualified:
-        return None
-    buy = next((item for item in qualified if item["transaction_type"] == "BUY"), None)
-    sell = next((item for item in qualified if item["transaction_type"] == "SELL"), None)
-    if not sell:
-        return buy
-    if not buy:
-        return sell
-    advantage = configured_non_negative_float("SHORT_SCORE_ADVANTAGE", 5.0)
-    sell_score = float(sell["weighted"].get("score") or 0)
-    buy_score = float(buy["weighted"].get("score") or 0)
-    return sell if sell_score >= buy_score + advantage else buy
+    return max(
+        qualified,
+        key=lambda item: float(item.get("weighted", {}).get("score") or 0),
+        default=None,
+    )
 
 
-def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
+def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
     risk_reason, risk_mode = risk_limit_mode()
     if risk_mode == "stop":
         log(f"{symbol} no trade: daily risk limit reached ({risk_reason})")
@@ -2020,25 +2019,24 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
     institutional = collect_institutional_footprint(symbol, rec)
     option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
     candidates = []
-    for transaction_type in ("BUY", "SELL"):
-        try:
-            candidate, _ = build_trade_candidate(
-                symbol,
-                rec,
-                base_technicals,
-                institutional,
-                option_trend,
-                transaction_type,
+    try:
+        candidate, _ = build_trade_candidate(
+            symbol,
+            rec,
+            base_technicals,
+            institutional,
+            option_trend,
+            "BUY",
+        )
+        if candidate:
+            candidates.append(candidate)
+            log(
+                f"{symbol} BUY candidate: allowed={candidate.get('allowed')} "
+                f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
+                f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
             )
-            if candidate:
-                candidates.append(candidate)
-                log(
-                    f"{symbol} {transaction_type} candidate: allowed={candidate.get('allowed')} "
-                    f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
-                    f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
-                )
-        except Exception as error:
-            log(f"{symbol} {transaction_type} candidate unavailable: {error}")
+    except Exception as error:
+        log(f"{symbol} BUY candidate unavailable: {error}")
 
     preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
     if not preferred:
@@ -2057,13 +2055,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
                 "reason": best.get("reason"),
             }
             record_analysis(symbol, best["option_summary"], best["technicals"], decision)
-        if not allow_option_sell and any(
-            item.get("allowed") and item.get("transaction_type") == "SELL"
-            for item in candidates
-        ):
-            log(f"{symbol} no trade: option SELL blocked while another bot position is open.")
-        else:
-            log(f"{symbol} no trade: neither BUY nor SELL structure passed deterministic gates.")
+        log(f"{symbol} no trade: BUY structure did not pass deterministic gates.")
         return False
 
     qualified = [
@@ -2071,13 +2063,10 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
         for item in candidates
         if item
         and item.get("allowed")
-        and (allow_option_sell or item.get("transaction_type") != "SELL")
+        and item.get("transaction_type") == "BUY"
     ]
     ordered = [preferred] + [item for item in qualified if item is not preferred]
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    check_short_margin = live or (
-        os.getenv("CHECK_SHORT_MARGIN_IN_DRY_RUN", "false").lower() == "true"
-    )
 
     for chosen in ordered:
         transaction_type = chosen["transaction_type"]
@@ -2096,35 +2085,13 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
             )
             continue
 
-        if transaction_type == "SELL" and check_short_margin:
-            try:
-                margin = validate_short_margin(
-                    instrument,
-                    quantity,
-                    chosen["entry_price"],
-                )
-            except Exception as error:
-                log(
-                    f"{symbol} SELL structure skipped: margin validation failed: {error}; "
-                    "considering the alternate qualified structure."
-                )
-                continue
-            chosen["short_margin_check"] = margin
-            log(f"{symbol} SELL candidate margin check: {margin}")
-            if not margin.get("allowed"):
-                log(
-                    f"{symbol} SELL structure skipped: insufficient buffered margin; "
-                    "considering the alternate qualified structure."
-                )
-                continue
-
         option_summary = chosen["option_summary"]
         technicals = chosen["technicals"]
         llm_decision = get_llm_decision(symbol, option_summary, technicals)
         record_analysis(symbol, option_summary, technicals, llm_decision)
         if not llm_decision.get("execute_trade") or llm_decision.get("decision") != direction:
             log(
-                f"{symbol} {transaction_type} structure rejected by LLM/rules: "
+                f"{symbol} BUY structure rejected by LLM/rules: "
                 f"{llm_decision.get('reason')}; considering alternate structure."
             )
             continue
@@ -2142,7 +2109,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=True):
         )
         return chosen
 
-    log(f"{symbol} no trade: every qualified BUY/SELL structure was rejected.")
+    log(f"{symbol} no trade: BUY structure was rejected by LLM/rules.")
     return False
 
 
@@ -2154,6 +2121,9 @@ def execute_selected_candidate(chosen):
     risk_reason = chosen.get("risk_reason")
     risk_mode = chosen.get("risk_mode")
     transaction_type = chosen["transaction_type"]
+    if transaction_type != "BUY":
+        log(f"{symbol} blocked unsupported transaction type: {transaction_type}")
+        return False
     instrument = chosen["instrument"]
     entry_price = chosen["entry_price"]
     target = chosen["target_price"]
@@ -2170,13 +2140,6 @@ def execute_selected_candidate(chosen):
         return False
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    if transaction_type == "SELL" and live:
-        margin = validate_short_margin(instrument, quantity, entry_price)
-        log(f"{symbol} short margin check: {margin}")
-        if not margin["allowed"]:
-            log(f"{symbol} no trade: insufficient buffered margin for naked option sell.")
-            return False
-
     log(
         f"{symbol} selected {transaction_type}: {instrument['trading_symbol']} qty={quantity} "
         f"entry={entry_price} target={target} stop={stop} live={live}"
@@ -2253,6 +2216,11 @@ def execute_selected_candidate(chosen):
 
 
 def execute_stock_future_candidate(chosen):
+    log("STOCK_FUTURE entry blocked: stock-futures execution is disabled.")
+    return False
+
+
+def _legacy_execute_stock_future_candidate(chosen):
     symbol = STOCK_FUTURE_STATE
     instrument = chosen["instrument"]
     transaction_type = chosen["transaction_type"]
@@ -2364,6 +2332,11 @@ def execute_stock_future_candidate(chosen):
 
 
 def run_stock_futures_fallback():
+    log("Stock-futures scanner disabled: no stock-futures orders will be placed.")
+    return False
+
+
+def _legacy_run_stock_futures_fallback():
     if os.getenv("ENABLE_STOCK_FUTURES_SCANNER", "false").lower() != "true":
         write_scanner_status(
             STOCK_SCANNER_STATUS_FILE,
@@ -2515,7 +2488,7 @@ def run_signal_check():
     if stock_future_active:
         log(
             "Stock-futures position is active; index option BUY is allowed, "
-            "but option SELL and another stock-futures entry are blocked."
+            "while new stock-futures entries remain disabled."
         )
 
     try:
@@ -2570,11 +2543,9 @@ def run_signal_check():
             log(f"{symbol} ERROR: {e}")
 
     if not qualified:
-        log("Global selection: no qualified NIFTY or BANKNIFTY BUY/SELL structure.")
+        log("Global selection: no qualified NIFTY or BANKNIFTY BUY structure.")
         if stock_future_active:
-            log("Stock-futures entry skipped: an existing stock-futures position is still active.")
-        else:
-            run_stock_futures_fallback()
+            log("Stock-futures entry is disabled; existing stock-futures position remains under monitor.")
         return
 
     chosen = max(
@@ -2592,19 +2563,7 @@ def run_signal_check():
         f"Global selection: {chosen['symbol']} {chosen['transaction_type']} chosen at "
         f"score={chosen.get('weighted', {}).get('score')} from {choices}"
     )
-    if os.getenv("ENABLE_STOCK_FUTURES_SCANNER", "false").lower() == "true":
-        write_scanner_status(
-            STOCK_SCANNER_STATUS_FILE,
-            enabled=True,
-            status="INDEX_PRIORITY",
-            message=(
-                f"Stock scan skipped because {chosen['symbol']} "
-                f"{chosen['transaction_type']} qualified first"
-            ),
-        )
-    if not execute_selected_candidate(chosen):
-        log("Selected index structure could not be executed; running stock-futures fallback.")
-        run_stock_futures_fallback()
+    execute_selected_candidate(chosen)
 
 
 def main():
