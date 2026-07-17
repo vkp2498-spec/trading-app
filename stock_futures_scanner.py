@@ -348,6 +348,15 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
     if reward_risk < minimum_rr:
         return None, f"{contract['underlying_symbol']}: opening reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
 
+    quantity = _int(contract.get("lot_size"))
+    expected_profit = abs(target - entry) * quantity
+    minimum_profit = _float(os.getenv("STOCK_FUTURES_MIN_EXPECTED_PROFIT"), 5000)
+    if expected_profit < minimum_profit:
+        return None, (
+            f"{contract['underlying_symbol']}: expected gross profit "
+            f"{expected_profit:.2f} is below minimum {minimum_profit:.2f}"
+        )
+
     volume_ratio = _float(five.get("volume_ratio"))
     depth = _depth_metrics(prefiltered.get("quote", {}))
     score = 55.0  # confirmed touch plus close-back-inside rejection
@@ -382,8 +391,9 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         "entry_price": round(entry, 2),
         "target_price": target,
         "stop_loss_price": stop,
+        "expected_gross_profit": round(expected_profit, 2),
         "reward_risk": round(reward_risk, 2),
-        "quantity": _int(contract.get("lot_size")),
+        "quantity": quantity,
         "technicals": technicals,
         "reasons": [
             f"Opening Bollinger mean-reversion: {touch_reason}",
@@ -478,6 +488,15 @@ def evaluate_contract(prefiltered):
     if reward_risk < minimum_rr:
         return None, f"{contract['underlying_symbol']}: reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
 
+    quantity = _int(contract.get("lot_size"))
+    expected_profit = abs(target - entry) * quantity
+    minimum_profit = _float(os.getenv("STOCK_FUTURES_MIN_EXPECTED_PROFIT"), 5000)
+    if expected_profit < minimum_profit:
+        return None, (
+            f"{contract['underlying_symbol']}: expected gross profit "
+            f"{expected_profit:.2f} is below minimum {minimum_profit:.2f}"
+        )
+
     minimum_score = _float(os.getenv("STOCK_FUTURES_MIN_SCORE"), 80)
     if score < minimum_score:
         return None, f"{contract['underlying_symbol']}: score {score:.1f} is below {minimum_score:.1f}"
@@ -494,8 +513,9 @@ def evaluate_contract(prefiltered):
         "entry_price": round(entry, 2),
         "target_price": target,
         "stop_loss_price": stop,
+        "expected_gross_profit": round(expected_profit, 2),
         "reward_risk": round(reward_risk, 2),
-        "quantity": _int(contract.get("lot_size")),
+        "quantity": quantity,
         "technicals": technicals,
         "reasons": reasons,
         "spread_percent": round(spread, 3),

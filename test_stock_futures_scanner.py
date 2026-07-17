@@ -99,7 +99,7 @@ class StockFuturesScannerTests(unittest.TestCase):
         }
         with (
             patch.object(scanner, "get_instrument_technical_analysis", return_value=analysis),
-            patch.dict(os.environ, {"STOCK_FUTURES_MIN_SCORE": "80"}, clear=False),
+            patch.dict(os.environ, {"STOCK_FUTURES_MIN_SCORE": "80", "STOCK_FUTURES_MIN_EXPECTED_PROFIT": "0"}, clear=False),
         ):
             candidate, reason = scanner.evaluate_contract(item)
 
@@ -148,6 +148,7 @@ class StockFuturesScannerTests(unittest.TestCase):
         with (
             patch.object(scanner, "get_instrument_technical_analysis", return_value=analysis),
             patch.object(scanner, "_opening_reversion_window", return_value=True),
+            patch.dict(os.environ, {"STOCK_FUTURES_MIN_EXPECTED_PROFIT": "0"}, clear=False),
         ):
             candidate, reason = scanner.evaluate_contract(item)
 
@@ -174,6 +175,7 @@ class StockFuturesScannerTests(unittest.TestCase):
         with (
             patch.object(scanner, "get_instrument_technical_analysis", return_value=analysis),
             patch.object(scanner, "_opening_reversion_window", return_value=True),
+            patch.dict(os.environ, {"STOCK_FUTURES_MIN_EXPECTED_PROFIT": "0"}, clear=False),
         ):
             candidate, reason = scanner.evaluate_contract(item)
 
