@@ -2373,6 +2373,21 @@ def run_stock_futures_fallback():
         )
         return False
 
+    max_daily_trades = max(to_int(os.getenv("STOCK_FUTURES_MAX_TRADES_PER_DAY"), 1), 0)
+    if max_daily_trades and trade_count_for(STOCK_FUTURE_STATE) >= max_daily_trades:
+        message = (
+            f"Stock futures daily cap reached: "
+            f"{trade_count_for(STOCK_FUTURE_STATE)}/{max_daily_trades}"
+        )
+        write_scanner_status(
+            STOCK_SCANNER_STATUS_FILE,
+            enabled=True,
+            status="DAILY_CAP_REACHED",
+            message=message,
+        )
+        log(message)
+        return False
+
     ensure_instruments_file()
     try:
         result = scan_stock_futures(INSTRUMENT_CACHE, upstox_request, log)

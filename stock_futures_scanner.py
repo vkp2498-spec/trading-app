@@ -433,6 +433,12 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         )
 
     volume_ratio = _float(five.get("volume_ratio"))
+    minimum_volume = _float(os.getenv("STOCK_FUTURES_MIN_VOLUME_RATIO"), 1.20)
+    if volume_ratio < minimum_volume:
+        return None, (
+            f"{contract['underlying_symbol']}: opening volume ratio {volume_ratio:.2f} "
+            f"is below required {minimum_volume:.2f}"
+        )
     depth = _depth_metrics(prefiltered.get("quote", {}))
     score = 55.0  # confirmed touch plus close-back-inside rejection
     score += _aligned_component(fifteen, direction, 15, 7)
@@ -445,7 +451,7 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         score += 10
     if spread <= max_spread:
         score += 5
-    depth_points = _float(os.getenv("STOCK_FUTURES_DEPTH_POINTS"), 20)
+    depth_points = _float(os.getenv("STOCK_FUTURES_DEPTH_POINTS"), 10)
     if depth["bias"] == direction:
         score += depth_points
     elif depth["bias"] != "NEUTRAL":
@@ -515,6 +521,11 @@ def evaluate_contract(prefiltered):
 
     volume_ratio = _float(five.get("volume_ratio"))
     minimum_volume = _float(os.getenv("STOCK_FUTURES_MIN_VOLUME_RATIO"), 1.20)
+    if volume_ratio < minimum_volume:
+        return None, (
+            f"{contract['underlying_symbol']}: volume ratio {volume_ratio:.2f} "
+            f"is below required {minimum_volume:.2f}"
+        )
     depth = _depth_metrics(prefiltered.get("quote", {}))
     score = 0.0
     score += _aligned_component(fifteen, direction, 25, 5)
@@ -546,7 +557,7 @@ def evaluate_contract(prefiltered):
         )
     if spread <= max_spread:
         score += 5
-    depth_points = _float(os.getenv("STOCK_FUTURES_DEPTH_POINTS"), 20)
+    depth_points = _float(os.getenv("STOCK_FUTURES_DEPTH_POINTS"), 10)
     if depth["bias"] == direction:
         score += depth_points
         reasons.append(
