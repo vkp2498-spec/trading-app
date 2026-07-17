@@ -2309,8 +2309,24 @@ def run_signal_check():
             )
         ]
         if untracked_derivative_positions:
-            log("Global one-position rule: an untracked NSE derivatives position exists; no bot entry.")
-            return
+            allow_manual_overlap = (
+                os.getenv(
+                    "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS", "false"
+                ).lower()
+                == "true"
+            )
+            if not allow_manual_overlap:
+                log(
+                    "Global one-position rule: an untracked NSE derivatives position "
+                    "exists; no bot entry. Set "
+                    "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true only when "
+                    "manual positions are intentionally allowed to coexist."
+                )
+                return
+            log(
+                "Manual derivative position detected; override enabled. "
+                "Bot may enter one position and will manage only its own bot state."
+            )
     except Exception as error:
         log(f"Global broker-position precheck failed; no new entry for safety: {error}")
         return
