@@ -119,6 +119,15 @@ UPSTOX_MARGIN_URL = "https://api.upstox.com/v2/charges/margin"
 UPSTOX_FUNDS_URL = "https://api.upstox.com/v2/user/get-funds-and-margin"
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 
+# The monitor loop can still run every second, but repeated broker reads are
+# cached briefly to stay below Upstox rate limits. Order placement is never
+# cached.
+BROKER_READ_CACHE = {}
+
+
+def broker_read_cache_seconds():
+    return max(to_float(os.getenv("MONITOR_BROKER_CACHE_SECONDS"), 2.0), 0.5)
+
 
 def state_file(symbol):
     return BASE_DIR / f"trade_state_{symbol}.json"
@@ -858,21 +867,38 @@ def validate_stock_future_margin(instrument, transaction_type, quantity, price):
     }
 
 
-def get_order_details(order_id):
-    result = upstox_request("GET", UPSTOX_ORDER_DETAILS_URL, params={"order_id": order_id})
+def get_order_details(order_id, force=False):
+    cache_key = f"order:{order_id}"
+    cached = BROKER_READ_CACHE.get(cache_key)
+    now = time_module.monotonic()
+    if (
+        not force
+        and cached
+        and now - cached["at"] < broker_read_cache_seconds()
+    ):
+        return deepcopy(cached["data"])
+
+    try:
+        result = upstox_request("GET", UPSTOX_ORDER_DETAILS_URL, params={"order_id": order_id})
+    except RuntimeError as error:
+        if cached and " 429:" in str(error):
+            return deepcopy(cached["data"])
+        raise
     data = result.get("data", {})
 
     if isinstance(data, list):
-        return data[0] if data else {}
+        data = data[0] if data else {}
 
-    return data or {}
+    data = data or {}
+    BROKER_READ_CACHE[cache_key] = {"at": time_module.monotonic(), "data": deepcopy(data)}
+    return data
 
 
 def wait_for_order_complete(order_id, attempts=5, delay_seconds=2):
     latest = {}
 
     for _ in range(attempts):
-        latest = get_order_details(order_id)
+        latest = get_order_details(order_id, force=True)
         status = str(latest.get("status", "")).lower()
 
         if status in {"complete", "completed", "traded", "rejected", "cancelled", "canceled"}:
@@ -883,9 +909,26 @@ def wait_for_order_complete(order_id, attempts=5, delay_seconds=2):
     return latest
 
 
-def get_open_positions():
-    result = upstox_request("GET", UPSTOX_POSITIONS_URL)
-    return result.get("data", []) or []
+def get_open_positions(force=False):
+    cache_key = "positions"
+    cached = BROKER_READ_CACHE.get(cache_key)
+    now = time_module.monotonic()
+    if (
+        not force
+        and cached
+        and now - cached["at"] < broker_read_cache_seconds()
+    ):
+        return deepcopy(cached["data"])
+
+    try:
+        result = upstox_request("GET", UPSTOX_POSITIONS_URL)
+    except RuntimeError as error:
+        if cached and " 429:" in str(error):
+            return deepcopy(cached["data"])
+        raise
+    data = result.get("data", []) or []
+    BROKER_READ_CACHE[cache_key] = {"at": time_module.monotonic(), "data": deepcopy(data)}
+    return data
 
 
 def position_quantity(position):
