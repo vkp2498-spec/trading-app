@@ -130,6 +130,53 @@ def _spread_percent(quote, last_price):
     return max((ask - bid) / last_price * 100, 0)
 
 
+def _depth_metrics(quote):
+    """Summarize visible bid/offer quantities for a stock-futures quote."""
+    depth = (quote or {}).get("depth") or (quote or {}).get("market_depth") or {}
+    buys = depth.get("buy") or depth.get("bids") or []
+    sells = depth.get("sell") or depth.get("asks") or []
+
+    def level_quantity(level):
+        if not isinstance(level, dict):
+            return 0.0
+        return _float(
+            level.get("quantity")
+            or level.get("qty")
+            or level.get("volume")
+        )
+
+    buy_quantity = sum(level_quantity(level) for level in buys)
+    sell_quantity = sum(level_quantity(level) for level in sells)
+    total_quantity = buy_quantity + sell_quantity
+    if total_quantity <= 0:
+        return {
+            "available": False,
+            "bias": "NEUTRAL",
+            "buy_quantity": 0.0,
+            "sell_quantity": 0.0,
+            "buy_percent": 0.0,
+            "sell_percent": 0.0,
+        }
+
+    buy_percent = buy_quantity / total_quantity
+    sell_percent = sell_quantity / total_quantity
+    dominance = _float(os.getenv("STOCK_FUTURES_DEPTH_DOMINANCE_PERCENT"), 0.65)
+    if sell_percent >= dominance:
+        bias = "BEARISH"
+    elif buy_percent >= dominance:
+        bias = "BULLISH"
+    else:
+        bias = "NEUTRAL"
+    return {
+        "available": True,
+        "bias": bias,
+        "buy_quantity": round(buy_quantity, 2),
+        "sell_quantity": round(sell_quantity, 2),
+        "buy_percent": round(buy_percent, 4),
+        "sell_percent": round(sell_percent, 4),
+    }
+
+
 def fetch_bulk_quotes(contracts, request_func):
     if not contracts:
         return {}
@@ -302,6 +349,7 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         return None, f"{contract['underlying_symbol']}: opening reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
 
     volume_ratio = _float(five.get("volume_ratio"))
+    depth = _depth_metrics(prefiltered.get("quote", {}))
     score = 55.0  # confirmed touch plus close-back-inside rejection
     score += _aligned_component(fifteen, direction, 15, 7)
     score += _aligned_component(two, direction, 10, 5)
@@ -313,6 +361,10 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         score += 10
     if spread <= max_spread:
         score += 5
+    if depth["bias"] == direction:
+        score += 10
+    elif depth["bias"] != "NEUTRAL":
+        score -= 10
 
     minimum_score = _float(os.getenv("STOCK_FUTURES_OPENING_MIN_SCORE"), 70)
     if score < minimum_score:
@@ -340,6 +392,7 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         ],
         "spread_percent": round(spread, 3),
         "volume_ratio": round(volume_ratio, 2),
+        "depth": depth,
         "strategy": "OPENING_BOLLINGER_REVERSION",
         "opening_reversion": True,
     }, None
@@ -376,6 +429,7 @@ def evaluate_contract(prefiltered):
 
     volume_ratio = _float(five.get("volume_ratio"))
     minimum_volume = _float(os.getenv("STOCK_FUTURES_MIN_VOLUME_RATIO"), 1.20)
+    depth = _depth_metrics(prefiltered.get("quote", {}))
     score = 0.0
     score += _aligned_component(fifteen, direction, 25, 5)
     score += _aligned_component(five, direction, 25, 5)
@@ -406,6 +460,18 @@ def evaluate_contract(prefiltered):
         )
     if spread <= max_spread:
         score += 5
+    if depth["bias"] == direction:
+        score += 10
+        reasons.append(
+            f"Market depth confirms {direction.lower()} pressure "
+            f"({depth['buy_percent']:.0%} buy / {depth['sell_percent']:.0%} sell)"
+        )
+    elif depth["bias"] != "NEUTRAL":
+        score -= 10
+        reasons.append(
+            f"Market depth conflicts with {direction.lower()} direction "
+            f"({depth['buy_percent']:.0%} buy / {depth['sell_percent']:.0%} sell)"
+        )
 
     target, stop, reward_risk = _build_levels(entry, direction, five, fifteen)
     minimum_rr = _float(os.getenv("STOCK_FUTURES_MIN_REWARD_RISK"), 1.20)
@@ -434,6 +500,7 @@ def evaluate_contract(prefiltered):
         "reasons": reasons,
         "spread_percent": round(spread, 3),
         "volume_ratio": round(volume_ratio, 2),
+        "depth": depth,
     }, None
 
 

@@ -30,6 +30,19 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 class StockFuturesScannerTests(unittest.TestCase):
+    def test_market_depth_detects_sell_side_dominance(self):
+        quote = {
+            "depth": {
+                "buy": [{"quantity": 31}],
+                "sell": [{"quantity": 69}],
+            }
+        }
+        metrics = scanner._depth_metrics(quote)
+
+        self.assertTrue(metrics["available"])
+        self.assertEqual(metrics["bias"], "BEARISH")
+        self.assertAlmostEqual(metrics["sell_percent"], 0.69)
+
     def test_nearest_valid_expiry_is_selected(self):
         today = datetime.now(IST).date()
         instruments = [
