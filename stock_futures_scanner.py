@@ -225,7 +225,45 @@ def _aligned_component(analysis, direction, points, neutral_points=0):
     return 0
 
 
-def _build_levels(entry, direction, five, fifteen):
+def _target_increment(price):
+    configured = _float(os.getenv("STOCK_FUTURES_TARGET_INCREMENT"), 0)
+    if configured > 0:
+        return configured
+    if price < 1000:
+        return 10.0
+    if price < 5000:
+        return 20.0
+    return 100.0
+
+
+def _round_target_away_from_entry(target, entry, direction):
+    increment = _target_increment(entry)
+    if direction == "BULLISH":
+        return math.ceil(target / increment) * increment
+    return math.floor(target / increment) * increment
+
+
+def _two_hour_target(entry, direction, two, quantity, fallback_target):
+    """Choose the nearest qualifying 2H Bollinger target and round it outward."""
+    minimum_profit = _float(os.getenv("STOCK_FUTURES_MIN_EXPECTED_PROFIT"), 5000)
+    minimum_move = minimum_profit / quantity if quantity > 0 else 0
+    if direction == "BULLISH":
+        bands = [_float(two.get("middle_band")), _float(two.get("upper_band"))]
+        valid = sorted(value for value in bands if value > entry)
+        qualifying = [value for value in valid if value - entry >= minimum_move]
+        raw_target = min(qualifying) if qualifying else entry + minimum_move
+    else:
+        bands = [_float(two.get("middle_band")), _float(two.get("lower_band"))]
+        valid = sorted((value for value in bands if 0 < value < entry), reverse=True)
+        qualifying = [value for value in valid if entry - value >= minimum_move]
+        raw_target = max(qualifying) if qualifying else entry - minimum_move
+
+    if not valid and minimum_move <= 0:
+        raw_target = fallback_target
+    return round(_round_target_away_from_entry(raw_target, entry, direction), 2)
+
+
+def _build_levels(entry, direction, five, fifteen, two=None, quantity=0):
     aligned = [
         analysis
         for analysis in (five, fifteen)
@@ -242,11 +280,13 @@ def _build_levels(entry, direction, five, fifteen):
 
     atr = max(_float(five.get("atr14")), entry * 0.0025)
     if direction == "BULLISH":
-        target = min(targets) if targets else entry + atr * 1.5
+        fallback_target = min(targets) if targets else entry + atr * 1.5
+        target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         stop = max(stops) if stops else entry - atr
         reward, risk = target - entry, entry - stop
     else:
-        target = max(targets) if targets else entry - atr * 1.5
+        fallback_target = max(targets) if targets else entry - atr * 1.5
+        target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         stop = min(stops) if stops else entry + atr
         reward, risk = entry - target, stop - entry
     return round(target, 2), round(stop, 2), reward / risk if risk > 0 else 0
@@ -284,7 +324,7 @@ def _opening_reversion_signal(five):
     return None, "5M candle did not touch and reject an outer Bollinger Band"
 
 
-def _opening_reversion_levels(entry, direction, five, fifteen):
+def _opening_reversion_levels(entry, direction, five, fifteen, two=None, quantity=0):
     """Use the middle-band/pivot reversion objective with a nearby ATR stop."""
     atr = max(_float(five.get("atr14")), entry * 0.0025)
     if direction == "BULLISH":
@@ -295,7 +335,7 @@ def _opening_reversion_levels(entry, direction, five, fifteen):
             _float(fifteen.get("pivot")),
         ]
         targets = [value for value in targets if value > entry]
-        target = min(targets) if targets else entry + atr * 1.5
+        fallback_target = min(targets) if targets else entry + atr * 1.5
         stop_candidates = [
             _float(five.get("lower_band")),
             _float(fifteen.get("lower_band")),
@@ -303,6 +343,7 @@ def _opening_reversion_levels(entry, direction, five, fifteen):
         ]
         stop_candidates = [value for value in stop_candidates if 0 < value < entry]
         stop = max(stop_candidates) if stop_candidates else entry - atr
+        target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         reward, risk = target - entry, entry - stop
     else:
         targets = [
@@ -312,7 +353,7 @@ def _opening_reversion_levels(entry, direction, five, fifteen):
             _float(fifteen.get("pivot")),
         ]
         targets = [value for value in targets if 0 < value < entry]
-        target = max(targets) if targets else entry - atr * 1.5
+        fallback_target = max(targets) if targets else entry - atr * 1.5
         stop_candidates = [
             _float(five.get("upper_band")),
             _float(fifteen.get("upper_band")),
@@ -320,6 +361,7 @@ def _opening_reversion_levels(entry, direction, five, fifteen):
         ]
         stop_candidates = [value for value in stop_candidates if value > entry]
         stop = min(stop_candidates) if stop_candidates else entry + atr
+        target = _two_hour_target(entry, direction, two or {}, quantity, fallback_target)
         reward, risk = entry - target, stop - entry
     return round(target, 2), round(stop, 2), reward / risk if risk > 0 else 0
 
@@ -343,12 +385,14 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
     if spread > max_spread:
         return None, f"{contract['underlying_symbol']}: spread {spread:.2f}% exceeds {max_spread:.2f}%"
 
-    target, stop, reward_risk = _opening_reversion_levels(entry, direction, five, fifteen)
+    quantity = _int(contract.get("lot_size"))
+    target, stop, reward_risk = _opening_reversion_levels(
+        entry, direction, five, fifteen, two, quantity
+    )
     minimum_rr = _float(os.getenv("STOCK_FUTURES_OPENING_MIN_REWARD_RISK"), 1.00)
     if reward_risk < minimum_rr:
         return None, f"{contract['underlying_symbol']}: opening reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
 
-    quantity = _int(contract.get("lot_size"))
     expected_profit = abs(target - entry) * quantity
     minimum_profit = _float(os.getenv("STOCK_FUTURES_MIN_EXPECTED_PROFIT"), 5000)
     if expected_profit < minimum_profit:
@@ -370,12 +414,13 @@ def _evaluate_opening_reversion(prefiltered, contract, technicals):
         score += 10
     if spread <= max_spread:
         score += 5
+    depth_points = _float(os.getenv("STOCK_FUTURES_DEPTH_POINTS"), 20)
     if depth["bias"] == direction:
-        score += 10
+        score += depth_points
     elif depth["bias"] != "NEUTRAL":
-        score -= 10
+        score -= depth_points
 
-    minimum_score = _float(os.getenv("STOCK_FUTURES_OPENING_MIN_SCORE"), 70)
+    minimum_score = _float(os.getenv("STOCK_FUTURES_OPENING_MIN_SCORE"), 90)
     if score < minimum_score:
         return None, f"{contract['underlying_symbol']}: opening score {score:.1f} is below {minimum_score:.1f}"
 
@@ -470,25 +515,28 @@ def evaluate_contract(prefiltered):
         )
     if spread <= max_spread:
         score += 5
+    depth_points = _float(os.getenv("STOCK_FUTURES_DEPTH_POINTS"), 20)
     if depth["bias"] == direction:
-        score += 10
+        score += depth_points
         reasons.append(
             f"Market depth confirms {direction.lower()} pressure "
             f"({depth['buy_percent']:.0%} buy / {depth['sell_percent']:.0%} sell)"
         )
     elif depth["bias"] != "NEUTRAL":
-        score -= 10
+        score -= depth_points
         reasons.append(
             f"Market depth conflicts with {direction.lower()} direction "
             f"({depth['buy_percent']:.0%} buy / {depth['sell_percent']:.0%} sell)"
         )
 
-    target, stop, reward_risk = _build_levels(entry, direction, five, fifteen)
+    quantity = _int(contract.get("lot_size"))
+    target, stop, reward_risk = _build_levels(
+        entry, direction, five, fifteen, two, quantity
+    )
     minimum_rr = _float(os.getenv("STOCK_FUTURES_MIN_REWARD_RISK"), 1.20)
     if reward_risk < minimum_rr:
         return None, f"{contract['underlying_symbol']}: reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
 
-    quantity = _int(contract.get("lot_size"))
     expected_profit = abs(target - entry) * quantity
     minimum_profit = _float(os.getenv("STOCK_FUTURES_MIN_EXPECTED_PROFIT"), 5000)
     if expected_profit < minimum_profit:
@@ -497,7 +545,7 @@ def evaluate_contract(prefiltered):
             f"{expected_profit:.2f} is below minimum {minimum_profit:.2f}"
         )
 
-    minimum_score = _float(os.getenv("STOCK_FUTURES_MIN_SCORE"), 80)
+    minimum_score = _float(os.getenv("STOCK_FUTURES_MIN_SCORE"), 90)
     if score < minimum_score:
         return None, f"{contract['underlying_symbol']}: score {score:.1f} is below {minimum_score:.1f}"
 
