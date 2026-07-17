@@ -28,6 +28,9 @@ UPSTOX_POSITIONS_URL = (
     "https://api.upstox.com/v2/"
     "portfolio/short-term-positions"
 )
+UPSTOX_TRADE_PNL_URL = (
+    "https://api.upstox.com/v2/trade/profit-loss/data"
+)
 
 
 def load_env():
@@ -591,6 +594,53 @@ def build_equity_curve(
     return points
 
 
+def fetch_upstox_today_pnl() -> tuple[float | None, str | None]:
+    """Fetch today's realized gross P&L directly from Upstox."""
+    headers = upstox_headers()
+    if not headers:
+        return None, "UPSTOX_ACCESS_TOKEN is not configured"
+
+    today = datetime.now(IST)
+    date_text = today.strftime("%d-%m-%Y")
+    financial_year = (
+        f"{today.year % 100:02d}{(today.year + 1) % 100:02d}"
+        if today.month >= 4
+        else f"{(today.year - 1) % 100:02d}{today.year % 100:02d}"
+    )
+
+    try:
+        response = requests.get(
+            UPSTOX_TRADE_PNL_URL,
+            headers=headers,
+            params={
+                "from_date": date_text,
+                "to_date": date_text,
+                "segment": "FO",
+                "financial_year": financial_year,
+                "page_number": 1,
+                "page_size": 5000,
+            },
+            timeout=12,
+        )
+        if response.status_code >= 300:
+            return None, f"Upstox P&L request failed with status {response.status_code}"
+
+        payload = response.json()
+        rows = payload.get("data", [])
+        if not isinstance(rows, list):
+            return None, "Upstox P&L response contained invalid data"
+
+        gross_pnl = sum(
+            safe_float(row.get("sell_amount"))
+            - safe_float(row.get("buy_amount"))
+            for row in rows
+            if isinstance(row, dict)
+        )
+        return round(gross_pnl, 2), None
+    except (requests.RequestException, ValueError, TypeError) as error:
+        return None, f"Upstox P&L request failed: {type(error).__name__}"
+
+
 def build_trade_performance() -> dict:
     trades = read_trade_history()
 
@@ -612,27 +662,25 @@ def build_trade_performance() -> dict:
         key=lambda trade: trade["exitTime"],
         reverse=True,
     )[:20]
+    upstox_today_pnl, upstox_today_error = fetch_upstox_today_pnl()
+    today_closed_pnl = upstox_today_pnl if upstox_today_pnl is not None else 0.0
+    today_categories = today_category_pnl(today_trades)
+    today_categories["overall"] = today_closed_pnl
     average_profit, average_loss = average_trade_results(trades)
 
     return {
         "today": {
             "closedTrades": len(today_trades),
-            "closedPnL": round(
-                sum(
-                    trade["grossPnL"]
-                    for trade in today_trades
-                ),
-                2,
-            ),
+            "closedPnL": today_closed_pnl,
+            "closedPnLSource": "UPSTOX" if upstox_today_pnl is not None else "UNAVAILABLE",
+            "closedPnLError": upstox_today_error,
             "winRate": calculate_win_rate(
                 today_trades
             ),
             "symbolPnL": symbol_pnl(
                 today_trades
             ),
-            "categoryPnL": today_category_pnl(
-                today_trades
-            ),
+            "categoryPnL": today_categories,
         },
         "cumulative": {
             "totalTrades": len(trades),
