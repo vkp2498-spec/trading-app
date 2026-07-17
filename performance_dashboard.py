@@ -24,6 +24,8 @@ from post_market_review import (
     summarize,
 )
 from strategy_core import now_ist
+from dashboard_data import build_live_positions as api_build_live_positions
+from dashboard_data import build_trade_performance as api_build_trade_performance
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ICON = BASE_DIR / "assets" / "vamsi_icon_v2.jpg"
@@ -1057,156 +1059,48 @@ def pnl_for(data, symbol):
 
 load_env()
 
-main_tab, review_tab, replay_tab = st.tabs(["Live Dashboard", "Post-Market X-Ray", "Strategy Replay"])
+if st.button("Refresh Dashboard", use_container_width=True):
+    st.rerun()
 
-with main_tab:
-    st.markdown('<div class="dash-title">Trading Bot Performance</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="dash-subtitle">Live status, open trade P&L, and closed trade performance</div>',
-        unsafe_allow_html=True,
-    )
+st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-subtitle">NIFTY and BANKNIFTY option-buy performance</div>', unsafe_allow_html=True)
 
-    if st.button("Refresh Dashboard", use_container_width=True):
-        st.rerun()
+performance = api_build_trade_performance()
+live = api_build_live_positions()
+today = performance.get("today", {})
+cumulative = performance.get("cumulative", {})
+today_symbol = today.get("symbolPnL", {})
+cumulative_symbol = cumulative.get("symbolPnL", {})
+symbol_trades = today.get("symbolTrades", {})
+positions = live.get("positions", [])
 
-    last_run_time, bot_status = parse_latest_bot_status()
-    live_df, live_error = get_live_bot_positions()
+def open_for(symbol):
+    matching = [p for p in positions if symbol in str(p.get("underlyingSymbol", "")).upper()]
+    return sum(float(p.get("livePnL") or 0) for p in matching), len(matching)
 
-    st.markdown("### Live Cockpit")
+overall_today = float(today.get("closedPnL", 0) or 0) + float(live.get("totalLivePnL", 0) or 0)
 
-    top1, top2, top3, top4 = st.columns(4)
+st.markdown("### Overall")
+overall_cols = st.columns(6)
+overall_cols[0].metric("Today P&L", money(overall_today))
+overall_cols[1].metric("Today Trades", today.get("closedTrades", 0))
+overall_cols[2].metric("Open Trades", live.get("openTradeCount", 0))
+overall_cols[3].metric("Cumulative P&L", money(cumulative.get("totalPnL", 0)))
+overall_cols[4].metric("Avg Profit / Win", money(cumulative.get("averageProfitPerWinningTrade", 0)))
+overall_cols[5].metric("Avg Loss / Loss", money(-float(cumulative.get("averageLossPerLosingTrade", 0) or 0)))
 
-    live_pnl_total = 0.0
-    if not live_df.empty:
-        live_pnl_total = live_df["live_pnl"].fillna(0).sum()
+st.markdown("### NIFTY and BANKNIFTY")
+for symbol in SYMBOLS:
+    open_pnl, open_count = open_for(symbol)
+    cols = st.columns(6)
+    cols[0].metric(f"{symbol} Today", money(today_symbol.get(symbol, 0)))
+    cols[1].metric(f"{symbol} Trades", symbol_trades.get(symbol, 0))
+    cols[2].metric(f"{symbol} Open P&L", money(open_pnl))
+    cols[3].metric(f"{symbol} Open Trades", open_count)
+    cols[4].metric(f"{symbol} Cumulative", money(cumulative_symbol.get(symbol, 0)))
+    cols[5].metric(f"{symbol} Total Today", money(float(today_symbol.get(symbol, 0) or 0) + open_pnl))
 
-    top1.metric("Last Bot Log", last_run_time)
-    top2.metric("Open Bot Trades", len(live_df))
-    top3.metric("Live Bot P&L", money(live_pnl_total))
-    top4.metric("Upstox Live Data", "OK" if not live_error else "Check")
-
-    if live_error:
-        st.warning(live_error)
-
-    status_cols = st.columns(2)
-
-    for idx, symbol in enumerate(SYMBOLS):
-        item = bot_status[symbol]
-        cls = status_class(item["status"])
-
-        with status_cols[idx]:
-            st.markdown(
-                f"""
-                <div class="status-card">
-                    <div class="small-label">{symbol}</div>
-                    <div class="big-value {cls}">{item["status"]}</div>
-                    <div class="muted">Last update: {item["last_time"]}</div>
-                    <br>
-                    <div class="small-label">Signal</div>
-                    <div>{item["signal"]} | Confidence: {item["confidence"]} | Option score: {item["option_score"]}</div>
-                    <br>
-                    <div class="small-label">Overall</div>
-                    <div>Score: {item["weighted_score"]} | Grade: {item["weighted_grade"]}</div>
-                    <br>
-                    <div class="small-label">ATM Option Flow</div>
-                    <div>{item["atm_option_flow"]}</div>
-                    <br>
-                    <div class="small-label">Reason</div>
-                    <div class="muted">{item["reason"]}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("### Live Bot Trades")
-    render_live_trade_cards(live_df)
-
-    scanner = read_json(STOCK_SCANNER_STATUS_FILE, {})
-    scanner_status = scanner.get("status", "NO DATA")
-    scanner_message = scanner.get("message") or (
-        f"Universe {scanner.get('universe_count', 0)} | "
-        f"Shortlist {scanner.get('shortlist_count', 0)} | "
-        f"Qualified {scanner.get('qualified_count', 0)}"
-    )
-    selected = scanner.get("selected") or {}
-    selected_text = (
-        f"{selected.get('underlying')} {selected.get('direction')} | "
-        f"Score {selected.get('score')}"
-        if selected else "No stock future selected"
-    )
-    st.markdown("### NIFTY 50 Futures Scanner")
-    s1, s2, s3 = st.columns(3)
-    s1.metric("Scanner Status", scanner_status)
-    s2.metric("Last Run", str(scanner.get("last_run", "N/A"))[:19])
-    s3.metric("Selection", selected_text)
-    st.caption(scanner_message)
-    attempts = scanner.get("attempts") or []
-    if attempts:
-        with st.expander("Scanner attempts and margin checks"):
-            st.dataframe(pd.DataFrame(attempts), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    if not TRADE_HISTORY_FILE.exists():
-        st.info("No closed trades recorded yet.")
-    else:
-        df = pd.read_csv(TRADE_HISTORY_FILE)
-
-        if df.empty:
-            st.info("No closed trades recorded yet.")
-        else:
-            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
-            df["gross_pnl"] = pd.to_numeric(df["gross_pnl"], errors="coerce").fillna(0)
-            df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-
-            today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-            today_df = df[df["trade_date"] == today]
-
-            st.markdown("### Today")
-
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Closed Trades", len(today_df))
-            c2.metric("Closed P&L", money(today_df["gross_pnl"].sum()))
-            c3.metric("Win %", f"{win_percent(today_df)}%")
-            c4.metric("NIFTY P&L", money(pnl_for(today_df, "NIFTY")))
-            c5.metric("BANKNIFTY P&L", money(pnl_for(today_df, "BANKNIFTY")))
-            c6.metric("Stock Futures P&L", money(pnl_for(today_df, "STOCK_FUTURE")))
-
-            st.markdown("### Cumulative")
-
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("Total Trades", len(df))
-            c2.metric("Total P&L", money(df["gross_pnl"].sum()))
-            c3.metric("Win %", f"{win_percent(df)}%")
-            c4.metric("NIFTY Total", money(pnl_for(df, "NIFTY")))
-            c5.metric("BANKNIFTY Total", money(pnl_for(df, "BANKNIFTY")))
-            c6.metric("Stock Futures Total", money(pnl_for(df, "STOCK_FUTURE")))
-
-            daily = df.groupby("trade_date", as_index=False)["gross_pnl"].sum()
-            daily["cumulative_pnl"] = daily["gross_pnl"].cumsum()
-
-            left, right = st.columns(2)
-
-            with left:
-                st.markdown("### Daily P&L")
-                st.bar_chart(daily.set_index("trade_date")["gross_pnl"])
-
-            with right:
-                st.markdown("### Cumulative Equity Curve")
-                st.line_chart(daily.set_index("trade_date")["cumulative_pnl"])
-
-            st.markdown("### Symbol P&L")
-            symbol_pnl = df.groupby("symbol", as_index=False)["gross_pnl"].sum()
-            st.bar_chart(symbol_pnl.set_index("symbol")["gross_pnl"])
-
-            st.markdown("### Today's Closed Trades")
-            st.dataframe(today_df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
-
-            st.markdown("### All Closed Trades")
-            st.dataframe(df.sort_values("exit_time", ascending=False), use_container_width=True, hide_index=True)
-
-with review_tab:
-    render_post_market_review_tab()
-
-with replay_tab:
-    render_strategy_replay_tab()
+if live.get("error"):
+    st.warning(live["error"])
+if today.get("closedPnLSource") != "UPSTOX":
+    st.warning("Today’s realized P&L is currently unavailable from Upstox.")
