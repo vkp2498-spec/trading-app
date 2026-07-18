@@ -24,6 +24,10 @@ from trading_config import select_profile
 from stock_screener import get_screener
 from stock_screener import run_screener
 from stock_screener import save_invested
+from mobile_orders import buy_delivery
+from mobile_orders import exit_holding
+from mobile_orders import holdings
+from mobile_orders import live_orders_enabled
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -74,6 +78,19 @@ class InvestedStock(BaseModel):
     instrumentKey: str
     entryPrice: float
     quantity: int = 1
+
+
+class LiveBuyRequest(BaseModel):
+    symbol: str
+    instrumentKey: str
+    maximumAmount: float = 100_000
+    confirmation: bool = False
+
+
+class LiveExitRequest(BaseModel):
+    symbol: str
+    instrumentKey: str
+    confirmation: bool = False
 
 
 def require_mobile_token(
@@ -248,6 +265,42 @@ def update_invested_stock(item: InvestedStock):
 def remove_invested_stock(symbol: str):
     current = [row for row in get_screener().get("invested", []) if str(row.get("symbol", "")).upper() != symbol.upper()]
     return save_invested(current)
+
+
+@app.get("/api/v1/portfolio/holdings", dependencies=[Depends(require_mobile_token)])
+def portfolio_holdings():
+    try:
+        return {"liveOrdersEnabled": live_orders_enabled(), "holdings": holdings()}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Holdings are temporarily unavailable")
+
+
+@app.post("/api/v1/orders/buy", dependencies=[Depends(require_mobile_token)])
+def live_buy_order(request: LiveBuyRequest):
+    if not request.confirmation:
+        raise HTTPException(status_code=400, detail="Explicit order confirmation is required")
+    try:
+        return buy_delivery(request.instrumentKey, request.symbol, request.maximumAmount)
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/api/v1/orders/exit", dependencies=[Depends(require_mobile_token)])
+def live_exit_order(request: LiveExitRequest):
+    if not request.confirmation:
+        raise HTTPException(status_code=400, detail="Explicit exit confirmation is required")
+    try:
+        return exit_holding(request.instrumentKey, request.symbol)
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.post(
