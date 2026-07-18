@@ -532,6 +532,7 @@ def normalize_trade(row: dict) -> dict:
         "grossPnL": safe_float(
             row.get("gross_pnl")
         ),
+        "score": safe_float(row.get("score"), None),
         "status": row.get("status", "CLOSED"),
     }
 

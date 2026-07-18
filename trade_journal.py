@@ -25,6 +25,7 @@ COLUMNS = [
     "stop_loss_price",
     "exit_reason",
     "gross_pnl",
+    "score",
     "status",
 ]
 
@@ -88,6 +89,7 @@ def record_closed_trade(state, exit_price, exit_reason):
         "stop_loss_price": state.get("stop_loss_price", ""),
         "exit_reason": exit_reason,
         "gross_pnl": gross_pnl,
+        "score": state.get("score", ""),
         "status": "CLOSED",
     }
 

@@ -293,6 +293,9 @@ class TradeControlTests(unittest.TestCase):
                 "MAX_LOTS_PER_ENTRY": "0",
             },
             clear=False,
+        ), patch(
+            "trade_bot.active_value",
+            side_effect=lambda name, fallback: os.getenv(name, fallback),
         ):
             quantity = trade_bot.order_quantity_for(
                 "NIFTY",
@@ -307,6 +310,9 @@ class TradeControlTests(unittest.TestCase):
             os.environ,
             {"OPTION_CAPITAL_PER_ENTRY": "1", "MAX_LOTS_PER_ENTRY": "0"},
             clear=False,
+        ), patch(
+            "trade_bot.active_value",
+            side_effect=lambda name, fallback: os.getenv(name, fallback),
         ):
             quantity = trade_bot.order_quantity_for(
                 "BANKNIFTY",
