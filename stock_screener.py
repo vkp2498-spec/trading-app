@@ -109,6 +109,9 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
         return None
     close = frame["close"]
     latest = float(close.iloc[-1])
+    minimum_price = _number(os.getenv("STOCK_SCREENER_MIN_PRICE"), 50.0)
+    if latest < minimum_price:
+        return None
     ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
     ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
     rolling20 = close.rolling(20)
@@ -119,6 +122,10 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
     rsi = _rsi(close)
     recent_volume = float(frame["volume"].tail(20).mean())
     volume_ratio = float(frame["volume"].iloc[-1]) / recent_volume if recent_volume > 0 else 1
+    average_turnover = recent_volume * latest
+    minimum_turnover = _number(os.getenv("STOCK_SCREENER_MIN_AVG_TURNOVER"), 5_000_000.0)
+    if recent_volume > 0 and average_turnover < minimum_turnover:
+        return None
     monthly = frame.resample("ME").agg({"close": "last"}).dropna()
     monthly_up = len(monthly) >= 3 and float(monthly["close"].iloc[-1]) > float(monthly["close"].iloc[-3])
 
@@ -142,11 +149,21 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
         return None
     target = round(latest + max(atr * 3, latest * 0.08), 2)
     stop = round(max(latest - atr * 1.5, latest * 0.90), 2)
+    investment_amount = _number(os.getenv("STOCK_SCREENER_INVESTMENT_AMOUNT"), 100_000.0)
+    quantity = max(1, int(investment_amount // latest))
+    invested_value = round(quantity * latest, 2)
+    potential_profit = round(max((target - latest) * quantity, 0), 2)
+    potential_loss = round(max((latest - stop) * quantity, 0), 2)
+    reward_risk = round(potential_profit / potential_loss, 2) if potential_loss else 0.0
     probability = round(min(85, max(55, 50 + score * 0.38)), 1)
     return {
         "symbol": asset["symbol"], "name": asset["name"], "instrumentKey": asset["instrumentKey"],
         "isETF": asset["isETF"], "lastPrice": round(latest, 2), "targetPrice": target,
         "stopLossPrice": stop, "probabilityUp": probability, "score": round(score, 1),
+        "investmentAmount": investment_amount, "quantity": quantity,
+        "investedValue": invested_value, "potentialProfit": potential_profit,
+        "potentialLoss": potential_loss, "rewardRisk": reward_risk,
+        "averageDailyTurnover": round(average_turnover, 2),
         "trend": "BULLISH", "horizon": "1–3 months", "rsi14": round(rsi, 1),
         "reasons": reasons, "asOf": datetime.now(IST).isoformat(),
     }
