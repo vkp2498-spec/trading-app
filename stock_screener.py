@@ -1,4 +1,4 @@
-"""Longer-horizon NSE equity/ETF research screener.
+"""Short-horizon NSE equity research screener.
 
 This module is deliberately read-only: it produces research candidates and
 does not place orders. Results are cached so the mobile app remains useful
@@ -69,19 +69,22 @@ def equity_universe() -> list[dict]:
         if not key or not symbol or symbol in seen:
             continue
         seen.add(symbol)
+        is_etf = " ETF" in f" {symbol} " or "ETF" in str(row.get("name") or "").upper()
+        if is_etf:
+            continue
         result.append({
             "instrumentKey": key,
             "symbol": symbol,
             "name": row.get("name") or symbol,
-            "isETF": " ETF" in f" {symbol} " or "ETF" in str(row.get("name") or "").upper(),
+            "isETF": False,
         })
     return result
 
 
-def _candles(instrument_key: str, days: int = 400) -> pd.DataFrame:
+def _candles(instrument_key: str, days: int = 400, unit: str = "days", interval: int = 1) -> pd.DataFrame:
     today = datetime.now(IST).date()
     start = today - timedelta(days=days)
-    url = f"{HISTORICAL_URL}/{instrument_key}/days/1/{today}/{start}"
+    url = f"{HISTORICAL_URL}/{instrument_key}/{unit}/{interval}/{today}/{start}"
     response = requests.get(url, headers=upstox_headers(), timeout=25)
     response.raise_for_status()
     rows = []
@@ -104,7 +107,7 @@ def _rsi(series: pd.Series, period: int = 14) -> float:
     return 100 - (100 / (1 + float(gains.iloc[-1]) / last_loss))
 
 
-def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
+def _evaluate(asset: dict, frame: pd.DataFrame, four_hour: pd.DataFrame) -> dict | None:
     if len(frame) < 80:
         return None
     close = frame["close"]
@@ -126,8 +129,12 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
     minimum_turnover = _number(os.getenv("STOCK_SCREENER_MIN_AVG_TURNOVER"), 5_000_000.0)
     if recent_volume > 0 and average_turnover < minimum_turnover:
         return None
-    monthly = frame.resample("ME").agg({"close": "last"}).dropna()
-    monthly_up = len(monthly) >= 3 and float(monthly["close"].iloc[-1]) > float(monthly["close"].iloc[-3])
+    if len(four_hour) < 50:
+        return None
+    four_close = four_hour["close"]
+    four_ema20 = float(four_close.ewm(span=20, adjust=False).mean().iloc[-1])
+    four_ema50 = float(four_close.ewm(span=50, adjust=False).mean().iloc[-1])
+    four_hour_up = float(four_close.iloc[-1]) > four_ema20 > four_ema50
 
     score = 0.0
     reasons = []
@@ -135,8 +142,10 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
         score += 30; reasons.append("Price is above rising 20/50-day averages")
     elif latest > ema20:
         score += 15; reasons.append("Price is above the 20-day average")
-    if monthly_up:
-        score += 25; reasons.append("Monthly trend is higher")
+    if four_hour_up:
+        score += 25; reasons.append("4-hour trend confirms higher highs")
+    elif float(four_close.iloc[-1]) > four_ema20:
+        score += 10; reasons.append("4-hour price is above its 20-candle average")
     if 52 <= rsi <= 72:
         score += 20; reasons.append("RSI supports constructive momentum")
     elif rsi > 72:
@@ -147,14 +156,17 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
         score += 10; reasons.append("Recent volume is above its 20-day average")
     if score < 55 or atr <= 0 or latest <= 0:
         return None
-    target = round(latest + max(atr * 3, latest * 0.08), 2)
-    stop = round(max(latest - atr * 1.5, latest * 0.90), 2)
+    target = round(latest + max(atr * 2.5, latest * 0.04), 2)
+    stop = round(max(latest - atr * 1.25, latest * 0.94), 2)
     investment_amount = _number(os.getenv("STOCK_SCREENER_INVESTMENT_AMOUNT"), 100_000.0)
     quantity = max(1, int(investment_amount // latest))
     invested_value = round(quantity * latest, 2)
     potential_profit = round(max((target - latest) * quantity, 0), 2)
     potential_loss = round(max((latest - stop) * quantity, 0), 2)
     reward_risk = round(potential_profit / potential_loss, 2) if potential_loss else 0.0
+    minimum_reward_risk = _number(os.getenv("STOCK_SCREENER_MIN_REWARD_RISK"), 1.50)
+    if reward_risk < minimum_reward_risk:
+        return None
     probability = round(min(85, max(55, 50 + score * 0.38)), 1)
     return {
         "symbol": asset["symbol"], "name": asset["name"], "instrumentKey": asset["instrumentKey"],
@@ -164,7 +176,7 @@ def _evaluate(asset: dict, frame: pd.DataFrame) -> dict | None:
         "investedValue": invested_value, "potentialProfit": potential_profit,
         "potentialLoss": potential_loss, "rewardRisk": reward_risk,
         "averageDailyTurnover": round(average_turnover, 2),
-        "trend": "BULLISH", "horizon": "1–3 months", "rsi14": round(rsi, 1),
+        "trend": "BULLISH", "horizon": "Up to 1 week", "rsi14": round(rsi, 1),
         "reasons": reasons, "asOf": datetime.now(IST).isoformat(),
     }
 
@@ -196,17 +208,19 @@ def run_screener() -> dict:
                     recommendations.append(result)
             except Exception:
                 errors += 1
-    recommendations.sort(key=lambda row: (row["probabilityUp"], row["score"]), reverse=True)
+    recommendations.sort(key=lambda row: (row["potentialProfit"], row["rewardRisk"], row["probabilityUp"]), reverse=True)
     previous = load_result()
     invested = _refresh_invested(previous.get("invested", []), universe, recommendations)
-    result = {"status": "READY", "asOf": datetime.now(IST).isoformat(), "scanned": len(candidates), "errors": errors, "recommendations": recommendations[:5], "invested": invested}
+    result = {"status": "READY", "asOf": datetime.now(IST).isoformat(), "scanned": len(candidates), "errors": errors, "recommendations": recommendations[:10], "invested": invested}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     RESULT_FILE.write_text(json.dumps(result, indent=2))
     return result
 
 
 def _screen_asset(asset: dict) -> dict | None:
-    return _evaluate(asset, _candles(asset["instrumentKey"]))
+    daily = _candles(asset["instrumentKey"], days=400, unit="days", interval=1)
+    four_hour = _candles(asset["instrumentKey"], days=60, unit="hours", interval=4)
+    return _evaluate(asset, daily, four_hour)
 
 
 def get_screener() -> dict:
