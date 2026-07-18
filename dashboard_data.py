@@ -18,6 +18,7 @@ LOG_DIR = BASE_DIR / "logs"
 
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
+ANALYSIS_HISTORY_FILE = DATA_DIR / "analysis_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
@@ -299,6 +300,113 @@ def safe_int(value, default=0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def analysis_indicator(label: str, maximum: float, contribution: float, detail: str) -> dict:
+    return {
+        "label": label,
+        "weight": maximum,
+        "contribution": round(contribution, 1),
+        "detail": detail,
+    }
+
+
+def weighted_components(option_summary: dict, technicals: dict) -> list[dict]:
+    """Return the same five transparent components used by signal_score.py."""
+    weighted = option_summary.get("weighted_alignment", {}) or {}
+    component_values = {}
+    labels = {
+        "Option-chain": "option_chain",
+        "15M": "fifteen_min",
+        "2H": "two_hour",
+        "5M momentum/volume": "five_min",
+        "ATM option VWAP/volume": "atm_option_flow",
+    }
+    for reason in weighted.get("reasons", []) or []:
+        match = re.search(r"^(.+?) component=([-0-9.]+)/([0-9.]+)", str(reason))
+        if match:
+            key = labels.get(match.group(1))
+            if key:
+                component_values[key] = safe_float(match.group(2))
+
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    two_hour = technicals.get("two_hour", {}) or {}
+    five_min = technicals.get("five_min", {}) or {}
+    flow = technicals.get("atm_option_flow", {}) or {}
+    return [
+        analysis_indicator(
+            "Option chain", 35, component_values.get("option_chain", 0),
+            f"{option_summary.get('bias') or '—'} • {option_summary.get('confidence') or '—'}",
+        ),
+        analysis_indicator(
+            "15-minute trend", 25, component_values.get("fifteen_min", 0),
+            f"{fifteen.get('bias') or '—'} • {fifteen.get('confidence') or '—'}",
+        ),
+        analysis_indicator(
+            "2-hour trend", 10, component_values.get("two_hour", 0),
+            f"{two_hour.get('bias') or '—'} • {two_hour.get('confidence') or '—'}",
+        ),
+        analysis_indicator(
+            "5-minute momentum", 15, component_values.get("five_min", 0),
+            f"Momentum {five_min.get('momentum_score', '—')} • volume {'confirmed' if five_min.get('volume_confirmed') else 'not confirmed'}",
+        ),
+        analysis_indicator(
+            "ATM option flow", 15, component_values.get("atm_option_flow", 0),
+            f"{flow.get('bias') or '—'} • volume {safe_float(flow.get('volume_ratio')):.2f}x",
+        ),
+    ]
+
+
+def normalize_analysis(row: dict) -> dict:
+    try:
+        raw = json.loads(row.get("raw_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw = {}
+    option_summary = raw.get("option_summary", {}) or {}
+    technicals = raw.get("technicals", {}) or {}
+    llm = raw.get("llm_decision", {}) or {}
+    weighted = option_summary.get("weighted_alignment", {}) or {}
+    entry = safe_float(option_summary.get("entry_price"), None)
+    target = safe_float(option_summary.get("target_price") or llm.get("target_price"), None)
+    stop = safe_float(option_summary.get("stop_loss_price") or llm.get("stop_loss_price"), None)
+    reward = abs(target - entry) if target is not None and entry is not None else None
+    risk = abs(entry - stop) if stop is not None and entry is not None else None
+    traded = bool(llm.get("execute_trade")) and str(llm.get("decision") or "").upper() != "NO_TRADE"
+    return {
+        "timestamp": row.get("timestamp", ""),
+        "symbol": row.get("symbol", ""),
+        "decision": "TRADED" if traded else "REJECTED",
+        "signal": option_summary.get("bias"),
+        "llmDecision": llm.get("decision") or ("TRADE" if traded else "NO_TRADE"),
+        "llmConfidence": llm.get("confidence"),
+        "reason": llm.get("reason") or row.get("llm_reason") or "",
+        "overallScore": safe_float(weighted.get("score"), None),
+        "grade": weighted.get("grade"),
+        "indicators": weighted_components(option_summary, technicals),
+        "strike": safe_float(option_summary.get("strike"), None),
+        "instrument": option_summary.get("trading_symbol") or "",
+        "optionType": option_summary.get("option_type") or row.get("option_type") or "",
+        "entryPrice": entry,
+        "targetPrice": target,
+        "stopLossPrice": stop,
+        "risk": round(risk, 2) if risk is not None else None,
+        "reward": round(reward, 2) if reward is not None else None,
+        "rewardRiskRatio": round(reward / risk, 2) if reward is not None and risk else None,
+    }
+
+
+def latest_symbol_analyses() -> list[dict]:
+    latest = {}
+    if ANALYSIS_HISTORY_FILE.exists():
+        try:
+            with ANALYSIS_HISTORY_FILE.open("r", newline="", errors="ignore") as file:
+                for row in csv.DictReader(file):
+                    symbol = str(row.get("symbol") or "").upper()
+                    if symbol in SYMBOLS:
+                        latest[symbol] = normalize_analysis(row)
+        except (OSError, csv.Error):
+            pass
+    return [latest.get(symbol, {"symbol": symbol, "decision": "NO DATA", "indicators": []}) for symbol in SYMBOLS]
 
 
 def empty_trade_performance() -> dict:
@@ -1134,6 +1242,9 @@ def build_health_snapshot() -> dict:
             "tradeHistory": file_status(
                 TRADE_HISTORY_FILE
             ),
+            "analysisHistory": file_status(
+                ANALYSIS_HISTORY_FILE
+            ),
             "botLog": file_status(LOG_FILE),
             "stockScannerStatus": file_status(STOCK_SCANNER_STATUS_FILE),
             "environmentFilePresent": ENV_FILE.exists(),
@@ -1144,6 +1255,7 @@ def build_health_snapshot() -> dict:
             )
         },
         "bot": bot_status,
+        "lastRuns": latest_symbol_analyses(),
         "performance": trade_performance,
         "live": live_positions,
         "stockFuturesScanner": stock_scanner,
