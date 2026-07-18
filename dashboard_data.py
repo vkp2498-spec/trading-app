@@ -439,6 +439,8 @@ def empty_trade_performance() -> dict:
             "categoryPerformance": category_performance(
                 []
             ),
+            "dayOfWeekPerformance": day_of_week_performance([]),
+            "optionTypePerformance": option_type_performance([]),
         },
         "equityCurve": [],
         "recentTrades": [],
@@ -569,6 +571,69 @@ def category_performance(
         )
 
     return summaries
+
+
+def normalized_underlying(trade: dict) -> str:
+    symbol = str(
+        trade.get("underlyingSymbol")
+        or trade.get("underlying_symbol")
+        or trade.get("symbol")
+        or ""
+    ).upper()
+    if "BANKNIFTY" in symbol:
+        return "BANKNIFTY"
+    if "NIFTY" in symbol:
+        return "NIFTY"
+    return symbol
+
+
+def option_type(trade: dict) -> str:
+    value = str(
+        trade.get("tradingSymbol")
+        or trade.get("trading_symbol")
+        or trade.get("optionType")
+        or trade.get("option_type")
+        or ""
+    ).upper()
+    return "PUT" if re.search(r"(?:^|[ _-])PE$|PE$", value) else "CALL"
+
+
+def day_of_week_performance(trades: list[dict]) -> list[dict]:
+    totals = {
+        (day, symbol): 0.0
+        for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+        for symbol in SYMBOLS
+    }
+    for trade in trades:
+        try:
+            day = datetime.strptime(str(trade.get("tradeDate") or ""), "%Y-%m-%d").strftime("%A")
+        except (TypeError, ValueError):
+            continue
+        symbol = normalized_underlying(trade)
+        if (day, symbol) in totals:
+            totals[(day, symbol)] += safe_float(trade.get("grossPnL"))
+    return [
+        {"day": day, "symbol": symbol, "netPnL": round(totals[(day, symbol)], 2)}
+        for day in ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+        for symbol in SYMBOLS
+    ]
+
+
+def option_type_performance(trades: list[dict]) -> list[dict]:
+    totals = {
+        (option, symbol): 0.0
+        for option in ("CALL", "PUT")
+        for symbol in SYMBOLS
+    }
+    for trade in trades:
+        key = (option_type(trade), normalized_underlying(trade))
+        if key in totals:
+            totals[key] += safe_float(trade.get("grossPnL"))
+    return [
+        {"optionType": option, "symbol": symbol, "netPnL": round(totals[(option, symbol)], 2)}
+        for option in ("CALL", "PUT")
+        for symbol in SYMBOLS
+    ]
 
 
 def today_category_pnl(
@@ -831,6 +896,8 @@ def build_trade_performance() -> dict:
             "categoryPerformance": category_performance(
                 trades
             ),
+            "dayOfWeekPerformance": day_of_week_performance(trades),
+            "optionTypePerformance": option_type_performance(trades),
         },
         "equityCurve": build_equity_curve(
             trades
