@@ -24,6 +24,7 @@ from trading_config import select_profile
 from stock_screener import get_screener
 from stock_screener import run_screener
 from stock_screener import save_invested
+from stock_screener import start_screener
 from mobile_orders import buy_delivery
 from mobile_orders import exit_holding
 from mobile_orders import holdings
@@ -251,6 +252,15 @@ def run_stock_screener():
         return run_screener()
     except Exception:
         raise HTTPException(status_code=503, detail="Stock screener is temporarily unavailable")
+
+
+@app.post("/api/v1/screener/run-background", dependencies=[Depends(require_mobile_token)])
+def run_stock_screener_background():
+    """Start the long scan and return immediately so mobile gateways do not time out."""
+    try:
+        return start_screener()
+    except Exception:
+        raise HTTPException(status_code=503, detail="Stock screener could not be started")
 
 
 @app.post("/api/v1/screener/invested", dependencies=[Depends(require_mobile_token)])

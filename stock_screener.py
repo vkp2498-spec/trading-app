@@ -14,6 +14,7 @@ import os
 import tempfile
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Thread
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -26,6 +27,7 @@ IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 RESULT_FILE = DATA_DIR / "stock_screener.json"
+RUNNING_FILE = DATA_DIR / "stock_screener.running"
 INSTRUMENTS_FILE = DATA_DIR / "complete.json.gz"
 INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 HISTORICAL_URL = "https://api.upstox.com/v3/historical-candle"
@@ -217,6 +219,38 @@ def run_screener() -> dict:
     return result
 
 
+def _background_screener() -> None:
+    try:
+        run_screener()
+    except Exception:
+        previous = load_result()
+        previous["status"] = "ERROR"
+        previous["error"] = "The stock scan failed. Please try again."
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        RESULT_FILE.write_text(json.dumps(previous, indent=2))
+    finally:
+        RUNNING_FILE.unlink(missing_ok=True)
+
+
+def start_screener() -> dict:
+    """Start a scan without holding the mobile HTTP request open."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if RUNNING_FILE.exists():
+        age_seconds = datetime.now().timestamp() - RUNNING_FILE.stat().st_mtime
+        if age_seconds < 900:
+            return {**load_result(), "status": "RUNNING"}
+        RUNNING_FILE.unlink(missing_ok=True)
+
+    try:
+        descriptor = os.open(RUNNING_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(descriptor)
+    except FileExistsError:
+        return {**load_result(), "status": "RUNNING"}
+
+    Thread(target=_background_screener, name="stock-screener", daemon=True).start()
+    return {**load_result(), "status": "RUNNING"}
+
+
 def _screen_asset(asset: dict) -> dict | None:
     daily = _candles(asset["instrumentKey"], days=400, unit="days", interval=1)
     four_hour = _candles(asset["instrumentKey"], days=60, unit="hours", interval=4)
@@ -224,7 +258,10 @@ def _screen_asset(asset: dict) -> dict | None:
 
 
 def get_screener() -> dict:
-    return load_result()
+    result = load_result()
+    if RUNNING_FILE.exists():
+        result["status"] = "RUNNING"
+    return result
 
 
 def save_invested(items: list[dict]) -> dict:
