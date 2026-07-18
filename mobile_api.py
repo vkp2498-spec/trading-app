@@ -21,6 +21,9 @@ from dashboard_data import build_trade_performance
 from dashboard_data import load_env
 from trading_config import get_config
 from trading_config import select_profile
+from stock_screener import get_screener
+from stock_screener import run_screener
+from stock_screener import save_invested
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -64,6 +67,13 @@ class NotificationDevice(BaseModel):
 
 class CapitalProfileSelection(BaseModel):
     profileId: str
+
+
+class InvestedStock(BaseModel):
+    symbol: str
+    instrumentKey: str
+    entryPrice: float
+    quantity: int = 1
 
 
 def require_mobile_token(
@@ -209,6 +219,35 @@ def update_trading_config(selection: CapitalProfileSelection):
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(error),
         ) from error
+
+
+@app.get("/api/v1/screener", dependencies=[Depends(require_mobile_token)])
+def stock_screener():
+    """Return the latest cached equity/ETF research scan."""
+    return get_screener()
+
+
+@app.post("/api/v1/screener/run", dependencies=[Depends(require_mobile_token)])
+def run_stock_screener():
+    """Run a read-only NSE equity/ETF scan and cache the top five candidates."""
+    try:
+        return run_screener()
+    except Exception:
+        raise HTTPException(status_code=503, detail="Stock screener is temporarily unavailable")
+
+
+@app.post("/api/v1/screener/invested", dependencies=[Depends(require_mobile_token)])
+def update_invested_stock(item: InvestedStock):
+    current = get_screener().get("invested", [])
+    current = [row for row in current if str(row.get("symbol", "")).upper() != item.symbol.upper()]
+    current.append(item.model_dump())
+    return save_invested(current)
+
+
+@app.delete("/api/v1/screener/invested/{symbol}", dependencies=[Depends(require_mobile_token)])
+def remove_invested_stock(symbol: str):
+    current = [row for row in get_screener().get("invested", []) if str(row.get("symbol", "")).upper() != symbol.upper()]
+    return save_invested(current)
 
 
 @app.post(
