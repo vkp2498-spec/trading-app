@@ -316,7 +316,50 @@ class StrategyReplay:
         weighted = weighted_alignment_score(summary, technicals, trend)
         summary["weighted_alignment"] = weighted
         cautious = weighted["grade"] == "CAUTIOUS_TRADE"
-        minimum = 70 if symbol == "NIFTY" else 65
+        if os.getenv("CAUSAL_CONFIRMATION_MODE", "false").lower() == "true":
+            confirmation_failures = []
+            five = technicals.get("five_min", {})
+            fifteen = technicals.get("fifteen_min", {})
+            if fifteen.get("bias") != direction:
+                confirmation_failures.append(f"15M bias={fifteen.get('bias')} does not align")
+            if five.get("bias") != direction:
+                confirmation_failures.append(f"5M bias={five.get('bias')} does not align")
+            completed_spot = _completed(spot_frame, timestamp, 5)
+            if len(completed_spot) < 2:
+                confirmation_failures.append("not enough completed 5M candles")
+            else:
+                current_spot = completed_spot.iloc[-1]
+                previous_spot = completed_spot.iloc[-2]
+                current_close = _float(current_spot.get("close"))
+                previous_high = _float(previous_spot.get("high"))
+                previous_low = _float(previous_spot.get("low"))
+                breakout = (
+                    current_close > previous_high
+                    if direction == "BULLISH"
+                    else current_close < previous_low
+                )
+                if not breakout:
+                    confirmation_failures.append("latest completed 5M candle did not break the previous candle")
+            # For a BUY, the option premium itself must be strengthening. This
+            # is deliberately independent of whether the contract is a CE or PE.
+            if transaction_type == "BUY" and _float(flow.get("score")) < 1:
+                confirmation_failures.append("ATM option premium flow is not strengthening")
+            summary["causal_confirmation"] = {
+                "enabled": True,
+                "passed": not confirmation_failures,
+                "failures": confirmation_failures,
+            }
+            if confirmation_failures:
+                self._record_decision(
+                    timestamp, symbol, transaction_type, weighted, False,
+                    "; ".join(confirmation_failures), contract,
+                )
+                return None
+        # Research scenarios can vary symbol-specific quality thresholds without
+        # changing the live bot configuration. The defaults preserve the
+        # existing replay behavior.
+        default_minimum = 70 if symbol == "NIFTY" else 65
+        minimum = _float(os.getenv(f"{symbol}_REPLAY_MIN_SCORE"), default_minimum)
         if weighted["score"] < minimum:
             self._record_decision(timestamp, symbol, transaction_type, weighted, False, "weighted score below symbol minimum")
             return None

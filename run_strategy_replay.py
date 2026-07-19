@@ -120,6 +120,11 @@ def main():
             "Historical order-book depth and daily FII snapshots are unavailable; the institutional component is marked RECONSTRUCTED_HISTORY.",
             "The portfolio tries index option candidates first and scans stock futures only when neither index has a qualified setup.",
             "LLM decisions are replayed only when --use-llm is supplied; deterministic safety rules always remain active.",
+            (
+                "Causal confirmation mode requires aligned completed 15M and 5M candles, a completed 5M breakout, and strengthening ATM option premium flow."
+                if os.getenv("CAUSAL_CONFIRMATION_MODE", "false").lower() == "true"
+                else "Causal confirmation mode is disabled."
+            ),
             f"Portfolio mode: {args.portfolio_mode}.",
         ]
         summary = build_reports(trades, decisions, output_dir, assumptions, coverage)

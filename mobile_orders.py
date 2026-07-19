@@ -106,7 +106,13 @@ def buy_delivery(instrument_key: str, symbol: str, maximum_amount: float) -> dic
     if quantity < 1:
         raise ValueError("₹1,00,000 is less than the current price of one share")
     result = _place(instrument_key, quantity, "BUY", symbol)
-    result.update({"symbol": symbol, "marketPrice": price, "requestedAmount": maximum_amount})
+    result.update({
+        "symbol": symbol,
+        "marketPrice": price,
+        "requestedAmount": maximum_amount,
+        "protectionStatus": "ADVISORY_ONLY",
+        "protectionMessage": "The displayed weekly target and stop are not broker orders; exit remains manual.",
+    })
     return result
 
 

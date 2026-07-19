@@ -241,13 +241,13 @@ def update_trading_config(selection: CapitalProfileSelection):
 
 @app.get("/api/v1/screener", dependencies=[Depends(require_mobile_token)])
 def stock_screener():
-    """Return the latest cached equity/ETF research scan."""
+    """Return the latest equity research scan and refresh tracked prices."""
     return get_screener()
 
 
 @app.post("/api/v1/screener/run", dependencies=[Depends(require_mobile_token)])
 def run_stock_screener():
-    """Run a read-only NSE equity/ETF scan and cache the top five candidates."""
+    """Run a read-only NSE equity scan and cache the top ten candidates."""
     try:
         return run_screener()
     except Exception:
@@ -265,7 +265,7 @@ def run_stock_screener_background():
 
 @app.post("/api/v1/screener/invested", dependencies=[Depends(require_mobile_token)])
 def update_invested_stock(item: InvestedStock):
-    current = get_screener().get("invested", [])
+    current = get_screener(refresh_invested=False).get("invested", [])
     current = [row for row in current if str(row.get("symbol", "")).upper() != item.symbol.upper()]
     current.append(item.model_dump())
     return save_invested(current)
@@ -273,7 +273,7 @@ def update_invested_stock(item: InvestedStock):
 
 @app.delete("/api/v1/screener/invested/{symbol}", dependencies=[Depends(require_mobile_token)])
 def remove_invested_stock(symbol: str):
-    current = [row for row in get_screener().get("invested", []) if str(row.get("symbol", "")).upper() != symbol.upper()]
+    current = [row for row in get_screener(refresh_invested=False).get("invested", []) if str(row.get("symbol", "")).upper() != symbol.upper()]
     return save_invested(current)
 
 
@@ -289,6 +289,40 @@ def portfolio_holdings():
 def live_buy_order(request: LiveBuyRequest):
     if not request.confirmation:
         raise HTTPException(status_code=400, detail="Explicit order confirmation is required")
+    screener = get_screener(refresh_invested=False)
+    scan_time_text = str(screener.get("asOf") or "")
+    try:
+        scan_time = datetime.fromisoformat(scan_time_text)
+        if scan_time.tzinfo is None:
+            scan_time = scan_time.replace(tzinfo=IST)
+        maximum_age = float(os.getenv("STOCK_SCREENER_MAX_SIGNAL_AGE_HOURS", "96"))
+        signal_age = (datetime.now(IST) - scan_time.astimezone(IST)).total_seconds() / 3600
+        if signal_age > maximum_age:
+            raise HTTPException(
+                status_code=422,
+                detail="The weekly screener result is stale; run a fresh scan before buying",
+            )
+    except HTTPException:
+        raise
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="The weekly screener has no valid scan timestamp; run a fresh scan before buying",
+        )
+    recommendations = screener.get("recommendations", [])
+    approved = next(
+        (
+            row for row in recommendations
+            if str(row.get("symbol", "")).upper() == request.symbol.upper()
+            and str(row.get("instrumentKey", "")) == request.instrumentKey
+        ),
+        None,
+    )
+    if approved is None:
+        raise HTTPException(
+            status_code=422,
+            detail="The requested stock is not in the current weekly screener recommendations",
+        )
     try:
         return buy_delivery(request.instrumentKey, request.symbol, request.maximumAmount)
     except PermissionError as error:
