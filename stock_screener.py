@@ -109,7 +109,61 @@ def _rsi(series: pd.Series, period: int = 14) -> float:
     return 100 - (100 / (1 + float(gains.iloc[-1]) / last_loss))
 
 
+def _candle_signal(frame: pd.DataFrame) -> tuple[str, str] | None:
+    """Return a simple, explainable signal from the two most recent candles.
+
+    This is deliberately limited to strong body/wick patterns.  It is a
+    confirmation input, not a standalone trading strategy.
+    """
+    if len(frame) < 2:
+        return None
+    previous = frame.iloc[-2]
+    current = frame.iloc[-1]
+
+    def parts(candle):
+        body = abs(float(candle["close"]) - float(candle["open"]))
+        candle_range = max(float(candle["high"]) - float(candle["low"]), 1e-9)
+        upper = float(candle["high"]) - max(float(candle["open"]), float(candle["close"]))
+        lower = min(float(candle["open"]), float(candle["close"])) - float(candle["low"])
+        return body, candle_range, upper, lower
+
+    body, candle_range, upper, lower = parts(current)
+    previous_open = float(previous["open"])
+    previous_close = float(previous["close"])
+    current_open = float(current["open"])
+    current_close = float(current["close"])
+    bullish = current_close > current_open
+    bearish = current_close < current_open
+    previous_bearish = previous_close < previous_open
+    previous_bullish = previous_close > previous_open
+
+    if bullish and previous_bearish and current_open <= previous_close and current_close >= previous_open:
+        return "Bullish engulfing", "BULLISH"
+    if bearish and previous_bullish and current_open >= previous_close and current_close <= previous_open:
+        return "Bearish engulfing", "BEARISH"
+    if bullish and lower >= max(body * 2, candle_range * 0.45) and upper <= max(body, candle_range * 0.15):
+        return "Hammer", "BULLISH"
+    if bearish and upper >= max(body * 2, candle_range * 0.45) and lower <= max(body, candle_range * 0.15):
+        return "Shooting star", "BEARISH"
+    return None
+
+
 def _evaluate(asset: dict, frame: pd.DataFrame, four_hour: pd.DataFrame) -> dict | None:
+    # Avoid scoring a candle while it is still forming.  This matters because
+    # the screener can be run during market hours.
+    def completed(data: pd.DataFrame, interval_hours: int) -> pd.DataFrame:
+        if data.empty:
+            return data
+        timestamps = pd.DatetimeIndex(pd.to_datetime(data.index))
+        if timestamps.tz is None:
+            timestamps = timestamps.tz_localize(IST)
+        else:
+            timestamps = timestamps.tz_convert(IST)
+        cutoff = pd.Timestamp(datetime.now(IST)) - pd.Timedelta(hours=interval_hours)
+        return data.loc[timestamps <= cutoff]
+
+    frame = completed(frame, 24)
+    four_hour = completed(four_hour, 4)
     if len(frame) < 80:
         return None
     close = frame["close"]
@@ -138,6 +192,9 @@ def _evaluate(asset: dict, frame: pd.DataFrame, four_hour: pd.DataFrame) -> dict
     four_ema50 = float(four_close.ewm(span=50, adjust=False).mean().iloc[-1])
     four_hour_up = float(four_close.iloc[-1]) > four_ema20 > four_ema50
 
+    daily_candle = _candle_signal(frame)
+    four_hour_candle = _candle_signal(four_hour)
+
     score = 0.0
     reasons = []
     if latest > ema20 > ema50:
@@ -156,6 +213,19 @@ def _evaluate(asset: dict, frame: pd.DataFrame, four_hour: pd.DataFrame) -> dict
         score += 15; reasons.append("Price is above Bollinger middle band")
     if volume_ratio >= 1.1:
         score += 10; reasons.append("Recent volume is above its 20-day average")
+    candle_score = 0.0
+    candle_pattern = daily_candle[0] if daily_candle else None
+    candle_direction = daily_candle[1] if daily_candle else "NEUTRAL"
+    if daily_candle:
+        candle_score = 5.0 if daily_candle[1] == "BULLISH" else -5.0
+        reasons.append(f"{daily_candle[0]} on daily candles ({candle_score:+.0f} confirmation points)")
+        if four_hour_candle and four_hour_candle[1] == daily_candle[1]:
+            candle_score += 3.0 if daily_candle[1] == "BULLISH" else -3.0
+            reasons.append(f"4-hour {four_hour_candle[0].lower()} confirms the daily direction")
+        elif four_hour_candle and four_hour_candle[1] != daily_candle[1]:
+            candle_score = 0.0
+            reasons.append("4-hour candle disagrees; candle bonus withheld")
+    score += candle_score
     if score < 55 or atr <= 0 or latest <= 0:
         return None
     target = round(latest + max(atr * 2.5, latest * 0.04), 2)
@@ -180,6 +250,10 @@ def _evaluate(asset: dict, frame: pd.DataFrame, four_hour: pd.DataFrame) -> dict
         "averageDailyTurnover": round(average_turnover, 2),
         "trend": "BULLISH", "horizon": "Up to 1 week", "rsi14": round(rsi, 1),
         "reasons": reasons, "asOf": datetime.now(IST).isoformat(),
+        "candlePattern": candle_pattern,
+        "candleDirection": candle_direction,
+        "candleConfirmation": "CONFIRMED" if daily_candle and four_hour_candle and daily_candle[1] == four_hour_candle[1] else "DAILY ONLY" if daily_candle else "NONE",
+        "candleScore": round(candle_score, 1),
     }
 
 
