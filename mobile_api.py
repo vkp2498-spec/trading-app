@@ -241,8 +241,48 @@ def update_trading_config(selection: CapitalProfileSelection):
 
 @app.get("/api/v1/screener", dependencies=[Depends(require_mobile_token)])
 def stock_screener():
-    """Return the latest equity research scan and refresh tracked prices."""
-    return get_screener()
+    """Return research and attach qualifying broker holdings to position review."""
+    result = get_screener()
+    tracked = list(result.get("invested", []))
+    tracked_keys = {
+        str(row.get("instrumentKey") or "").strip() for row in tracked
+    }
+    tracked_symbols = {
+        str(row.get("symbol") or "").strip().upper() for row in tracked
+    }
+    recommendations = result.get("recommendations", [])
+    try:
+        broker_holdings = holdings()
+    except Exception:
+        broker_holdings = []
+    for holding in broker_holdings:
+        instrument_key = str(holding.get("instrumentKey") or "").strip()
+        symbol = str(holding.get("symbol") or "").strip().upper()
+        if instrument_key in tracked_keys or symbol in tracked_symbols:
+            continue
+        candidate = next(
+            (
+                row for row in recommendations
+                if str(row.get("instrumentKey") or "").strip() == instrument_key
+                or str(row.get("symbol") or "").strip().upper() == symbol
+            ),
+            None,
+        )
+        if candidate is None:
+            continue
+        tracked.append({
+            "symbol": candidate.get("symbol") or symbol,
+            "instrumentKey": candidate.get("instrumentKey") or instrument_key,
+            "entryPrice": holding.get("averagePrice"),
+            "quantity": holding.get("quantity", 1),
+            "lastPrice": holding.get("lastPrice"),
+            "trackingSource": "UPSTOX_HOLDING",
+        })
+        tracked_keys.add(instrument_key)
+        tracked_symbols.add(symbol)
+    if len(tracked) != len(result.get("invested", [])):
+        result = save_invested(tracked)
+    return result
 
 
 @app.post("/api/v1/screener/run", dependencies=[Depends(require_mobile_token)])

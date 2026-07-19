@@ -488,7 +488,7 @@ def run_screener() -> dict:
         result = {
             **previous,
             "status": "ERROR",
-            "asOf": datetime.now(IST).isoformat(),
+            "lastAttemptAt": datetime.now(IST).isoformat(),
             "scanned": len(candidates),
             "successful": 0,
             "errors": errors,
@@ -498,12 +498,19 @@ def run_screener() -> dict:
         _write_result(result)
         return result
     top_recommendations = recommendations[:10]
+    scan_time = datetime.now(IST)
     prices = _latest_prices(previous.get("invested", []))
-    invested = _refresh_invested(previous.get("invested", []), universe, top_recommendations, prices)
+    invested = _refresh_invested(
+        previous.get("invested", []),
+        universe,
+        top_recommendations,
+        prices,
+        as_of=scan_time,
+    )
     coverage = round(successful / len(candidates) * 100, 1) if candidates else 0.0
     result = {
         "status": "READY" if errors == 0 else "PARTIAL",
-        "asOf": datetime.now(IST).isoformat(),
+        "asOf": scan_time.isoformat(),
         "scanned": len(candidates),
         "successful": successful,
         "coveragePercent": coverage,
@@ -563,6 +570,7 @@ def get_screener(refresh_invested: bool = True) -> dict:
             [],
             result.get("recommendations", []),
             prices,
+            as_of=result.get("asOf"),
         )
         if refreshed != result.get("invested"):
             result["invested"] = refreshed
@@ -576,7 +584,11 @@ def save_invested(items: list[dict]) -> dict:
     result = load_result()
     prices = _latest_prices(items[:20])
     result["invested"] = _refresh_invested(
-        items[:20], [], result.get("recommendations", []), prices
+        items[:20],
+        [],
+        result.get("recommendations", []),
+        prices,
+        as_of=result.get("asOf"),
     )
     _write_result(result)
     return result
@@ -611,15 +623,29 @@ def _refresh_invested(
     universe: list[dict],
     recommendations: list[dict],
     prices: dict[str, float] | None = None,
+    as_of: datetime | str | None = None,
 ) -> list[dict]:
-    """Refresh prices while preserving the levels accepted at entry."""
+    """Refresh tracked positions without rewriting their original trade plan."""
+    now = datetime.now(IST)
+    scan_time = _parse_ist_datetime(as_of)
+    maximum_age = max(
+        1.0,
+        _number(os.getenv("STOCK_SCREENER_POSITION_REVIEW_MAX_AGE_HOURS"), 18.0),
+    )
+    signal_age_hours = (
+        (now - scan_time).total_seconds() / 3600 if scan_time is not None else None
+    )
+    signal_fresh = signal_age_hours is not None and 0 <= signal_age_hours <= maximum_age
     by_symbol = {row.get("symbol"): row for row in universe}
-    by_symbol.update({row.get("symbol"): row for row in recommendations})
+    recommendation_by_symbol = {row.get("symbol"): row for row in recommendations}
+    by_symbol.update(recommendation_by_symbol)
     prices = prices or {}
     refreshed = []
     for item in items:
         row = dict(item)
         candidate = by_symbol.get(row.get("symbol"))
+        current_recommendation = recommendation_by_symbol.get(row.get("symbol"))
+        row["trackedAt"] = row.get("trackedAt") or now.isoformat()
         if candidate:
             if not row.get("instrumentKey"):
                 row["instrumentKey"] = candidate.get("instrumentKey")
@@ -628,7 +654,11 @@ def _refresh_invested(
             if not row.get("originalStopLossPrice"):
                 row["originalStopLossPrice"] = row.get("stopLossPrice") or candidate.get("stopLossPrice")
             row["signalSetupStrength"] = row.get("signalSetupStrength") or candidate.get("setupStrength")
-            row["currentSetupStrength"] = candidate.get("setupStrength")
+            row["currentSetupStrength"] = (
+                current_recommendation.get("setupStrength")
+                if current_recommendation
+                else None
+            )
             row["trend"] = candidate.get("trend", row.get("trend", "NEUTRAL"))
             row["rsi14"] = candidate.get("rsi14", row.get("rsi14"))
         row["targetPrice"] = row.get("originalTargetPrice") or row.get("targetPrice")
@@ -656,5 +686,133 @@ def _refresh_invested(
             row["status"] = "ACTIVE"
         else:
             row["status"] = "PRICE UNAVAILABLE"
+        row.update(
+            _position_review(
+                row=row,
+                candidate=current_recommendation,
+                signal_fresh=signal_fresh,
+                signal_age_hours=signal_age_hours,
+                now=now,
+            )
+        )
         refreshed.append(row)
     return refreshed
+
+
+def _parse_ist_datetime(value: datetime | str | None) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=IST)
+    return parsed.astimezone(IST)
+
+
+def _trading_days_elapsed(start: datetime | str | None, end: datetime) -> int:
+    tracked = _parse_ist_datetime(start)
+    if tracked is None or tracked.date() >= end.date():
+        return 0
+    day = tracked.date() + timedelta(days=1)
+    elapsed = 0
+    while day <= end.date():
+        if day.weekday() < 5:
+            elapsed += 1
+        day += timedelta(days=1)
+    return elapsed
+
+
+def _position_review(
+    row: dict,
+    candidate: dict | None,
+    signal_fresh: bool,
+    signal_age_hours: float | None,
+    now: datetime,
+) -> dict:
+    """Return an advisory position action based on the accepted trade levels."""
+    last = _number(row.get("lastPrice"))
+    entry = _number(row.get("entryPrice"))
+    target = _number(row.get("targetPrice"))
+    stop = _number(row.get("stopLossPrice"))
+    holding_days = _trading_days_elapsed(row.get("trackedAt"), now)
+    progress = None
+    if last > 0 and entry > 0 and target > entry:
+        progress = round((last - entry) / (target - entry) * 100, 1)
+
+    review = {
+        "recommendationAction": "REVIEW",
+        "actionReason": "A current market price is unavailable.",
+        "targetProgressPercent": progress,
+        "suggestedStopPrice": stop or None,
+        "holdingDays": holding_days,
+        "signalFresh": bool(signal_fresh),
+        "signalAgeHours": round(signal_age_hours, 1) if signal_age_hours is not None else None,
+        "currentQualified": candidate is not None,
+        "lastReviewedAt": now.isoformat(),
+    }
+
+    if last <= 0:
+        return review
+    if stop > 0 and last <= stop:
+        review.update(
+            recommendationAction="EXIT",
+            actionReason="The original stop-loss level has been reached.",
+        )
+        return review
+    if target > 0 and last >= target:
+        review.update(
+            recommendationAction="EXIT",
+            actionReason="The original one-week target has been reached.",
+            suggestedStopPrice=round(last, 2),
+        )
+        return review
+    if holding_days >= 5:
+        review.update(
+            recommendationAction="REVIEW",
+            actionReason="The five-session research horizon is complete; review an exit instead of extending the original setup.",
+        )
+        return review
+    if not signal_fresh:
+        review.update(
+            recommendationAction="REVIEW",
+            actionReason="The stock signal is stale; run a fresh scan before deciding to hold longer.",
+        )
+        return review
+    if candidate is None:
+        review.update(
+            recommendationAction="REVIEW",
+            actionReason="The stock is no longer in the latest top-10 qualified list.",
+        )
+        return review
+
+    if progress is not None and progress >= 75:
+        protected_gain_stop = entry + max(last - entry, 0) * 0.50
+        atr = _number(candidate.get("atr14"))
+        atr_stop = last - atr if atr > 0 else 0
+        suggested = max(stop, protected_gain_stop, atr_stop)
+        suggested = min(suggested, last - max(0.05, last * 0.001))
+        review.update(
+            recommendationAction="TRAIL STOP",
+            actionReason="Price has covered at least 75% of the original path to target; protect part of the open gain.",
+            suggestedStopPrice=round(max(suggested, stop), 2),
+        )
+        return review
+    if progress is not None and progress >= 40:
+        suggested = min(max(stop, entry), last - max(0.05, last * 0.001))
+        review.update(
+            recommendationAction="TRAIL STOP",
+            actionReason="Price has covered at least 40% of the path to target; consider moving risk to breakeven.",
+            suggestedStopPrice=round(max(suggested, stop), 2),
+        )
+        return review
+
+    review.update(
+        recommendationAction="HOLD",
+        actionReason="The original levels remain intact and the stock is still in the latest qualified list.",
+    )
+    return review

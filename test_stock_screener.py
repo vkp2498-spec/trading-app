@@ -6,6 +6,7 @@ import pandas as pd
 from stock_screener import _completed_candles
 from stock_screener import _evaluate
 from stock_screener import _refresh_invested
+from stock_screener import _position_review
 from stock_screener import _wilder_atr
 
 
@@ -115,3 +116,76 @@ def test_invested_levels_do_not_move_with_new_recommendation():
     assert result["lastPrice"] == 108.0
     assert result["unrealizedPnl"] == 80.0
     assert result["status"] == "ACTIVE"
+
+
+def _position(last_price, tracked_at="2026-07-17T09:30:00+05:30"):
+    return {
+        "lastPrice": last_price,
+        "entryPrice": 100.0,
+        "targetPrice": 110.0,
+        "stopLossPrice": 95.0,
+        "trackedAt": tracked_at,
+    }
+
+
+def test_position_review_holds_fresh_qualified_setup():
+    result = _position_review(
+        _position(103.0),
+        {"atr14": 2.0},
+        signal_fresh=True,
+        signal_age_hours=2.0,
+        now=datetime(2026, 7, 17, 12, 0, tzinfo=IST),
+    )
+
+    assert result["recommendationAction"] == "HOLD"
+    assert result["targetProgressPercent"] == 30.0
+    assert result["currentQualified"] is True
+
+
+def test_position_review_trails_to_breakeven_after_40_percent_progress():
+    result = _position_review(
+        _position(105.0),
+        {"atr14": 2.0},
+        signal_fresh=True,
+        signal_age_hours=2.0,
+        now=datetime(2026, 7, 17, 12, 0, tzinfo=IST),
+    )
+
+    assert result["recommendationAction"] == "TRAIL STOP"
+    assert result["suggestedStopPrice"] == 100.0
+
+
+def test_position_review_exits_at_original_levels():
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=IST)
+    target = _position_review(_position(110.0), {}, True, 1.0, now)
+    stop = _position_review(_position(94.0), {}, True, 1.0, now)
+
+    assert target["recommendationAction"] == "EXIT"
+    assert "target" in target["actionReason"].lower()
+    assert stop["recommendationAction"] == "EXIT"
+    assert "stop-loss" in stop["actionReason"].lower()
+
+
+def test_position_review_requires_review_when_signal_is_stale_or_missing():
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=IST)
+    stale = _position_review(_position(103.0), {"atr14": 2.0}, False, 120.0, now)
+    missing = _position_review(_position(103.0), None, True, 1.0, now)
+
+    assert stale["recommendationAction"] == "REVIEW"
+    assert "stale" in stale["actionReason"].lower()
+    assert missing["recommendationAction"] == "REVIEW"
+    assert "top-10" in missing["actionReason"].lower()
+
+
+def test_position_review_flags_completed_five_session_horizon():
+    result = _position_review(
+        _position(103.0, "2026-07-10T09:30:00+05:30"),
+        {"atr14": 2.0},
+        signal_fresh=True,
+        signal_age_hours=1.0,
+        now=datetime(2026, 7, 17, 12, 0, tzinfo=IST),
+    )
+
+    assert result["holdingDays"] == 5
+    assert result["recommendationAction"] == "REVIEW"
+    assert "five-session" in result["actionReason"].lower()
