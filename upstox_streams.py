@@ -159,6 +159,15 @@ def _status(**values):
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         previous = {}
     previous.update(values, updated_at=time.time())
+
+    # Clear stale connection errors after the service starts or reconnects.
+    if values.get("service") == "starting":
+        for key in ("market_error", "portfolio_error", "token_rotation_detected"):
+            previous.pop(key, None)
+    if values.get("market") == "connected":
+        previous.pop("market_error", None)
+    if values.get("portfolio") == "connected":
+        previous.pop("portfolio_error", None)
     _atomic_write(LOG_FILE, previous)
 
 
@@ -184,14 +193,14 @@ def run():
     market.auto_reconnect(True, 5, -1)
     portfolio.auto_reconnect(True, 5, -1)
 
-    market.on("open", lambda: _status(market="connected", market_keys=read_stream_instruments()))
+    market.on("open", lambda *args: _status(market="connected", market_keys=read_stream_instruments()))
     market.on("message", _market_message)
-    market.on("error", lambda error: _status(market_error=str(error)))
-    market.on("close", lambda: _status(market="closed"))
-    portfolio.on("open", lambda: _status(portfolio="connected"))
+    market.on("error", lambda *args: _status(market_error=" ".join(str(arg) for arg in args)))
+    market.on("close", lambda *args: _status(market="closed"))
+    portfolio.on("open", lambda *args: _status(portfolio="connected"))
     portfolio.on("message", _portfolio_message)
-    portfolio.on("error", lambda error: _status(portfolio_error=str(error)))
-    portfolio.on("close", lambda: _status(portfolio="closed"))
+    portfolio.on("error", lambda *args: _status(portfolio_error=" ".join(str(arg) for arg in args)))
+    portfolio.on("close", lambda *args: _status(portfolio="closed"))
 
     def refresh_market_subscription():
         previous = set(market_keys)
