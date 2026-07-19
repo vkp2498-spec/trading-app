@@ -8,3 +8,4 @@ uvicorn
 httpx[http2]
 PyJWT[crypto]
 openai
+upstox-python-sdk>=2.28.0

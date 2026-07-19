@@ -102,6 +102,32 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
         f"(volume_ratio={volume_ratio:.2f})"
     )
 
+    quality = technicals.get("option_market_quality", {}) or {}
+    quality_adjustment = 0.0
+    spread_percent = quality.get("spread_percent")
+    if spread_percent is not None:
+        if float(spread_percent) <= 1.0:
+            quality_adjustment += 2.0
+            reasons.append(f"Option spread is liquid ({float(spread_percent):.2f}%) (+2)")
+        elif float(spread_percent) > float(quality.get("max_spread_percent") or 2.5):
+            quality_adjustment -= 5.0
+            reasons.append(f"Option spread is wide ({float(spread_percent):.2f}%) (-5)")
+
+    depth_bias = quality.get("depth_bias")
+    if depth_bias == direction:
+        quality_adjustment += 2.0
+        reasons.append(f"ATM option depth supports {direction} (+2)")
+    elif depth_bias in {"BULLISH", "BEARISH"} and depth_bias != direction:
+        quality_adjustment -= 3.0
+        reasons.append(f"ATM option depth conflicts with {direction} (-3)")
+
+    if quality.get("delta") is not None:
+        quality_adjustment += 1.0
+        reasons.append(f"ATM option Greeks available (delta={float(quality['delta']):.3f}) (+1)")
+    if quality_adjustment:
+        flow_component = max(0.0, min(weights["atm_option_flow"], flow_component + quality_adjustment))
+        reasons.append(f"ATM option liquidity/Greeks adjustment={quality_adjustment:+.1f}")
+
     trend_bonus = 0
     if option_chain_trend.get("bias") == direction:
         trend_bonus = 5

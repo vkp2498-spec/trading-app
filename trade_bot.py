@@ -37,8 +37,10 @@ import requests
 import urllib3.util.connection as urllib3_cn
 
 from strategy_core import get_index_recommendation, now_ist, option_chain_signal
+from strategy_core import option_contract_quality
 from trade_journal import record_closed_trade
 from trading_config import active_value
+from upstox_streams import read_market_cache, read_portfolio_cache, write_stream_instruments
 
 from apns_push import send_trade_closed_notification, send_trade_entered_notification
 
@@ -937,6 +939,31 @@ def get_order_details(order_id, force=False):
         and now - cached["at"] < broker_read_cache_seconds()
     ):
         return deepcopy(cached["data"])
+
+    # Prefer a very recent portfolio-stream event when it carries this order.
+    # REST remains the authoritative fallback for older or incomplete events.
+    stream = read_portfolio_cache()
+    if stream and time_module.time() - to_float(stream.get("received_at"), 0) <= 15:
+        def find_event(value):
+            if isinstance(value, dict):
+                event_order_id = str(value.get("order_id") or value.get("orderId") or "")
+                if event_order_id == str(order_id) and value.get("status"):
+                    return value
+                for child in value.values():
+                    found = find_event(child)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = find_event(child)
+                    if found:
+                        return found
+            return None
+
+        event = find_event(stream.get("message") or {})
+        if event:
+            BROKER_READ_CACHE[cache_key] = {"at": time_module.monotonic(), "data": deepcopy(event)}
+            return deepcopy(event)
 
     try:
         result = upstox_request("GET", UPSTOX_ORDER_DETAILS_URL, params={"order_id": order_id})
@@ -1977,6 +2004,49 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         atm["strike"],
         option_type,
     )
+    stream_quote = read_market_cache(instrument.get("instrument_key"))
+    option_quality = option_contract_quality(atm, option_type, stream_quote)
+    option_quality["instrument_key"] = instrument.get("instrument_key")
+    option_quality["max_spread_percent"] = to_float(
+        os.getenv("MAX_OPTION_SPREAD_PERCENT"), 2.5
+    )
+    option_quality["depth_filter_enabled"] = os.getenv(
+        "OPTION_DEPTH_FILTER", "false"
+    ).lower() == "true"
+    option_quality["greeks_filter_enabled"] = os.getenv(
+        "OPTION_GREEKS_FILTER", "true"
+    ).lower() == "true"
+    min_delta = to_float(os.getenv("MIN_OPTION_DELTA"), 0.20)
+    max_delta = to_float(os.getenv("MAX_OPTION_DELTA"), 0.80)
+    option_quality["entry_allowed"] = True
+    quality_reasons = []
+    if option_quality.get("spread_percent") is not None and option_quality["spread_percent"] > option_quality["max_spread_percent"]:
+        option_quality["entry_allowed"] = False
+        quality_reasons.append(
+            f"spread {option_quality['spread_percent']:.2f}% exceeds "
+            f"{option_quality['max_spread_percent']:.2f}%"
+        )
+    if option_quality.get("greeks_filter_enabled") and option_quality.get("delta") is not None:
+        if abs(option_quality["delta"]) < min_delta or abs(option_quality["delta"]) > max_delta:
+            option_quality["entry_allowed"] = False
+            quality_reasons.append(
+                f"delta {option_quality['delta']:.3f} outside {min_delta:.2f}-{max_delta:.2f}"
+            )
+    if option_quality.get("depth_filter_enabled") and option_quality.get("depth_bias") not in {"NEUTRAL", direction}:
+        option_quality["entry_allowed"] = False
+        quality_reasons.append(
+            f"depth {option_quality.get('depth_bias')} conflicts with {direction}"
+        )
+    option_quality["rejection_reasons"] = quality_reasons
+
+    # The stream is dynamic because the ATM strike changes. The persistent
+    # service will subscribe to the next set on its next refresh/restart.
+    write_stream_instruments([
+        "NSE_INDEX|Nifty 50",
+        "NSE_INDEX|Nifty Bank",
+        "NSE_INDEX|India VIX",
+        instrument.get("instrument_key"),
+    ])
     raw_flow = get_option_volume_vwap_analysis(
         instrument["instrument_key"],
         side_label=instrument["trading_symbol"],
@@ -1988,6 +2058,7 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         transaction_type,
     )
     technicals["institutional_flow"] = institutional
+    technicals["option_market_quality"] = option_quality
 
     for timeframe in ("two_hour", "fifteen_min", "five_min"):
         technicals[timeframe] = convert_index_levels_to_option_premium(
@@ -2011,9 +2082,21 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         "option_type": option_type,
         "trading_symbol": instrument["trading_symbol"],
         "option_chain_trend": option_trend,
+        "option_market_quality": option_quality,
     }
     weighted = weighted_alignment_score(option_summary, technicals, option_trend)
     option_summary["weighted_alignment"] = weighted
+
+    if not option_quality.get("entry_allowed"):
+        return {
+            "allowed": False,
+            "reason": "option market quality rejected: " + "; ".join(quality_reasons),
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+        }, None
 
     if transaction_type == "SELL":
         allowed, reason = short_structure_allowed(direction, technicals, raw_flow, weighted)

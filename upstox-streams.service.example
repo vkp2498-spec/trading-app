@@ -1,0 +1,16 @@
+[Unit]
+Description=Upstox Plus market and portfolio streams
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-app
+ExecStart=/home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/upstox_streams.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

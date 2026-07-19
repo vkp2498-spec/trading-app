@@ -155,6 +155,11 @@ def fetch_upstox_option_chain(symbol, nearby=5):
             "strike": item.get("strike_price"),
 
             "CE_ltp": call_md.get("ltp"),
+            "CE_instrument_key": call.get("instrument_key"),
+            "CE_bid_price": call_md.get("bid_price"),
+            "CE_ask_price": call_md.get("ask_price"),
+            "CE_bid_qty": call_md.get("bid_qty"),
+            "CE_ask_qty": call_md.get("ask_qty"),
             "CE_oi": call_oi,
             "CE_previous_oi": call_previous_oi,
             "CE_change_oi": call_change_oi,
@@ -165,8 +170,18 @@ def fetch_upstox_option_chain(symbol, nearby=5):
             ),
             "CE_volume": call_md.get("volume"),
             "CE_iv": call_greeks.get("iv"),
+            "CE_delta": call_greeks.get("delta"),
+            "CE_gamma": call_greeks.get("gamma"),
+            "CE_theta": call_greeks.get("theta"),
+            "CE_vega": call_greeks.get("vega"),
+            "CE_pop": call_greeks.get("pop"),
 
             "PE_ltp": put_md.get("ltp"),
+            "PE_instrument_key": put.get("instrument_key"),
+            "PE_bid_price": put_md.get("bid_price"),
+            "PE_ask_price": put_md.get("ask_price"),
+            "PE_bid_qty": put_md.get("bid_qty"),
+            "PE_ask_qty": put_md.get("ask_qty"),
             "PE_oi": put_oi,
             "PE_previous_oi": put_previous_oi,
             "PE_change_oi": put_change_oi,
@@ -177,6 +192,11 @@ def fetch_upstox_option_chain(symbol, nearby=5):
             ),
             "PE_volume": put_md.get("volume"),
             "PE_iv": put_greeks.get("iv"),
+            "PE_delta": put_greeks.get("delta"),
+            "PE_gamma": put_greeks.get("gamma"),
+            "PE_theta": put_greeks.get("theta"),
+            "PE_vega": put_greeks.get("vega"),
+            "PE_pop": put_greeks.get("pop"),
         })
 
     df_chain = pd.DataFrame(rows)
@@ -187,9 +207,13 @@ def fetch_upstox_option_chain(symbol, nearby=5):
     numeric_cols = [
         "spot", "strike",
         "CE_ltp", "CE_oi", "CE_previous_oi", "CE_change_oi",
-        "CE_change_oi_pct", "CE_volume", "CE_iv",
+        "CE_change_oi_pct", "CE_volume", "CE_iv", "CE_delta", "CE_gamma",
+        "CE_theta", "CE_vega", "CE_pop", "CE_bid_price", "CE_ask_price",
+        "CE_bid_qty", "CE_ask_qty",
         "PE_ltp", "PE_oi", "PE_previous_oi", "PE_change_oi",
-        "PE_change_oi_pct", "PE_volume", "PE_iv",
+        "PE_change_oi_pct", "PE_volume", "PE_iv", "PE_delta", "PE_gamma",
+        "PE_theta", "PE_vega", "PE_pop", "PE_bid_price", "PE_ask_price",
+        "PE_bid_qty", "PE_ask_qty",
     ]
 
     for col in numeric_cols:
@@ -310,6 +334,75 @@ def expected_atm_option_prices(atm, levels, direction, confidence, signal_score)
         "entry_price": round(entry_price, 0),
         "target_price": round(entry_price * (1 + target_percent / 100), 0),
         "stop_loss_price": round(max(entry_price * (1 - stop_percent / 100), 0), 0),
+    }
+
+
+def option_contract_quality(atm, option_type, stream_quote=None):
+    """Normalize spread, depth and Greeks for the selected ATM contract."""
+    prefix = "CE" if str(option_type).upper() == "CE" else "PE"
+    stream_quote = stream_quote or {}
+
+    def value(name, default=None):
+        stream_value = stream_quote.get(name)
+        return stream_value if stream_value is not None else atm.get(f"{prefix}_{name}", default)
+
+    def number(name, default=None):
+        try:
+            raw = value(name, default)
+            return default if raw is None else float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    ltp = number("ltp")
+    bid = number("bid_price")
+    ask = number("ask_price")
+    bid_qty = number("bid_qty", 0) or 0
+    ask_qty = number("ask_qty", 0) or 0
+    spread = round(ask - bid, 4) if bid is not None and ask is not None and ask >= bid else None
+    spread_percent = round(spread / ltp * 100, 3) if spread is not None and ltp and ltp > 0 else None
+    total_depth = bid_qty + ask_qty
+    depth_ratio = round((bid_qty - ask_qty) / total_depth, 4) if total_depth > 0 else None
+    depth_bias = (
+        "BULLISH" if depth_ratio is not None and depth_ratio >= 0.20
+        else "BEARISH" if depth_ratio is not None and depth_ratio <= -0.20
+        else "NEUTRAL"
+    )
+
+    greeks = stream_quote.get("option_greeks") or {}
+    delta = greeks.get("delta")
+    if delta is None:
+        delta = atm.get(f"{prefix}_delta")
+    iv = greeks.get("iv") if greeks.get("iv") is not None else atm.get(f"{prefix}_iv")
+    pop = greeks.get("pop") if greeks.get("pop") is not None else atm.get(f"{prefix}_pop")
+    try:
+        delta = float(delta) if delta is not None else None
+    except (TypeError, ValueError):
+        delta = None
+
+    reasons = []
+    if spread_percent is not None:
+        reasons.append(f"spread={spread_percent:.3f}%")
+    if depth_ratio is not None:
+        reasons.append(f"depth={depth_bias} ratio={depth_ratio:.3f}")
+    if delta is not None:
+        reasons.append(f"delta={delta:.3f}")
+
+    return {
+        "option_type": prefix,
+        "ltp": ltp,
+        "bid_price": bid,
+        "ask_price": ask,
+        "bid_qty": bid_qty,
+        "ask_qty": ask_qty,
+        "spread": spread,
+        "spread_percent": spread_percent,
+        "depth_ratio": depth_ratio,
+        "depth_bias": depth_bias,
+        "delta": delta,
+        "iv": iv,
+        "pop": pop,
+        "stream_used": bool(stream_quote),
+        "reasons": reasons,
     }
 
 

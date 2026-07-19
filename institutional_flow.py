@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 
 from strategy_core import now_ist
+from market_information import get_market_information
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,6 +51,7 @@ COLUMNS = [
     "atm_component",
     "vix_component",
     "fii_component",
+    "market_info_component",
     "base_score",
     "persistence_component",
     "score",
@@ -428,8 +430,38 @@ def get_institutional_footprint(symbol, recommendation, atm_flow):
         fii_score = 0.0
         reasons.append(f"Daily FII context unavailable: {error}")
 
+    try:
+        market_info = get_market_information(
+            symbol,
+            recommendation.get("atm", {}).get("expiry"),
+        )
+        market_summary = market_info.get("summary", {}) or {}
+        fii_market_score = to_float(market_summary.get("fii_futures_score"), 0.0)
+        dii_market_score = to_float(market_summary.get("dii_cash_score"), 0.0)
+        market_info_score = clamp((fii_market_score + dii_market_score) / 20.0, -5.0, 5.0)
+        if market_summary.get("reported_pcr") is not None:
+            reasons.append(f"Upstox market PCR={market_summary.get('reported_pcr')}")
+        if market_summary.get("max_pain") is not None:
+            reasons.append(f"Upstox max pain={market_summary.get('max_pain')}")
+        reasons.append(
+            f"Upstox FII futures flow={fii_market_score:.2f}, "
+            f"DII cash flow={dii_market_score:.2f}"
+        )
+        for error in market_info.get("errors", [])[:2]:
+            reasons.append(f"Market information partial: {error}")
+    except Exception as error:
+        market_info = {"errors": [str(error)], "summary": {}}
+        market_info_score = 0.0
+        reasons.append(f"Upstox market information unavailable: {error}")
+
     base_score = round(
-        futures_score + option_score + basis_score + selected_option_score + vix_score + fii_score,
+        futures_score
+        + option_score
+        + basis_score
+        + selected_option_score
+        + vix_score
+        + fii_score
+        + market_info_score,
         2,
     )
     persistence_score, persistence_reason = persistence_component(previous_rows, base_score)
@@ -458,6 +490,7 @@ def get_institutional_footprint(symbol, recommendation, atm_flow):
         "atm_component": selected_option_score,
         "vix_component": vix_score,
         "fii_component": fii_score,
+        "market_info_component": market_info_score,
         "base_score": base_score,
         "persistence_component": persistence_score,
         "score": score,
@@ -474,6 +507,7 @@ def get_institutional_footprint(symbol, recommendation, atm_flow):
         ),
         "reasons": reasons,
         "fii_context": fii,
+        "market_information": market_info,
     }
 
 
