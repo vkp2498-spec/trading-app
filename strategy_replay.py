@@ -407,6 +407,28 @@ class StrategyReplay:
                 break
             best = min(best, low) if is_short else max(best, high)
             current_stop = self._trail(entry, target, current_stop, best, is_short)
+        observed = future[future.index <= exit_time]
+        max_high_after_entry = _float(observed["high"].max())
+        min_low_after_entry = _float(observed["low"].min())
+        if is_short:
+            favorable_price = min_low_after_entry
+            adverse_price = max_high_after_entry
+            favorable_time = observed["low"].idxmin()
+            adverse_time = observed["high"].idxmax()
+            mfe_points = entry - favorable_price
+            mae_points = entry - adverse_price
+        else:
+            favorable_price = max_high_after_entry
+            adverse_price = min_low_after_entry
+            favorable_time = observed["high"].idxmax()
+            adverse_time = observed["low"].idxmin()
+            mfe_points = favorable_price - entry
+            mae_points = adverse_price - entry
+        target_gap_actual = abs(target - entry)
+        stop_gap_actual = abs(entry - stop)
+        mfe_pct = (mfe_points / entry * 100) if entry else 0
+        mae_pct = (mae_points / entry * 100) if entry else 0
+        target_progress_pct = (mfe_points / target_gap_actual * 100) if target_gap_actual else 0
         exit_price *= 1 + slip if is_short else 1 - slip
         quantity = max(int(_float(candidate.contract.get("lot_size"), 1)), 1)
         gross = ((entry - exit_price) if is_short else (exit_price - entry)) * quantity
@@ -418,6 +440,15 @@ class StrategyReplay:
             "exit_time": exit_time.isoformat(), "entry_price": round(entry, 2),
             "target_price": round(target, 2), "stop_loss_price": round(stop, 2),
             "exit_price": round(exit_price, 2), "exit_reason": reason,
+            "max_high_after_entry": round(max_high_after_entry, 2),
+            "min_low_after_entry": round(min_low_after_entry, 2),
+            "mfe_points": round(mfe_points, 2), "mae_points": round(mae_points, 2),
+            "mfe_pct": round(mfe_pct, 2), "mae_pct": round(mae_pct, 2),
+            "target_progress_pct": round(target_progress_pct, 2),
+            "near_target_before_exit": bool(target_progress_pct >= 80 and reason not in {"TARGET", "STOP_AND_TARGET_SAME_CANDLE"}),
+            "favorable_extreme_time": favorable_time.isoformat(),
+            "adverse_extreme_time": adverse_time.isoformat(),
+            "risk_points": round(stop_gap_actual, 2), "reward_points": round(target_gap_actual, 2),
             "weighted_score": candidate.score, "weighted_grade": candidate.grade,
             "gross_pnl": round(gross, 2), "estimated_costs": round(self.cost_per_order * 2, 2),
             "source": "POINT_IN_TIME_REPLAY",
