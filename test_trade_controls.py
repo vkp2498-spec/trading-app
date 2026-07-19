@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pandas as pd
 
@@ -210,7 +210,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["exit_reason"], "TARGET")
         self.assertEqual(result["gross_pnl"], 300)
 
-    def test_global_signal_check_executes_only_highest_scoring_index_candidate(self):
+    def test_signal_check_executes_each_qualified_index_candidate(self):
         candidates = {
             "NIFTY": {
                 "symbol": "NIFTY",
@@ -219,7 +219,7 @@ class TradeControlTests(unittest.TestCase):
             },
             "BANKNIFTY": {
                 "symbol": "BANKNIFTY",
-                "transaction_type": "SELL",
+                "transaction_type": "BUY",
                 "weighted": {"score": 88},
             },
         }
@@ -231,13 +231,63 @@ class TradeControlTests(unittest.TestCase):
             patch.object(
                 trade_bot,
                 "evaluate_symbol_buy_or_sell",
-                side_effect=lambda symbol: candidates[symbol],
+                side_effect=lambda symbol, **kwargs: candidates[symbol],
             ),
             patch.object(trade_bot, "execute_selected_candidate") as execute,
         ):
             trade_bot.run_signal_check()
 
-        execute.assert_called_once_with(candidates["BANKNIFTY"])
+        self.assertEqual(execute.call_count, 2)
+        execute.assert_has_calls([
+            call(candidates["BANKNIFTY"]),
+            call(candidates["NIFTY"]),
+        ])
+
+    def test_index_point_exits_are_read_from_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "NIFTY_TARGET_POINTS": "30",
+                "NIFTY_STOP_POINTS": "30",
+                "OPTION_DELTA_APPROXIMATION": "0.5",
+            },
+            clear=False,
+        ):
+            levels = trade_bot.option_levels_from_index_points("NIFTY", 150)
+
+        self.assertEqual(levels["target_price"], 165)
+        self.assertEqual(levels["stop_loss_price"], 135)
+        self.assertEqual(levels["target_points"], 30)
+        self.assertEqual(levels["stop_points"], 30)
+
+    def test_active_nifty_does_not_block_banknifty_entry(self):
+        bank_candidate = {
+            "symbol": "BANKNIFTY",
+            "transaction_type": "BUY",
+            "weighted": {"score": 82},
+        }
+
+        def state_for(symbol):
+            if symbol == "NIFTY":
+                return {"instrument_key": "NSE_FO|NIFTY_OPEN"}
+            return {}
+
+        with (
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "read_state", side_effect=state_for),
+            patch.object(trade_bot, "handle_existing_state"),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=bank_candidate,
+            ) as evaluate,
+            patch.object(trade_bot, "execute_selected_candidate") as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        evaluate.assert_called_once_with("BANKNIFTY", allow_option_sell=False)
+        execute.assert_called_once_with(bank_candidate)
 
     def test_losing_setups_are_rejected_by_feasibility_gate(self):
         first = trade_bot.evaluate_trade_feasibility(
@@ -321,6 +371,25 @@ class TradeControlTests(unittest.TestCase):
             )
 
         self.assertEqual(quantity, 30)
+
+    def test_mobile_capital_is_applied_independently_to_both_indices(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"OPTION_CAPITAL_PER_ENTRY": "1", "MAX_LOTS_PER_ENTRY": "0"},
+                clear=False,
+            ),
+            patch("trade_bot.active_value", return_value=100000),
+        ):
+            nifty_quantity = trade_bot.order_quantity_for(
+                "NIFTY", {"lot_size": 65}, entry_price=100
+            )
+            banknifty_quantity = trade_bot.order_quantity_for(
+                "BANKNIFTY", {"lot_size": 30}, entry_price=500
+            )
+
+        self.assertEqual(nifty_quantity, 975)
+        self.assertEqual(banknifty_quantity, 180)
 
     def test_short_levels_and_risk_are_side_aware(self):
         target, stop = trade_bot.option_levels_from_fill(

@@ -18,56 +18,57 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "data" / "trading_config.json"
 DEFAULT_PROFILE_ID = "1_LOT"
 
-# Daily limits are deliberately explicit and easy to review.  They are
-# conservative starting values, not a promise of achievable returns.
+# Daily profit/loss fields remain in the API for mobile-client compatibility,
+# but zero means no daily P&L gate. Capital is allocated independently to each
+# eligible NIFTY and BANKNIFTY position.
 CAPITAL_PROFILES = {
     "1_LOT": {
         "label": "1 Lot",
         "optionCapitalPerEntry": 1.0,
-        "dailyMaxLoss": 1500.0,
-        "dailyProfitTarget": 2000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "50000": {
         "label": "50K",
         "optionCapitalPerEntry": 50000.0,
-        "dailyMaxLoss": 2000.0,
-        "dailyProfitTarget": 3000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "100000": {
         "label": "1L",
         "optionCapitalPerEntry": 100000.0,
-        "dailyMaxLoss": 4000.0,
-        "dailyProfitTarget": 6000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "150000": {
         "label": "1.5L",
         "optionCapitalPerEntry": 150000.0,
-        "dailyMaxLoss": 6000.0,
-        "dailyProfitTarget": 9000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "200000": {
         "label": "2L",
         "optionCapitalPerEntry": 200000.0,
-        "dailyMaxLoss": 8000.0,
-        "dailyProfitTarget": 12000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "250000": {
         "label": "2.5L",
         "optionCapitalPerEntry": 250000.0,
-        "dailyMaxLoss": 10000.0,
-        "dailyProfitTarget": 15000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "300000": {
         "label": "3L",
         "optionCapitalPerEntry": 300000.0,
-        "dailyMaxLoss": 12000.0,
-        "dailyProfitTarget": 18000.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
     "350000": {
         "label": "3.5L",
         "optionCapitalPerEntry": 350000.0,
-        "dailyMaxLoss": 15000.0,
-        "dailyProfitTarget": 22500.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
     },
 }
 

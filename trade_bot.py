@@ -22,7 +22,6 @@ from institutional_flow import (
     get_institutional_footprint,
     neutral_institutional_footprint,
 )
-from llm_decision import get_llm_decision
 from market_technicals import (
     get_technical_analysis,
     convert_index_levels_to_option_premium,
@@ -91,13 +90,17 @@ MIN_SCORE_BY_SYMBOL = {
     "NIFTY": 70,
     "BANKNIFTY": 65,
 }
-
-LLM_RESCUE_SCORE = 50
+DEFAULT_CAUTIOUS_OVERRIDE_SCORE = 50
 
 DEFAULT_NORMAL_TARGET_PERCENT = 10.0
 DEFAULT_NORMAL_STOP_PERCENT = 7.5
 DEFAULT_CAUTIOUS_TARGET_PERCENT = 6.0
 DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
+DEFAULT_INDEX_EXIT_POINTS = {
+    "NIFTY": {"target": 30.0, "stop": 30.0},
+    "BANKNIFTY": {"target": 60.0, "stop": 60.0},
+}
+DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
 DEFAULT_RISK_SLOTS_PER_DAY = 3
@@ -217,6 +220,53 @@ def configured_non_negative_float(env_key, default):
     return value
 
 
+def configured_positive_float(env_key, default):
+    value = to_float(os.getenv(env_key), default)
+    if value <= 0:
+        raise RuntimeError(f"{env_key} must be greater than 0")
+    return value
+
+
+def index_point_exit_settings(symbol):
+    defaults = DEFAULT_INDEX_EXIT_POINTS[symbol]
+    settings = {
+        "target_points": configured_positive_float(
+            f"{symbol}_TARGET_POINTS", defaults["target"]
+        ),
+        "stop_points": configured_positive_float(
+            f"{symbol}_STOP_POINTS", defaults["stop"]
+        ),
+        "delta": configured_positive_float(
+            "OPTION_DELTA_APPROXIMATION",
+            DEFAULT_OPTION_DELTA_APPROXIMATION,
+        ),
+    }
+    if settings["delta"] > 1:
+        raise RuntimeError("OPTION_DELTA_APPROXIMATION must be greater than 0 and at most 1")
+    return settings
+
+
+def option_levels_from_index_points(
+    symbol,
+    entry_price,
+    target_points=None,
+    stop_points=None,
+    delta=None,
+):
+    settings = index_point_exit_settings(symbol)
+    target_points = float(target_points or settings["target_points"])
+    stop_points = float(stop_points or settings["stop_points"])
+    delta = float(delta or settings["delta"])
+    entry = float(entry_price)
+    return {
+        "target_price": round(entry + target_points * delta, 2),
+        "stop_loss_price": round(max(entry - stop_points * delta, 0.05), 2),
+        "target_points": target_points,
+        "stop_points": stop_points,
+        "delta": delta,
+    }
+
+
 def evaluate_trade_feasibility(
     direction,
     entry_price,
@@ -327,31 +377,37 @@ def evaluate_trade_feasibility(
 
 
 def revalidate_option_after_fill(
+    symbol,
     direction,
     option_type,
     fill_price,
-    target_percent,
-    stop_percent,
+    target_points,
+    stop_points,
+    delta,
     technicals,
 ):
     """Recalculate levels and feasibility using the actual market fill."""
     fill = float(fill_price)
+    levels = option_levels_from_index_points(
+        symbol,
+        fill,
+        target_points=target_points,
+        stop_points=stop_points,
+        delta=delta,
+    )
+    delta = levels["delta"]
     recalculated_technicals = deepcopy(technicals or {})
     for timeframe in ("two_hour", "fifteen_min", "five_min"):
         recalculated_technicals[timeframe] = convert_index_levels_to_option_premium(
             recalculated_technicals.get(timeframe, {}),
             option_side=option_type,
             option_entry_price=fill,
-            delta=0.5,
+            delta=delta,
             transaction_type="BUY",
         )
 
-    target, stop = option_levels_from_fill(
-        fill,
-        target_percent,
-        stop_percent,
-        transaction_type="BUY",
-    )
+    target = levels["target_price"]
+    stop = levels["stop_loss_price"]
     feasibility = evaluate_trade_feasibility(
         direction,
         fill,
@@ -363,8 +419,11 @@ def revalidate_option_after_fill(
     recalculated_technicals["trade_feasibility"] = feasibility
     return {
         "allowed": bool(feasibility.get("allowed")),
-        "target_price": float(feasibility.get("adjusted_target_price") or target),
+        "target_price": float(target),
         "stop_loss_price": float(stop),
+        "target_points": levels["target_points"],
+        "stop_points": levels["stop_points"],
+        "delta": levels["delta"],
         "technicals": recalculated_technicals,
         "feasibility": feasibility,
     }
@@ -1164,6 +1223,9 @@ def save_open_position_state(
     protective_stop_order_id=None,
     instrument_class="INDEX_OPTION",
     underlying_symbol=None,
+    target_points=None,
+    stop_points=None,
+    option_delta_used=None,
 ):
     entry_transaction_type = str(entry_transaction_type).upper()
     if target_percent is not None and stop_percent is not None:
@@ -1230,6 +1292,9 @@ def save_open_position_state(
         "stop_loss_price": stop_loss_price,
         "target_percent": target_percent,
         "stop_percent": stop_percent,
+        "target_points": target_points,
+        "stop_points": stop_points,
+        "option_delta_used": option_delta_used,
         "status": "POSITION_OPEN",
         "created_at": now_ist().isoformat(),
         "highest_ltp": round(float(entry_price), 2),
@@ -1584,6 +1649,9 @@ def handle_existing_state(symbol, state, verbose=True):
                 entry_transaction_type=entry_transaction,
                 instrument_class=state.get("instrument_class", "INDEX_OPTION"),
                 underlying_symbol=state.get("underlying_symbol"),
+                target_points=state.get("target_points"),
+                stop_points=state.get("stop_points"),
+                option_delta_used=state.get("option_delta_used"),
             )
             state = read_state(symbol)
             technical_context = state.get("technical_context") or {}
@@ -1591,11 +1659,13 @@ def handle_existing_state(symbol, state, verbose=True):
                 state.get("direction"), "BUY"
             )
             post_fill = revalidate_option_after_fill(
+                symbol,
                 state.get("direction"),
                 option_type,
                 entry_price,
-                float(state.get("target_percent") or risk_percentages(False)[0]),
-                float(state.get("stop_percent") or risk_percentages(False)[1]),
+                state.get("target_points"),
+                state.get("stop_points"),
+                state.get("option_delta_used"),
                 technical_context,
             )
             state["post_fill_feasibility"] = post_fill["feasibility"]
@@ -1943,17 +2013,17 @@ def run_squareoff():
             clear_state(symbol)
 
 def cautious_override_allowed(direction, weighted_score, technicals):
+    """Compatibility rule used by offline counterfactual research only."""
     score_value = float(weighted_score.get("score") or 0)
     fifteen = technicals.get("fifteen_min", {}) or {}
     five = technicals.get("five_min", {}) or {}
     atm_flow = technicals.get("atm_option_flow", {}) or {}
     institutional = technicals.get("institutional_flow", {}) or {}
-
     atm_close = float(atm_flow.get("close") or 0)
     atm_vwap = float(atm_flow.get("vwap") or 999999)
 
     return (
-        score_value >= LLM_RESCUE_SCORE
+        score_value >= DEFAULT_CAUTIOUS_OVERRIDE_SCORE
         and fifteen.get("bias") != opposite_direction(direction)
         and five.get("bias") != opposite_direction(direction)
         and atm_flow.get("bias") in {"BULLISH", "NEUTRAL"}
@@ -1997,6 +2067,7 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
     entry_price = entry_price_for(atm, direction, transaction_type)
     if entry_price <= 0:
         return None, "missing option premium"
+    exit_settings = index_point_exit_settings(symbol)
 
     instrument = find_index_option_instrument(
         symbol,
@@ -2065,7 +2136,7 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             technicals.get(timeframe, {}),
             option_side=option_type,
             option_entry_price=entry_price,
-            delta=0.5,
+            delta=exit_settings["delta"],
             transaction_type=transaction_type,
         )
 
@@ -2127,18 +2198,23 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         }, None
 
     cautious = weighted.get("grade") == "CAUTIOUS_TRADE"
-    target_percent, stop_percent = risk_percentages(cautious=cautious)
-    target, stop = option_levels_from_fill(
+    levels = option_levels_from_index_points(
+        symbol,
         entry_price,
-        target_percent,
-        stop_percent,
-        transaction_type=transaction_type,
+        target_points=exit_settings["target_points"],
+        stop_points=exit_settings["stop_points"],
+        delta=exit_settings["delta"],
     )
+    target = levels["target_price"]
+    stop = levels["stop_loss_price"]
     option_summary.update(
         {
             "target_price": target,
             "stop_loss_price": stop,
             "cautious_trade": cautious,
+            "target_points": levels["target_points"],
+            "stop_points": levels["stop_points"],
+            "option_delta_used": levels["delta"],
         }
     )
     feasibility = evaluate_trade_feasibility(
@@ -2162,17 +2238,19 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             "weighted": weighted,
         }, None
 
-    option_summary["target_price"] = float(feasibility["adjusted_target_price"])
     return {
         "allowed": True,
         "reason": "qualified",
         "transaction_type": transaction_type,
         "instrument": instrument,
         "entry_price": entry_price,
-        "target_price": float(feasibility["adjusted_target_price"]),
+        "target_price": float(target),
         "stop_loss_price": float(stop),
-        "target_percent": target_percent,
-        "stop_percent": stop_percent,
+        "target_percent": None,
+        "stop_percent": None,
+        "target_points": levels["target_points"],
+        "stop_points": levels["stop_points"],
+        "option_delta_used": levels["delta"],
         "technicals": technicals,
         "option_summary": option_summary,
         "weighted": weighted,
@@ -2195,11 +2273,6 @@ def select_trade_candidate(candidates, allow_sell=True):
 
 
 def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
-    risk_reason, risk_mode = risk_limit_mode()
-    if risk_mode == "stop":
-        log(f"{symbol} no trade: daily risk limit reached ({risk_reason})")
-        return False
-
     rec = get_index_recommendation(symbol)
     record_option_chain_snapshot(symbol, rec)
     direction = rec["direction"]
@@ -2280,7 +2353,6 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         and item.get("transaction_type") == "BUY"
     ]
     ordered = [preferred] + [item for item in qualified if item is not preferred]
-    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
 
     for chosen in ordered:
         transaction_type = chosen["transaction_type"]
@@ -2301,14 +2373,22 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
 
         option_summary = chosen["option_summary"]
         technicals = chosen["technicals"]
-        llm_decision = get_llm_decision(symbol, option_summary, technicals)
-        record_analysis(symbol, option_summary, technicals, llm_decision)
-        if not llm_decision.get("execute_trade") or llm_decision.get("decision") != direction:
-            log(
-                f"{symbol} BUY structure rejected by LLM/rules: "
-                f"{llm_decision.get('reason')}; considering alternate structure."
-            )
-            continue
+        decision = {
+            "execute_trade": True,
+            "decision": direction,
+            "confidence": (
+                "HIGH"
+                if chosen.get("weighted", {}).get("grade") == "TRADE"
+                else "MEDIUM"
+            ),
+            "target_price": chosen["target_price"],
+            "stop_loss_price": chosen["stop_loss_price"],
+            "reason": (
+                "Approved by deterministic option-chain, technical, market-quality, "
+                "and entry-feasibility rules."
+            ),
+        }
+        record_analysis(symbol, option_summary, technicals, decision)
 
         chosen.update(
             {
@@ -2316,14 +2396,12 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
                 "direction": direction,
                 "confidence": confidence,
                 "signal_score": score,
-                "risk_reason": risk_reason,
-                "risk_mode": risk_mode,
-                "llm_decision": llm_decision,
+                "decision": decision,
             }
         )
         return chosen
 
-    log(f"{symbol} no trade: BUY structure was rejected by LLM/rules.")
+    log(f"{symbol} no trade: BUY structure did not pass deterministic rules.")
     return False
 
 
@@ -2332,8 +2410,6 @@ def execute_selected_candidate(chosen):
     direction = chosen["direction"]
     confidence = chosen["confidence"]
     score = chosen["signal_score"]
-    risk_reason = chosen.get("risk_reason")
-    risk_mode = chosen.get("risk_mode")
     transaction_type = chosen["transaction_type"]
     if transaction_type != "BUY":
         log(f"{symbol} blocked unsupported transaction type: {transaction_type}")
@@ -2358,13 +2434,6 @@ def execute_selected_candidate(chosen):
         f"{symbol} selected {transaction_type}: {instrument['trading_symbol']} qty={quantity} "
         f"entry={entry_price} target={target} stop={stop} live={live}"
     )
-    if risk_mode == "paper":
-        log(
-            f"{symbol} PAPER ONLY after daily risk limit: reason={risk_reason} "
-            f"would_{transaction_type.lower()}={instrument['trading_symbol']} qty={quantity} "
-            f"entry={entry_price} target={target} stop_loss={stop}"
-        )
-        return True
     if not live:
         log(f"{symbol} DRY RUN ONLY: would {transaction_type} one lot.")
         return True
@@ -2391,6 +2460,9 @@ def execute_selected_candidate(chosen):
             "stop_loss_price": stop,
             "target_percent": chosen["target_percent"],
             "stop_percent": chosen["stop_percent"],
+            "target_points": chosen["target_points"],
+            "stop_points": chosen["stop_points"],
+            "option_delta_used": chosen["option_delta_used"],
             "option_type": chosen.get("option_summary", {}).get("option_type"),
             "technical_context": chosen.get("technicals", {}),
             "direction": direction,
@@ -2408,14 +2480,19 @@ def execute_selected_candidate(chosen):
         symbol, order_id, instrument, direction, confidence, score, fill, quantity,
         target, stop, chosen["target_percent"], chosen["stop_percent"],
         entry_transaction_type=transaction_type,
+        target_points=chosen["target_points"],
+        stop_points=chosen["stop_points"],
+        option_delta_used=chosen["option_delta_used"],
     )
 
     post_fill = revalidate_option_after_fill(
+        symbol,
         direction,
         chosen.get("option_summary", {}).get("option_type"),
         fill,
-        chosen["target_percent"],
-        chosen["stop_percent"],
+        chosen["target_points"],
+        chosen["stop_points"],
+        chosen["option_delta_used"],
         chosen.get("technicals", {}),
     )
     state = read_state(symbol)
@@ -2750,20 +2827,11 @@ def run_signal_check():
             except Exception as error:
                 log(f"{symbol} existing-position check ERROR: {error}")
 
-    active = [symbol for symbol in BOT_STATE_SLOTS if read_state(symbol).get("instrument_key")]
-    active_index = [symbol for symbol in SYMBOLS if symbol in active]
-    stock_future_active = STOCK_FUTURE_STATE in active
-    if active_index:
-        log(
-            f"Global one-position rule: active index option exists in {active_index[0]}; "
-            "no new entry."
-        )
-        return
-    if stock_future_active:
-        log(
-            "Stock-futures position is active; index option BUY is allowed, "
-            "while new stock-futures entries remain disabled."
-        )
+    active_index = {
+        symbol
+        for symbol in SYMBOLS
+        if read_state(symbol).get("instrument_key")
+    }
 
     try:
         tracked_instrument_keys = {
@@ -2790,7 +2858,7 @@ def run_signal_check():
             )
             if not allow_manual_overlap:
                 log(
-                    "Global one-position rule: an untracked NSE derivatives position "
+                    "An untracked NSE derivatives position "
                     "exists; no bot entry. Set "
                     "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true only when "
                     "manual positions are intentionally allowed to coexist."
@@ -2798,7 +2866,7 @@ def run_signal_check():
                 return
             log(
                 "Manual derivative position detected; override enabled. "
-                "Bot may enter one position and will manage only its own bot state."
+                "Bot may enter index-option positions and will manage only its own state."
             )
     except Exception as error:
         log(f"Global broker-position precheck failed; no new entry for safety: {error}")
@@ -2806,38 +2874,40 @@ def run_signal_check():
 
     qualified = []
     for symbol in SYMBOLS:
+        if symbol in active_index:
+            log(f"{symbol} already has an active bot position; skipping only {symbol} entry.")
+            continue
         try:
-            if stock_future_active:
-                candidate = evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False)
-            else:
-                candidate = evaluate_symbol_buy_or_sell(symbol)
+            candidate = evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False)
             if candidate:
                 qualified.append(candidate)
         except Exception as e:
             log(f"{symbol} ERROR: {e}")
 
     if not qualified:
-        log("Global selection: no qualified NIFTY or BANKNIFTY BUY structure.")
-        if stock_future_active:
-            log("Stock-futures entry is disabled; existing stock-futures position remains under monitor.")
+        log("No new qualified NIFTY or BANKNIFTY BUY structure.")
         return
 
-    chosen = max(
+    ordered = sorted(
         qualified,
         key=lambda item: (
             float(item.get("weighted", {}).get("score") or 0),
             1 if item.get("transaction_type") == "BUY" else 0,
         ),
+        reverse=True,
     )
     choices = [
         (item["symbol"], item["transaction_type"], item.get("weighted", {}).get("score"))
         for item in qualified
     ]
     log(
-        f"Global selection: {chosen['symbol']} {chosen['transaction_type']} chosen at "
-        f"score={chosen.get('weighted', {}).get('score')} from {choices}"
+        "Independent index selections qualified: " + str(choices)
     )
-    execute_selected_candidate(chosen)
+    for chosen in ordered:
+        try:
+            execute_selected_candidate(chosen)
+        except Exception as error:
+            log(f"{chosen['symbol']} order execution ERROR: {error}")
 
 
 def main():

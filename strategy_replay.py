@@ -355,6 +355,20 @@ class StrategyReplay:
                     "; ".join(confirmation_failures), contract,
                 )
                 return None
+        if (
+            os.getenv("REPLAY_REQUIRE_NORMAL_TRADE", "false").lower() == "true"
+            and weighted.get("grade") != "TRADE"
+        ):
+            self._record_decision(
+                timestamp,
+                symbol,
+                transaction_type,
+                weighted,
+                False,
+                f"strict replay requires TRADE grade; received {weighted.get('grade')}",
+                contract,
+            )
+            return None
         # Research scenarios can vary symbol-specific quality thresholds without
         # changing the live bot configuration. The defaults preserve the
         # existing replay behavior.
@@ -382,6 +396,32 @@ class StrategyReplay:
             self._record_decision(timestamp, symbol, transaction_type, weighted, False, "; ".join(feasibility.get("reasons") or []))
             return None
         target = _float(feasibility.get("adjusted_target_price"), target)
+        if (
+            transaction_type == "BUY"
+            and os.getenv("REPLAY_FIXED_INDEX_POINT_EXITS", "false").lower() == "true"
+        ):
+            delta = max(_float(os.getenv("REPLAY_OPTION_DELTA"), 0.5), 0.01)
+            target_points = max(
+                _float(os.getenv(f"REPLAY_{symbol}_TARGET_POINTS"), 30 if symbol == "NIFTY" else 60),
+                0,
+            )
+            stop_points = max(
+                _float(os.getenv(f"REPLAY_{symbol}_STOP_POINTS"), 15 if symbol == "NIFTY" else 30),
+                0,
+            )
+            if target_points <= 0 or stop_points <= 0:
+                self._record_decision(
+                    timestamp, symbol, transaction_type, weighted, False,
+                    "fixed replay target and stop points must be positive", contract,
+                )
+                return None
+            target = entry + target_points * delta
+            stop = max(entry - stop_points * delta, 0.05)
+            feasibility["fixed_index_point_exits"] = {
+                "target_points": target_points,
+                "stop_points": stop_points,
+                "delta": delta,
+            }
         summary["target_price"] = target
         summary["stop_loss_price"] = stop
         summary["technical_feasibility"] = feasibility
