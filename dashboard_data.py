@@ -429,6 +429,7 @@ def empty_trade_performance() -> dict:
         "cumulative": {
             "totalTrades": 0,
             "totalPnL": 0.0,
+            "stockOptionsPnL": 0.0,
             "winRate": 0.0,
             "averageProfitPerWinningTrade": 0.0,
             "averageLossPerLosingTrade": 0.0,
@@ -460,6 +461,17 @@ def calculate_win_rate(trades: list[dict]) -> float:
     return round(
         winning_trades / len(trades) * 100,
         1,
+    )
+
+
+def cumulative_stock_option_pnl(trades: list[dict]) -> float:
+    return round(
+        sum(
+            trade["grossPnL"]
+            for trade in trades
+            if str(trade.get("instrumentClass") or "").upper() == "STOCK_OPTION"
+        ),
+        2,
     )
 
 
@@ -887,6 +899,7 @@ def build_trade_performance() -> dict:
                 ),
                 2,
             ),
+            "stockOptionsPnL": cumulative_stock_option_pnl(trades),
             "winRate": calculate_win_rate(
                 trades
             ),

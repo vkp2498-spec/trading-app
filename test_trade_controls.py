@@ -486,6 +486,17 @@ class TradeControlTests(unittest.TestCase):
             750,
         )
 
+    def test_mobile_dashboard_calculates_cumulative_stock_option_pnl(self):
+        trades = [
+            {"instrumentClass": "STOCK_OPTION", "grossPnL": 3200},
+            {"instrumentClass": "STOCK_OPTION", "grossPnL": -1200},
+            {"instrumentClass": "INDEX_OPTION", "grossPnL": 9000},
+        ]
+        self.assertEqual(
+            dashboard_data.cumulative_stock_option_pnl(trades),
+            2000,
+        )
+
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {
             "symbol": "NIFTY",
