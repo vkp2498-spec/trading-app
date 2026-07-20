@@ -2962,8 +2962,9 @@ def run_stock_options_scan():
         "target_price": None,
         "stop_loss_price": None,
         "reason": (
-            f"{chosen['mover_type']} passed stock option-chain, 5M/15M, "
-            "VWAP/volume, liquidity, and weighted-score gates."
+            f"{chosen['mover_type']} passed tradeability, 5M/15M structure, "
+            "VWAP/momentum, futures OI, market context, option evidence, "
+            "and directional-score gates."
         ),
     }
     record_analysis(

@@ -578,3 +578,61 @@ def get_instrument_technical_analysis(instrument_key):
         "fifteen_min": analyze_latest(df_15, "15M"),
         "five_min": analyze_latest(df_5, "5M"),
     }
+
+
+def get_stock_futures_oi_analysis(instrument_key):
+    """Classify the latest completed stock-futures price/OI transition."""
+    try:
+        frame = fetch_v3_intraday_minutes(instrument_key, minutes=5)
+        valid = frame.dropna(subset=["close"]).copy()
+        if len(valid) < 2:
+            raise RuntimeError("fewer than two completed futures candles")
+        latest = valid.iloc[-1]
+        previous = valid.iloc[-2]
+        previous_price = float(previous.get("close") or 0)
+        previous_oi = float(previous.get("oi") or 0)
+        if previous_price <= 0 or previous_oi <= 0:
+            raise RuntimeError("stock-futures price or OI history is unavailable")
+
+        price_change = (float(latest.get("close") or 0) - previous_price) / previous_price * 100
+        oi_change = (float(latest.get("oi") or 0) - previous_oi) / previous_oi * 100
+        price_threshold = max(float(os.getenv("STOCK_OPTION_FUTURES_PRICE_THRESHOLD", "0.03")), 0.0)
+        oi_threshold = max(float(os.getenv("STOCK_OPTION_FUTURES_OI_THRESHOLD", "0.05")), 0.0)
+
+        bias = "NEUTRAL"
+        interpretation = "Price/OI transition is not decisive"
+        if price_change >= price_threshold and oi_change >= oi_threshold:
+            bias = "BULLISH"
+            interpretation = "Long buildup"
+        elif price_change <= -price_threshold and oi_change >= oi_threshold:
+            bias = "BEARISH"
+            interpretation = "Short buildup"
+        elif price_change >= price_threshold and oi_change <= -oi_threshold:
+            bias = "BULLISH"
+            interpretation = "Short covering"
+        elif price_change <= -price_threshold and oi_change <= -oi_threshold:
+            bias = "BEARISH"
+            interpretation = "Long unwinding"
+
+        oi_strength = abs(oi_change)
+        confidence = "HIGH" if oi_strength >= 0.20 else "MEDIUM" if oi_strength >= oi_threshold else "LOW"
+        return {
+            "bias": bias,
+            "confidence": confidence,
+            "price_change_percent": round(price_change, 4),
+            "oi_change_percent": round(oi_change, 4),
+            "interpretation": interpretation,
+            "candle_time": latest.name.isoformat(),
+            "reasons": [
+                f"{interpretation}: price={price_change:+.3f}%, OI={oi_change:+.3f}%"
+            ],
+        }
+    except Exception as error:
+        return {
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "price_change_percent": None,
+            "oi_change_percent": None,
+            "interpretation": "Unavailable",
+            "reasons": [f"Stock-futures OI unavailable: {error}"],
+        }

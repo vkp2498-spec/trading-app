@@ -19,9 +19,13 @@ from institutional_flow import neutral_institutional_footprint
 from market_technicals import (
     get_instrument_technical_analysis,
     get_option_volume_vwap_analysis,
+    get_stock_futures_oi_analysis,
 )
 from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
-from signal_score import weighted_alignment_score
+from stock_option_score import (
+    stock_option_directional_score,
+    stock_option_tradeability,
+)
 from stock_futures_scanner import NIFTY50_SYMBOLS
 from strategy_core import option_chain_signal, option_contract_quality
 
@@ -30,6 +34,26 @@ IST = ZoneInfo("Asia/Kolkata")
 UPSTOX_FULL_QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
 UPSTOX_OPTION_CONTRACT_URL = "https://api.upstox.com/v2/option/contract"
 UPSTOX_OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
+
+MARKET_CONTEXT_KEYS = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANK": "NSE_INDEX|Nifty Bank",
+    "IT": "NSE_INDEX|Nifty IT",
+    "AUTO": "NSE_INDEX|Nifty Auto",
+    "PHARMA": "NSE_INDEX|Nifty Pharma",
+    "FINANCE": "NSE_INDEX|Nifty Fin Service",
+    "FMCG": "NSE_INDEX|Nifty FMCG",
+    "METAL": "NSE_INDEX|Nifty Metal",
+}
+SECTOR_BY_SYMBOL = {
+    **{symbol: "BANK" for symbol in ("AXISBANK", "HDFCBANK", "ICICIBANK", "INDUSINDBK", "KOTAKBANK", "SBIN")},
+    **{symbol: "IT" for symbol in ("HCLTECH", "INFY", "TCS", "TECHM", "WIPRO")},
+    **{symbol: "AUTO" for symbol in ("BAJAJ-AUTO", "EICHERMOT", "HEROMOTOCO", "M&M", "MARUTI", "TATAMOTORS")},
+    **{symbol: "PHARMA" for symbol in ("APOLLOHOSP", "CIPLA", "DRREDDY", "SUNPHARMA")},
+    **{symbol: "FINANCE" for symbol in ("BAJFINANCE", "BAJAJFINSV", "HDFCLIFE", "JIOFIN", "SBILIFE", "SHRIRAMFIN")},
+    **{symbol: "FMCG" for symbol in ("BRITANNIA", "HINDUNILVR", "ITC", "NESTLEIND", "TATACONSUM")},
+    **{symbol: "METAL" for symbol in ("HINDALCO", "JSWSTEEL", "TATASTEEL")},
+}
 
 
 def _number(value, default=0.0):
@@ -63,7 +87,11 @@ def choose_stock_option_expiry(expiries, today=None, minimum_days=3):
     if not parsed:
         raise RuntimeError("No current stock-option expiry is available")
     eligible = [expiry for expiry in parsed if (expiry - today).days >= int(minimum_days)]
-    return (eligible[0] if eligible else parsed[-1]).isoformat()
+    if not eligible:
+        raise RuntimeError(
+            f"No stock-option expiry has at least {int(minimum_days)} days remaining"
+        )
+    return eligible[0].isoformat()
 
 
 def _load_instruments(instrument_cache):
@@ -72,6 +100,7 @@ def _load_instruments(instrument_cache):
 
     equities = []
     derivatives_by_key = {}
+    futures_by_symbol = {}
     configured = os.getenv("STOCK_OPTION_SYMBOLS", "").strip()
     allowed = (
         {item.strip().upper() for item in configured.split(",") if item.strip()}
@@ -84,6 +113,16 @@ def _load_instruments(instrument_cache):
         segment = str(row.get("segment") or "").upper()
         if segment == "NSE_FO" and key:
             derivatives_by_key[key] = row
+            instrument_type = str(row.get("instrument_type") or "").upper()
+            underlying = str(row.get("underlying_symbol") or "").upper()
+            expiry = _expiry_date(row.get("expiry"))
+            if instrument_type in {"FUT", "FUTSTK"} and underlying and expiry:
+                current = futures_by_symbol.get(underlying)
+                current_expiry = _expiry_date(current.get("expiry")) if current else None
+                if expiry >= datetime.now(IST).date() and (
+                    current_expiry is None or expiry < current_expiry
+                ):
+                    futures_by_symbol[underlying] = row
             continue
         if segment != "NSE_EQ":
             continue
@@ -101,7 +140,7 @@ def _load_instruments(instrument_cache):
                 "trading_symbol": row.get("trading_symbol") or symbol,
             }
         )
-    return equities, derivatives_by_key
+    return equities, derivatives_by_key, futures_by_symbol
 
 
 def _quote_rows(payload):
@@ -137,6 +176,63 @@ def _previous_close(quote):
         or quote.get("close_price")
         or quote.get("cp")
     )
+
+
+def _quote_change_percent(quote):
+    last = _quote_price(quote)
+    previous = _previous_close(quote)
+    return (last - previous) / previous * 100 if last > 0 and previous > 0 else None
+
+
+def market_context_for(mover, quote_payload):
+    """Measure broad-market, sector and stock-relative confirmation."""
+    quotes = _quote_rows(quote_payload)
+    direction = mover["direction"]
+    sign = 1.0 if direction == "BULLISH" else -1.0
+    nifty_change = _quote_change_percent(quotes.get(MARKET_CONTEXT_KEYS["NIFTY"], {}))
+    sector_name = SECTOR_BY_SYMBOL.get(mover["symbol"])
+    sector_key = MARKET_CONTEXT_KEYS.get(sector_name)
+    sector_change = _quote_change_percent(quotes.get(sector_key, {})) if sector_key else None
+    stock_change = _number(mover.get("change_percent"))
+
+    contributions = []
+    if nifty_change is not None:
+        contributions.append(0.25 * max(-1.0, min(1.0, sign * nifty_change / 0.35)))
+    if sector_change is not None:
+        contributions.append(0.50 * max(-1.0, min(1.0, sign * sector_change / 0.35)))
+        relative = sign * (stock_change - sector_change)
+        contributions.append(0.25 * max(-1.0, min(1.0, relative / 0.50)))
+    elif nifty_change is not None:
+        relative = sign * (stock_change - nifty_change)
+        contributions.append(0.50 * max(-1.0, min(1.0, relative / 0.75)))
+
+    support = sum(contributions)
+    reliability = min(1.0, len(contributions) / 3.0)
+    bias = (
+        direction
+        if support >= 0.20
+        else ("BEARISH" if direction == "BULLISH" else "BULLISH")
+        if support <= -0.20
+        else "NEUTRAL"
+    )
+    confidence = "HIGH" if abs(support) >= 0.65 else "MEDIUM" if abs(support) >= 0.35 else "LOW"
+    return {
+        "bias": bias,
+        "confidence": confidence,
+        "directional_support": round(support, 3),
+        "reliability": round(reliability, 3),
+        "nifty_change_percent": round(nifty_change, 3) if nifty_change is not None else None,
+        "sector": sector_name,
+        "sector_change_percent": round(sector_change, 3) if sector_change is not None else None,
+        "stock_relative_change_percent": round(
+            stock_change - (sector_change if sector_change is not None else nifty_change), 3
+        ) if sector_change is not None or nifty_change is not None else None,
+        "reasons": [
+            f"NIFTY={nifty_change:+.2f}%" if nifty_change is not None else "NIFTY context unavailable",
+            f"{sector_name}={sector_change:+.2f}%" if sector_change is not None else "Sector context unavailable",
+            f"Directional context support={support:+.2f}",
+        ],
+    }
 
 
 def rank_top_movers(equities, quote_payload):
@@ -344,20 +440,80 @@ def _get_expiry(equity_key, request_func):
     return choose_stock_option_expiry(expiries, minimum_days=minimum_days)
 
 
-def _quality_allowed(quality):
-    maximum_spread = _number(os.getenv("STOCK_OPTION_MAX_SPREAD_PERCENT"), 2.5)
-    spread = quality.get("spread_percent")
-    if spread is not None and float(spread) > maximum_spread:
-        return False, f"spread {float(spread):.2f}% exceeds {maximum_spread:.2f}%"
-    delta = quality.get("delta")
-    minimum_delta = _number(os.getenv("STOCK_OPTION_MIN_DELTA"), 0.20)
-    maximum_delta = _number(os.getenv("STOCK_OPTION_MAX_DELTA"), 0.80)
-    if delta is not None and not minimum_delta <= abs(float(delta)) <= maximum_delta:
-        return False, f"delta {float(delta):.3f} is outside {minimum_delta:.2f}-{maximum_delta:.2f}"
-    return True, "liquidity and Greeks accepted"
+def _select_tradeable_contract(
+    symbol,
+    expected_direction,
+    atm,
+    chain,
+    derivatives_by_key,
+    market_cache_reader,
+):
+    """Choose ATM or one-step ITM using executable market quality."""
+    option_type = "CE" if expected_direction == "BULLISH" else "PE"
+    atm_index = int((chain["strike"] - float(atm["strike"])).abs().idxmin())
+    itm_index = atm_index - 1 if option_type == "CE" else atm_index + 1
+    row_specs = [("ATM", atm_index)]
+    if 0 <= itm_index < len(chain):
+        row_specs.append(("ITM1", itm_index))
+
+    evaluated = []
+    for contract_kind, index in row_specs:
+        row = chain.loc[index]
+        option_key = row.get(f"{option_type}_instrument_key")
+        instrument = derivatives_by_key.get(option_key)
+        entry_price = _number(row.get(f"{option_type}_ltp"))
+        if not option_key or not instrument or entry_price <= 0:
+            continue
+        stream_quote = market_cache_reader(option_key) or {}
+        quality = option_contract_quality(row, option_type, stream_quote)
+        lot_size = max(int(_number(instrument.get("lot_size"), 1)), 1)
+        tradeability = stock_option_tradeability(
+            symbol=symbol,
+            quality=quality,
+            chain_volume=row.get(f"{option_type}_volume"),
+            lot_size=lot_size,
+            stream_quote=stream_quote,
+        )
+        evaluated.append(
+            {
+                "contract_kind": contract_kind,
+                "row": row,
+                "instrument": instrument,
+                "option_key": option_key,
+                "entry_price": entry_price,
+                "quality": quality,
+                "tradeability": tradeability,
+            }
+        )
+
+    allowed = [item for item in evaluated if item["tradeability"]["allowed"]]
+    if not allowed:
+        details = []
+        for item in evaluated:
+            blockers = "; ".join(item["tradeability"]["blockers"]) or "score too low"
+            details.append(f"{item['contract_kind']}: {blockers}")
+        return None, "tradeability rejected: " + (" | ".join(details) or "no ATM/ITM contract")
+
+    allowed.sort(
+        key=lambda item: (
+            item["tradeability"]["score"],
+            -_number(item["tradeability"].get("midpoint_spread_percent"), 999),
+            _number(item["row"].get(f"{option_type}_volume")),
+            item["contract_kind"] == "ATM",
+        ),
+        reverse=True,
+    )
+    return allowed[0], "qualified"
 
 
-def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader):
+def _evaluate_mover(
+    mover,
+    derivatives_by_key,
+    futures_contract,
+    market_context,
+    request_func,
+    market_cache_reader,
+):
     symbol = mover["symbol"]
     expected_direction = mover["direction"]
     expiry = _get_expiry(mover["instrument_key"], request_func)
@@ -380,75 +536,96 @@ def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader
         },
     }
     record_option_chain_snapshot(symbol, recommendation)
-    if direction != expected_direction or confidence != "HIGH" or abs(score) < 4:
-        return None, (
-            f"mover={expected_direction} but option chain={direction}/{confidence} score={score}"
-        )
-
-    option_type = "CE" if direction == "BULLISH" else "PE"
-    option_key = atm.get(f"{option_type}_instrument_key")
-    instrument = derivatives_by_key.get(option_key)
-    entry_price = _number(atm.get(f"{option_type}_ltp"))
-    if not instrument or entry_price <= 0:
-        return None, "ATM option instrument or premium is unavailable"
+    # The underlying setup selects CALL versus PUT. A neutral option chain now
+    # contributes zero evidence instead of vetoing an otherwise strong setup.
+    option_type = "CE" if expected_direction == "BULLISH" else "PE"
+    selected, selection_reason = _select_tradeable_contract(
+        symbol,
+        expected_direction,
+        atm,
+        chain,
+        derivatives_by_key,
+        market_cache_reader,
+    )
+    if not selected:
+        return None, selection_reason
+    selected_row = selected["row"]
+    option_key = selected["option_key"]
+    instrument = selected["instrument"]
+    entry_price = selected["entry_price"]
+    quality = selected["quality"]
+    tradeability = selected["tradeability"]
 
     technicals = get_instrument_technical_analysis(mover["instrument_key"])
     fifteen = technicals.get("fifteen_min", {}) or {}
     five = technicals.get("five_min", {}) or {}
     two = technicals.get("two_hour", {}) or {}
-    opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
-    if fifteen.get("bias") != direction or five.get("bias") != direction:
+    opposite = "BEARISH" if expected_direction == "BULLISH" else "BULLISH"
+    if fifteen.get("bias") != expected_direction or five.get("bias") != expected_direction:
         return None, "5M and 15M must both align with the intraday direction"
+    if five.get("vwap_bias") != expected_direction:
+        return None, "underlying 5M price structure and VWAP do not agree"
     if two.get("bias") == opposite and two.get("confidence") in {"MEDIUM", "HIGH"}:
         return None, "2H technical trend strongly conflicts with the intraday direction"
-
-    stream_quote = market_cache_reader(option_key) or {}
-    quality = option_contract_quality(atm, option_type, stream_quote)
-    quality["max_spread_percent"] = _number(
-        os.getenv("STOCK_OPTION_MAX_SPREAD_PERCENT"), 2.5
-    )
-    quality_ok, quality_reason = _quality_allowed(quality)
-    if not quality_ok:
-        return None, quality_reason
+    if _number(market_context.get("directional_support")) <= -0.65:
+        return None, "sector/broad-market context strongly contradicts the stock direction"
 
     option_flow = get_option_volume_vwap_analysis(
         option_key, side_label=instrument.get("trading_symbol") or symbol
     )
-    minimum_volume = _number(os.getenv("STOCK_OPTION_MIN_VOLUME_RATIO"), 1.0)
-    if option_flow.get("bias") != "BULLISH":
-        return None, "selected option premium is not above a supportive VWAP trend"
-    if _number(option_flow.get("volume_ratio")) < minimum_volume:
-        return None, f"selected option volume ratio is below {minimum_volume:.2f}"
+    futures_flow = (
+        get_stock_futures_oi_analysis(futures_contract["instrument_key"])
+        if futures_contract and futures_contract.get("instrument_key")
+        else {
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "reasons": ["No current stock-future contract was found"],
+        }
+    )
 
     technicals["atm_option_flow"] = option_flow
     technicals["option_market_quality"] = quality
+    technicals["stock_option_tradeability"] = tradeability
+    technicals["stock_futures_flow"] = futures_flow
+    technicals["market_context"] = market_context
     technicals["institutional_flow"] = neutral_institutional_footprint(
         "Index-level institutional footprint is not applied to an individual stock"
     )
-    trend = get_option_chain_trend(symbol, direction, expiry=expiry)
+    trend = get_option_chain_trend(symbol, expected_direction, expiry=expiry)
     option_summary = {
         "bias": direction,
         "confidence": confidence,
         "score": score,
-        "strike": float(atm["strike"]),
+        "strike": float(selected_row["strike"]),
         "expiry": expiry,
         "entry_price": round(entry_price, 2),
         "reasons": reasons,
         "trade_action": "BUY_STOCK_OPTION",
         "transaction_type": "BUY",
         "option_type": option_type,
+        "contract_kind": selected["contract_kind"],
         "trading_symbol": instrument.get("trading_symbol"),
         "option_chain_trend": trend,
         "option_market_quality": quality,
+        "tradeability": tradeability,
         "mover_type": mover["mover_type"],
         "mover_change_percent": mover["change_percent"],
         "intraday_score": mover.get("intraday_score"),
         "intraday_range_position": mover.get("range_position"),
     }
-    weighted = weighted_alignment_score(option_summary, technicals, trend)
-    minimum_score = _number(os.getenv("STOCK_OPTION_MIN_WEIGHTED_SCORE"), 80.0)
-    if weighted.get("grade") != "TRADE" or _number(weighted.get("score")) < minimum_score:
-        return None, f"weighted score {weighted.get('score')} is below TRADE/{minimum_score:.1f}"
+    weighted = stock_option_directional_score(
+        direction=expected_direction,
+        technicals=technicals,
+        option_chain=recommendation,
+        option_flow=option_flow,
+        futures_flow=futures_flow,
+        market_context=market_context,
+    )
+    if weighted["grade"] != "TRADE":
+        return None, (
+            f"directional score {weighted['score']:.1f} is below "
+            f"{weighted['minimum_score']:.1f}; chain={direction}/{confidence}"
+        )
 
     return {
         "underlying_symbol": symbol,
@@ -457,7 +634,7 @@ def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader
         "mover_change_percent": mover["change_percent"],
         "intraday_score": mover.get("intraday_score"),
         "intraday_range_position": mover.get("range_position"),
-        "direction": direction,
+        "direction": expected_direction,
         "confidence": confidence,
         "signal_score": score,
         "entry_price": entry_price,
@@ -469,13 +646,20 @@ def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader
 
 
 def scan_stock_option_candidates(instrument_cache, request_func, market_cache_reader, log_func=print):
-    equities, derivatives_by_key = _load_instruments(instrument_cache)
+    equities, derivatives_by_key, futures_by_symbol = _load_instruments(instrument_cache)
     if not equities:
         raise RuntimeError("No eligible NIFTY-50 equity instruments were found")
     quote_payload = request_func(
         "GET",
         UPSTOX_FULL_QUOTE_URL,
-        params={"instrument_key": ",".join(row["instrument_key"] for row in equities)},
+        params={
+            "instrument_key": ",".join(
+                dict.fromkeys(
+                    [row["instrument_key"] for row in equities]
+                    + list(MARKET_CONTEXT_KEYS.values())
+                )
+            )
+        },
     )
     quotes = _quote_rows(quote_payload)
     quoted_count = sum(
@@ -512,7 +696,12 @@ def scan_stock_option_candidates(instrument_cache, request_func, market_cache_re
     for mover in movers:
         try:
             candidate, reason = _evaluate_mover(
-                mover, derivatives_by_key, request_func, market_cache_reader
+                mover,
+                derivatives_by_key,
+                futures_by_symbol.get(mover["symbol"]),
+                market_context_for(mover, quote_payload),
+                request_func,
+                market_cache_reader,
             )
             if candidate:
                 qualified.append(candidate)
