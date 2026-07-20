@@ -98,7 +98,7 @@ DEFAULT_CAUTIOUS_TARGET_PERCENT = 6.0
 DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
 DEFAULT_INDEX_EXIT_POINTS = {
     "NIFTY": {"target": 30.0, "stop": 30.0},
-    "BANKNIFTY": {"target": 60.0, "stop": 60.0},
+    "BANKNIFTY": {"target": 90.0, "stop": 90.0},
 }
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
@@ -578,6 +578,47 @@ def today_realized_pnl():
         return 0.0
 
     return round(total, 2)
+
+
+def stop_after_first_profit_or_loss_enabled():
+    return os.getenv("STOP_AFTER_FIRST_PROFIT_OR_LOSS", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def first_index_trade_outcome_today(symbol):
+    """Return the first non-flat closed bot outcome for this index today."""
+    if not stop_after_first_profit_or_loss_enabled() or not TRADE_HISTORY_FILE.exists():
+        return None
+
+    today = now_ist().strftime("%Y-%m-%d")
+    with TRADE_HISTORY_FILE.open("r", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("trade_date")) != today:
+                continue
+            if str(row.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if str(row.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
+                continue
+            pnl = to_float(row.get("gross_pnl"))
+            if pnl > 0:
+                return {"outcome": "PROFIT", "gross_pnl": pnl, "row": row}
+            if pnl < 0:
+                return {"outcome": "LOSS", "gross_pnl": pnl, "row": row}
+    return None
+
+
+def daily_index_entry_block_reason(symbol):
+    outcome = first_index_trade_outcome_today(symbol)
+    if not outcome:
+        return ""
+    return (
+        f"daily first-outcome guard active after {outcome['outcome']}: "
+        f"gross_pnl={outcome['gross_pnl']:.2f}; no further {symbol} entries today"
+    )
 
 
 def bot_unrealized_pnl():
@@ -2876,6 +2917,17 @@ def run_signal_check():
     for symbol in SYMBOLS:
         if symbol in active_index:
             log(f"{symbol} already has an active bot position; skipping only {symbol} entry.")
+            continue
+        try:
+            daily_block = daily_index_entry_block_reason(symbol)
+        except Exception as error:
+            log(
+                f"{symbol} daily first-outcome guard could not read trade history; "
+                f"no new entry for safety: {error}"
+            )
+            continue
+        if daily_block:
+            log(f"{symbol} no trade: {daily_block}")
             continue
         try:
             candidate = evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False)

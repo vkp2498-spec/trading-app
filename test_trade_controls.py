@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -46,11 +47,194 @@ import apns_push
 import dashboard_data
 import trade_journal
 from counterfactual_replay import simulate_trade
+from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
 from signal_score import weighted_alignment_score
 from backtest_report import build_reports
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_live_daily_first_outcome_guard_is_independent_by_index(self):
+        today = datetime(2026, 7, 20, 10, 0)
+        history = "\n".join([
+            "trade_date,symbol,instrument_class,gross_pnl",
+            "2026-07-20,NIFTY,INDEX_OPTION,1250",
+            "2026-07-20,BANKNIFTY,INDEX_OPTION,-800",
+            "2026-07-19,NIFTY,INDEX_OPTION,-500",
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "trade_history.csv"
+            history_path.write_text(history)
+            with (
+                patch.object(trade_bot, "TRADE_HISTORY_FILE", history_path),
+                patch.object(trade_bot, "now_ist", return_value=today),
+                patch.dict(os.environ, {"STOP_AFTER_FIRST_PROFIT_OR_LOSS": "true"}),
+            ):
+                nifty_reason = trade_bot.daily_index_entry_block_reason("NIFTY")
+                bank_reason = trade_bot.daily_index_entry_block_reason("BANKNIFTY")
+
+        self.assertIn("PROFIT", nifty_reason)
+        self.assertIn("1250.00", nifty_reason)
+        self.assertIn("LOSS", bank_reason)
+        self.assertIn("-800.00", bank_reason)
+
+    def test_live_daily_first_outcome_guard_can_be_disabled(self):
+        with patch.dict(os.environ, {"STOP_AFTER_FIRST_PROFIT_OR_LOSS": "false"}):
+            self.assertEqual(trade_bot.daily_index_entry_block_reason("NIFTY"), "")
+
+    def test_replay_sizes_each_option_entry_to_one_lakh(self):
+        nifty_quantity, nifty_lots = capital_sized_option_quantity(100, 65, 100000)
+        bank_quantity, bank_lots = capital_sized_option_quantity(500, 30, 100000)
+
+        self.assertEqual((nifty_quantity, nifty_lots), (975, 15))
+        self.assertEqual((bank_quantity, bank_lots), (180, 6))
+
+    def test_replay_allows_nifty_and_banknifty_at_same_timestamp(self):
+        day = pd.Timestamp("2026-07-15").date()
+        first_time = pd.Timestamp("2026-07-15 09:20", tz="Asia/Kolkata")
+        spot_frame = pd.DataFrame(
+            [{"close": 100}, {"close": 101}],
+            index=[first_time, first_time + pd.Timedelta(minutes=5)],
+        )
+
+        class ReplayData:
+            def get_expiries(self, instrument_key):
+                return [day]
+
+        engine = StrategyReplay(
+            ReplayData(),
+            day,
+            day,
+            include_stock_futures=False,
+            portfolio_mode="live",
+        )
+        engine.allow_simultaneous_index_positions = True
+
+        def candidate_for(symbol, timestamp, *args):
+            transaction_type = args[-1]
+            if transaction_type != "BUY":
+                return None
+            return Candidate(
+                category=f"{symbol}_OPTION_BUY",
+                symbol=symbol,
+                direction="BULLISH",
+                transaction_type="BUY",
+                contract={"lot_size": 1, "trading_symbol": symbol},
+                signal_time=timestamp,
+                expected_entry=100,
+                target=110,
+                stop=90,
+                score=80,
+                grade="TRADE",
+                reason="test",
+            )
+
+        def simulate(candidate, replay_day):
+            return {
+                "symbol": candidate.symbol,
+                "signal_time": candidate.signal_time.isoformat(),
+                "exit_time": (candidate.signal_time + pd.Timedelta(minutes=5)).isoformat(),
+            }
+
+        with (
+            patch.object(engine, "_candles", return_value=spot_frame),
+            patch.object(engine, "_option_contracts", return_value=[]),
+            patch.object(engine, "_candidate", side_effect=candidate_for),
+            patch.object(engine, "_simulate", side_effect=simulate),
+        ):
+            trades, _, _ = engine.run()
+
+        simultaneous = [
+            trade for trade in trades if trade["signal_time"] == first_time.isoformat()
+        ]
+        self.assertEqual({trade["symbol"] for trade in simultaneous}, {"NIFTY", "BANKNIFTY"})
+
+    def test_replay_daily_policy_is_applied_per_index(self):
+        day = pd.Timestamp("2026-07-15").date()
+        first_time = pd.Timestamp("2026-07-15 09:20", tz="Asia/Kolkata")
+        times = [first_time + pd.Timedelta(minutes=5 * index) for index in range(8)]
+        spot_frame = pd.DataFrame(
+            [{"close": 100 + index} for index in range(len(times))],
+            index=times,
+        )
+
+        class ReplayData:
+            def get_expiries(self, instrument_key):
+                return [day]
+
+        def run_policy(
+            max_trades=0,
+            stop_after_win=False,
+            stop_after_loss=False,
+            gross_pnl=100,
+        ):
+            engine = StrategyReplay(
+                ReplayData(), day, day, include_stock_futures=False, portfolio_mode="live"
+            )
+            engine.allow_simultaneous_index_positions = True
+            engine.max_trades_per_day_per_index = max_trades
+            engine.stop_after_first_win = stop_after_win
+            engine.stop_after_first_loss = stop_after_loss
+
+            def candidate_for(symbol, timestamp, *args):
+                if args[-1] != "BUY":
+                    return None
+                return Candidate(
+                    category=f"{symbol}_OPTION_BUY",
+                    symbol=symbol,
+                    direction="BULLISH",
+                    transaction_type="BUY",
+                    contract={"lot_size": 1, "trading_symbol": symbol},
+                    signal_time=timestamp,
+                    expected_entry=100,
+                    target=110,
+                    stop=90,
+                    score=80,
+                    grade="TRADE",
+                    reason="test",
+                )
+
+            def simulate(candidate, replay_day):
+                return {
+                    "symbol": candidate.symbol,
+                    "signal_time": candidate.signal_time.isoformat(),
+                    "exit_time": (
+                        candidate.signal_time + pd.Timedelta(minutes=5)
+                    ).isoformat(),
+                    "gross_pnl": gross_pnl,
+                    "estimated_costs": 0,
+                }
+
+            with (
+                patch.object(engine, "_candles", return_value=spot_frame),
+                patch.object(engine, "_option_contracts", return_value=[]),
+                patch.object(engine, "_candidate", side_effect=candidate_for),
+                patch.object(engine, "_simulate", side_effect=simulate),
+            ):
+                trades, _, _ = engine.run()
+            return trades
+
+        capped = run_policy(max_trades=2)
+        stopped_after_win = run_policy(stop_after_win=True)
+        stopped_after_loss = run_policy(stop_after_loss=True, gross_pnl=-100)
+        self.assertEqual(
+            {symbol: sum(trade["symbol"] == symbol for trade in capped) for symbol in ("NIFTY", "BANKNIFTY")},
+            {"NIFTY": 2, "BANKNIFTY": 2},
+        )
+        self.assertEqual(
+            {
+                symbol: sum(trade["symbol"] == symbol for trade in stopped_after_win)
+                for symbol in ("NIFTY", "BANKNIFTY")
+            },
+            {"NIFTY": 1, "BANKNIFTY": 1},
+        )
+        self.assertEqual(
+            {
+                symbol: sum(trade["symbol"] == symbol for trade in stopped_after_loss)
+                for symbol in ("NIFTY", "BANKNIFTY")
+            },
+            {"NIFTY": 1, "BANKNIFTY": 1},
+        )
+
     def test_mobile_dashboard_calculates_short_option_metrics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = {

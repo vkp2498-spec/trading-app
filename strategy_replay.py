@@ -34,6 +34,18 @@ def _float(value, default=0.0):
         return default
 
 
+def capital_sized_option_quantity(entry_price, lot_size, capital):
+    lot_size = max(int(_float(lot_size, 1)), 1)
+    capital = max(_float(capital, 1), 1)
+    if capital == 1:
+        return lot_size, 1
+    entry_price = _float(entry_price)
+    if entry_price <= 0:
+        return 0, 0
+    lots = int(capital // (entry_price * lot_size))
+    return lot_size * max(lots, 0), max(lots, 0)
+
+
 def _expiry(value):
     return pd.Timestamp(value).date()
 
@@ -201,6 +213,24 @@ class StrategyReplay:
         self.slippage_bps = float(slippage_bps)
         self.cost_per_order = float(cost_per_order)
         self.portfolio_mode = portfolio_mode if portfolio_mode in {"live", "independent"} else "live"
+        self.allow_simultaneous_index_positions = (
+            os.getenv("REPLAY_ALLOW_SIMULTANEOUS_INDEX_POSITIONS", "false").lower()
+            == "true"
+        )
+        self.option_capital_per_entry = max(
+            _float(os.getenv("REPLAY_OPTION_CAPITAL_PER_ENTRY"), 1),
+            1,
+        )
+        self.max_trades_per_day_per_index = max(
+            int(_float(os.getenv("REPLAY_MAX_TRADES_PER_DAY_PER_INDEX"), 0)),
+            0,
+        )
+        self.stop_after_first_win = (
+            os.getenv("REPLAY_STOP_AFTER_FIRST_WIN", "false").lower() == "true"
+        )
+        self.stop_after_first_loss = (
+            os.getenv("REPLAY_STOP_AFTER_FIRST_LOSS", "false").lower() == "true"
+        )
         self.candles = {}
         self.contracts = {}
         self.expiries = {}
@@ -513,12 +543,25 @@ class StrategyReplay:
         mae_pct = (mae_points / entry * 100) if entry else 0
         target_progress_pct = (mfe_points / target_gap_actual * 100) if target_gap_actual else 0
         exit_price *= 1 + slip if is_short else 1 - slip
-        quantity = max(int(_float(candidate.contract.get("lot_size"), 1)), 1)
+        lot_size = max(int(_float(candidate.contract.get("lot_size"), 1)), 1)
+        quantity = lot_size
+        lot_multiplier = 1
+        if candidate.category in {"NIFTY_OPTION_BUY", "BANKNIFTY_OPTION_BUY"}:
+            quantity, lot_multiplier = capital_sized_option_quantity(
+                entry,
+                lot_size,
+                self.option_capital_per_entry,
+            )
+            if lot_multiplier < 1:
+                self.coverage["insufficient_capital_entries"] += 1
+                return None
         gross = ((entry - exit_price) if is_short else (exit_price - entry)) * quantity
         return {
             "trade_date": str(day), "category": candidate.category, "symbol": candidate.symbol,
             "trading_symbol": candidate.contract.get("trading_symbol"), "direction": candidate.direction,
             "transaction_type": candidate.transaction_type, "quantity": quantity,
+            "lot_size": lot_size, "lot_multiplier": lot_multiplier,
+            "allocated_capital": round(self.option_capital_per_entry, 2),
             "signal_time": candidate.signal_time.isoformat(), "entry_time": future.index[0].isoformat(),
             "exit_time": exit_time.isoformat(), "entry_price": round(entry, 2),
             "target_price": round(target, 2), "stop_loss_price": round(stop, 2),
@@ -632,16 +675,36 @@ class StrategyReplay:
         for day_index, day in enumerate(sessions, 1):
             self.progress(f"Replaying {day} ({day_index}/{len(sessions)})", day=str(day), current=day_index, total=len(sessions))
             open_until = None
+            open_until_by_symbol = {}
             open_until_by_category = {}
+            daily_index_policy = {
+                symbol: {"trades": 0, "halted": False}
+                for symbol in ("NIFTY", "BANKNIFTY")
+            }
             times = pd.date_range(
                 pd.Timestamp.combine(day, MARKET_START).tz_localize(IST),
                 pd.Timestamp.combine(day, LAST_ENTRY).tz_localize(IST), freq="5min",
             )
             for timestamp in times:
-                if self.portfolio_mode == "live" and open_until is not None and timestamp <= open_until:
+                if (
+                    self.portfolio_mode == "live"
+                    and not self.allow_simultaneous_index_positions
+                    and open_until is not None
+                    and timestamp <= open_until
+                ):
                     continue
                 candidates = []
                 for symbol in ("NIFTY", "BANKNIFTY"):
+                    policy = daily_index_policy[symbol]
+                    if policy["halted"] or (
+                        self.max_trades_per_day_per_index > 0
+                        and policy["trades"] >= self.max_trades_per_day_per_index
+                    ):
+                        continue
+                    if self.allow_simultaneous_index_positions:
+                        symbol_open_until = open_until_by_symbol.get(symbol)
+                        if symbol_open_until is not None and timestamp <= symbol_open_until:
+                            continue
                     expiry = _choose_expiry(symbol, self.expiries[symbol], day)
                     if not expiry:
                         continue
@@ -654,10 +717,27 @@ class StrategyReplay:
                         except Exception as error:
                             self.progress(f"{symbol} {transaction_type} replay skipped at {timestamp.time()}: {error}")
                 if self.portfolio_mode == "live":
-                    candidate = max(candidates, key=lambda item: item.score, default=None)
-                    if candidate is None and stock_frames:
-                        candidate = self._stock_candidate(timestamp, stock_frames)
-                    selected_candidates = [candidate] if candidate else []
+                    if self.allow_simultaneous_index_positions:
+                        selected_candidates = []
+                        for symbol in ("NIFTY", "BANKNIFTY"):
+                            symbol_open_until = open_until_by_symbol.get(symbol)
+                            if symbol_open_until is not None and timestamp <= symbol_open_until:
+                                continue
+                            symbol_candidates = [
+                                item for item in candidates if item.symbol == symbol
+                            ]
+                            candidate = max(
+                                symbol_candidates,
+                                key=lambda item: item.score,
+                                default=None,
+                            )
+                            if candidate:
+                                selected_candidates.append(candidate)
+                    else:
+                        candidate = max(candidates, key=lambda item: item.score, default=None)
+                        if candidate is None and stock_frames:
+                            candidate = self._stock_candidate(timestamp, stock_frames)
+                        selected_candidates = [candidate] if candidate else []
                 else:
                     selected_candidates = []
                     for category in {item.category for item in candidates}:
@@ -679,9 +759,22 @@ class StrategyReplay:
                     if not trade:
                         continue
                     self.trades.append(trade)
+                    if candidate.symbol in daily_index_policy:
+                        policy = daily_index_policy[candidate.symbol]
+                        policy["trades"] += 1
+                        realized_pnl = _float(trade.get("gross_pnl")) - _float(
+                            trade.get("estimated_costs")
+                        )
+                        if self.stop_after_first_win and realized_pnl > 0:
+                            policy["halted"] = True
+                        elif self.stop_after_first_loss and realized_pnl < 0:
+                            policy["halted"] = True
                     exit_time = pd.Timestamp(trade["exit_time"])
                     if self.portfolio_mode == "live":
-                        open_until = exit_time
+                        if self.allow_simultaneous_index_positions:
+                            open_until_by_symbol[candidate.symbol] = exit_time
+                        else:
+                            open_until = exit_time
                     else:
                         open_until_by_category[candidate.category] = exit_time
         return self.trades, self.decisions, dict(self.coverage)
