@@ -19,6 +19,118 @@ def confidence_multiplier(confidence):
     }.get(confidence, 0.4)
 
 
+def banknifty_neutral_chain_direction(technicals):
+    """Return a direction only for unusually strong non-chain confirmation."""
+    five = technicals.get("five_min", {}) or {}
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    two = technicals.get("two_hour", {}) or {}
+    breadth = technicals.get("banknifty_breadth", {}) or {}
+
+    direction = five.get("bias")
+    blockers = []
+    if direction not in {"BULLISH", "BEARISH"} or fifteen.get("bias") != direction:
+        blockers.append("5M and 15M price structures are not directionally aligned")
+    if five.get("confidence") not in {"MEDIUM", "HIGH"}:
+        blockers.append("5M confidence is below MEDIUM")
+    if fifteen.get("confidence") not in {"MEDIUM", "HIGH"}:
+        blockers.append("15M confidence is below MEDIUM")
+    if two.get("bias") not in {direction, "NEUTRAL"} and two.get("confidence") in {"MEDIUM", "HIGH"}:
+        blockers.append("2H structure materially opposes the proposed direction")
+    if breadth.get("bias") != direction or breadth.get("confidence") not in {"MEDIUM", "HIGH"}:
+        blockers.append("major-bank breadth does not confirm with MEDIUM/HIGH confidence")
+    momentum = float(five.get("momentum_score") or 0)
+    if direction == "BEARISH":
+        momentum = -momentum
+    if momentum < 3:
+        blockers.append("5M momentum is not strongly aligned")
+
+    return (direction if not blockers else None), blockers
+
+
+def _banknifty_alignment_score(option_summary, technicals, option_chain_trend):
+    direction = option_summary.get("bias")
+    reasons = []
+
+    # Price trend, pivots and Bollinger Bands: 35%.
+    price_component = 0.0
+    for key, label, weight in (
+        ("fifteen_min", "15M", 15.0),
+        ("five_min", "5M", 12.0),
+        ("two_hour", "2H", 8.0),
+    ):
+        analysis = technicals.get(key, {}) or {}
+        if analysis.get("bias") == "NEUTRAL":
+            value = weight * 0.50
+        else:
+            value = (
+                weight
+                * direction_score(analysis.get("bias"), direction)
+                * confidence_multiplier(analysis.get("confidence"))
+            )
+        price_component += value
+        reasons.append(f"{label} price/pivot/BB={value:.1f}/{weight:.0f}")
+
+    # VWAP, volume and completed-candle confirmation: 25%.
+    five = technicals.get("five_min", {}) or {}
+    momentum = float(five.get("momentum_score") or 0)
+    if direction == "BEARISH":
+        momentum = -momentum
+    candle_component = 10.0 if momentum >= 3 else 6.5 if momentum >= 1 else 3.0 if momentum >= 0 else 0.0
+    if five.get("volume_confirmed"):
+        candle_component = min(10.0, candle_component + 1.5)
+
+    flow = technicals.get("atm_option_flow", {}) or {}
+    flow_bias = flow.get("bias")
+    volume_ratio = float(flow.get("volume_ratio") or 0)
+    if flow_bias == "BULLISH":
+        flow_component = 15.0 if volume_ratio >= 1.5 else 12.0 if volume_ratio >= 1.2 else 8.0
+    elif flow_bias == "NEUTRAL":
+        flow_component = 4.0 if volume_ratio >= 1.2 else 1.5
+    else:
+        flow_component = 0.0
+    confirmation_component = min(candle_component + flow_component, 25.0)
+    reasons.append(
+        f"VWAP/volume/candle confirmation={confirmation_component:.1f}/25 "
+        f"(option volume_ratio={volume_ratio:.2f})"
+    )
+
+    # Option-chain change in OI: 25%. Snapshot and multi-run trend are kept distinct.
+    chain_bias = option_summary.get("chain_bias", direction)
+    chain_confidence = option_summary.get("chain_confidence", option_summary.get("confidence"))
+    snapshot_component = (
+        15.0 * confidence_multiplier(chain_confidence)
+        if chain_bias == direction
+        else 0.0
+    )
+    trend_bias = option_chain_trend.get("bias")
+    trend_component = 10.0 if trend_bias == direction else 4.0 if trend_bias == "NEUTRAL" else 0.0
+    oi_component = snapshot_component + trend_component
+    reasons.append(
+        f"Option-chain OI change={oi_component:.1f}/25 "
+        f"(snapshot={chain_bias}/{chain_confidence}, trend={trend_bias})"
+    )
+
+    # Major-bank constituent breadth: 15%.
+    breadth = technicals.get("banknifty_breadth", {}) or {}
+    if breadth.get("bias") == direction:
+        breadth_component = 15.0 * confidence_multiplier(breadth.get("confidence"))
+    elif breadth.get("bias") == "NEUTRAL" and int(breadth.get("coverage") or 0) >= 3:
+        breadth_component = 3.0
+    else:
+        breadth_component = 0.0
+    reasons.append(
+        f"Major-bank breadth={breadth_component:.1f}/15 "
+        f"({breadth.get('bias', 'NEUTRAL')}/{breadth.get('confidence', 'LOW')})"
+    )
+
+    total = max(
+        0.0,
+        min(100.0, round(price_component + confirmation_component + oi_component + breadth_component, 1)),
+    )
+    grade = "TRADE" if total >= 80 else "CAUTIOUS_TRADE" if total >= 65 else "SKIP"
+    return {"score": total, "grade": grade, "reasons": reasons}
+
+
 def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     direction = option_summary.get("bias")
 
@@ -28,6 +140,9 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
             "grade": "SKIP",
             "reasons": ["Option chain is not directional"],
         }
+
+    if option_summary.get("symbol") == "BANKNIFTY":
+        return _banknifty_alignment_score(option_summary, technicals, option_chain_trend)
 
     weights = {
         "option_chain": 35,

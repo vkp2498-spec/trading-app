@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - Windows development fallback
     fcntl = None
 
 from analysis_journal import record_analysis
+from banknifty_breadth import get_banknifty_breadth
 from institutional_flow import (
     get_institutional_footprint,
     neutral_institutional_footprint,
@@ -31,7 +32,7 @@ from stock_option_scanner import scan_stock_option_candidates
 from stock_futures_scanner import scan_stock_futures, write_scanner_status
 
 from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
-from signal_score import weighted_alignment_score
+from signal_score import banknifty_neutral_chain_direction, weighted_alignment_score
 
 import requests
 import urllib3.util.connection as urllib3_cn
@@ -2342,8 +2343,12 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         )
 
     option_summary = {
+        "symbol": symbol,
         "bias": direction,
         "confidence": rec["confidence"],
+        "chain_bias": rec.get("chain_bias", direction),
+        "chain_confidence": rec.get("chain_confidence", rec["confidence"]),
+        "neutral_chain_override": bool(rec.get("neutral_chain_override")),
         "score": rec["score"],
         "strike": atm["strike"],
         "expiry": atm["expiry"],
@@ -2385,8 +2390,13 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
 
     score_value = float(weighted.get("score") or 0)
     minimum = MIN_SCORE_BY_SYMBOL.get(symbol, 65)
+    if symbol == "BANKNIFTY" and option_summary.get("neutral_chain_override"):
+        minimum = max(
+            minimum,
+            configured_non_negative_float("BANKNIFTY_NEUTRAL_CHAIN_MIN_SCORE", 75.0),
+        )
     if weighted.get("grade") == "SKIP" or (
-        weighted.get("grade") == "CAUTIOUS_TRADE" and score_value < minimum
+        score_value < minimum
     ):
         return {
             "allowed": False,
@@ -2484,14 +2494,15 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         f"{symbol} signal: {direction}, confidence={confidence}, score={score}, "
         f"strike={atm['strike']}, expiry={atm['expiry']}"
     )
-    observe_signal_reset(symbol, direction)
-    if direction not in {"BULLISH", "BEARISH"} or confidence != "HIGH" or abs(score) < 4:
+    directional_high = (
+        direction in {"BULLISH", "BEARISH"}
+        and confidence == "HIGH"
+        and abs(score) >= 4
+    )
+    neutral_banknifty_candidate = symbol == "BANKNIFTY" and direction == "NEUTRAL"
+    if not directional_high and not neutral_banknifty_candidate:
         collect_institutional_footprint(symbol, rec)
         log(f"{symbol} no trade: signal is not directional HIGH confidence.")
-        return False
-    blocked_reason = reentry_block_reason(symbol, direction)
-    if blocked_reason:
-        log(f"{symbol} no trade: {blocked_reason}")
         return False
 
     try:
@@ -2503,6 +2514,55 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
             "five_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(error)]},
         }
         log(f"{symbol} technical analysis failed: {error}")
+
+    if symbol == "BANKNIFTY":
+        try:
+            breadth = get_banknifty_breadth(INSTRUMENT_CACHE, upstox_request)
+        except Exception as error:
+            breadth = {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "score": 0,
+                "reasons": [f"BANKNIFTY breadth unavailable: {error}"],
+            }
+        base_technicals["banknifty_breadth"] = breadth
+        log(
+            f"BANKNIFTY breadth: bias={breadth.get('bias')} "
+            f"confidence={breadth.get('confidence')} score={breadth.get('score')} "
+            f"reasons={breadth.get('reasons')}"
+        )
+
+    if neutral_banknifty_candidate:
+        inferred_direction, blockers = banknifty_neutral_chain_direction(base_technicals)
+        if not inferred_direction:
+            collect_institutional_footprint(symbol, rec)
+            log(
+                "BANKNIFTY no trade: neutral option chain and strong-technical "
+                "override failed: " + "; ".join(blockers)
+            )
+            return False
+        original_direction = direction
+        original_confidence = confidence
+        rec = deepcopy(rec)
+        rec.update(
+            {
+                "chain_bias": original_direction,
+                "chain_confidence": original_confidence,
+                "neutral_chain_override": True,
+                "direction": inferred_direction,
+            }
+        )
+        direction = inferred_direction
+        log(
+            f"BANKNIFTY neutral-chain override candidate: direction={direction}; "
+            "5M/15M, 2H and major-bank breadth passed preconditions"
+        )
+
+    observe_signal_reset(symbol, direction)
+    blocked_reason = reentry_block_reason(symbol, direction)
+    if blocked_reason:
+        log(f"{symbol} no trade: {blocked_reason}")
+        return False
 
     institutional = collect_institutional_footprint(symbol, rec)
     option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
