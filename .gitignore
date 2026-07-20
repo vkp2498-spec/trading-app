@@ -8,5 +8,6 @@ AuthKey_*.p8
 daily_trade_count.json
 trade_state_*.json
 reentry_guard_*.json
+.*.lock
 upstox_complete.json.gz
 data/

@@ -47,6 +47,35 @@ def banknifty_neutral_chain_direction(technicals):
     return (direction if not blockers else None), blockers
 
 
+def nifty_neutral_chain_direction(technicals):
+    """Infer NIFTY direction only when non-chain evidence is unusually strong."""
+    five = technicals.get("five_min", {}) or {}
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    two = technicals.get("two_hour", {}) or {}
+
+    direction = five.get("bias")
+    blockers = []
+    if direction not in {"BULLISH", "BEARISH"} or fifteen.get("bias") != direction:
+        blockers.append("5M and 15M price structures are not directionally aligned")
+    if five.get("confidence") not in {"MEDIUM", "HIGH"}:
+        blockers.append("5M confidence is below MEDIUM")
+    if fifteen.get("confidence") not in {"MEDIUM", "HIGH"}:
+        blockers.append("15M confidence is below MEDIUM")
+    if two.get("bias") not in {direction, "NEUTRAL"} and two.get("confidence") in {
+        "MEDIUM",
+        "HIGH",
+    }:
+        blockers.append("2H structure materially opposes the proposed direction")
+
+    momentum = float(five.get("momentum_score") or 0)
+    if direction == "BEARISH":
+        momentum = -momentum
+    if momentum < 3:
+        blockers.append("5M momentum is not strongly aligned")
+
+    return (direction if not blockers else None), blockers
+
+
 def _banknifty_alignment_score(option_summary, technicals, option_chain_trend):
     direction = option_summary.get("bias")
     reasons = []
@@ -154,9 +183,19 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
 
     reasons = []
 
-    option_conf = confidence_multiplier(option_summary.get("confidence"))
-    option_component = weights["option_chain"] * option_conf
-    reasons.append(f"Option-chain component={option_component:.1f}/{weights['option_chain']}")
+    chain_bias = option_summary.get("chain_bias", direction)
+    chain_confidence = option_summary.get(
+        "chain_confidence", option_summary.get("confidence")
+    )
+    option_component = (
+        weights["option_chain"] * confidence_multiplier(chain_confidence)
+        if chain_bias == direction
+        else 0.0
+    )
+    reasons.append(
+        f"Option-chain component={option_component:.1f}/{weights['option_chain']} "
+        f"({chain_bias}/{chain_confidence})"
+    )
 
     fifteen = technicals.get("fifteen_min", {}) or {}
     fifteen_component = (

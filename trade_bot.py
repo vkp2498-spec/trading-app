@@ -6,7 +6,7 @@ import time as time_module
 import socket
 import urllib.request
 from pathlib import Path
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import csv
 from copy import deepcopy
@@ -32,7 +32,16 @@ from stock_option_scanner import scan_stock_option_candidates
 from stock_futures_scanner import scan_stock_futures, write_scanner_status
 
 from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
-from signal_score import banknifty_neutral_chain_direction, weighted_alignment_score
+from signal_score import (
+    banknifty_neutral_chain_direction,
+    nifty_neutral_chain_direction,
+    weighted_alignment_score,
+)
+from portfolio_risk import (
+    aggregate_risk_decision,
+    correlation_decision,
+    state_is_active,
+)
 
 import requests
 import urllib3.util.connection as urllib3_cn
@@ -77,6 +86,8 @@ INSTRUMENT_CACHE = BASE_DIR / "upstox_complete.json.gz"
 TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 STOCK_SCANNER_STATUS_FILE = BASE_DIR / "data" / "stock_scanner_status.json"
+DAY_RISK_STATE_FILE = BASE_DIR / "data" / "day_risk_state.json"
+PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
@@ -228,6 +239,13 @@ def configured_positive_float(env_key, default):
     if value <= 0:
         raise RuntimeError(f"{env_key} must be greater than 0")
     return value
+
+
+def configured_bool(env_key, default=False):
+    raw = os.getenv(env_key)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def index_point_exit_settings(symbol):
@@ -443,6 +461,7 @@ def read_json(path, default):
 
 
 def write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
@@ -463,6 +482,19 @@ def protective_stop_lock(symbol):
     """Serialize broker-stop creation across entry and monitor processes."""
     lock_path = BASE_DIR / f".{symbol.lower()}_protective_stop.lock"
     with lock_path.open("a+") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def portfolio_entry_lock():
+    """Serialize the final portfolio check and broker entry submission."""
+    with PORTFOLIO_ENTRY_LOCK_FILE.open("a+") as lock_file:
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
@@ -699,6 +731,216 @@ def bot_unrealized_pnl():
                 total += (float(ltp) - entry) * quantity
 
     return round(total, 2)
+
+
+def active_bot_states():
+    return [
+        state
+        for state in (read_state(symbol) for symbol in BOT_STATE_SLOTS)
+        if state_is_active(state)
+    ]
+
+
+def today_closed_trade_rows():
+    if not TRADE_HISTORY_FILE.exists():
+        return []
+    today = now_ist().strftime("%Y-%m-%d")
+    try:
+        with TRADE_HISTORY_FILE.open("r", newline="") as handle:
+            return [
+                row
+                for row in csv.DictReader(handle)
+                if str(row.get("trade_date")) == today
+                and str(row.get("status") or "CLOSED").upper() == "CLOSED"
+            ]
+    except Exception as error:
+        log(f"Could not read today's closed trades for portfolio circuit: {error}")
+        return []
+
+
+def consecutive_losses_today():
+    count = 0
+    for row in reversed(today_closed_trade_rows()):
+        pnl = to_float(row.get("gross_pnl"))
+        if pnl < 0:
+            count += 1
+        else:
+            break
+    return count
+
+
+def read_day_risk_state():
+    today = now_ist().strftime("%Y-%m-%d")
+    state = read_json(DAY_RISK_STATE_FILE, {})
+    if state.get("date") != today:
+        return {"date": today, "peak_pnl": 0.0}
+    return state
+
+
+def write_day_risk_state(state):
+    state["date"] = now_ist().strftime("%Y-%m-%d")
+    state["updated_at"] = now_ist().isoformat()
+    write_json(DAY_RISK_STATE_FILE, state)
+
+
+def portfolio_day_circuit():
+    """Return the persistent day-level entry circuit; exits remain unaffected."""
+    realized = today_realized_pnl()
+    try:
+        unrealized = bot_unrealized_pnl()
+    except Exception as error:
+        log(f"Portfolio circuit could not read unrealized P&L: {error}")
+        unrealized = 0.0
+    pnl = round(realized + unrealized, 2)
+    state = read_day_risk_state()
+    state["peak_pnl"] = round(max(to_float(state.get("peak_pnl")), pnl, 0.0), 2)
+
+    soft_loss = configured_non_negative_float("DAILY_SOFT_LOSS", 0.0)
+    pause_minutes = configured_non_negative_float("DAILY_SOFT_PAUSE_MINUTES", 30.0)
+    score_penalty = configured_non_negative_float("DAILY_SOFT_SCORE_PENALTY", 10.0)
+    hard_loss = configured_non_negative_float("DAILY_HARD_LOSS", 0.0)
+    max_consecutive = max(to_int(os.getenv("MAX_CONSECUTIVE_LOSSES"), 3), 0)
+    giveback_trigger = configured_non_negative_float(
+        "PEAK_PROFIT_GIVEBACK_TRIGGER", 0.0
+    )
+    giveback_percent = configured_non_negative_float(
+        "MAX_PEAK_GIVEBACK_PERCENT", 50.0
+    )
+    if giveback_percent > 100:
+        raise RuntimeError("MAX_PEAK_GIVEBACK_PERCENT must be at most 100")
+
+    now = now_ist()
+    if soft_loss > 0 and pnl <= -soft_loss and not state.get("soft_triggered_at"):
+        state["soft_triggered_at"] = now.isoformat()
+        state["soft_pause_until"] = (now + timedelta(minutes=pause_minutes)).isoformat()
+
+    write_day_risk_state(state)
+    result = {
+        "allowed": True,
+        "reason": "daily portfolio circuit accepted",
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "combined_pnl": pnl,
+        "peak_pnl": state["peak_pnl"],
+        "consecutive_losses": consecutive_losses_today(),
+        "score_penalty": score_penalty if state.get("soft_triggered_at") else 0.0,
+    }
+
+    if hard_loss > 0 and pnl <= -hard_loss:
+        result.update(
+            allowed=False,
+            reason=f"daily hard loss reached: P&L Rs {pnl:.2f} <= -Rs {hard_loss:.2f}",
+        )
+        return result
+    if max_consecutive > 0 and result["consecutive_losses"] >= max_consecutive:
+        result.update(
+            allowed=False,
+            reason=f"{result['consecutive_losses']} consecutive losses reached daily limit",
+        )
+        return result
+    if giveback_trigger > 0 and state["peak_pnl"] >= giveback_trigger:
+        floor = state["peak_pnl"] * (1.0 - giveback_percent / 100.0)
+        if pnl <= floor:
+            result.update(
+                allowed=False,
+                reason=(
+                    f"daily peak-profit giveback reached: P&L Rs {pnl:.2f}, "
+                    f"peak Rs {state['peak_pnl']:.2f}, floor Rs {floor:.2f}"
+                ),
+            )
+            return result
+
+    pause_until = state.get("soft_pause_until")
+    if pause_until:
+        try:
+            pause_time = datetime.fromisoformat(pause_until)
+            if now < pause_time:
+                result.update(
+                    allowed=False,
+                    reason=(
+                        f"soft-loss pause active until {pause_time.strftime('%H:%M:%S')} IST; "
+                        f"combined P&L Rs {pnl:.2f}"
+                    ),
+                )
+        except Exception:
+            pass
+    return result
+
+
+def candidate_weighted_score(chosen):
+    return to_float(
+        (chosen.get("weighted") or {}).get("score"),
+        to_float(chosen.get("weighted_score"), to_float(chosen.get("signal_score"))),
+    )
+
+
+def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price):
+    """Final shared gate, designed to run under ``portfolio_entry_lock``."""
+    circuit = portfolio_day_circuit()
+    if not circuit["allowed"]:
+        return {"allowed": False, "reason": circuit["reason"], "circuit": circuit}
+
+    symbol = str(chosen.get("symbol") or STOCK_OPTION_STATE).upper()
+    score = candidate_weighted_score(chosen)
+    base_minimum = to_float(
+        chosen.get("entry_minimum_score"),
+        to_float(
+            os.getenv("STOCK_OPTION_MIN_WEIGHTED_SCORE"), 80.0
+        ) if symbol == STOCK_OPTION_STATE else MIN_SCORE_BY_SYMBOL.get(symbol, 65),
+    )
+    required_score = base_minimum + to_float(circuit.get("score_penalty"))
+    if score < required_score:
+        return {
+            "allowed": False,
+            "reason": (
+                f"entry score {score:.1f} is below portfolio-adjusted minimum "
+                f"{required_score:.1f}"
+            ),
+            "circuit": circuit,
+        }
+
+    states = active_bot_states()
+    risk = aggregate_risk_decision(
+        states,
+        entry_price,
+        stop_loss_price,
+        quantity,
+        chosen.get("transaction_type", "BUY"),
+        configured_non_negative_float("MAX_OPEN_PORTFOLIO_RISK", 0.0),
+        configured_non_negative_float("PORTFOLIO_RISK_BUFFER_PERCENT", 15.0),
+    )
+    if not risk["allowed"]:
+        return {"allowed": False, "reason": risk["reason"], "risk": risk, "circuit": circuit}
+
+    proposed = {
+        "symbol": symbol,
+        "underlying_symbol": chosen.get("underlying_symbol", symbol),
+        "direction": chosen.get("direction"),
+        "weighted_score": score,
+    }
+    correlation = correlation_decision(
+        proposed,
+        states,
+        configured_non_negative_float("SAME_DIRECTION_INDEX_MIN_SCORE", 80.0),
+        max(to_int(os.getenv("MAX_SAME_DIRECTION_POSITIONS"), 2), 1),
+        configured_bool("ALLOW_PROFIT_LOCKED_CORRELATED_POSITIONS", True),
+    )
+    if not correlation["allowed"]:
+        return {
+            "allowed": False,
+            "reason": correlation["reason"],
+            "risk": risk,
+            "correlation": correlation,
+            "circuit": circuit,
+        }
+    return {
+        "allowed": True,
+        "reason": "portfolio entry accepted",
+        "risk": risk,
+        "correlation": correlation,
+        "circuit": circuit,
+        "required_score": required_score,
+    }
 
 
 def daily_profit_target():
@@ -1422,6 +1664,13 @@ def save_open_position_state(
         "trailing_stop_reason": "",
     }
     state["profit_booking_percent"] = profit_booking_target_percent()
+    state["profit_booking_mode"] = profit_booking_mode()
+    if profit_booking_mode() == "runner":
+        progress = profit_booking_target_percent() / 100.0
+        state["runner_activation_price"] = round(
+            float(entry_price) + (float(target_price) - float(entry_price)) * progress,
+            2,
+        )
     state["profit_booking_price"] = profit_booking_price(state)
 
     write_state(symbol, state)
@@ -1920,6 +2169,13 @@ def profit_booking_target_percent():
     return value
 
 
+def profit_booking_mode():
+    mode = os.getenv("PROFIT_BOOKING_MODE", "exit").strip().lower()
+    if mode not in {"exit", "runner"}:
+        raise RuntimeError("PROFIT_BOOKING_MODE must be 'exit' or 'runner'")
+    return mode
+
+
 def profit_protection_settings():
     """Return validated, staged profit-protection thresholds."""
     enabled = os.getenv("PROFIT_PROTECTION_ENABLED", "true").strip().lower() in {
@@ -1940,6 +2196,9 @@ def profit_protection_settings():
             "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT", 35.0
         ),
         "booking_trigger": profit_booking_target_percent(),
+        "runner_lock": configured_non_negative_float(
+            "PROFIT_RUNNER_LOCK_PERCENT", 55.0
+        ),
     }
     if not (
         0 <= settings["stage_one_lock"] < settings["stage_one_trigger"]
@@ -1957,6 +2216,13 @@ def profit_protection_settings():
             "Profit-protection locks must satisfy stage-one lock <= stage-two "
             "lock < stage-two trigger"
         )
+    if profit_booking_mode() == "runner" and not (
+        settings["stage_two_lock"] <= settings["runner_lock"]
+        < settings["booking_trigger"]
+    ):
+        raise RuntimeError(
+            "Runner lock must satisfy stage-two lock <= runner lock < booking trigger"
+        )
     return settings
 
 
@@ -1968,6 +2234,9 @@ def profit_booking_price(state):
     if entry_price <= 0 or (target_price >= entry_price if is_short else target_price <= entry_price):
         return target_price
 
+    if profit_booking_mode() == "runner":
+        return round(target_price, 2)
+
     progress = profit_booking_target_percent() / 100.0
     booking_price = entry_price + (target_price - entry_price) * progress
     precision = 2 if state.get("instrument_class") in {"STOCK_FUTURE", "STOCK_OPTION"} else 0
@@ -1975,7 +2244,7 @@ def profit_booking_price(state):
 
 
 def apply_trailing_stop(symbol, state, ltp):
-    """Apply two one-time profit locks before the 80% profit-booking exit.
+    """Apply staged profit locks; runner mode protects gains through full target.
 
     The original stop remains untouched below 60% target progress. At 60%
     progress the stop protects 20% of the planned move, and at 70% progress it
@@ -2007,7 +2276,14 @@ def apply_trailing_stop(symbol, state, ltp):
     current_stage = int(to_float(state.get("profit_protection_stage"), 0) or 0)
     new_stage = current_stage
     lock_percent = None
-    if progress >= settings["stage_two_trigger"] and current_stage < 2:
+    if (
+        profit_booking_mode() == "runner"
+        and progress >= settings["booking_trigger"]
+        and current_stage < 3
+    ):
+        new_stage = 3
+        lock_percent = settings["runner_lock"]
+    elif progress >= settings["stage_two_trigger"] and current_stage < 2:
         new_stage = 2
         lock_percent = settings["stage_two_lock"]
     elif progress >= settings["stage_one_trigger"] and current_stage < 1:
@@ -2390,10 +2666,13 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
 
     score_value = float(weighted.get("score") or 0)
     minimum = MIN_SCORE_BY_SYMBOL.get(symbol, 65)
-    if symbol == "BANKNIFTY" and option_summary.get("neutral_chain_override"):
+    if option_summary.get("neutral_chain_override"):
+        neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
         minimum = max(
             minimum,
-            configured_non_negative_float("BANKNIFTY_NEUTRAL_CHAIN_MIN_SCORE", 75.0),
+            configured_non_negative_float(
+                f"{symbol}_NEUTRAL_CHAIN_MIN_SCORE", neutral_default
+            ),
         )
     if weighted.get("grade") == "SKIP" or (
         score_value < minimum
@@ -2465,6 +2744,7 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         "technicals": technicals,
         "option_summary": option_summary,
         "weighted": weighted,
+        "entry_minimum_score": minimum,
     }, None
 
 
@@ -2500,7 +2780,8 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         and abs(score) >= 4
     )
     neutral_banknifty_candidate = symbol == "BANKNIFTY" and direction == "NEUTRAL"
-    if not directional_high and not neutral_banknifty_candidate:
+    neutral_nifty_candidate = symbol == "NIFTY" and direction == "NEUTRAL"
+    if not directional_high and not neutral_banknifty_candidate and not neutral_nifty_candidate:
         collect_institutional_footprint(symbol, rec)
         log(f"{symbol} no trade: signal is not directional HIGH confidence.")
         return False
@@ -2556,6 +2837,31 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         log(
             f"BANKNIFTY neutral-chain override candidate: direction={direction}; "
             "5M/15M, 2H and major-bank breadth passed preconditions"
+        )
+    elif neutral_nifty_candidate:
+        inferred_direction, blockers = nifty_neutral_chain_direction(base_technicals)
+        if not inferred_direction:
+            collect_institutional_footprint(symbol, rec)
+            log(
+                "NIFTY no trade: neutral option chain and strong-technical "
+                "override failed: " + "; ".join(blockers)
+            )
+            return False
+        original_direction = direction
+        original_confidence = confidence
+        rec = deepcopy(rec)
+        rec.update(
+            {
+                "chain_bias": original_direction,
+                "chain_confidence": original_confidence,
+                "neutral_chain_override": True,
+                "direction": inferred_direction,
+            }
+        )
+        direction = inferred_direction
+        log(
+            f"NIFTY neutral-chain override candidate: direction={direction}; "
+            "5M/15M momentum and 2H risk preconditions passed"
         )
 
     observe_signal_reset(symbol, direction)
@@ -2696,13 +3002,56 @@ def execute_selected_candidate(chosen):
         f"entry={entry_price} target={target} stop={stop} live={live}"
     )
     if not live:
-        log(f"{symbol} DRY RUN ONLY: would {transaction_type} one lot.")
-        return True
+        dry_run_note = " (dry run)"
+    else:
+        dry_run_note = ""
 
-    result, payload = place_market_order(instrument, transaction_type, quantity)
-    order_id = result.get("data", {}).get("order_id")
-    if not order_id:
-        raise RuntimeError(f"{symbol} {transaction_type} returned no order_id: {result}")
+    with portfolio_entry_lock():
+        portfolio_decision = pre_order_portfolio_decision(
+            chosen,
+            quantity,
+            entry_price,
+            stop,
+        )
+        if not portfolio_decision.get("allowed"):
+            log(
+                f"{symbol} portfolio gate rejected entry: "
+                f"{portfolio_decision.get('reason')}"
+            )
+            return False
+        risk = portfolio_decision.get("risk", {})
+        log(
+            f"{symbol} portfolio gate accepted{dry_run_note}: "
+            f"current_risk={risk.get('current_risk')} proposed_risk={risk.get('proposed_risk')} "
+            f"projected_risk={risk.get('projected_risk')} limit={risk.get('risk_limit')}"
+        )
+        if not live:
+            log(f"{symbol} DRY RUN ONLY: would {transaction_type} configured quantity.")
+            return True
+        result, payload = place_market_order(instrument, transaction_type, quantity)
+        order_id = result.get("data", {}).get("order_id")
+        if not order_id:
+            raise RuntimeError(f"{symbol} {transaction_type} returned no order_id: {result}")
+        # Reserve this risk slot before releasing the portfolio lock.
+        write_state(symbol, {
+            "date": now_ist().strftime("%Y-%m-%d"),
+            "symbol": symbol,
+            "entry_order_id": order_id,
+            "entry_transaction_type": transaction_type,
+            "instrument_key": instrument["instrument_key"],
+            "trading_symbol": instrument["trading_symbol"],
+            "quantity": int(quantity),
+            "lot_size": int(instrument["lot_size"]),
+            "entry_price": entry_price,
+            "target_price": target,
+            "stop_loss_price": stop,
+            "direction": direction,
+            "confidence": confidence,
+            "score": score,
+            "weighted_score": candidate_weighted_score(chosen),
+            "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
+            "created_at": now_ist().isoformat(),
+        })
     increment_trade_count(symbol)
     log(f"{symbol} MARKET {transaction_type} placed: order_id={order_id} payload={payload}")
     details = wait_for_order_complete(order_id)
@@ -2717,6 +3066,7 @@ def execute_selected_candidate(chosen):
             "quantity": int(quantity),
             "lot_size": int(instrument["lot_size"]),
             "lot_multiplier": 1,
+            "entry_price": entry_price,
             "target_price": target,
             "stop_loss_price": stop,
             "target_percent": chosen["target_percent"],
@@ -2729,6 +3079,7 @@ def execute_selected_candidate(chosen):
             "direction": direction,
             "confidence": confidence,
             "score": score,
+            "weighted_score": candidate_weighted_score(chosen),
             "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
             "created_at": now_ist().isoformat(),
         })
@@ -2757,6 +3108,7 @@ def execute_selected_candidate(chosen):
         chosen.get("technicals", {}),
     )
     state = read_state(symbol)
+    state["weighted_score"] = candidate_weighted_score(chosen)
     state["post_fill_feasibility"] = post_fill["feasibility"]
     if not post_fill["allowed"]:
         reason = "; ".join(post_fill["feasibility"].get("reasons", []))
@@ -2849,14 +3201,66 @@ def execute_stock_option_candidate(chosen):
         f"target={levels['target_price']} stop={levels['stop_loss_price']} "
         f"score={chosen.get('weighted', {}).get('score')} live={live}"
     )
-    if not live:
-        log("STOCK_OPTION dry run only: ENABLE_LIVE_TRADING is not true; no order placed.")
-        return False
+    chosen = dict(chosen)
+    chosen.setdefault("symbol", STOCK_OPTION_STATE)
+    chosen.setdefault("transaction_type", "BUY")
+    chosen.setdefault(
+        "entry_minimum_score",
+        to_float(os.getenv("STOCK_OPTION_MIN_WEIGHTED_SCORE"), 80.0),
+    )
+    with portfolio_entry_lock():
+        portfolio_decision = pre_order_portfolio_decision(
+            chosen,
+            quantity,
+            expected_entry,
+            levels["stop_loss_price"],
+        )
+        if not portfolio_decision.get("allowed"):
+            log(
+                "STOCK_OPTION portfolio gate rejected entry: "
+                f"{portfolio_decision.get('reason')}"
+            )
+            return False
+        risk = portfolio_decision.get("risk", {})
+        log(
+            "STOCK_OPTION portfolio gate accepted: "
+            f"current_risk={risk.get('current_risk')} proposed_risk={risk.get('proposed_risk')} "
+            f"projected_risk={risk.get('projected_risk')} limit={risk.get('risk_limit')}"
+        )
+        if not live:
+            log("STOCK_OPTION dry run only: ENABLE_LIVE_TRADING is not true; no order placed.")
+            return False
 
-    result, payload = place_market_order(instrument, "BUY", quantity)
-    order_id = result.get("data", {}).get("order_id")
-    if not order_id:
-        raise RuntimeError(f"STOCK_OPTION BUY returned no order_id: {result}")
+        result, payload = place_market_order(instrument, "BUY", quantity)
+        order_id = result.get("data", {}).get("order_id")
+        if not order_id:
+            raise RuntimeError(f"STOCK_OPTION BUY returned no order_id: {result}")
+        write_state(
+            symbol,
+            {
+                "date": now_ist().strftime("%Y-%m-%d"),
+                "symbol": symbol,
+                "underlying_symbol": chosen["underlying_symbol"],
+                "instrument_class": "STOCK_OPTION",
+                "entry_order_id": order_id,
+                "buy_order_id": order_id,
+                "entry_transaction_type": "BUY",
+                "exit_transaction_type": "SELL",
+                "instrument_key": instrument["instrument_key"],
+                "trading_symbol": instrument.get("trading_symbol"),
+                "quantity": quantity,
+                "lot_size": quantity,
+                "entry_price": expected_entry,
+                "target_price": levels["target_price"],
+                "stop_loss_price": levels["stop_loss_price"],
+                "direction": chosen["direction"],
+                "confidence": chosen["confidence"],
+                "score": chosen["signal_score"],
+                "weighted_score": candidate_weighted_score(chosen),
+                "status": "BUY_PLACED_NOT_COMPLETE",
+                "created_at": now_ist().isoformat(),
+            },
+        )
     log(f"STOCK_OPTION MARKET BUY placed: order_id={order_id} payload={payload}")
     details = wait_for_order_complete(order_id)
     if not order_is_complete(details):
@@ -2886,6 +3290,7 @@ def execute_stock_option_candidate(chosen):
                 "direction": chosen["direction"],
                 "confidence": chosen["confidence"],
                 "score": chosen["signal_score"],
+                "weighted_score": candidate_weighted_score(chosen),
                 "status": "BUY_PLACED_NOT_COMPLETE",
                 "created_at": now_ist().isoformat(),
             },
@@ -2924,6 +3329,7 @@ def execute_stock_option_candidate(chosen):
             "fixed_stop_rupees": levels["stop_rupees"],
             "mover_type": chosen.get("mover_type"),
             "mover_change_percent": chosen.get("mover_change_percent"),
+            "weighted_score": candidate_weighted_score(chosen),
         }
     )
     write_state(symbol, state)
@@ -3235,6 +3641,20 @@ def run_signal_check():
                 handle_existing_state(symbol, state)
             except Exception as error:
                 log(f"{symbol} existing-position check ERROR: {error}")
+
+    try:
+        day_circuit = portfolio_day_circuit()
+    except Exception as error:
+        log(f"Portfolio day circuit failed; no new entry for safety: {error}")
+        return
+    if not day_circuit.get("allowed"):
+        log(f"Portfolio day circuit blocked all new entries: {day_circuit.get('reason')}")
+        return
+    if to_float(day_circuit.get("score_penalty")) > 0:
+        log(
+            "Portfolio soft-loss mode active: new-entry minimum scores increased by "
+            f"{day_circuit['score_penalty']:.1f} points"
+        )
 
     active_index = {
         symbol

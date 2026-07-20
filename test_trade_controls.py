@@ -53,7 +53,7 @@ from stock_option_scanner import (
 )
 from counterfactual_replay import simulate_trade
 from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
-from signal_score import weighted_alignment_score
+from signal_score import nifty_neutral_chain_direction, weighted_alignment_score
 from backtest_report import build_reports
 
 
@@ -1166,6 +1166,55 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(outcomes[False]["exit_price"], 90)
         self.assertTrue(outcomes[True]["trailing_stop_enabled"])
         self.assertFalse(outcomes[False]["trailing_stop_enabled"])
+
+    def test_runner_mode_locks_profit_at_eighty_percent_and_keeps_full_target(self):
+        state = {
+            "instrument_key": "NSE_FO|RUNNER",
+            "instrument_class": "INDEX_OPTION",
+            "entry_transaction_type": "BUY",
+            "entry_price": 100,
+            "planned_target_price": 130,
+            "target_price": 130,
+            "stop_loss_price": 85,
+            "quantity": 65,
+            "profit_protection_stage": 2,
+            "highest_ltp": 120,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            with (
+                patch.object(trade_bot, "state_file", return_value=state_path),
+                patch.dict(
+                    os.environ,
+                    {
+                        "PROFIT_BOOKING_MODE": "runner",
+                        "PROFIT_BOOKING_TARGET_PERCENT": "80",
+                        "PROFIT_RUNNER_LOCK_PERCENT": "55",
+                    },
+                    clear=False,
+                ),
+            ):
+                updated = trade_bot.apply_trailing_stop("NIFTY", state, 124)
+                booking = trade_bot.profit_booking_price(updated)
+
+        self.assertEqual(updated["profit_protection_stage"], 3)
+        self.assertEqual(updated["stop_loss_price"], 116.5)
+        self.assertEqual(booking, 130)
+
+    def test_nifty_neutral_chain_override_requires_strong_aligned_momentum(self):
+        direction, blockers = nifty_neutral_chain_direction(
+            {
+                "five_min": {
+                    "bias": "BEARISH",
+                    "confidence": "HIGH",
+                    "momentum_score": -4,
+                },
+                "fifteen_min": {"bias": "BEARISH", "confidence": "MEDIUM"},
+                "two_hour": {"bias": "NEUTRAL", "confidence": "LOW"},
+            }
+        )
+        self.assertEqual(direction, "BEARISH")
+        self.assertEqual(blockers, [])
 
 
 if __name__ == "__main__":
