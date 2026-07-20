@@ -1,6 +1,7 @@
 from collections import deque
 from pathlib import Path
 import ast
+import html
 import json
 import os
 import re
@@ -35,12 +36,14 @@ from trade_forensics import (
     read_rejected_signals as read_forensic_rejected_signals,
     read_trades as read_forensic_trades,
 )
+from session_insights import build_session_insights, read_analysis_rows, read_log_lines
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ICON = BASE_DIR / "assets" / "vamsi_icon_v2.jpg"
 DATA_DIR = BASE_DIR / "data"
 ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
+ANALYSIS_HISTORY_FILE = BASE_DIR / "data" / "analysis_history.csv"
 LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 BACKTEST_DIR = DATA_DIR / "backtests"
@@ -169,6 +172,15 @@ st.markdown(
         font-size: 13px;
         margin-top: -8px;
         margin-bottom: 12px;
+    }
+    .insight-line {
+        border-left: 3px solid #38bdf8;
+        background: rgba(15, 23, 42, 0.72);
+        border-radius: 6px;
+        color: #dbeafe;
+        font-size: 14px;
+        margin: 8px 0;
+        padding: 11px 13px;
     }
     @media (max-width: 768px) {
         .block-container {
@@ -1137,16 +1149,30 @@ def render_trade_forensics_dashboard():
                     forward_candles,
                     post_exit_candles,
                 )
+                analysis = read_analysis_rows(ANALYSIS_HISTORY_FILE, date_text)
+                insight_report = build_session_insights(
+                    date_text,
+                    analysis,
+                    executed,
+                    rejected,
+                    read_log_lines(LOG_FILE, date_text),
+                    os.environ,
+                )
                 DATA_DIR.mkdir(exist_ok=True)
                 executed.to_csv(executed_file, index=False)
                 rejected.to_csv(rejected_file, index=False)
                 summary_file.write_text(
                     json.dumps(summary, indent=2, sort_keys=True, default=str)
                 )
+                insight_file = DATA_DIR / f"session_insights_{date_text}.json"
+                insight_file.write_text(
+                    json.dumps(insight_report, indent=2, sort_keys=True, default=str)
+                )
                 st.session_state["forensic_report_date"] = date_text
                 st.session_state["forensic_executed"] = executed
                 st.session_state["forensic_rejected"] = rejected
                 st.session_state["forensic_summary"] = summary
+                st.session_state["forensic_insights"] = insight_report
             except Exception as error:
                 st.error(f"Trade forensic report could not be generated: {error}")
 
@@ -1154,10 +1180,12 @@ def render_trade_forensics_dashboard():
         executed = st.session_state.get("forensic_executed", pd.DataFrame())
         rejected = st.session_state.get("forensic_rejected", pd.DataFrame())
         summary = st.session_state.get("forensic_summary", {})
+        insights = st.session_state.get("forensic_insights", {})
     elif executed_file.exists() or rejected_file.exists() or summary_file.exists():
         executed = read_csv_if_present(executed_file)
         rejected = read_csv_if_present(rejected_file)
         summary = read_json(summary_file, {})
+        insights = read_json(DATA_DIR / f"session_insights_{date_text}.json", {})
     else:
         st.info("Choose a date and build the report. Saved reports are reused automatically.")
         return
@@ -1196,59 +1224,114 @@ def render_trade_forensics_dashboard():
     if error_count:
         st.warning(f"{error_count} row(s) could not be fully analyzed. See the detailed tables for the error text.")
 
-    st.markdown("### Executed Trade Path")
-    st.markdown(
-        '<div class="xray-section-note">Peak and adverse values are measured while the trade was open. Post-exit values use the selected future window.</div>',
-        unsafe_allow_html=True,
+    insight_tab, executed_tab, rejected_tab = st.tabs(
+        ["Session Insights", "Executed Trades", "Rejected Signals"]
     )
-    if executed.empty:
-        st.info("No closed trades were recorded for this date.")
-    else:
-        executed_columns = [
-            "symbol",
-            "trading_symbol",
-            "realized_pnl",
-            "max_favorable_pnl",
-            "max_adverse_pnl",
-            "max_favorable_points",
-            "max_adverse_points",
-            "profit_given_back_from_peak",
-            "exit_reason",
-            "post_exit_best_pnl_from_entry",
-            "post_exit_planned_level_outcome",
-            "recovered_to_entry_after_exit",
-            "analysis_error",
-        ]
-        executed_columns = [column for column in executed_columns if column in executed.columns]
-        st.dataframe(executed[executed_columns], use_container_width=True, hide_index=True)
 
-    st.markdown("### Rejected Signal Follow-Through")
-    st.markdown(
-        '<div class="xray-section-note">Each saved directional rejection is followed through for the selected number of five-minute candles. Repeated checks can overlap and are not independent trades.</div>',
-        unsafe_allow_html=True,
-    )
-    if rejected.empty:
-        st.info("No saved directional rejected signals were available for this date.")
-    else:
-        rejected_columns = [
-            "signal_time",
-            "symbol",
-            "direction",
-            "trading_symbol",
-            "weighted_score",
-            "forward_outcome",
-            "max_favorable_pnl",
-            "max_adverse_pnl",
-            "max_favorable_points",
-            "max_adverse_points",
-            "rejection_reason",
-            "analysis_error",
-        ]
-        rejected_columns = [column for column in rejected_columns if column in rejected.columns]
-        st.dataframe(rejected[rejected_columns], use_container_width=True, hide_index=True)
-        if "forward_outcome" in rejected.columns:
-            outcome_chart = rejected["forward_outcome"].fillna("UNKNOWN").value_counts()
-            st.bar_chart(outcome_chart)
+    with insight_tab:
+        if not insights:
+            analysis = read_analysis_rows(ANALYSIS_HISTORY_FILE, date_text)
+            insights = build_session_insights(
+                date_text,
+                analysis,
+                executed,
+                rejected,
+                read_log_lines(LOG_FILE, date_text),
+                os.environ,
+            )
+
+        st.markdown("### What The Session Evidence Says")
+        for line in insights.get("narrative", []):
+            st.markdown(
+                f'<div class="insight-line">{html.escape(str(line))}</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("#### Review Priorities")
+        for priority in insights.get("review_priorities", []):
+            st.write(f"- {priority}")
+
+        signal_mix = pd.DataFrame(insights.get("signal_mix", []))
+        blocker_mix = pd.DataFrame(insights.get("blockers", []))
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Signal Regime")
+            if signal_mix.empty:
+                st.info("No saved signal mix was available.")
+            else:
+                st.dataframe(signal_mix, use_container_width=True, hide_index=True)
+        with right:
+            st.markdown("#### Dominant Blockers")
+            if blocker_mix.empty:
+                st.info("No blocker lines were found in the saved log.")
+            else:
+                st.dataframe(blocker_mix, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Effective Trade Controls")
+        controls_frame = pd.DataFrame(
+            [
+                {"setting": key, "effective_value": value}
+                for key, value in insights.get("controls", {}).items()
+            ]
+        )
+        st.dataframe(controls_frame, use_container_width=True, hide_index=True)
+        st.caption(str(insights.get("caveat") or ""))
+
+    with executed_tab:
+        st.markdown("### Executed Trade Path")
+        st.markdown(
+            '<div class="xray-section-note">Peak and adverse values are measured while the trade was open. Post-exit values use the selected future window.</div>',
+            unsafe_allow_html=True,
+        )
+        if executed.empty:
+            st.info("No closed trades were recorded for this date.")
+        else:
+            executed_columns = [
+                "symbol",
+                "trading_symbol",
+                "realized_pnl",
+                "max_favorable_pnl",
+                "max_adverse_pnl",
+                "max_favorable_points",
+                "max_adverse_points",
+                "profit_given_back_from_peak",
+                "exit_reason",
+                "post_exit_best_pnl_from_entry",
+                "post_exit_planned_level_outcome",
+                "recovered_to_entry_after_exit",
+                "analysis_error",
+            ]
+            executed_columns = [column for column in executed_columns if column in executed.columns]
+            st.dataframe(executed[executed_columns], use_container_width=True, hide_index=True)
+
+    with rejected_tab:
+        st.markdown("### Rejected Signal Follow-Through")
+        st.markdown(
+            '<div class="xray-section-note">Each saved directional rejection is followed through for the selected number of five-minute candles. Repeated checks can overlap and are not independent trades.</div>',
+            unsafe_allow_html=True,
+        )
+        if rejected.empty:
+            st.info("No saved directional rejected signals were available for this date.")
+        else:
+            rejected_columns = [
+                "signal_time",
+                "symbol",
+                "direction",
+                "trading_symbol",
+                "weighted_score",
+                "forward_outcome",
+                "max_favorable_pnl",
+                "max_adverse_pnl",
+                "max_favorable_points",
+                "max_adverse_points",
+                "rejection_reason",
+                "analysis_error",
+            ]
+            rejected_columns = [column for column in rejected_columns if column in rejected.columns]
+            st.dataframe(rejected[rejected_columns], use_container_width=True, hide_index=True)
+            if "forward_outcome" in rejected.columns:
+                outcome_chart = rejected["forward_outcome"].fillna("UNKNOWN").value_counts()
+                st.bar_chart(outcome_chart)
 
     st.caption(str(summary.get("caveat") or ""))
     with st.expander("Generated report files"):
@@ -1257,6 +1340,7 @@ def render_trade_forensics_dashboard():
                 "executed_trades": str(executed_file),
                 "rejected_signals": str(rejected_file),
                 "summary": str(summary_file),
+                "session_insights": str(DATA_DIR / f"session_insights_{date_text}.json"),
             }
         )
 
