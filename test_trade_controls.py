@@ -46,7 +46,11 @@ import trade_bot
 import apns_push
 import dashboard_data
 import trade_journal
-from stock_option_scanner import choose_stock_option_expiry, rank_top_movers
+from stock_option_scanner import (
+    choose_stock_option_expiry,
+    rank_intraday_stock_setups,
+    rank_top_movers,
+)
 from counterfactual_replay import simulate_trade
 from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
 from signal_score import weighted_alignment_score
@@ -119,6 +123,48 @@ class TradeControlTests(unittest.TestCase):
         }
         with patch.dict(os.environ, {"STOCK_OPTION_MIN_MOVER_PERCENT": "0.25"}):
             self.assertEqual(rank_top_movers(equities, quotes), [])
+
+    def test_stock_option_intraday_scan_finds_strong_bullish_and_bearish_setups(self):
+        equities = [
+            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
+            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
+            {"symbol": "CCC", "instrument_key": "NSE_EQ|3"},
+        ]
+        quotes = {
+            "data": {
+                "NSE_EQ:1": {
+                    "last_price": 105,
+                    "net_change": 5,
+                    "average_price": 102,
+                    "ohlc": {"open": 101, "high": 106, "low": 99, "close": 100},
+                },
+                "NSE_EQ:2": {
+                    "last_price": 95,
+                    "net_change": -5,
+                    "average_price": 98,
+                    "ohlc": {"open": 99, "high": 101, "low": 94, "close": 100},
+                },
+                "NSE_EQ:3": {
+                    "last_price": 100.2,
+                    "net_change": 0.2,
+                    "average_price": 100.1,
+                    "ohlc": {"open": 100, "high": 101, "low": 99, "close": 100},
+                },
+            }
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_OPTION_MIN_INTRADAY_MOVE_PERCENT": "0.75",
+                "STOCK_OPTION_INTRADAY_RANGE_EDGE": "0.65",
+            },
+        ):
+            setups = rank_intraday_stock_setups(equities, quotes)
+        self.assertEqual(
+            {(row["symbol"], row["direction"]) for row in setups},
+            {("AAA", "BULLISH"), ("BBB", "BEARISH")},
+        )
+        self.assertTrue(all(row["intraday_score"] > 0 for row in setups))
 
     def test_stock_option_levels_equal_configured_one_lot_rupee_risk(self):
         with patch.dict(

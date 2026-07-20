@@ -1,8 +1,9 @@
-"""Live NIFTY-50 top-mover stock-option scanner.
+"""Live NIFTY-50 intraday stock-option scanner.
 
-The scanner is intentionally decision-only. It ranks the current top gainer
-and loser, evaluates one ATM option for each, and returns qualified long-option
-candidates. Order placement and position state remain owned by trade_bot.py.
+The scanner is intentionally decision-only. It screens every configured
+NIFTY-50 equity in one quote request, shortlists the strongest bullish and
+bearish intraday structures, and fully evaluates only those stock options.
+Order placement and position state remain owned by trade_bot.py.
 """
 
 import gzip
@@ -172,6 +173,93 @@ def rank_top_movers(equities, quote_payload):
     return movers
 
 
+def rank_intraday_stock_setups(equities, quote_payload):
+    """Return all equities that exhibit a strong directional intraday structure."""
+    quotes = _quote_rows(quote_payload)
+    minimum_move = max(
+        _number(os.getenv("STOCK_OPTION_MIN_INTRADAY_MOVE_PERCENT"), 0.75),
+        0.05,
+    )
+    range_edge = min(
+        max(_number(os.getenv("STOCK_OPTION_INTRADAY_RANGE_EDGE"), 0.65), 0.50),
+        0.95,
+    )
+    setups = []
+    for equity in equities:
+        quote = quotes.get(equity["instrument_key"], {})
+        ohlc = quote.get("ohlc", {}) or {}
+        last_price = _quote_price(quote)
+        previous_close = _previous_close(quote)
+        open_price = _number(ohlc.get("open") or quote.get("open_price"))
+        high_price = _number(ohlc.get("high") or quote.get("high_price"))
+        low_price = _number(ohlc.get("low") or quote.get("low_price"))
+        average_price = _number(
+            quote.get("average_price")
+            or quote.get("atp")
+            or (quote.get("market_data") or {}).get("atp")
+        )
+        if (
+            min(last_price, previous_close, open_price, high_price, low_price, average_price)
+            <= 0
+            or high_price <= low_price
+        ):
+            continue
+
+        change_percent = (last_price - previous_close) / previous_close * 100
+        range_position = min(
+            max((last_price - low_price) / (high_price - low_price), 0.0),
+            1.0,
+        )
+        direction = None
+        if (
+            change_percent >= minimum_move
+            and last_price > open_price
+            and last_price > average_price
+            and range_position >= range_edge
+        ):
+            direction = "BULLISH"
+        elif (
+            change_percent <= -minimum_move
+            and last_price < open_price
+            and last_price < average_price
+            and range_position <= 1.0 - range_edge
+        ):
+            direction = "BEARISH"
+        if not direction:
+            continue
+
+        directional_range_position = (
+            range_position if direction == "BULLISH" else 1.0 - range_position
+        )
+        move_component = min(abs(change_percent) / minimum_move, 3.0) / 3.0 * 45.0
+        range_component = directional_range_position * 25.0
+        open_distance = abs(last_price - open_price) / open_price * 100
+        average_distance = abs(last_price - average_price) / average_price * 100
+        open_component = min(open_distance / minimum_move, 2.0) / 2.0 * 15.0
+        average_component = min(average_distance / minimum_move, 2.0) / 2.0 * 15.0
+        intraday_score = min(
+            move_component + range_component + open_component + average_component,
+            100.0,
+        )
+        setups.append(
+            {
+                **equity,
+                "direction": direction,
+                "mover_type": f"STRONG_{direction}",
+                "last_price": round(last_price, 2),
+                "previous_close": round(previous_close, 2),
+                "open_price": round(open_price, 2),
+                "high_price": round(high_price, 2),
+                "low_price": round(low_price, 2),
+                "average_price": round(average_price, 2),
+                "change_percent": round(change_percent, 3),
+                "range_position": round(range_position, 3),
+                "intraday_score": round(intraday_score, 1),
+            }
+        )
+    return sorted(setups, key=lambda row: row["intraday_score"], reverse=True)
+
+
 def _chain_frames(symbol, equity_key, expiry, request_func, nearby=5):
     payload = request_func(
         "GET",
@@ -310,9 +398,9 @@ def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader
     two = technicals.get("two_hour", {}) or {}
     opposite = "BEARISH" if direction == "BULLISH" else "BULLISH"
     if fifteen.get("bias") != direction or five.get("bias") != direction:
-        return None, "5M and 15M must both align with the top-mover direction"
+        return None, "5M and 15M must both align with the intraday direction"
     if two.get("bias") == opposite and two.get("confidence") in {"MEDIUM", "HIGH"}:
-        return None, "2H technical trend strongly conflicts with the top-mover direction"
+        return None, "2H technical trend strongly conflicts with the intraday direction"
 
     stream_quote = market_cache_reader(option_key) or {}
     quality = option_contract_quality(atm, option_type, stream_quote)
@@ -354,6 +442,8 @@ def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader
         "option_market_quality": quality,
         "mover_type": mover["mover_type"],
         "mover_change_percent": mover["change_percent"],
+        "intraday_score": mover.get("intraday_score"),
+        "intraday_range_position": mover.get("range_position"),
     }
     weighted = weighted_alignment_score(option_summary, technicals, trend)
     minimum_score = _number(os.getenv("STOCK_OPTION_MIN_WEIGHTED_SCORE"), 80.0)
@@ -365,6 +455,8 @@ def _evaluate_mover(mover, derivatives_by_key, request_func, market_cache_reader
         "underlying_instrument_key": mover["instrument_key"],
         "mover_type": mover["mover_type"],
         "mover_change_percent": mover["change_percent"],
+        "intraday_score": mover.get("intraday_score"),
+        "intraday_range_position": mover.get("range_position"),
         "direction": direction,
         "confidence": confidence,
         "signal_score": score,
@@ -385,13 +477,33 @@ def scan_stock_option_candidates(instrument_cache, request_func, market_cache_re
         UPSTOX_FULL_QUOTE_URL,
         params={"instrument_key": ",".join(row["instrument_key"] for row in equities)},
     )
-    movers = rank_top_movers(equities, quote_payload)
-    if not movers:
-        raise RuntimeError("Could not calculate top gainer and loser from live quotes")
+    quotes = _quote_rows(quote_payload)
+    quoted_count = sum(
+        1 for equity in equities if equity["instrument_key"] in quotes
+    )
+    setups = rank_intraday_stock_setups(equities, quote_payload)
+    bullish = [row for row in setups if row["direction"] == "BULLISH"]
+    bearish = [row for row in setups if row["direction"] == "BEARISH"]
+    shortlist_limit = max(
+        int(_number(os.getenv("STOCK_OPTION_SHORTLIST_PER_SIDE"), 2)),
+        1,
+    )
+    movers = bullish[:shortlist_limit] + bearish[:shortlist_limit]
+    movers.sort(key=lambda row: row["intraday_score"], reverse=True)
     log_func(
-        "Stock-option movers: "
+        "Stock-option NIFTY50 scan: "
+        f"universe={len(equities)} quoted={quoted_count} "
+        f"strong_bullish={len(bullish)} strong_bearish={len(bearish)} "
+        f"shortlisted={len(movers)}"
+    )
+    if not movers:
+        log_func("STOCK_OPTION no trade: no strong NIFTY-50 intraday setup passed the quote gates.")
+        return {"movers": [], "qualified": [], "rejected": []}
+    log_func(
+        "Stock-option shortlist: "
         + ", ".join(
-            f"{row['mover_type']}={row['symbol']}({row['change_percent']:+.2f}%)"
+            f"{row['symbol']}={row['direction']} change={row['change_percent']:+.2f}% "
+            f"range={row['range_position']:.2f} score={row['intraday_score']:.1f}"
             for row in movers
         )
     )
