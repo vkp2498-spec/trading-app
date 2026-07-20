@@ -2772,7 +2772,7 @@ def run_stock_options_scan():
         return False
     qualified = result.get("qualified", [])
     if not qualified:
-        log("STOCK_OPTION no trade: top gainer and loser failed deterministic gates.")
+        log("STOCK_OPTION no trade: all shortlisted NIFTY-50 stocks failed deterministic gates.")
         return False
 
     chosen = qualified[0]
