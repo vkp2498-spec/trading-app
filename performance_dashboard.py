@@ -1402,14 +1402,14 @@ def render_banknifty_post_market():
                 summary_file.write_text(
                     json.dumps(summary, indent=2, sort_keys=True, default=str)
                 )
-                st.session_state["banknifty_veto_date"] = date_text
+                st.session_state["banknifty_veto_report_date"] = date_text
                 st.session_state["banknifty_veto_observations"] = observations
                 st.session_state["banknifty_veto_episodes"] = episodes
                 st.session_state["banknifty_veto_summary"] = summary
             except Exception as error:
                 st.error(f"BANKNIFTY post-market audit could not be generated: {error}")
 
-    if st.session_state.get("banknifty_veto_date") == date_text:
+    if st.session_state.get("banknifty_veto_report_date") == date_text:
         observations = st.session_state.get("banknifty_veto_observations", pd.DataFrame())
         episodes = st.session_state.get("banknifty_veto_episodes", pd.DataFrame())
         summary = st.session_state.get("banknifty_veto_summary", {})
