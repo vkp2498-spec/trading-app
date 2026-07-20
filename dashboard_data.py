@@ -469,7 +469,7 @@ def cumulative_stock_option_pnl(trades: list[dict]) -> float:
         sum(
             trade["grossPnL"]
             for trade in trades
-            if str(trade.get("instrumentClass") or "").upper() == "STOCK_OPTION"
+            if inferred_instrument_class(trade) == "STOCK_OPTION"
         ),
         2,
     )
@@ -599,15 +599,53 @@ def normalized_underlying(trade: dict) -> str:
     return symbol
 
 
-def option_type(trade: dict) -> str:
-    value = str(
+def inferred_instrument_class(trade: dict) -> str:
+    """Classify legacy journal rows that predate the instrument_class column."""
+    explicit = str(
+        trade.get("instrumentClass")
+        or trade.get("instrument_class")
+        or ""
+    ).upper()
+    if explicit and explicit != "INDEX_OPTION":
+        return explicit
+
+    trading_symbol = str(
         trade.get("tradingSymbol")
         or trade.get("trading_symbol")
-        or trade.get("optionType")
+        or ""
+    ).upper()
+    underlying = normalized_underlying(trade)
+    if re.search(r"(?:^|[ _-])FUT(?:$|[ _-])", trading_symbol):
+        return "STOCK_FUTURE"
+    has_option_token = bool(
+        re.search(r"(?:^|[ _-])(?:CE|PE|CALL|PUT)(?:$|[ _-])", trading_symbol)
+    )
+    if has_option_token and underlying not in SYMBOLS:
+        return "STOCK_OPTION"
+    return explicit or "INDEX_OPTION"
+
+
+def option_type(trade: dict) -> str:
+    explicit = str(
+        trade.get("optionType")
         or trade.get("option_type")
         or ""
     ).upper()
-    return "PUT" if re.search(r"(?:^|[ _-])PE$|PE$", value) else "CALL"
+    if explicit in {"PE", "PUT"}:
+        return "PUT"
+    if explicit in {"CE", "CALL"}:
+        return "CALL"
+
+    trading_symbol = str(
+        trade.get("tradingSymbol")
+        or trade.get("trading_symbol")
+        or ""
+    ).upper()
+    if re.search(r"(?:^|[ _-])(?:PE|PUT)(?:$|[ _-])", trading_symbol):
+        return "PUT"
+    if re.search(r"(?:^|[ _-])(?:CE|CALL)(?:$|[ _-])", trading_symbol):
+        return "CALL"
+    return "UNKNOWN"
 
 
 def day_of_week_performance(trades: list[dict]) -> list[dict]:
@@ -681,7 +719,7 @@ def today_category_pnl(
 
 
 def normalize_trade(row: dict) -> dict:
-    return {
+    trade = {
         "tradeDate": row.get("trade_date", ""),
         "symbol": row.get("symbol", ""),
         "underlyingSymbol": row.get("underlying_symbol", row.get("symbol", "")),
@@ -690,6 +728,7 @@ def normalize_trade(row: dict) -> dict:
             "trading_symbol",
             "",
         ),
+        "optionType": row.get("option_type", ""),
         "direction": row.get("direction", ""),
         "transactionType": str(
             row.get("transaction_type") or "BUY"
@@ -720,6 +759,9 @@ def normalize_trade(row: dict) -> dict:
         "score": safe_float(row.get("score"), None),
         "status": row.get("status", "CLOSED"),
     }
+    trade["instrumentClass"] = inferred_instrument_class(trade)
+    trade["optionType"] = option_type(trade)
+    return trade
 
 
 def read_trade_history() -> list[dict]:
@@ -869,26 +911,51 @@ def build_trade_performance() -> dict:
         reverse=True,
     )[:20]
     upstox_today_pnl, upstox_today_error, upstox_today_count, upstox_symbol_pnl, upstox_symbol_counts = fetch_upstox_today_pnl()
-    today_closed_pnl = upstox_today_pnl if upstox_today_pnl is not None else 0.0
+    local_today_pnl = round(sum(trade["grossPnL"] for trade in today_trades), 2)
+    if today_trades:
+        today_closed_pnl = local_today_pnl
+        today_closed_trades = len(today_trades)
+        today_pnl_source = "BOT_JOURNAL"
+        today_symbol_pnl = symbol_pnl(today_trades)
+        today_symbol_trades = {
+            symbol: sum(
+                1
+                for trade in today_trades
+                if normalized_underlying(trade) == symbol
+            )
+            for symbol in SYMBOLS
+        }
+    elif upstox_today_pnl is not None:
+        today_closed_pnl = upstox_today_pnl
+        today_closed_trades = upstox_today_count
+        today_pnl_source = "UPSTOX"
+        today_symbol_pnl = upstox_symbol_pnl
+        today_symbol_trades = upstox_symbol_counts
+    else:
+        today_closed_pnl = 0.0
+        today_closed_trades = 0
+        today_pnl_source = "UNAVAILABLE"
+        today_symbol_pnl = symbol_pnl([])
+        today_symbol_trades = {symbol: 0 for symbol in SYMBOLS}
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
     average_profit, average_loss = average_trade_results(trades)
 
     return {
         "today": {
-            "closedTrades": upstox_today_count if upstox_today_pnl is not None else len(today_trades),
+            "closedTrades": today_closed_trades,
             "closedPnL": today_closed_pnl,
-            "closedPnLSource": "UPSTOX" if upstox_today_pnl is not None else "UNAVAILABLE",
+            "closedPnLSource": today_pnl_source,
             "closedPnLError": upstox_today_error,
+            "brokerClosedTrades": upstox_today_count,
+            "brokerClosedPnL": upstox_today_pnl,
             "winRate": calculate_win_rate(
                 today_trades
             ),
-            "symbolPnL": upstox_symbol_pnl if upstox_today_pnl is not None else symbol_pnl(today_trades),
-            "symbolTrades": upstox_symbol_counts if upstox_today_pnl is not None else {
-                symbol: sum(1 for trade in today_trades if trade.get("underlyingSymbol", "").upper() == symbol)
-                for symbol in SYMBOLS
-            },
+            "symbolPnL": today_symbol_pnl,
+            "symbolTrades": today_symbol_trades,
             "categoryPnL": today_categories,
+            "optionTypePerformance": option_type_performance(today_trades),
         },
         "cumulative": {
             "totalTrades": len(trades),

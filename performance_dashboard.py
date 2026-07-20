@@ -1393,8 +1393,10 @@ with dashboard_tab:
 
     if live.get("error"):
         st.warning(live["error"])
-    if today.get("closedPnLSource") != "UPSTOX":
-        st.warning("Today’s realized P&L is currently unavailable from Upstox.")
+    if today.get("closedPnLSource") == "BOT_JOURNAL":
+        st.caption("Today’s realized bot P&L is sourced from the local closed-trade journal.")
+    elif today.get("closedPnLSource") != "UPSTOX":
+        st.warning("Today’s realized P&L is currently unavailable.")
 
 with forensic_report_tab:
     render_trade_forensics_dashboard()

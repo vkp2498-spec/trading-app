@@ -543,6 +543,59 @@ class TradeControlTests(unittest.TestCase):
             2000,
         )
 
+    def test_mobile_dashboard_infers_legacy_stock_option_rows(self):
+        trades = [
+            {
+                "underlyingSymbol": "RELIANCE",
+                "tradingSymbol": "RELIANCE 3000 PE 28 JUL 26",
+                "instrumentClass": "INDEX_OPTION",
+                "grossPnL": 1750,
+            }
+        ]
+        self.assertEqual(dashboard_data.cumulative_stock_option_pnl(trades), 1750)
+
+    def test_option_type_recognizes_put_token_inside_trading_symbol(self):
+        trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}
+        self.assertEqual(dashboard_data.option_type(trade), "PUT")
+
+    def test_unknown_option_type_is_not_mislabeled_as_call(self):
+        self.assertEqual(dashboard_data.option_type({"tradingSymbol": "N/A"}), "UNKNOWN")
+
+    def test_mobile_dashboard_prefers_today_bot_journal_without_broker_lag(self):
+        trades = [
+            {
+                "tradeDate": "2026-07-20",
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "tradingSymbol": "NIFTY 24200 PE 28 JUL 26",
+                "optionType": "PUT",
+                "grossPnL": 1984.45,
+                "exitTime": "2026-07-20T11:18:00+05:30",
+            }
+        ]
+        with (
+            patch.object(dashboard_data, "read_trade_history", return_value=trades),
+            patch.object(
+                dashboard_data,
+                "fetch_upstox_today_pnl",
+                return_value=(0.0, None, 0, {}, {}),
+            ),
+            patch.object(dashboard_data, "datetime") as mocked_datetime,
+        ):
+            mocked_datetime.now.return_value = datetime(2026, 7, 20, 12, 0)
+            performance = dashboard_data.build_trade_performance()
+
+        self.assertEqual(performance["today"]["closedTrades"], 1)
+        self.assertEqual(performance["today"]["closedPnL"], 1984.45)
+        self.assertEqual(performance["today"]["closedPnLSource"], "BOT_JOURNAL")
+        put_rows = [
+            row
+            for row in performance["today"]["optionTypePerformance"]
+            if row["optionType"] == "PUT" and row["symbol"] == "NIFTY"
+        ]
+        self.assertEqual(put_rows[0]["netPnL"], 1984.45)
+
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {
             "symbol": "NIFTY",
