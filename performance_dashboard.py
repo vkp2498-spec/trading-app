@@ -14,6 +14,7 @@ import streamlit as st
 
 from datetime import time
 
+from banknifty_post_market import run_banknifty_veto_audit
 from post_market_review import (
     ask_llm_for_insights,
     build_decision_funnel,
@@ -1345,9 +1346,238 @@ def render_trade_forensics_dashboard():
         )
 
 
+def render_banknifty_post_market():
+    st.markdown('<div class="dash-title">BANKNIFTY Post Market</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">Did low option-chain confidence protect us, or suppress technically strong BANKNIFTY opportunities?</div>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "Research only. This rebuilds evidence from completed candles and does not alter the live option-chain gate."
+    )
+
+    controls = st.columns([1.4, 1, 1])
+    audit_date = controls[0].date_input(
+        "Trading date",
+        value=now_ist().date(),
+        max_value=now_ist().date(),
+        key="banknifty_veto_date",
+    )
+    forward_minutes = controls[1].selectbox(
+        "Follow-through window",
+        options=[15, 30, 45, 60],
+        index=1,
+        format_func=lambda value: f"{value} minutes",
+        key="banknifty_veto_forward_minutes",
+    )
+    minimum_score = controls[2].slider(
+        "Strong technical score",
+        min_value=50,
+        max_value=90,
+        value=70,
+        step=5,
+        key="banknifty_veto_minimum_score",
+    )
+    date_text = audit_date.isoformat()
+    observations_file = DATA_DIR / f"banknifty_veto_observations_{date_text}.csv"
+    episodes_file = DATA_DIR / f"banknifty_veto_episodes_{date_text}.csv"
+    summary_file = DATA_DIR / f"banknifty_veto_summary_{date_text}.json"
+
+    if st.button(
+        "Run BANKNIFTY Veto Audit",
+        type="primary",
+        use_container_width=True,
+        key="run_banknifty_veto_audit",
+    ):
+        with st.spinner("Rebuilding BANKNIFTY evidence and following the rejected setups..."):
+            try:
+                observations, episodes, summary = run_banknifty_veto_audit(
+                    date_text,
+                    forward_candles=max(int(forward_minutes / 5), 1),
+                    minimum_score=minimum_score,
+                )
+                DATA_DIR.mkdir(exist_ok=True)
+                observations.to_csv(observations_file, index=False)
+                episodes.to_csv(episodes_file, index=False)
+                summary_file.write_text(
+                    json.dumps(summary, indent=2, sort_keys=True, default=str)
+                )
+                st.session_state["banknifty_veto_date"] = date_text
+                st.session_state["banknifty_veto_observations"] = observations
+                st.session_state["banknifty_veto_episodes"] = episodes
+                st.session_state["banknifty_veto_summary"] = summary
+            except Exception as error:
+                st.error(f"BANKNIFTY post-market audit could not be generated: {error}")
+
+    if st.session_state.get("banknifty_veto_date") == date_text:
+        observations = st.session_state.get("banknifty_veto_observations", pd.DataFrame())
+        episodes = st.session_state.get("banknifty_veto_episodes", pd.DataFrame())
+        summary = st.session_state.get("banknifty_veto_summary", {})
+    elif summary_file.exists():
+        observations = read_csv_if_present(observations_file)
+        episodes = read_csv_if_present(episodes_file)
+        summary = read_json(summary_file, {})
+    else:
+        st.caption("Select the date after market hours and run the audit.")
+        return
+
+    if summary.get("message"):
+        st.warning(summary["message"])
+        return
+
+    metrics = st.columns(6)
+    metrics[0].metric("Option-Chain Vetoes", summary.get("veto_checks", 0))
+    metrics[1].metric("Technical Direction", summary.get("technically_directional_checks", 0))
+    metrics[2].metric("Strong Checks", summary.get("strong_raw_checks", 0))
+    metrics[3].metric("Independent Episodes", summary.get("independent_episodes", 0))
+    metrics[4].metric("Episode Win %", f"{summary.get('episode_win_percent', 0):.1f}%")
+    metrics[5].metric("One-Lot Hypothetical", money(summary.get("one_lot_hypothetical_pnl", 0)))
+
+    outcome_metrics = st.columns(4)
+    outcome_metrics[0].metric("Target First", summary.get("target_first", 0))
+    outcome_metrics[1].metric(
+        "Stop First / Ambiguous", summary.get("stop_first_or_ambiguous", 0)
+    )
+    outcome_metrics[2].metric("No Clear Edge", summary.get("no_edge_episodes", 0))
+    outcome_metrics[3].metric(
+        "Underlying Direction Right",
+        f"{summary.get('underlying_direction_accuracy', 0):.1f}%",
+        help="Whether BANKNIFTY itself finished the selected window in the reconstructed technical direction.",
+    )
+
+    verdict = str(summary.get("verdict") or "NO_VERDICT").replace("_", " ").title()
+    st.markdown("### Evidence Verdict")
+    if summary.get("verdict") == "OPTION_CHAIN_VETO_MAY_BE_TOO_STRICT_FOR_STRONG_TECHNICAL_SETUPS":
+        st.success(verdict)
+    elif summary.get("verdict") == "OPTION_CHAIN_VETO_WAS_PROTECTIVE_OR_TECHNICAL_EDGE_WAS_WEAK":
+        st.warning(verdict)
+    else:
+        st.info(verdict)
+    st.caption(
+        f"Target {summary.get('target_index_points')} BANKNIFTY points | "
+        f"Stop {summary.get('stop_index_points')} points | "
+        f"Delta {summary.get('delta_approximation')} | "
+        f"Forward window {summary.get('forward_five_minute_candles', 0) * 5} minutes"
+    )
+
+    episode_tab, score_tab, all_checks_tab = st.tabs(
+        ["Independent Episodes", "Score Evidence", "All Rejected Checks"]
+    )
+    with episode_tab:
+        st.markdown("#### Non-Overlapping Trade-Like Episodes")
+        st.caption(
+            "Repeated five-minute checks are collapsed while the prior hypothetical setup remains active. This is the table used for P&L and win rate."
+        )
+        if episodes.empty:
+            st.info("No independent setup met the selected technical-score threshold.")
+        else:
+            columns = [
+                "signal_time",
+                "technical_direction",
+                "technical_score",
+                "trading_symbol",
+                "option_type",
+                "entry_price",
+                "target_price",
+                "stop_loss_price",
+                "forward_outcome",
+                "hypothetical_pnl",
+                "max_favorable_pnl",
+                "max_adverse_pnl",
+                "underlying_signed_move_points",
+                "option_flow_bias",
+                "option_flow_volume_ratio",
+            ]
+            st.dataframe(
+                episodes[[column for column in columns if column in episodes.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with score_tab:
+        st.markdown("#### What Happened At Each Technical-Score Band")
+        valid = observations.copy()
+        if not valid.empty:
+            valid = valid[valid.get("analysis_error", "").fillna("").eq("")]
+            valid["score_band"] = pd.cut(
+                pd.to_numeric(valid["technical_score"], errors="coerce"),
+                bins=[0, 49.999, 59.999, 69.999, 79.999, 89.999, 100],
+                labels=["<50", "50-59", "60-69", "70-79", "80-89", "90-100"],
+                include_lowest=True,
+            )
+        if valid.empty:
+            st.info("No reconstructed technical observations were available.")
+        else:
+            score_summary = (
+                valid.groupby("score_band", observed=True)
+                .agg(
+                    checks=("technical_score", "size"),
+                    average_score=("technical_score", "mean"),
+                    target_first=("forward_outcome", lambda values: int((values == "TARGET_FIRST").sum())),
+                    stop_first=("forward_outcome", lambda values: int(values.isin({"STOP_FIRST", "AMBIGUOUS_SAME_CANDLE"}).sum())),
+                    average_favorable_pnl=("max_favorable_pnl", "mean"),
+                    average_adverse_pnl=("max_adverse_pnl", "mean"),
+                )
+                .reset_index()
+            )
+            score_summary["target_first_rate"] = (
+                score_summary["target_first"]
+                / (score_summary["target_first"] + score_summary["stop_first"]).replace(0, pd.NA)
+                * 100
+            ).round(1)
+            st.dataframe(score_summary, use_container_width=True, hide_index=True)
+            chart = score_summary.set_index("score_band")[["target_first", "stop_first"]]
+            st.bar_chart(chart)
+
+    with all_checks_tab:
+        st.markdown("#### Every Non-HIGH Option-Chain Observation")
+        st.caption(
+            "These rows overlap and must not be added together as trades. They answer whether the subsequent direction and option-premium excursion supported the independent indicators."
+        )
+        if observations.empty:
+            st.info("No observations were reconstructed.")
+        else:
+            columns = [
+                "signal_time",
+                "option_chain_confidence",
+                "option_chain_score",
+                "technical_direction",
+                "technical_score",
+                "five_min_bias",
+                "five_min_momentum",
+                "fifteen_min_bias",
+                "two_hour_bias",
+                "institutional_bias",
+                "option_flow_bias",
+                "forward_outcome",
+                "hypothetical_pnl",
+                "max_favorable_pnl",
+                "max_adverse_pnl",
+                "underlying_direction_correct",
+                "analysis_error",
+            ]
+            st.dataframe(
+                observations[[column for column in columns if column in observations.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(str(summary.get("caveat") or ""))
+    with st.expander("Generated report files"):
+        st.write(
+            {
+                "all_observations": str(observations_file),
+                "independent_episodes": str(episodes_file),
+                "summary": str(summary_file),
+            }
+        )
+
+
 load_env()
 
-dashboard_tab, forensic_report_tab = st.tabs(["Dashboard", "Trade Forensics"])
+dashboard_tab, forensic_report_tab, banknifty_post_market_tab = st.tabs(
+    ["Dashboard", "Trade Forensics", "BANKNIFTY Post Market"]
+)
 
 with dashboard_tab:
     if st.button("Refresh Dashboard", use_container_width=True):
@@ -1400,3 +1630,6 @@ with dashboard_tab:
 
 with forensic_report_tab:
     render_trade_forensics_dashboard()
+
+with banknifty_post_market_tab:
+    render_banknifty_post_market()
