@@ -122,17 +122,27 @@ def _fetch_range(instrument_key, unit, interval, from_date, to_date, cache):
     today = datetime.now(IST).date()
     historical_to = min(to_date, today - timedelta(days=1)) if to_date >= today else to_date
     if from_date <= historical_to:
-        url = (
-            f"{UPSTOX_BASE}/v3/historical-candle/{instrument_key}/{unit}/{interval}/"
-            f"{historical_to}/{from_date}"
-        )
-        response = requests.get(url, headers=upstox_headers(), timeout=30)
-        if response.status_code >= 300:
-            raise RuntimeError(
-                f"Upstox historical candle API failed {response.status_code}: "
-                f"{response.text[:300]}"
+        # Upstox rejects long date ranges for minute candles. Keep each request
+        # comfortably inside the API limit, then merge the inclusive windows.
+        max_span_days = 28 if unit == "minutes" and int(interval) <= 15 else 365
+        window_from = from_date
+        while window_from <= historical_to:
+            window_to = min(
+                window_from + timedelta(days=max_span_days - 1),
+                historical_to,
             )
-        frames.append(_parse_candles(response.json()))
+            url = (
+                f"{UPSTOX_BASE}/v3/historical-candle/{instrument_key}/{unit}/{interval}/"
+                f"{window_to}/{window_from}"
+            )
+            response = requests.get(url, headers=upstox_headers(), timeout=30)
+            if response.status_code >= 300:
+                raise RuntimeError(
+                    f"Upstox historical candle API failed {response.status_code} "
+                    f"for {window_from} to {window_to}: {response.text[:300]}"
+                )
+            frames.append(_parse_candles(response.json()))
+            window_from = window_to + timedelta(days=1)
 
     if to_date >= today:
         url = f"{UPSTOX_BASE}/v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}"
