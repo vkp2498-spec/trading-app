@@ -1415,6 +1415,8 @@ def save_open_position_state(
         "created_at": now_ist().isoformat(),
         "highest_ltp": round(float(entry_price), 2),
         "lowest_ltp": round(float(entry_price), 2),
+        "profit_protection_stage": 0,
+        "target_progress_percent": 0.0,
         "trailing_stop_active": False,
         "trailing_stop_reason": "",
     }
@@ -1673,6 +1675,8 @@ def handle_existing_state(symbol, state, verbose=True):
                 details = wait_for_order_complete(order_id) if order_id else {}
                 complete_exit(symbol, state, details, ltp, "PROTECTION_FAILURE", result, payload)
                 return True
+        if ltp is not None:
+            state = apply_trailing_stop(symbol, state, ltp)
         target_price = float(state.get("target_price"))
         stop_loss_price = float(state.get("stop_loss_price"))
         is_short = entry_transaction == "SELL"
@@ -1866,6 +1870,7 @@ def handle_existing_state(symbol, state, verbose=True):
                 {
                     "target_price": post_fill["target_price"],
                     "stop_loss_price": post_fill["stop_loss_price"],
+                    "original_stop_loss_price": post_fill["stop_loss_price"],
                     "technical_context": post_fill["technicals"],
                 }
             )
@@ -1914,6 +1919,46 @@ def profit_booking_target_percent():
     return value
 
 
+def profit_protection_settings():
+    """Return validated, staged profit-protection thresholds."""
+    enabled = os.getenv("PROFIT_PROTECTION_ENABLED", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    settings = {
+        "enabled": enabled,
+        "stage_one_trigger": configured_positive_float(
+            "PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT", 60.0
+        ),
+        "stage_one_lock": configured_non_negative_float(
+            "PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT", 20.0
+        ),
+        "stage_two_trigger": configured_positive_float(
+            "PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT", 70.0
+        ),
+        "stage_two_lock": configured_non_negative_float(
+            "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT", 35.0
+        ),
+        "booking_trigger": profit_booking_target_percent(),
+    }
+    if not (
+        0 <= settings["stage_one_lock"] < settings["stage_one_trigger"]
+        < settings["stage_two_trigger"] < settings["booking_trigger"] <= 100
+    ):
+        raise RuntimeError(
+            "Profit-protection triggers must satisfy 0 <= stage-one lock < "
+            "stage-one trigger < stage-two trigger < booking trigger <= 100"
+        )
+    if not (
+        settings["stage_one_lock"] <= settings["stage_two_lock"]
+        < settings["stage_two_trigger"]
+    ):
+        raise RuntimeError(
+            "Profit-protection locks must satisfy stage-one lock <= stage-two "
+            "lock < stage-two trigger"
+        )
+    return settings
+
+
 def profit_booking_price(state):
     """Return the premium that represents the configured share of target progress."""
     entry_price = float(state.get("entry_price") or 0)
@@ -1929,7 +1974,80 @@ def profit_booking_price(state):
 
 
 def apply_trailing_stop(symbol, state, ltp):
-    """Compatibility shim: live trailing stops are intentionally disabled."""
+    """Apply two one-time profit locks before the 80% profit-booking exit.
+
+    The original stop remains untouched below 60% target progress. At 60%
+    progress the stop protects 20% of the planned move, and at 70% progress it
+    protects 35%. The stop never moves backwards.
+    """
+    if ltp is None or state.get("instrument_class") not in {
+        "INDEX_OPTION", "STOCK_OPTION",
+    }:
+        return state
+
+    settings = profit_protection_settings()
+    if not settings["enabled"]:
+        return state
+
+    entry = to_float(state.get("entry_price"))
+    target = to_float(state.get("planned_target_price") or state.get("target_price"))
+    current_stop = to_float(state.get("stop_loss_price"))
+    current_ltp = to_float(ltp)
+    if not entry or not target or not current_stop or not current_ltp:
+        return state
+
+    is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
+    planned_move = entry - target if is_short else target - entry
+    favorable_move = entry - current_ltp if is_short else current_ltp - entry
+    if planned_move <= 0:
+        return state
+
+    progress = max(favorable_move / planned_move * 100.0, 0.0)
+    current_stage = int(to_float(state.get("profit_protection_stage"), 0) or 0)
+    new_stage = current_stage
+    lock_percent = None
+    if progress >= settings["stage_two_trigger"] and current_stage < 2:
+        new_stage = 2
+        lock_percent = settings["stage_two_lock"]
+    elif progress >= settings["stage_one_trigger"] and current_stage < 1:
+        new_stage = 1
+        lock_percent = settings["stage_one_lock"]
+
+    state_changed = False
+    if is_short:
+        lowest = min(to_float(state.get("lowest_ltp"), entry), current_ltp)
+        if lowest != to_float(state.get("lowest_ltp"), entry):
+            state["lowest_ltp"] = round(lowest, 2)
+            state_changed = True
+    else:
+        highest = max(to_float(state.get("highest_ltp"), entry), current_ltp)
+        if highest != to_float(state.get("highest_ltp"), entry):
+            state["highest_ltp"] = round(highest, 2)
+            state_changed = True
+
+    if lock_percent is not None:
+        locked_move = planned_move * lock_percent / 100.0
+        proposed_stop = entry - locked_move if is_short else entry + locked_move
+        proposed_stop = round(proposed_stop, 2)
+        improved_stop = min(current_stop, proposed_stop) if is_short else max(current_stop, proposed_stop)
+        if improved_stop != current_stop:
+            state["stop_loss_price"] = improved_stop
+            state_changed = True
+        state["profit_protection_stage"] = new_stage
+        state["trailing_stop_active"] = True
+        state["trailing_stop_reason"] = (
+            f"stage {new_stage}: progress={progress:.1f}% lock={lock_percent:.1f}%"
+        )
+        state_changed = True
+        log(
+            f"{symbol} staged profit protection activated: stage={new_stage} "
+            f"progress={progress:.1f}% ltp={current_ltp} "
+            f"stop={state['stop_loss_price']} lock={lock_percent:.1f}%"
+        )
+
+    if state_changed:
+        state["target_progress_percent"] = round(progress, 2)
+        write_state(symbol, state)
     return state
 
 def minutes_since_created(state):
@@ -2618,6 +2736,7 @@ def execute_selected_candidate(chosen):
         {
             "target_price": post_fill["target_price"],
             "stop_loss_price": post_fill["stop_loss_price"],
+            "original_stop_loss_price": post_fill["stop_loss_price"],
             "technical_context": post_fill["technicals"],
         }
     )

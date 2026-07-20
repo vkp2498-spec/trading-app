@@ -267,6 +267,13 @@ def analyze_executed_trades(trades, by_symbol, by_key, candle_cache, post_exit_c
             "quantity": int(safe_float(trade.get("quantity"), 0) or 0),
             "target_price": safe_float(trade.get("target_price")),
             "stop_loss_price": safe_float(trade.get("stop_loss_price")),
+            "original_stop_loss_price": safe_float(
+                trade.get("original_stop_loss_price")
+            ),
+            "profit_protection_stage": int(
+                safe_float(trade.get("profit_protection_stage"), 0) or 0
+            ),
+            "profit_booking_price": safe_float(trade.get("profit_booking_price")),
             "exit_reason": trade.get("exit_reason"),
             "realized_pnl": safe_float(trade.get("gross_pnl"), 0.0),
             "transaction_type": str(trade.get("transaction_type") or "BUY").upper(),
@@ -285,7 +292,7 @@ def analyze_executed_trades(trades, by_symbol, by_key, candle_cache, post_exit_c
             level_outcome, level_time = first_level_touch(
                 in_trade,
                 base["target_price"],
-                base["stop_loss_price"],
+                base["original_stop_loss_price"] or base["stop_loss_price"],
                 base["transaction_type"],
             )
 
@@ -301,7 +308,7 @@ def analyze_executed_trades(trades, by_symbol, by_key, candle_cache, post_exit_c
             post_outcome, post_outcome_time = first_level_touch(
                 post_window,
                 base["target_price"],
-                base["stop_loss_price"],
+                base["original_stop_loss_price"] or base["stop_loss_price"],
                 base["transaction_type"],
             )
             realized = base["realized_pnl"] or 0.0
@@ -313,6 +320,11 @@ def analyze_executed_trades(trades, by_symbol, by_key, candle_cache, post_exit_c
                     **metrics,
                     "planned_level_outcome_during_trade": level_outcome,
                     "planned_level_time_during_trade": level_time,
+                    "stop_history_quality": (
+                        "ORIGINAL_STOP_RECORDED"
+                        if base["original_stop_loss_price"] is not None
+                        else "FINAL_STOP_ONLY"
+                    ),
                     "profit_given_back_from_peak": round(max(peak_pnl - realized, 0.0), 2),
                     "post_exit_candles": int(len(post_window)),
                     "post_exit_best_price": post_metrics.get("max_favorable_price"),

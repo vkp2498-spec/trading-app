@@ -833,20 +833,68 @@ class TradeControlTests(unittest.TestCase):
         sell["weighted"]["score"] = 120
         self.assertIs(trade_bot.select_trade_candidate([buy, sell]), buy)
 
-    def test_live_trailing_stop_does_not_modify_fixed_stop(self):
+    def test_profit_protection_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch.object(trade_bot, "BASE_DIR", Path(temp_dir)):
+            with (
+                patch.object(trade_bot, "BASE_DIR", Path(temp_dir)),
+                patch.dict(os.environ, {"PROFIT_PROTECTION_ENABLED": "false"}),
+            ):
                 state = {
-                    "entry_transaction_type": "SELL",
+                    "instrument_class": "INDEX_OPTION",
+                    "entry_transaction_type": "BUY",
                     "entry_price": 100,
-                    "target_price": 90,
-                    "stop_loss_price": 108,
-                    "lowest_ltp": 100,
+                    "target_price": 130,
+                    "planned_target_price": 130,
+                    "stop_loss_price": 90,
+                    "highest_ltp": 100,
                     "quantity": 30,
                 }
-                updated = trade_bot.apply_trailing_stop("BANKNIFTY", state, 94)
-        self.assertEqual(updated["lowest_ltp"], 100)
-        self.assertEqual(updated["stop_loss_price"], 108)
+                updated = trade_bot.apply_trailing_stop("NIFTY", state, 121)
+        self.assertEqual(updated["highest_ltp"], 100)
+        self.assertEqual(updated["stop_loss_price"], 90)
+
+    def test_stage_one_profit_protection_locks_twenty_percent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(trade_bot, "BASE_DIR", Path(temp_dir)),
+                patch.dict(os.environ, {"PROFIT_PROTECTION_ENABLED": "true"}),
+            ):
+                state = {
+                    "instrument_class": "INDEX_OPTION",
+                    "entry_transaction_type": "BUY",
+                    "entry_price": 100,
+                    "target_price": 130,
+                    "planned_target_price": 130,
+                    "stop_loss_price": 90,
+                    "highest_ltp": 100,
+                    "profit_protection_stage": 0,
+                }
+                updated = trade_bot.apply_trailing_stop("NIFTY", state, 118)
+        self.assertEqual(updated["profit_protection_stage"], 1)
+        self.assertEqual(updated["stop_loss_price"], 106)
+        self.assertEqual(updated["target_progress_percent"], 60)
+
+    def test_stage_two_profit_protection_never_moves_stop_backwards(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(trade_bot, "BASE_DIR", Path(temp_dir)),
+                patch.dict(os.environ, {"PROFIT_PROTECTION_ENABLED": "true"}),
+            ):
+                state = {
+                    "instrument_class": "STOCK_OPTION",
+                    "entry_transaction_type": "BUY",
+                    "entry_price": 100,
+                    "target_price": 130,
+                    "planned_target_price": 130,
+                    "stop_loss_price": 108,
+                    "highest_ltp": 118,
+                    "profit_protection_stage": 1,
+                }
+                updated = trade_bot.apply_trailing_stop("STOCK_OPTION", state, 121)
+                unchanged = trade_bot.apply_trailing_stop("STOCK_OPTION", updated, 119)
+        self.assertEqual(updated["profit_protection_stage"], 2)
+        self.assertEqual(updated["stop_loss_price"], 110.5)
+        self.assertEqual(unchanged["stop_loss_price"], 110.5)
 
     def test_profit_booking_price_is_eighty_percent_of_long_target(self):
         with patch.dict(os.environ, {"PROFIT_BOOKING_TARGET_PERCENT": "80"}):

@@ -23,6 +23,9 @@ COLUMNS = [
     "exit_price",
     "target_price",
     "stop_loss_price",
+    "original_stop_loss_price",
+    "profit_protection_stage",
+    "profit_booking_price",
     "exit_reason",
     "gross_pnl",
     "score",
@@ -87,6 +90,11 @@ def record_closed_trade(state, exit_price, exit_reason):
         "exit_price": exit_price,
         "target_price": state.get("target_price", ""),
         "stop_loss_price": state.get("stop_loss_price", ""),
+        "original_stop_loss_price": state.get(
+            "original_stop_loss_price", state.get("stop_loss_price", "")
+        ),
+        "profit_protection_stage": state.get("profit_protection_stage", 0),
+        "profit_booking_price": state.get("profit_booking_price", ""),
         "exit_reason": exit_reason,
         "gross_pnl": gross_pnl,
         "score": state.get("score", ""),
