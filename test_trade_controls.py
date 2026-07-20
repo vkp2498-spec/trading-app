@@ -81,6 +81,45 @@ class TradeControlTests(unittest.TestCase):
             [("AAA", "BULLISH"), ("BBB", "BEARISH")],
         )
 
+    def test_stock_option_movers_use_net_change_for_previous_close(self):
+        equities = [
+            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
+            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
+        ]
+        quotes = {
+            "data": {
+                "NSE_EQ:1": {
+                    "last_price": 102,
+                    "net_change": 2,
+                    "ohlc": {"close": 102},
+                },
+                "NSE_EQ:2": {
+                    "last_price": 98,
+                    "net_change": -2,
+                    "ohlc": {"close": 98},
+                },
+            }
+        }
+        movers = rank_top_movers(equities, quotes)
+        self.assertEqual(movers[0]["symbol"], "AAA")
+        self.assertAlmostEqual(movers[0]["change_percent"], 2.0)
+        self.assertEqual(movers[1]["symbol"], "BBB")
+        self.assertAlmostEqual(movers[1]["change_percent"], -2.0)
+
+    def test_stock_option_movers_reject_flat_market_data(self):
+        equities = [
+            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
+            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
+        ]
+        quotes = {
+            "data": {
+                "NSE_EQ:1": {"last_price": 100, "net_change": 0},
+                "NSE_EQ:2": {"last_price": 100, "net_change": 0},
+            }
+        }
+        with patch.dict(os.environ, {"STOCK_OPTION_MIN_MOVER_PERCENT": "0.25"}):
+            self.assertEqual(rank_top_movers(equities, quotes), [])
+
     def test_stock_option_levels_equal_configured_one_lot_rupee_risk(self):
         with patch.dict(
             os.environ,

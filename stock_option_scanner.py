@@ -125,6 +125,12 @@ def _quote_price(quote):
 
 def _previous_close(quote):
     quote = quote or {}
+    last_price = _quote_price(quote)
+    net_change = quote.get("net_change")
+    if net_change is not None and last_price > 0:
+        previous_close = last_price - _number(net_change)
+        if previous_close > 0:
+            return previous_close
     return _number(
         (quote.get("ohlc") or {}).get("close")
         or quote.get("close_price")
@@ -153,9 +159,17 @@ def rank_top_movers(equities, quote_payload):
     if not ranked:
         return []
     ranked.sort(key=lambda row: row["change_percent"])
-    loser = {**ranked[0], "mover_type": "TOP_LOSER", "direction": "BEARISH"}
-    gainer = {**ranked[-1], "mover_type": "TOP_GAINER", "direction": "BULLISH"}
-    return [gainer] if gainer["symbol"] == loser["symbol"] else [gainer, loser]
+    minimum_move = max(_number(os.getenv("STOCK_OPTION_MIN_MOVER_PERCENT"), 0.25), 0)
+    movers = []
+    if ranked[-1]["change_percent"] >= minimum_move:
+        movers.append(
+            {**ranked[-1], "mover_type": "TOP_GAINER", "direction": "BULLISH"}
+        )
+    if ranked[0]["change_percent"] <= -minimum_move:
+        movers.append(
+            {**ranked[0], "mover_type": "TOP_LOSER", "direction": "BEARISH"}
+        )
+    return movers
 
 
 def _chain_frames(symbol, equity_key, expiry, request_func, nearby=5):
