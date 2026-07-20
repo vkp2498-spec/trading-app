@@ -23,7 +23,7 @@ LOG_FILE = LOG_DIR / "trade_bot.log"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
-STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
+STATE_SLOTS = SYMBOLS + ["STOCK_OPTION", "STOCK_FUTURE"]
 
 UPSTOX_POSITIONS_URL = (
     "https://api.upstox.com/v2/"
@@ -1139,8 +1139,12 @@ def build_live_positions() -> dict:
             if broker_entry is not None:
                 entry_price = broker_entry
 
-        target_price = safe_float(
+        planned_target_price = safe_float(
             state.get("target_price")
+        )
+        target_price = safe_float(
+            state.get("profit_booking_price"),
+            planned_target_price,
         )
 
         stop_loss_price = safe_float(
@@ -1229,6 +1233,11 @@ def build_live_positions() -> dict:
                 "entryPrice": entry_price,
                 "lastPrice": last_price,
                 "targetPrice": target_price,
+                "plannedTargetPrice": planned_target_price,
+                "profitBookingPercent": safe_float(
+                    state.get("profit_booking_percent"),
+                    80,
+                ),
                 "stopLossPrice": (
                     stop_loss_price
                 ),

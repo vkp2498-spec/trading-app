@@ -46,6 +46,7 @@ import trade_bot
 import apns_push
 import dashboard_data
 import trade_journal
+from stock_option_scanner import choose_stock_option_expiry, rank_top_movers
 from counterfactual_replay import simulate_trade
 from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
 from signal_score import weighted_alignment_score
@@ -53,6 +54,99 @@ from backtest_report import build_reports
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_stock_option_expiry_rolls_past_near_expiry(self):
+        chosen = choose_stock_option_expiry(
+            ["2026-07-23", "2026-08-27"],
+            today=datetime(2026, 7, 21).date(),
+            minimum_days=3,
+        )
+        self.assertEqual(chosen, "2026-08-27")
+
+    def test_stock_option_movers_pick_highest_and_lowest_change(self):
+        equities = [
+            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
+            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
+            {"symbol": "CCC", "instrument_key": "NSE_EQ|3"},
+        ]
+        quotes = {
+            "data": {
+                "NSE_EQ:1": {"last_price": 110, "ohlc": {"close": 100}},
+                "NSE_EQ:2": {"last_price": 90, "ohlc": {"close": 100}},
+                "NSE_EQ:3": {"last_price": 101, "ohlc": {"close": 100}},
+            }
+        }
+        movers = rank_top_movers(equities, quotes)
+        self.assertEqual(
+            [(row["symbol"], row["direction"]) for row in movers],
+            [("AAA", "BULLISH"), ("BBB", "BEARISH")],
+        )
+
+    def test_stock_option_levels_equal_configured_one_lot_rupee_risk(self):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_OPTION_TARGET_RUPEES": "5000",
+                "STOCK_OPTION_STOP_RUPEES": "5000",
+            },
+        ):
+            levels = trade_bot.stock_option_rupee_levels(100, 500)
+        self.assertEqual(levels["target_price"], 110.0)
+        self.assertEqual(levels["stop_loss_price"], 90.0)
+
+    def test_stock_option_execution_uses_exactly_one_lot(self):
+        chosen = {
+            "underlying_symbol": "RELIANCE",
+            "mover_type": "TOP_GAINER",
+            "mover_change_percent": 2.5,
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "signal_score": 4,
+            "entry_price": 100,
+            "instrument": {
+                "instrument_key": "NSE_FO|TEST",
+                "trading_symbol": "RELIANCE TEST CE",
+                "lot_size": 500,
+            },
+            "option_summary": {"option_type": "CE"},
+            "technicals": {},
+            "weighted": {"score": 85},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "stock-option-state.json"
+            guard_path = Path(temp_dir) / "stock-option-guard.json"
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ENABLE_LIVE_TRADING": "true",
+                        "STOCK_OPTION_TARGET_RUPEES": "5000",
+                        "STOCK_OPTION_STOP_RUPEES": "5000",
+                    },
+                ),
+                patch.object(trade_bot, "state_file", return_value=state_path),
+                patch.object(trade_bot, "reentry_guard_file", return_value=guard_path),
+                patch.object(
+                    trade_bot,
+                    "place_market_order",
+                    return_value=({"data": {"order_id": "ORDER-1"}}, {"quantity": 500}),
+                ) as place_order,
+                patch.object(
+                    trade_bot,
+                    "wait_for_order_complete",
+                    return_value={"status": "complete", "average_price": 100},
+                ),
+                patch.object(trade_bot, "find_matching_position_for_side", return_value=None),
+                patch.object(trade_bot, "send_apple_trade_entered_alert"),
+            ):
+                result = trade_bot.execute_stock_option_candidate(chosen)
+                state = json.loads(state_path.read_text())
+
+        self.assertTrue(result)
+        self.assertEqual(place_order.call_args.args[2], 500)
+        self.assertEqual(state["quantity"], 500)
+        self.assertEqual(state["target_price"], 110.0)
+        self.assertEqual(state["stop_loss_price"], 90.0)
+
     def test_live_daily_first_outcome_guard_is_independent_by_index(self):
         today = datetime(2026, 7, 20, 10, 0)
         history = "\n".join([
@@ -80,6 +174,29 @@ class TradeControlTests(unittest.TestCase):
     def test_live_daily_first_outcome_guard_can_be_disabled(self):
         with patch.dict(os.environ, {"STOP_AFTER_FIRST_PROFIT_OR_LOSS": "false"}):
             self.assertEqual(trade_bot.daily_index_entry_block_reason("NIFTY"), "")
+
+    def test_daily_loss_guard_can_be_relaxed_without_disabling_profit_guard(self):
+        today = datetime(2026, 7, 20, 10, 0)
+        history = "\n".join([
+            "trade_date,symbol,instrument_class,gross_pnl",
+            "2026-07-20,NIFTY,INDEX_OPTION,-800",
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "trade_history.csv"
+            history_path.write_text(history)
+            with (
+                patch.object(trade_bot, "TRADE_HISTORY_FILE", history_path),
+                patch.object(trade_bot, "now_ist", return_value=today),
+                patch.dict(
+                    os.environ,
+                    {
+                        "STOP_AFTER_FIRST_PROFIT_OR_LOSS": "true",
+                        "STOP_AFTER_FIRST_LOSS": "false",
+                    },
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(trade_bot.daily_index_entry_block_reason("NIFTY"), "")
 
     def test_replay_sizes_each_option_entry_to_one_lakh(self):
         nifty_quantity, nifty_lots = capital_sized_option_quantity(100, 65, 100000)
@@ -620,7 +737,7 @@ class TradeControlTests(unittest.TestCase):
         sell["weighted"]["score"] = 120
         self.assertIs(trade_bot.select_trade_candidate([buy, sell]), buy)
 
-    def test_short_trailing_stop_moves_down_as_premium_falls(self):
+    def test_live_trailing_stop_does_not_modify_fixed_stop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(trade_bot, "BASE_DIR", Path(temp_dir)):
                 state = {
@@ -632,8 +749,32 @@ class TradeControlTests(unittest.TestCase):
                     "quantity": 30,
                 }
                 updated = trade_bot.apply_trailing_stop("BANKNIFTY", state, 94)
-        self.assertEqual(updated["lowest_ltp"], 94)
-        self.assertEqual(updated["stop_loss_price"], 97)
+        self.assertEqual(updated["lowest_ltp"], 100)
+        self.assertEqual(updated["stop_loss_price"], 108)
+
+    def test_profit_booking_price_is_eighty_percent_of_long_target(self):
+        with patch.dict(os.environ, {"PROFIT_BOOKING_TARGET_PERCENT": "80"}):
+            price = trade_bot.profit_booking_price(
+                {
+                    "entry_transaction_type": "BUY",
+                    "entry_price": 100,
+                    "target_price": 130,
+                    "instrument_class": "INDEX_OPTION",
+                }
+            )
+        self.assertEqual(price, 124)
+
+    def test_profit_booking_price_supports_short_positions(self):
+        with patch.dict(os.environ, {"PROFIT_BOOKING_TARGET_PERCENT": "80"}):
+            price = trade_bot.profit_booking_price(
+                {
+                    "entry_transaction_type": "SELL",
+                    "entry_price": 100,
+                    "target_price": 70,
+                    "instrument_class": "INDEX_OPTION",
+                }
+            )
+        self.assertEqual(price, 76)
 
     def test_short_trade_journal_calculates_profit_when_premium_falls(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -682,7 +823,11 @@ class TradeControlTests(unittest.TestCase):
     def test_losing_exit_requires_signal_reset_before_reentry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(trade_bot, "BASE_DIR", Path(temp_dir)):
-                with patch.dict(os.environ, {"MIN_REENTRY_MINUTES": "0"}, clear=False):
+                with patch.dict(
+                    os.environ,
+                    {"MIN_REENTRY_MINUTES": "0", "LOSS_REENTRY_MODE": "reset"},
+                    clear=False,
+                ):
                     state = {
                         "direction": "BULLISH",
                         "trading_symbol": "NIFTY TEST CE",
@@ -702,6 +847,25 @@ class TradeControlTests(unittest.TestCase):
                     trade_bot.observe_signal_reset("NIFTY", "NEUTRAL")
                     self.assertEqual(
                         trade_bot.reentry_block_reason("NIFTY", "BULLISH"),
+                        "",
+                    )
+
+    def test_losing_exit_allows_next_signal_when_cooldown_is_zero(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(trade_bot, "BASE_DIR", Path(temp_dir)):
+                with patch.dict(
+                    os.environ,
+                    {"MIN_REENTRY_MINUTES": "0", "LOSS_REENTRY_MODE": "cooldown"},
+                    clear=False,
+                ):
+                    trade_bot.register_losing_exit_guard(
+                        "NIFTY",
+                        {"direction": "BEARISH", "trading_symbol": "NIFTY TEST PE"},
+                        {"gross_pnl": -500},
+                        "STOP_LOSS",
+                    )
+                    self.assertEqual(
+                        trade_bot.reentry_block_reason("NIFTY", "BEARISH"),
                         "",
                     )
 
@@ -757,6 +921,54 @@ class TradeControlTests(unittest.TestCase):
         rows = daily[daily["category"] == "NIFTY_OPTION_BUY"].sort_values("trade_date")
         self.assertEqual(summary["categories"][0]["net_pnl"], 600)
         self.assertEqual(rows.iloc[-1]["cumulative_net_pnl"], 600)
+
+    def test_replay_can_compare_trailing_and_fixed_stops(self):
+        signal_time = pd.Timestamp("2026-07-15 10:00:00", tz="Asia/Kolkata")
+        day = signal_time.date()
+        candles = pd.DataFrame(
+            [
+                {"open": 100, "high": 106, "low": 99, "close": 105},
+                {"open": 105, "high": 106, "low": 102, "close": 102},
+                {"open": 102, "high": 103, "low": 89, "close": 90},
+            ],
+            index=[
+                signal_time + pd.Timedelta(minutes=5),
+                signal_time + pd.Timedelta(minutes=10),
+                signal_time + pd.Timedelta(minutes=15),
+            ],
+        )
+        candidate = Candidate(
+            category="NIFTY_OPTION_BUY",
+            symbol="NIFTY",
+            direction="BULLISH",
+            transaction_type="BUY",
+            contract={"lot_size": 1, "trading_symbol": "TEST"},
+            signal_time=signal_time,
+            expected_entry=100,
+            target=110,
+            stop=90,
+            score=80,
+            grade="TRADE",
+            reason="test",
+        )
+
+        outcomes = {}
+        for enabled in (True, False):
+            with patch.dict(
+                os.environ,
+                {"REPLAY_ENABLE_TRAILING_STOP": str(enabled).lower()},
+            ):
+                engine = StrategyReplay(
+                    object(), day, day, include_stock_futures=False,
+                    slippage_bps=0, cost_per_order=0,
+                )
+            with patch.object(engine, "_candles", return_value=candles):
+                outcomes[enabled] = engine._simulate(candidate, day)
+
+        self.assertEqual(outcomes[True]["exit_price"], 103)
+        self.assertEqual(outcomes[False]["exit_price"], 90)
+        self.assertTrue(outcomes[True]["trailing_stop_enabled"])
+        self.assertFalse(outcomes[False]["trailing_stop_enabled"])
 
 
 if __name__ == "__main__":

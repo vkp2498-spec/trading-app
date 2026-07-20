@@ -113,7 +113,11 @@ def main():
                 else "Independent mode evaluates each strategy category separately; category totals are diagnostic and cannot be added together as one account result."
             ),
             "When target and stop occur in one candle, the stop is assumed first.",
-            "A newly trailed stop becomes active from the following candle.",
+            (
+                "A newly trailed stop becomes active from the following candle."
+                if engine.enable_trailing_stop
+                else "Trailing stop is disabled; the original target and stop remain fixed until exit."
+            ),
             f"Entry and exit slippage are estimated at {args.slippage_bps:.1f} bps per side.",
             f"Estimated charges are Rs {args.cost_per_order:.2f} per order, two orders per trade.",
             "Historical option-chain OI is reconstructed from contract candles; it is not a saved Upstox option-chain snapshot.",

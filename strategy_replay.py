@@ -231,6 +231,9 @@ class StrategyReplay:
         self.stop_after_first_loss = (
             os.getenv("REPLAY_STOP_AFTER_FIRST_LOSS", "false").lower() == "true"
         )
+        self.enable_trailing_stop = (
+            os.getenv("REPLAY_ENABLE_TRAILING_STOP", "true").lower() == "true"
+        )
         self.candles = {}
         self.contracts = {}
         self.expiries = {}
@@ -519,7 +522,8 @@ class StrategyReplay:
                 exit_price, exit_time, reason = target, timestamp, "TARGET"
                 break
             best = min(best, low) if is_short else max(best, high)
-            current_stop = self._trail(entry, target, current_stop, best, is_short)
+            if self.enable_trailing_stop:
+                current_stop = self._trail(entry, target, current_stop, best, is_short)
         observed = future[future.index <= exit_time]
         max_high_after_entry = _float(observed["high"].max())
         min_low_after_entry = _float(observed["low"].min())
@@ -565,6 +569,8 @@ class StrategyReplay:
             "signal_time": candidate.signal_time.isoformat(), "entry_time": future.index[0].isoformat(),
             "exit_time": exit_time.isoformat(), "entry_price": round(entry, 2),
             "target_price": round(target, 2), "stop_loss_price": round(stop, 2),
+            "final_stop_price": round(current_stop, 2),
+            "trailing_stop_enabled": self.enable_trailing_stop,
             "exit_price": round(exit_price, 2), "exit_reason": reason,
             "max_high_after_entry": round(max_high_after_entry, 2),
             "min_low_after_entry": round(min_low_after_entry, 2),
