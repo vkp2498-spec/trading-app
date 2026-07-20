@@ -26,6 +26,15 @@ from post_market_review import (
 from strategy_core import now_ist
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
+from trade_forensics import (
+    analyze_executed_trades as run_executed_trade_forensics,
+    analyze_rejected_signals as run_rejected_signal_forensics,
+    build_summary as build_forensic_summary,
+    instrument_lookup as forensic_instrument_lookup,
+    load_instruments as load_forensic_instruments,
+    read_rejected_signals as read_forensic_rejected_signals,
+    read_trades as read_forensic_trades,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ICON = BASE_DIR / "assets" / "vamsi_icon_v2.jpg"
@@ -1057,50 +1066,251 @@ def pnl_for(data, symbol):
     return round(data[data["symbol"] == symbol]["gross_pnl"].sum(), 2)
 
 
+def render_trade_forensics_dashboard():
+    st.markdown('<div class="dash-title">Trade Forensics</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">Peak unrealized P&L, adverse movement, post-exit path, and rejected-signal outcomes</div>',
+        unsafe_allow_html=True,
+    )
+
+    controls = st.columns([1.4, 1, 1])
+    review_date = controls[0].date_input(
+        "Trading date",
+        value=now_ist().date(),
+        key="forensic_review_date",
+    )
+    forward_minutes = controls[1].selectbox(
+        "Rejected-signal window",
+        options=[30, 60, 90],
+        index=0,
+        key="forensic_forward_minutes",
+    )
+    post_exit_minutes = controls[2].selectbox(
+        "Post-exit window",
+        options=[30, 60, 90],
+        index=0,
+        key="forensic_post_exit_minutes",
+    )
+    date_text = review_date.strftime("%Y-%m-%d")
+    if review_date == now_ist().date() and now_ist().time() < POST_MARKET_REVIEW_TIME:
+        st.info(
+            "Today’s report is provisional while the market is active. Run it again after 3:30 PM IST for the complete path."
+        )
+
+    executed_file = DATA_DIR / f"executed_trade_forensics_{date_text}.csv"
+    rejected_file = DATA_DIR / f"rejected_signal_forensics_{date_text}.csv"
+    summary_file = DATA_DIR / f"trade_forensics_summary_{date_text}.json"
+
+    if st.button(
+        "Build Trade Forensic Report",
+        type="primary",
+        use_container_width=True,
+        key="run_trade_forensics",
+    ):
+        with st.spinner("Reconstructing trades and rejected signals from Upstox candles..."):
+            try:
+                instruments = load_forensic_instruments()
+                by_symbol, by_key = forensic_instrument_lookup(instruments)
+                candle_cache = {}
+                trades = read_forensic_trades(date_text)
+                rejected_signals = read_forensic_rejected_signals(date_text)
+                forward_candles = max(int(forward_minutes / 5), 1)
+                post_exit_candles = max(int(post_exit_minutes / 5), 1)
+                executed = run_executed_trade_forensics(
+                    trades,
+                    by_symbol,
+                    by_key,
+                    candle_cache,
+                    post_exit_candles,
+                )
+                rejected = run_rejected_signal_forensics(
+                    rejected_signals,
+                    by_symbol,
+                    by_key,
+                    candle_cache,
+                    forward_candles,
+                )
+                summary = build_forensic_summary(
+                    date_text,
+                    executed,
+                    rejected,
+                    forward_candles,
+                    post_exit_candles,
+                )
+                DATA_DIR.mkdir(exist_ok=True)
+                executed.to_csv(executed_file, index=False)
+                rejected.to_csv(rejected_file, index=False)
+                summary_file.write_text(
+                    json.dumps(summary, indent=2, sort_keys=True, default=str)
+                )
+                st.session_state["forensic_report_date"] = date_text
+                st.session_state["forensic_executed"] = executed
+                st.session_state["forensic_rejected"] = rejected
+                st.session_state["forensic_summary"] = summary
+            except Exception as error:
+                st.error(f"Trade forensic report could not be generated: {error}")
+
+    if st.session_state.get("forensic_report_date") == date_text:
+        executed = st.session_state.get("forensic_executed", pd.DataFrame())
+        rejected = st.session_state.get("forensic_rejected", pd.DataFrame())
+        summary = st.session_state.get("forensic_summary", {})
+    elif executed_file.exists() or rejected_file.exists() or summary_file.exists():
+        executed = read_csv_if_present(executed_file)
+        rejected = read_csv_if_present(rejected_file)
+        summary = read_json(summary_file, {})
+    else:
+        st.info("Choose a date and build the report. Saved reports are reused automatically.")
+        return
+
+    outcomes = summary.get("rejected_forward_outcomes", {}) or {}
+    metrics = st.columns(6)
+    metrics[0].metric("Executed Trades", summary.get("executed_trades", 0))
+    metrics[1].metric("Realized P&L", money(summary.get("realized_pnl", 0)))
+    metrics[2].metric(
+        "Peak Unrealized",
+        money(summary.get("sum_peak_unrealized_pnl", 0)),
+    )
+    metrics[3].metric(
+        "Profit Given Back",
+        money(summary.get("sum_profit_given_back", 0)),
+    )
+    metrics[4].metric(
+        "Rejected Analyzed",
+        summary.get("rejected_directional_signals_analyzed", 0),
+    )
+    metrics[5].metric("Missed Winners", outcomes.get("MISSED_WINNER", 0))
+
+    executed_errors = (
+        executed.get("analysis_error", pd.Series(index=executed.index, dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    ) if not executed.empty else pd.Series(dtype="object")
+    rejected_errors = (
+        rejected.get("analysis_error", pd.Series(index=rejected.index, dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    ) if not rejected.empty else pd.Series(dtype="object")
+    error_count = int(executed_errors.ne("").sum() + rejected_errors.ne("").sum())
+    if error_count:
+        st.warning(f"{error_count} row(s) could not be fully analyzed. See the detailed tables for the error text.")
+
+    st.markdown("### Executed Trade Path")
+    st.markdown(
+        '<div class="xray-section-note">Peak and adverse values are measured while the trade was open. Post-exit values use the selected future window.</div>',
+        unsafe_allow_html=True,
+    )
+    if executed.empty:
+        st.info("No closed trades were recorded for this date.")
+    else:
+        executed_columns = [
+            "symbol",
+            "trading_symbol",
+            "realized_pnl",
+            "max_favorable_pnl",
+            "max_adverse_pnl",
+            "max_favorable_points",
+            "max_adverse_points",
+            "profit_given_back_from_peak",
+            "exit_reason",
+            "post_exit_best_pnl_from_entry",
+            "post_exit_planned_level_outcome",
+            "recovered_to_entry_after_exit",
+            "analysis_error",
+        ]
+        executed_columns = [column for column in executed_columns if column in executed.columns]
+        st.dataframe(executed[executed_columns], use_container_width=True, hide_index=True)
+
+    st.markdown("### Rejected Signal Follow-Through")
+    st.markdown(
+        '<div class="xray-section-note">Each saved directional rejection is followed through for the selected number of five-minute candles. Repeated checks can overlap and are not independent trades.</div>',
+        unsafe_allow_html=True,
+    )
+    if rejected.empty:
+        st.info("No saved directional rejected signals were available for this date.")
+    else:
+        rejected_columns = [
+            "signal_time",
+            "symbol",
+            "direction",
+            "trading_symbol",
+            "weighted_score",
+            "forward_outcome",
+            "max_favorable_pnl",
+            "max_adverse_pnl",
+            "max_favorable_points",
+            "max_adverse_points",
+            "rejection_reason",
+            "analysis_error",
+        ]
+        rejected_columns = [column for column in rejected_columns if column in rejected.columns]
+        st.dataframe(rejected[rejected_columns], use_container_width=True, hide_index=True)
+        if "forward_outcome" in rejected.columns:
+            outcome_chart = rejected["forward_outcome"].fillna("UNKNOWN").value_counts()
+            st.bar_chart(outcome_chart)
+
+    st.caption(str(summary.get("caveat") or ""))
+    with st.expander("Generated report files"):
+        st.write(
+            {
+                "executed_trades": str(executed_file),
+                "rejected_signals": str(rejected_file),
+                "summary": str(summary_file),
+            }
+        )
+
+
 load_env()
 
-if st.button("Refresh Dashboard", use_container_width=True):
-    st.rerun()
+dashboard_tab, forensic_report_tab = st.tabs(["Dashboard", "Trade Forensics"])
 
-st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
-st.markdown('<div class="dash-subtitle">NIFTY and BANKNIFTY option-buy performance</div>', unsafe_allow_html=True)
+with dashboard_tab:
+    if st.button("Refresh Dashboard", use_container_width=True):
+        st.rerun()
 
-performance = api_build_trade_performance()
-live = api_build_live_positions()
-today = performance.get("today", {})
-cumulative = performance.get("cumulative", {})
-today_symbol = today.get("symbolPnL", {})
-cumulative_symbol = cumulative.get("symbolPnL", {})
-symbol_trades = today.get("symbolTrades", {})
-positions = live.get("positions", [])
+    st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
+    st.markdown('<div class="dash-subtitle">NIFTY and BANKNIFTY option-buy performance</div>', unsafe_allow_html=True)
 
-def open_for(symbol):
-    matching = [p for p in positions if symbol in str(p.get("underlyingSymbol", "")).upper()]
-    return sum(float(p.get("livePnL") or 0) for p in matching), len(matching)
+    performance = api_build_trade_performance()
+    live = api_build_live_positions()
+    today = performance.get("today", {})
+    cumulative = performance.get("cumulative", {})
+    today_symbol = today.get("symbolPnL", {})
+    cumulative_symbol = cumulative.get("symbolPnL", {})
+    symbol_trades = today.get("symbolTrades", {})
+    positions = live.get("positions", [])
 
-overall_today = float(today.get("closedPnL", 0) or 0) + float(live.get("totalLivePnL", 0) or 0)
+    def open_for(symbol):
+        matching = [p for p in positions if symbol in str(p.get("underlyingSymbol", "")).upper()]
+        return sum(float(p.get("livePnL") or 0) for p in matching), len(matching)
 
-st.markdown("### Overall")
-overall_cols = st.columns(6)
-overall_cols[0].metric("Today P&L", money(overall_today))
-overall_cols[1].metric("Today Trades", today.get("closedTrades", 0))
-overall_cols[2].metric("Open Trades", live.get("openTradeCount", 0))
-overall_cols[3].metric("Cumulative P&L", money(cumulative.get("totalPnL", 0)))
-overall_cols[4].metric("Avg Profit / Win", money(cumulative.get("averageProfitPerWinningTrade", 0)))
-overall_cols[5].metric("Avg Loss / Loss", money(-float(cumulative.get("averageLossPerLosingTrade", 0) or 0)))
+    overall_today = float(today.get("closedPnL", 0) or 0) + float(live.get("totalLivePnL", 0) or 0)
 
-st.markdown("### NIFTY and BANKNIFTY")
-for symbol in SYMBOLS:
-    open_pnl, open_count = open_for(symbol)
-    cols = st.columns(6)
-    cols[0].metric(f"{symbol} Today", money(today_symbol.get(symbol, 0)))
-    cols[1].metric(f"{symbol} Trades", symbol_trades.get(symbol, 0))
-    cols[2].metric(f"{symbol} Open P&L", money(open_pnl))
-    cols[3].metric(f"{symbol} Open Trades", open_count)
-    cols[4].metric(f"{symbol} Cumulative", money(cumulative_symbol.get(symbol, 0)))
-    cols[5].metric(f"{symbol} Total Today", money(float(today_symbol.get(symbol, 0) or 0) + open_pnl))
+    st.markdown("### Overall")
+    overall_cols = st.columns(6)
+    overall_cols[0].metric("Today P&L", money(overall_today))
+    overall_cols[1].metric("Today Trades", today.get("closedTrades", 0))
+    overall_cols[2].metric("Open Trades", live.get("openTradeCount", 0))
+    overall_cols[3].metric("Cumulative P&L", money(cumulative.get("totalPnL", 0)))
+    overall_cols[4].metric("Avg Profit / Win", money(cumulative.get("averageProfitPerWinningTrade", 0)))
+    overall_cols[5].metric("Avg Loss / Loss", money(-float(cumulative.get("averageLossPerLosingTrade", 0) or 0)))
 
-if live.get("error"):
-    st.warning(live["error"])
-if today.get("closedPnLSource") != "UPSTOX":
-    st.warning("Today’s realized P&L is currently unavailable from Upstox.")
+    st.markdown("### NIFTY and BANKNIFTY")
+    for symbol in SYMBOLS:
+        open_pnl, open_count = open_for(symbol)
+        cols = st.columns(6)
+        cols[0].metric(f"{symbol} Today", money(today_symbol.get(symbol, 0)))
+        cols[1].metric(f"{symbol} Trades", symbol_trades.get(symbol, 0))
+        cols[2].metric(f"{symbol} Open P&L", money(open_pnl))
+        cols[3].metric(f"{symbol} Open Trades", open_count)
+        cols[4].metric(f"{symbol} Cumulative", money(cumulative_symbol.get(symbol, 0)))
+        cols[5].metric(f"{symbol} Total Today", money(float(today_symbol.get(symbol, 0) or 0) + open_pnl))
+
+    if live.get("error"):
+        st.warning(live["error"])
+    if today.get("closedPnLSource") != "UPSTOX":
+        st.warning("Today’s realized P&L is currently unavailable from Upstox.")
+
+with forensic_report_tab:
+    render_trade_forensics_dashboard()
