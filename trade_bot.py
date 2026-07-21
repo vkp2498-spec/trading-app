@@ -117,6 +117,20 @@ DEFAULT_INDEX_EXIT_POINTS = {
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
+DEFAULT_INDEX_RR_LOW_THRESHOLD = 0.10
+DEFAULT_INDEX_RR_MID_THRESHOLD = 0.40
+DEFAULT_INDEX_RR_PROFILE_POINTS = {
+    "NIFTY": {
+        "LOW": {"target": 10.0, "stop": 10.0, "trailing": False},
+        "MID": {"target": 20.0, "stop": 20.0, "trailing": False},
+        "HIGH": {"target": 30.0, "stop": 30.0, "trailing": True},
+    },
+    "BANKNIFTY": {
+        "LOW": {"target": 20.0, "stop": 20.0, "trailing": False},
+        "MID": {"target": 30.0, "stop": 30.0, "trailing": False},
+        "HIGH": {"target": 60.0, "stop": 60.0, "trailing": True},
+    },
+}
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = 1.0
@@ -288,6 +302,62 @@ def option_levels_from_index_points(
     }
 
 
+def index_rr_profiles_enabled():
+    return os.getenv("INDEX_RR_PROFILE_ENABLED", "true").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def index_rr_profile_for(symbol, technical_reward_risk):
+    """Choose the index-option exit profile from reachable technical RR.
+
+    The profile changes target/stop size, not signal quality. A positive but
+    small reachable RR becomes a small fixed shot; wider headroom keeps the
+    normal runner/trailing behavior.
+    """
+    if not index_rr_profiles_enabled() or symbol not in DEFAULT_INDEX_RR_PROFILE_POINTS:
+        return None
+
+    rr = float(technical_reward_risk or 0)
+    low_threshold = configured_non_negative_float(
+        "INDEX_RR_LOW_THRESHOLD", DEFAULT_INDEX_RR_LOW_THRESHOLD
+    )
+    mid_threshold = configured_non_negative_float(
+        "INDEX_RR_MID_THRESHOLD", DEFAULT_INDEX_RR_MID_THRESHOLD
+    )
+    if rr < low_threshold:
+        profile_key = "LOW"
+        profile_name = "SINGLE"
+    elif rr < mid_threshold:
+        profile_key = "MID"
+        profile_name = "DOUBLE"
+    else:
+        profile_key = "HIGH"
+        profile_name = "BOUNDARY"
+
+    defaults = DEFAULT_INDEX_RR_PROFILE_POINTS[symbol][profile_key]
+    target_points = configured_positive_float(
+        f"{symbol}_RR_{profile_key}_TARGET_POINTS", defaults["target"]
+    )
+    stop_points = configured_positive_float(
+        f"{symbol}_RR_{profile_key}_STOP_POINTS", defaults["stop"]
+    )
+    trailing_env = os.getenv(f"{symbol}_RR_{profile_key}_TRAILING_ENABLED")
+    trailing_enabled = defaults["trailing"] if trailing_env is None else trailing_env.strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    return {
+        "key": profile_key,
+        "name": profile_name,
+        "technical_reward_risk": round(rr, 4),
+        "target_points": target_points,
+        "stop_points": stop_points,
+        "trailing_enabled": trailing_enabled,
+        "low_threshold": low_threshold,
+        "mid_threshold": mid_threshold,
+    }
+
+
 def evaluate_trade_feasibility(
     direction,
     entry_price,
@@ -295,6 +365,7 @@ def evaluate_trade_feasibility(
     stop_loss,
     technicals,
     transaction_type="BUY",
+    symbol=None,
 ):
     entry = float(entry_price)
     target = float(proposed_target)
@@ -382,7 +453,26 @@ def evaluate_trade_feasibility(
         }
     )
 
-    if reward <= 0 or reward_risk < min_rr:
+    if reward <= 0:
+        result["reasons"].append(
+            f"Technical reward/risk {reward_risk:.2f} has no positive reachable reward; "
+            f"{limiting_timeframe} target={reachable_target:.2f}"
+        )
+        return result
+
+    exit_profile = index_rr_profile_for(symbol, reward_risk)
+    if exit_profile:
+        result["allowed"] = True
+        result["exit_profile"] = exit_profile
+        result["reasons"].append(
+            f"Technical reward/risk {reward_risk:.2f} selected {exit_profile['name']} profile; "
+            f"target_points={exit_profile['target_points']:.0f} "
+            f"stop_points={exit_profile['stop_points']:.0f} "
+            f"trailing={'on' if exit_profile['trailing_enabled'] else 'off'}"
+        )
+        return result
+
+    if reward_risk < min_rr:
         result["reasons"].append(
             f"Technical reward/risk {reward_risk:.2f} is below required {min_rr:.2f}; "
             f"{limiting_timeframe} target={reachable_target:.2f}"
@@ -436,6 +526,7 @@ def revalidate_option_after_fill(
         stop,
         recalculated_technicals,
         transaction_type="BUY",
+        symbol=symbol,
     )
     recalculated_technicals["trade_feasibility"] = feasibility
     return {
@@ -1596,6 +1687,8 @@ def save_open_position_state(
     target_points=None,
     stop_points=None,
     option_delta_used=None,
+    exit_profile=None,
+    profit_protection_enabled_for_trade=None,
 ):
     entry_transaction_type = str(entry_transaction_type).upper()
     if target_percent is not None and stop_percent is not None:
@@ -1667,6 +1760,12 @@ def save_open_position_state(
         "target_points": target_points,
         "stop_points": stop_points,
         "option_delta_used": option_delta_used,
+        "exit_profile": exit_profile or {},
+        "profit_protection_enabled_for_trade": (
+            bool(profit_protection_enabled_for_trade)
+            if profit_protection_enabled_for_trade is not None
+            else True
+        ),
         "status": "POSITION_OPEN",
         "created_at": now_ist().isoformat(),
         "highest_ltp": round(float(entry_price), 2),
@@ -2060,6 +2159,8 @@ def handle_existing_state(symbol, state, verbose=True):
                 target_points=state.get("target_points"),
                 stop_points=state.get("stop_points"),
                 option_delta_used=state.get("option_delta_used"),
+                exit_profile=state.get("exit_profile", {}),
+                profit_protection_enabled_for_trade=state.get("profit_protection_enabled_for_trade", True),
             )
             state = read_state(symbol)
             if instrument_class == "STOCK_OPTION":
@@ -2144,6 +2245,8 @@ def handle_existing_state(symbol, state, verbose=True):
                     "stop_loss_price": post_fill["stop_loss_price"],
                     "original_stop_loss_price": post_fill["stop_loss_price"],
                     "technical_context": post_fill["technicals"],
+                    "exit_profile": state.get("exit_profile", {}),
+                    "profit_protection_enabled_for_trade": state.get("profit_protection_enabled_for_trade", True),
                 }
             )
             write_state(symbol, state)
@@ -2281,6 +2384,8 @@ def apply_trailing_stop(symbol, state, ltp):
 
     settings = profit_protection_settings()
     if not settings["enabled"]:
+        return state
+    if state.get("profit_protection_enabled_for_trade") is False:
         return state
 
     entry = to_float(state.get("entry_price"))
@@ -2738,6 +2843,7 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         stop,
         technicals,
         transaction_type=transaction_type,
+        symbol=symbol,
     )
     technicals["trade_feasibility"] = feasibility
     option_summary["trade_feasibility"] = feasibility
@@ -2752,9 +2858,35 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             "weighted": weighted,
         }, None
 
+    exit_profile = feasibility.get("exit_profile") or {}
+    if exit_profile:
+        levels = option_levels_from_index_points(
+            symbol,
+            entry_price,
+            target_points=exit_profile["target_points"],
+            stop_points=exit_profile["stop_points"],
+            delta=levels["delta"],
+        )
+        target = levels["target_price"]
+        stop = levels["stop_loss_price"]
+        option_summary.update(
+            {
+                "target_price": target,
+                "stop_loss_price": stop,
+                "target_points": levels["target_points"],
+                "stop_points": levels["stop_points"],
+                "option_delta_used": levels["delta"],
+                "exit_profile": exit_profile,
+            }
+        )
+
     return {
         "allowed": True,
-        "reason": "qualified",
+        "reason": (
+            "qualified"
+            if not exit_profile
+            else f"qualified profile={exit_profile.get('name')} rr={exit_profile.get('technical_reward_risk')}"
+        ),
         "transaction_type": transaction_type,
         "instrument": instrument,
         "entry_price": entry_price,
@@ -2765,6 +2897,10 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         "target_points": levels["target_points"],
         "stop_points": levels["stop_points"],
         "option_delta_used": levels["delta"],
+        "exit_profile": exit_profile,
+        "profit_protection_enabled_for_trade": (
+            bool(exit_profile.get("trailing_enabled")) if exit_profile else True
+        ),
         "technicals": technicals,
         "option_summary": option_summary,
         "weighted": weighted,
@@ -3023,7 +3159,9 @@ def execute_selected_candidate(chosen):
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
     log(
         f"{symbol} selected {transaction_type}: {instrument['trading_symbol']} qty={quantity} "
-        f"entry={entry_price} target={target} stop={stop} live={live}"
+        f"entry={entry_price} target={target} stop={stop} "
+        f"profile={(chosen.get('exit_profile') or {}).get('name', 'DEFAULT')} "
+        f"trailing={chosen.get('profit_protection_enabled_for_trade', True)} live={live}"
     )
     if not live:
         dry_run_note = " (dry run)"
@@ -3069,6 +3207,11 @@ def execute_selected_candidate(chosen):
             "entry_price": entry_price,
             "target_price": target,
             "stop_loss_price": stop,
+            "target_points": chosen["target_points"],
+            "stop_points": chosen["stop_points"],
+            "option_delta_used": chosen["option_delta_used"],
+            "exit_profile": chosen.get("exit_profile", {}),
+            "profit_protection_enabled_for_trade": chosen.get("profit_protection_enabled_for_trade", True),
             "direction": direction,
             "confidence": confidence,
             "score": score,
@@ -3098,6 +3241,8 @@ def execute_selected_candidate(chosen):
             "target_points": chosen["target_points"],
             "stop_points": chosen["stop_points"],
             "option_delta_used": chosen["option_delta_used"],
+            "exit_profile": chosen.get("exit_profile", {}),
+            "profit_protection_enabled_for_trade": chosen.get("profit_protection_enabled_for_trade", True),
             "option_type": chosen.get("option_summary", {}).get("option_type"),
             "technical_context": chosen.get("technicals", {}),
             "direction": direction,
@@ -3119,6 +3264,8 @@ def execute_selected_candidate(chosen):
         target_points=chosen["target_points"],
         stop_points=chosen["stop_points"],
         option_delta_used=chosen["option_delta_used"],
+        exit_profile=chosen.get("exit_profile", {}),
+        profit_protection_enabled_for_trade=chosen.get("profit_protection_enabled_for_trade", True),
     )
 
     post_fill = revalidate_option_after_fill(
@@ -3174,6 +3321,8 @@ def execute_selected_candidate(chosen):
             "stop_loss_price": post_fill["stop_loss_price"],
             "original_stop_loss_price": post_fill["stop_loss_price"],
             "technical_context": post_fill["technicals"],
+            "exit_profile": chosen.get("exit_profile", {}),
+            "profit_protection_enabled_for_trade": chosen.get("profit_protection_enabled_for_trade", True),
         }
     )
     write_state(symbol, state)

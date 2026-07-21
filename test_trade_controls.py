@@ -832,6 +832,69 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["adjusted_target_price"], 110)
         self.assertEqual(result["technical_reward_risk"], 1.25)
 
+    def test_low_reward_risk_selects_single_profile_without_trailing(self):
+        with patch.dict(os.environ, {"INDEX_RR_PROFILE_ENABLED": "true"}, clear=False):
+            result = trade_bot.evaluate_trade_feasibility(
+                "BEARISH",
+                100,
+                115,
+                85,
+                {
+                    "atm_option_flow": {"close": 100},
+                    "five_min": {"bias": "BEARISH", "option_target_price": 101},
+                    "fifteen_min": {"bias": "BEARISH", "option_target_price": 102},
+                },
+                symbol="NIFTY",
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["technical_reward_risk"], 0.07)
+        self.assertEqual(result["exit_profile"]["name"], "SINGLE")
+        self.assertEqual(result["exit_profile"]["target_points"], 10)
+        self.assertFalse(result["exit_profile"]["trailing_enabled"])
+
+    def test_mid_reward_risk_selects_double_profile_without_trailing(self):
+        with patch.dict(os.environ, {"INDEX_RR_PROFILE_ENABLED": "true"}, clear=False):
+            result = trade_bot.evaluate_trade_feasibility(
+                "BULLISH",
+                100,
+                115,
+                85,
+                {
+                    "atm_option_flow": {"close": 100},
+                    "five_min": {"bias": "BULLISH", "option_target_price": 104},
+                    "fifteen_min": {"bias": "BULLISH", "option_target_price": 106},
+                },
+                symbol="NIFTY",
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["technical_reward_risk"], 0.27)
+        self.assertEqual(result["exit_profile"]["name"], "DOUBLE")
+        self.assertEqual(result["exit_profile"]["target_points"], 20)
+        self.assertFalse(result["exit_profile"]["trailing_enabled"])
+
+    def test_high_reward_risk_selects_boundary_profile_with_trailing(self):
+        with patch.dict(os.environ, {"INDEX_RR_PROFILE_ENABLED": "true"}, clear=False):
+            result = trade_bot.evaluate_trade_feasibility(
+                "BULLISH",
+                100,
+                130,
+                85,
+                {
+                    "atm_option_flow": {"close": 100},
+                    "five_min": {"bias": "BULLISH", "option_target_price": 112},
+                    "fifteen_min": {"bias": "BULLISH", "option_target_price": 118},
+                },
+                symbol="BANKNIFTY",
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["technical_reward_risk"], 0.8)
+        self.assertEqual(result["exit_profile"]["name"], "BOUNDARY")
+        self.assertEqual(result["exit_profile"]["target_points"], 60)
+        self.assertTrue(result["exit_profile"]["trailing_enabled"])
+
     def test_capital_allocation_rounds_down_to_whole_lots(self):
         with patch.dict(
             os.environ,
@@ -951,6 +1014,27 @@ class TradeControlTests(unittest.TestCase):
                 }
                 updated = trade_bot.apply_trailing_stop("NIFTY", state, 121)
         self.assertEqual(updated["highest_ltp"], 100)
+        self.assertEqual(updated["stop_loss_price"], 90)
+
+    def test_trade_profile_can_disable_profit_protection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(trade_bot, "BASE_DIR", Path(temp_dir)),
+                patch.dict(os.environ, {"PROFIT_PROTECTION_ENABLED": "true"}),
+            ):
+                state = {
+                    "instrument_class": "INDEX_OPTION",
+                    "entry_transaction_type": "BUY",
+                    "entry_price": 100,
+                    "target_price": 130,
+                    "planned_target_price": 130,
+                    "stop_loss_price": 90,
+                    "highest_ltp": 100,
+                    "profit_protection_stage": 0,
+                    "profit_protection_enabled_for_trade": False,
+                }
+                updated = trade_bot.apply_trailing_stop("NIFTY", state, 121)
+        self.assertEqual(updated["profit_protection_stage"], 0)
         self.assertEqual(updated["stop_loss_price"], 90)
 
     def test_stage_one_profit_protection_locks_twenty_percent(self):
