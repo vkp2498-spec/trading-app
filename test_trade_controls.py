@@ -213,7 +213,10 @@ class TradeControlTests(unittest.TestCase):
                 patch.object(
                     trade_bot,
                     "place_market_order",
-                    return_value=({"data": {"order_id": "ORDER-1"}}, {"quantity": 500}),
+                    return_value=(
+                        {"data": {"order_id": "ORDER-1"}},
+                        {"quantity": 500, "product": "D"},
+                    ),
                 ) as place_order,
                 patch.object(
                     trade_bot,
@@ -228,9 +231,53 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(place_order.call_args.args[2], 500)
+        self.assertEqual(place_order.call_args.kwargs["product"], "D")
         self.assertEqual(state["quantity"], 500)
+        self.assertEqual(state["order_product"], "D")
         self.assertEqual(state["target_price"], 110.0)
         self.assertEqual(state["stop_loss_price"], 90.0)
+
+    def test_rejected_stock_option_entry_clears_state(self):
+        chosen = {
+            "underlying_symbol": "RELIANCE",
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "signal_score": 4,
+            "entry_price": 100,
+            "instrument": {
+                "instrument_key": "NSE_FO|TEST",
+                "trading_symbol": "RELIANCE TEST CE",
+                "lot_size": 500,
+            },
+            "option_summary": {"option_type": "CE"},
+            "technicals": {},
+            "weighted": {"score": 85},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "stock-option-state.json"
+            guard_path = Path(temp_dir) / "stock-option-guard.json"
+            with (
+                patch.dict(os.environ, {"ENABLE_LIVE_TRADING": "true"}),
+                patch.object(trade_bot, "state_file", return_value=state_path),
+                patch.object(trade_bot, "reentry_guard_file", return_value=guard_path),
+                patch.object(
+                    trade_bot,
+                    "place_market_order",
+                    return_value=(
+                        {"data": {"order_id": "ORDER-REJECTED"}},
+                        {"quantity": 500, "product": "D"},
+                    ),
+                ),
+                patch.object(
+                    trade_bot,
+                    "wait_for_order_complete",
+                    return_value={"status": "rejected", "status_message": "Intraday buy orders can't be placed for options."},
+                ),
+            ):
+                result = trade_bot.execute_stock_option_candidate(chosen)
+
+            self.assertFalse(result)
+            self.assertEqual(json.loads(state_path.read_text()), {})
 
     def test_live_daily_first_outcome_guard_is_independent_by_index(self):
         today = datetime(2026, 7, 20, 10, 0)

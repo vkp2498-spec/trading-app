@@ -1179,6 +1179,19 @@ def stock_option_rupee_levels(entry_price, quantity):
     }
 
 
+def stock_option_order_product():
+    """Return the broker product used for long stock-option orders.
+
+    Upstox rejects MIS/intraday option-buy orders for this account.  Keep the
+    product configurable, but default stock options to the normal delivery/
+    NRML-equivalent API product.  This does not change index-option orders.
+    """
+    product = os.getenv("STOCK_OPTION_ORDER_PRODUCT", "D").strip().upper()
+    if product not in {"D", "I"}:
+        raise RuntimeError("STOCK_OPTION_ORDER_PRODUCT must be D or I")
+    return product
+
+
 def max_lots_per_entry():
     """Optional hard ceiling; zero means no additional lot ceiling."""
     raw_value = os.getenv("MAX_LOTS_PER_ENTRY", "0").strip()
@@ -1219,10 +1232,10 @@ def order_quantity_for(
     return lot_size * max(lots, 0)
 
 
-def place_market_order(instrument, transaction_type, quantity):
+def place_market_order(instrument, transaction_type, quantity, product="I"):
     payload = {
         "quantity": int(quantity),
-        "product": "I",
+        "product": str(product).upper(),
         "validity": "DAY",
         "price": 0,
         "tag": "index_bot",
@@ -1888,6 +1901,11 @@ def handle_existing_state(symbol, state, verbose=True):
 
     entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
     exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
+    order_product = (
+        state.get("order_product")
+        if state.get("instrument_class") == "STOCK_OPTION"
+        else "I"
+    ) or stock_option_order_product()
 
     needs_broker_stop = entry_transaction == "SELL" or state.get("instrument_class") == "STOCK_FUTURE"
     if needs_broker_stop and protective_stop_filled(symbol, state):
@@ -1920,7 +1938,9 @@ def handle_existing_state(symbol, state, verbose=True):
             except Exception as error:
                 log(f"{symbol} CRITICAL: position has no broker stop; flattening now: {error}")
                 instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
-                result, payload = place_market_order(instrument, exit_transaction, qty)
+                result, payload = place_market_order(
+                    instrument, exit_transaction, qty, product=order_product
+                )
                 order_id = result.get("data", {}).get("order_id")
                 details = wait_for_order_complete(order_id) if order_id else {}
                 complete_exit(symbol, state, details, ltp, "PROTECTION_FAILURE", result, payload)
@@ -1982,7 +2002,9 @@ def handle_existing_state(symbol, state, verbose=True):
                 return True
 
             instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
-            result, payload = place_market_order(instrument, exit_transaction, qty)
+            result, payload = place_market_order(
+                instrument, exit_transaction, qty, product=order_product
+            )
             exit_order_id = result.get("data", {}).get("order_id")
             if not exit_order_id:
                 raise RuntimeError(f"{symbol} {exit_transaction} exit returned no order_id: {result}")
@@ -2088,7 +2110,7 @@ def handle_existing_state(symbol, state, verbose=True):
                     "trading_symbol": state.get("trading_symbol"),
                 }
                 exit_result, exit_payload = place_market_order(
-                    instrument, "SELL", quantity
+                    instrument, "SELL", quantity, product=order_product
                 )
                 exit_order_id = exit_result.get("data", {}).get("order_id")
                 if not exit_order_id:
@@ -2136,7 +2158,9 @@ def handle_existing_state(symbol, state, verbose=True):
                     ensure_protective_stop(symbol, state)
                 except Exception as error:
                     log(f"{symbol} CRITICAL: delayed fill has no broker stop; flattening: {error}")
-                    result, payload = place_market_order(instrument, exit_transaction, quantity)
+                    result, payload = place_market_order(
+                        instrument, exit_transaction, quantity, product=order_product
+                    )
                     exit_order_id = result.get("data", {}).get("order_id")
                     exit_details = wait_for_order_complete(exit_order_id) if exit_order_id else {}
                     complete_exit(
@@ -3231,7 +3255,10 @@ def execute_stock_option_candidate(chosen):
             log("STOCK_OPTION dry run only: ENABLE_LIVE_TRADING is not true; no order placed.")
             return False
 
-        result, payload = place_market_order(instrument, "BUY", quantity)
+        order_product = stock_option_order_product()
+        result, payload = place_market_order(
+            instrument, "BUY", quantity, product=order_product
+        )
         order_id = result.get("data", {}).get("order_id")
         if not order_id:
             raise RuntimeError(f"STOCK_OPTION BUY returned no order_id: {result}")
@@ -3246,6 +3273,7 @@ def execute_stock_option_candidate(chosen):
                 "buy_order_id": order_id,
                 "entry_transaction_type": "BUY",
                 "exit_transaction_type": "SELL",
+                "order_product": order_product,
                 "instrument_key": instrument["instrument_key"],
                 "trading_symbol": instrument.get("trading_symbol"),
                 "quantity": quantity,
@@ -3264,6 +3292,15 @@ def execute_stock_option_candidate(chosen):
     log(f"STOCK_OPTION MARKET BUY placed: order_id={order_id} payload={payload}")
     details = wait_for_order_complete(order_id)
     if not order_is_complete(details):
+        status = order_status(details)
+        if order_is_rejected(details):
+            clear_state(symbol)
+            clear_reentry_guard(symbol)
+            log(
+                f"STOCK_OPTION BUY rejected; state cleared: order_id={order_id} "
+                f"status={status} details={details}"
+            )
+            return False
         write_state(
             symbol,
             {
@@ -3275,6 +3312,7 @@ def execute_stock_option_candidate(chosen):
                 "buy_order_id": order_id,
                 "entry_transaction_type": "BUY",
                 "exit_transaction_type": "SELL",
+                "order_product": order_product,
                 "instrument_key": instrument["instrument_key"],
                 "trading_symbol": instrument.get("trading_symbol"),
                 "quantity": quantity,
@@ -3304,6 +3342,7 @@ def execute_stock_option_candidate(chosen):
     position = find_matching_position_for_side(instrument["instrument_key"], "BUY")
     fill = position_avg_price(position, "BUY") if position else None
     fill = fill or to_float(details.get("average_price")) or expected_entry
+    order_product = stock_option_order_product()
     levels = stock_option_rupee_levels(fill, quantity)
     save_open_position_state(
         symbol,
@@ -3323,6 +3362,7 @@ def execute_stock_option_candidate(chosen):
     state = read_state(symbol)
     state.update(
         {
+            "order_product": order_product,
             "option_type": chosen.get("option_summary", {}).get("option_type"),
             "technical_context": chosen.get("technicals", {}),
             "fixed_target_rupees": levels["target_rupees"],
