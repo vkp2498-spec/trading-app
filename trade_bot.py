@@ -1247,16 +1247,49 @@ def option_capital_per_entry():
     return capital
 
 
+def bounded_rupee_level(value, minimum, maximum):
+    value = float(value)
+    minimum = float(minimum)
+    maximum = float(maximum)
+    if minimum <= 0 or maximum <= 0:
+        raise RuntimeError("Stock-option min/max rupee levels must be positive")
+    if minimum > maximum:
+        raise RuntimeError("Stock-option min rupee level cannot exceed max rupee level")
+    return min(max(value, minimum), maximum)
+
+
 def stock_option_rupee_levels(entry_price, quantity):
-    """Convert fixed one-lot rupee reward/risk into option-premium levels."""
+    """Convert one-lot stock-option value into premium target/stop levels."""
     entry = float(entry_price)
     quantity = int(quantity)
     if entry <= 0 or quantity <= 0:
         raise RuntimeError("Stock-option entry price and quantity must be positive")
-    target_rupees = configured_non_negative_float("STOCK_OPTION_TARGET_RUPEES", 5000.0)
-    stop_rupees = configured_non_negative_float("STOCK_OPTION_STOP_RUPEES", 5000.0)
+
+    mode = os.getenv("STOCK_OPTION_LEVEL_MODE", "percent").strip().lower()
+    position_value = entry * quantity
+    if mode == "fixed":
+        target_rupees = configured_non_negative_float("STOCK_OPTION_TARGET_RUPEES", 5000.0)
+        stop_rupees = configured_non_negative_float("STOCK_OPTION_STOP_RUPEES", 5000.0)
+        target_percent = None
+        stop_percent = None
+    elif mode in {"percent", "value_percent", "value"}:
+        target_percent = configured_positive_float("STOCK_OPTION_TARGET_VALUE_PERCENT", 6.0)
+        stop_percent = configured_positive_float("STOCK_OPTION_STOP_VALUE_PERCENT", 4.0)
+        target_rupees = bounded_rupee_level(
+            position_value * target_percent / 100.0,
+            configured_positive_float("STOCK_OPTION_MIN_TARGET_RUPEES", 2000.0),
+            configured_positive_float("STOCK_OPTION_MAX_TARGET_RUPEES", 7000.0),
+        )
+        stop_rupees = bounded_rupee_level(
+            position_value * stop_percent / 100.0,
+            configured_positive_float("STOCK_OPTION_MIN_STOP_RUPEES", 1500.0),
+            configured_positive_float("STOCK_OPTION_MAX_STOP_RUPEES", 5000.0),
+        )
+    else:
+        raise RuntimeError("STOCK_OPTION_LEVEL_MODE must be 'percent' or 'fixed'")
+
     if target_rupees <= 0 or stop_rupees <= 0:
-        raise RuntimeError("STOCK_OPTION_TARGET_RUPEES and STOCK_OPTION_STOP_RUPEES must be positive")
+        raise RuntimeError("Stock-option target and stop rupees must be positive")
     tick = configured_non_negative_float("STOCK_OPTION_TICK_SIZE", 0.05) or 0.05
 
     def rounded(value):
@@ -1265,8 +1298,23 @@ def stock_option_rupee_levels(entry_price, quantity):
     return {
         "target_price": rounded(entry + target_rupees / quantity),
         "stop_loss_price": max(rounded(entry - stop_rupees / quantity), tick),
-        "target_rupees": target_rupees,
-        "stop_rupees": stop_rupees,
+        "target_rupees": round(target_rupees, 2),
+        "stop_rupees": round(stop_rupees, 2),
+        "level_mode": "fixed" if mode == "fixed" else "percent",
+        "position_value": round(position_value, 2),
+        "target_value_percent": target_percent,
+        "stop_value_percent": stop_percent,
+    }
+
+
+def stock_option_level_state_fields(levels):
+    return {
+        "fixed_target_rupees": levels["target_rupees"],
+        "fixed_stop_rupees": levels["stop_rupees"],
+        "stock_option_level_mode": levels.get("level_mode"),
+        "stock_option_position_value": levels.get("position_value"),
+        "stock_option_target_value_percent": levels.get("target_value_percent"),
+        "stock_option_stop_value_percent": levels.get("stop_value_percent"),
     }
 
 
@@ -2168,8 +2216,7 @@ def handle_existing_state(symbol, state, verbose=True):
                     {
                         "option_type": pending_option_type,
                         "technical_context": pending_technical_context,
-                        "fixed_target_rupees": fixed_levels["target_rupees"],
-                        "fixed_stop_rupees": fixed_levels["stop_rupees"],
+                        **stock_option_level_state_fields(fixed_levels),
                     }
                 )
                 write_state(symbol, state)
@@ -2303,28 +2350,79 @@ def profit_booking_mode():
     return mode
 
 
-def profit_protection_settings():
+def env_bool_with_fallback(primary, fallback, default="true"):
+    raw = os.getenv(primary)
+    if raw is None:
+        raw = os.getenv(fallback, default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+
+def profit_protection_settings(instrument_class=None):
     """Return validated, staged profit-protection thresholds."""
-    enabled = os.getenv("PROFIT_PROTECTION_ENABLED", "true").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    is_stock_option = instrument_class == "STOCK_OPTION"
+    prefix = "STOCK_OPTION_" if is_stock_option else ""
+    enabled = env_bool_with_fallback(
+        f"{prefix}PROFIT_PROTECTION_ENABLED",
+        "PROFIT_PROTECTION_ENABLED",
+        "true",
+    )
+    def positive_setting(primary, fallback, stock_default, normal_default):
+        if os.getenv(primary) is not None:
+            return configured_positive_float(primary, stock_default)
+        if is_stock_option:
+            return stock_default
+        return configured_positive_float(fallback, normal_default)
+
+    def non_negative_setting(primary, fallback, stock_default, normal_default):
+        if os.getenv(primary) is not None:
+            return configured_non_negative_float(primary, stock_default)
+        if is_stock_option:
+            return stock_default
+        return configured_non_negative_float(fallback, normal_default)
+
+    booking_trigger = (
+        positive_setting(
+            "STOCK_OPTION_PROFIT_BOOKING_TARGET_PERCENT",
+            "PROFIT_BOOKING_TARGET_PERCENT",
+            90.0,
+            80.0,
+        )
+        if is_stock_option
+        else profit_booking_target_percent()
+    )
     settings = {
         "enabled": enabled,
-        "stage_one_trigger": configured_positive_float(
-            "PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT", 60.0
+        "stage_one_trigger": positive_setting(
+            f"{prefix}PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT",
+            "PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT",
+            70.0,
+            60.0,
         ),
-        "stage_one_lock": configured_non_negative_float(
-            "PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT", 20.0
+        "stage_one_lock": non_negative_setting(
+            f"{prefix}PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT",
+            "PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT",
+            15.0,
+            20.0,
         ),
-        "stage_two_trigger": configured_positive_float(
-            "PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT", 70.0
+        "stage_two_trigger": positive_setting(
+            f"{prefix}PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT",
+            "PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT",
+            85.0,
+            70.0,
         ),
-        "stage_two_lock": configured_non_negative_float(
-            "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT", 35.0
+        "stage_two_lock": non_negative_setting(
+            f"{prefix}PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT",
+            "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT",
+            35.0,
+            35.0,
         ),
-        "booking_trigger": profit_booking_target_percent(),
-        "runner_lock": configured_non_negative_float(
-            "PROFIT_RUNNER_LOCK_PERCENT", 55.0
+        "booking_trigger": booking_trigger,
+        "runner_lock": non_negative_setting(
+            f"{prefix}PROFIT_RUNNER_LOCK_PERCENT",
+            "PROFIT_RUNNER_LOCK_PERCENT",
+            45.0,
+            55.0,
         ),
     }
     if not (
@@ -2382,7 +2480,7 @@ def apply_trailing_stop(symbol, state, ltp):
     }:
         return state
 
-    settings = profit_protection_settings()
+    settings = profit_protection_settings(state.get("instrument_class"))
     if not settings["enabled"]:
         return state
     if state.get("profit_protection_enabled_for_trade") is False:
@@ -3372,7 +3470,8 @@ def execute_stock_option_candidate(chosen):
         f"STOCK_OPTION selected: {chosen['direction']} "
         f"{instrument.get('trading_symbol')} qty={quantity} entry={expected_entry} "
         f"target={levels['target_price']} stop={levels['stop_loss_price']} "
-        f"score={chosen.get('weighted', {}).get('score')} live={live}"
+        f"target_rupees={levels['target_rupees']} stop_rupees={levels['stop_rupees']} "
+        f"mode={levels.get('level_mode')} score={chosen.get('weighted', {}).get('score')} live={live}"
     )
     chosen = dict(chosen)
     chosen.setdefault("symbol", STOCK_OPTION_STATE)
@@ -3430,6 +3529,7 @@ def execute_stock_option_candidate(chosen):
                 "entry_price": expected_entry,
                 "target_price": levels["target_price"],
                 "stop_loss_price": levels["stop_loss_price"],
+                **stock_option_level_state_fields(levels),
                 "direction": chosen["direction"],
                 "confidence": chosen["confidence"],
                 "score": chosen["signal_score"],
@@ -3470,8 +3570,7 @@ def execute_stock_option_candidate(chosen):
                 "entry_price": expected_entry,
                 "target_price": levels["target_price"],
                 "stop_loss_price": levels["stop_loss_price"],
-                "fixed_target_rupees": levels["target_rupees"],
-                "fixed_stop_rupees": levels["stop_rupees"],
+                **stock_option_level_state_fields(levels),
                 "option_type": chosen.get("option_summary", {}).get("option_type"),
                 "technical_context": chosen.get("technicals", {}),
                 "direction": chosen["direction"],
@@ -3514,8 +3613,7 @@ def execute_stock_option_candidate(chosen):
             "order_product": order_product,
             "option_type": chosen.get("option_summary", {}).get("option_type"),
             "technical_context": chosen.get("technicals", {}),
-            "fixed_target_rupees": levels["target_rupees"],
-            "fixed_stop_rupees": levels["stop_rupees"],
+            **stock_option_level_state_fields(levels),
             "mover_type": chosen.get("mover_type"),
             "mover_change_percent": chosen.get("mover_change_percent"),
             "weighted_score": candidate_weighted_score(chosen),

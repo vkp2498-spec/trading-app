@@ -166,10 +166,11 @@ class TradeControlTests(unittest.TestCase):
         )
         self.assertTrue(all(row["intraday_score"] > 0 for row in setups))
 
-    def test_stock_option_levels_equal_configured_one_lot_rupee_risk(self):
+    def test_stock_option_levels_equal_configured_one_lot_rupee_risk_in_fixed_mode(self):
         with patch.dict(
             os.environ,
             {
+                "STOCK_OPTION_LEVEL_MODE": "fixed",
                 "STOCK_OPTION_TARGET_RUPEES": "5000",
                 "STOCK_OPTION_STOP_RUPEES": "5000",
             },
@@ -177,6 +178,49 @@ class TradeControlTests(unittest.TestCase):
             levels = trade_bot.stock_option_rupee_levels(100, 500)
         self.assertEqual(levels["target_price"], 110.0)
         self.assertEqual(levels["stop_loss_price"], 90.0)
+        self.assertEqual(levels["level_mode"], "fixed")
+
+    def test_stock_option_levels_use_position_value_percent_with_guardrails(self):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_OPTION_LEVEL_MODE": "percent",
+                "STOCK_OPTION_TARGET_VALUE_PERCENT": "6",
+                "STOCK_OPTION_STOP_VALUE_PERCENT": "4",
+                "STOCK_OPTION_MIN_TARGET_RUPEES": "2000",
+                "STOCK_OPTION_MAX_TARGET_RUPEES": "7000",
+                "STOCK_OPTION_MIN_STOP_RUPEES": "1500",
+                "STOCK_OPTION_MAX_STOP_RUPEES": "5000",
+            },
+            clear=False,
+        ):
+            levels = trade_bot.stock_option_rupee_levels(100, 500)
+        self.assertEqual(levels["target_price"], 106.0)
+        self.assertEqual(levels["stop_loss_price"], 96.0)
+        self.assertEqual(levels["target_rupees"], 3000.0)
+        self.assertEqual(levels["stop_rupees"], 2000.0)
+        self.assertEqual(levels["position_value"], 50000.0)
+        self.assertEqual(levels["level_mode"], "percent")
+
+    def test_stock_option_levels_cap_large_position_value_risk(self):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_OPTION_LEVEL_MODE": "percent",
+                "STOCK_OPTION_TARGET_VALUE_PERCENT": "6",
+                "STOCK_OPTION_STOP_VALUE_PERCENT": "4",
+                "STOCK_OPTION_MIN_TARGET_RUPEES": "2000",
+                "STOCK_OPTION_MAX_TARGET_RUPEES": "7000",
+                "STOCK_OPTION_MIN_STOP_RUPEES": "1500",
+                "STOCK_OPTION_MAX_STOP_RUPEES": "5000",
+            },
+            clear=False,
+        ):
+            levels = trade_bot.stock_option_rupee_levels(500, 1000)
+        self.assertEqual(levels["target_price"], 507.0)
+        self.assertEqual(levels["stop_loss_price"], 495.0)
+        self.assertEqual(levels["target_rupees"], 7000.0)
+        self.assertEqual(levels["stop_rupees"], 5000.0)
 
     def test_stock_option_execution_uses_exactly_one_lot(self):
         chosen = {
@@ -204,6 +248,7 @@ class TradeControlTests(unittest.TestCase):
                     os.environ,
                     {
                         "ENABLE_LIVE_TRADING": "true",
+                        "STOCK_OPTION_LEVEL_MODE": "fixed",
                         "STOCK_OPTION_TARGET_RUPEES": "5000",
                         "STOCK_OPTION_STOP_RUPEES": "5000",
                     },
@@ -1058,7 +1103,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(updated["stop_loss_price"], 106)
         self.assertEqual(updated["target_progress_percent"], 60)
 
-    def test_stage_two_profit_protection_never_moves_stop_backwards(self):
+    def test_stock_option_profit_protection_uses_softer_default_locks(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch.object(trade_bot, "BASE_DIR", Path(temp_dir)),
@@ -1070,14 +1115,18 @@ class TradeControlTests(unittest.TestCase):
                     "entry_price": 100,
                     "target_price": 130,
                     "planned_target_price": 130,
-                    "stop_loss_price": 108,
-                    "highest_ltp": 118,
-                    "profit_protection_stage": 1,
+                    "stop_loss_price": 90,
+                    "highest_ltp": 100,
+                    "profit_protection_stage": 0,
                 }
-                updated = trade_bot.apply_trailing_stop("STOCK_OPTION", state, 121)
-                unchanged = trade_bot.apply_trailing_stop("STOCK_OPTION", updated, 119)
-        self.assertEqual(updated["profit_protection_stage"], 2)
-        self.assertEqual(updated["stop_loss_price"], 110.5)
+                stage_one = trade_bot.apply_trailing_stop("STOCK_OPTION", state, 121)
+                stage_one_snapshot = dict(stage_one)
+                stage_two = trade_bot.apply_trailing_stop("STOCK_OPTION", stage_one, 126)
+                unchanged = trade_bot.apply_trailing_stop("STOCK_OPTION", stage_two, 119)
+        self.assertEqual(stage_one_snapshot["profit_protection_stage"], 1)
+        self.assertEqual(stage_one_snapshot["stop_loss_price"], 104.5)
+        self.assertEqual(stage_two["profit_protection_stage"], 2)
+        self.assertEqual(stage_two["stop_loss_price"], 110.5)
         self.assertEqual(unchanged["stop_loss_price"], 110.5)
 
     def test_profit_booking_price_is_eighty_percent_of_long_target(self):
