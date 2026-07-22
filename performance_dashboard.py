@@ -232,6 +232,10 @@ st.markdown(
         border-radius: 8px;
         padding: 14px;
     }
+    div[data-testid="stButton"] button {
+        color: #ffffff;
+        font-weight: 800;
+    }
     div[data-testid="stDataFrame"] {
         border-radius: 12px;
         overflow: hidden;
