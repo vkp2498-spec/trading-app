@@ -618,7 +618,7 @@ def inferred_instrument_class(trade: dict) -> str:
     if re.search(r"(?:^|[ _-])FUT(?:$|[ _-])", trading_symbol):
         return "STOCK_FUTURE"
     has_option_token = bool(
-        re.search(r"(?:^|[ _-])(?:CE|PE|CALL|PUT)(?:$|[ _-])", trading_symbol)
+        re.search(r"(?:^|[ _-]|\d)(?:CE|PE|CALL|PUT)(?:$|[ _-]|\d)", trading_symbol)
     )
     if has_option_token and underlying not in SYMBOLS:
         return "STOCK_OPTION"
@@ -641,9 +641,9 @@ def option_type(trade: dict) -> str:
         or trade.get("trading_symbol")
         or ""
     ).upper()
-    if re.search(r"(?:^|[ _-])(?:PE|PUT)(?:$|[ _-])", trading_symbol):
+    if re.search(r"(?:^|[ _-]|\d)(?:PE|PUT)(?:$|[ _-]|\d)", trading_symbol):
         return "PUT"
-    if re.search(r"(?:^|[ _-])(?:CE|CALL)(?:$|[ _-])", trading_symbol):
+    if re.search(r"(?:^|[ _-]|\d)(?:CE|CALL)(?:$|[ _-]|\d)", trading_symbol):
         return "CALL"
     return "UNKNOWN"
 
@@ -918,7 +918,15 @@ def build_trade_performance() -> dict:
     upstox_today_pnl, upstox_today_error, upstox_today_count, upstox_symbol_pnl, upstox_symbol_counts = fetch_upstox_today_pnl()
     local_today_pnl = round(sum(trade["grossPnL"] for trade in today_trades), 2)
     today_pnl_delta = 0.0
-    if upstox_today_pnl is not None:
+    use_upstox_today = (
+        upstox_today_pnl is not None
+        and (
+            upstox_today_count > 0
+            or abs(upstox_today_pnl) > 0
+            or not today_trades
+        )
+    )
+    if use_upstox_today:
         today_closed_pnl = upstox_today_pnl
         today_closed_trades = upstox_today_count
         today_pnl_source = "UPSTOX"
@@ -965,7 +973,7 @@ def build_trade_performance() -> dict:
     cumulative_symbol_pnl = symbol_pnl(trades)
     day_of_week = day_of_week_performance(trades)
 
-    if upstox_today_pnl is not None:
+    if use_upstox_today:
         logged_symbol_pnl = symbol_pnl(today_trades)
         today_day = datetime.strptime(today_text, "%Y-%m-%d").strftime("%A")
         for symbol in SYMBOLS:
@@ -1023,7 +1031,7 @@ def build_trade_performance() -> dict:
         },
         "equityCurve": build_equity_curve(
             trades,
-            {today_text: today_closed_pnl} if upstox_today_pnl is not None else None,
+            {today_text: today_closed_pnl} if use_upstox_today else None,
         ),
         "recentTrades": recent_trades,
     }
