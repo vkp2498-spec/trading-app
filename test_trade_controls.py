@@ -688,7 +688,7 @@ class TradeControlTests(unittest.TestCase):
         ]
         self.assertEqual(put_rows[0]["netPnL"], 1984.45)
 
-    def test_mobile_dashboard_uses_synced_upstox_rows_before_broker_pnl(self):
+    def test_mobile_dashboard_keeps_main_pnl_bot_only_with_synced_upstox_rows(self):
         trades = [
             {
                 "tradeDate": "2026-07-22",
@@ -718,25 +718,25 @@ class TradeControlTests(unittest.TestCase):
             patch.object(
                 dashboard_data,
                 "fetch_upstox_today_pnl",
-                return_value=(-4500.0, "Upstox P&L request failed with status 403", 1, {"NIFTY": -4500.0}, {"NIFTY": 1}),
+                return_value=(15000.0, None, 2, {"NIFTY": 15000.0}, {"NIFTY": 2}),
             ),
             patch.object(dashboard_data, "datetime") as mocked_datetime,
         ):
             mocked_datetime.now.return_value = datetime(2026, 7, 22, 13, 5)
             performance = dashboard_data.build_trade_performance()
 
-        self.assertEqual(performance["today"]["closedPnL"], 15000.0)
+        self.assertEqual(performance["today"]["closedPnL"], -4500.0)
         self.assertEqual(performance["today"]["botPnL"], -4500.0)
-        self.assertEqual(performance["today"]["manualOtherPnL"], 19500.0)
-        self.assertEqual(performance["today"]["totalUpstoxPnL"], 15000.0)
+        self.assertIsNone(performance["today"]["manualOtherPnL"])
+        self.assertIsNone(performance["today"]["totalUpstoxPnL"])
         self.assertIsNone(performance["today"]["closedPnLError"])
-        self.assertEqual(performance["equityCurve"][-1]["dailyPnL"], 15000.0)
+        self.assertEqual(performance["equityCurve"][-1]["dailyPnL"], -4500.0)
         put_rows = [
             row
             for row in performance["cumulative"]["optionTypePerformance"]
             if row["optionType"] == "PUT" and row["symbol"] == "NIFTY"
         ]
-        self.assertEqual(put_rows[0]["netPnL"], 15000.0)
+        self.assertEqual(put_rows[0]["netPnL"], -4500.0)
 
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {

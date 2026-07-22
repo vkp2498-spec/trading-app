@@ -913,7 +913,7 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, f
 
 
 def build_trade_performance() -> dict:
-    trades = read_trade_history()
+    trades = bot_only_trades(read_trade_history())
 
     today_text = datetime.now(
         IST
@@ -930,29 +930,8 @@ def build_trade_performance() -> dict:
         key=lambda trade: trade["exitTime"],
         reverse=True,
     )[:20]
-    upstox_today_pnl, upstox_today_error, upstox_today_count, upstox_symbol_pnl, upstox_symbol_counts = fetch_upstox_today_pnl()
     local_today_pnl = round(sum(trade["grossPnL"] for trade in today_trades), 2)
-    today_bot_trades = bot_only_trades(today_trades)
-    local_bot_pnl = round(sum(trade["grossPnL"] for trade in today_bot_trades), 2)
-    has_upstox_sync_rows = any(is_upstox_sync_trade(trade) for trade in today_trades)
-    today_pnl_delta = 0.0
-    use_upstox_today = (
-        not has_upstox_sync_rows
-        and upstox_today_pnl is not None
-        and (
-            upstox_today_count > 0
-            or abs(upstox_today_pnl) > 0
-            or not today_trades
-        )
-    )
-    if use_upstox_today:
-        today_closed_pnl = upstox_today_pnl
-        today_closed_trades = upstox_today_count
-        today_pnl_source = "UPSTOX"
-        today_symbol_pnl = upstox_symbol_pnl
-        today_symbol_trades = upstox_symbol_counts
-        today_pnl_delta = round(upstox_today_pnl - local_today_pnl, 2)
-    elif today_trades:
+    if today_trades:
         today_closed_pnl = local_today_pnl
         today_closed_trades = len(today_trades)
         today_pnl_source = "TRADE_LOG"
@@ -974,47 +953,18 @@ def build_trade_performance() -> dict:
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
     average_profit, average_loss = average_trade_results(trades)
-    bot_pnl = local_bot_pnl if has_upstox_sync_rows else today_closed_pnl
-    total_upstox_pnl = upstox_today_pnl if upstox_today_pnl is not None else today_closed_pnl
-    if has_upstox_sync_rows:
-        total_upstox_pnl = today_closed_pnl
-        upstox_today_error = None
-    manual_other_pnl = (
-        round(total_upstox_pnl - bot_pnl, 2)
-        if total_upstox_pnl is not None
-        else None
-    )
+    bot_pnl = today_closed_pnl
+    total_upstox_pnl = None
+    manual_other_pnl = None
     cumulative_total_pnl = round(
         sum(
             trade["grossPnL"]
             for trade in trades
-        )
-        + today_pnl_delta,
+        ),
         2,
     )
     cumulative_symbol_pnl = symbol_pnl(trades)
     day_of_week = day_of_week_performance(trades)
-
-    if use_upstox_today:
-        logged_symbol_pnl = symbol_pnl(today_trades)
-        today_day = datetime.strptime(today_text, "%Y-%m-%d").strftime("%A")
-        for symbol in SYMBOLS:
-            symbol_delta = round(
-                today_symbol_pnl.get(symbol, 0.0)
-                - logged_symbol_pnl.get(symbol, 0.0),
-                2,
-            )
-            cumulative_symbol_pnl[symbol] = round(
-                cumulative_symbol_pnl.get(symbol, 0.0)
-                + symbol_delta,
-                2,
-            )
-            for row in day_of_week:
-                if row["day"] == today_day and row["symbol"] == symbol:
-                    row["netPnL"] = round(
-                        row["netPnL"] + symbol_delta,
-                        2,
-                    )
 
     return {
         "today": {
@@ -1022,9 +972,9 @@ def build_trade_performance() -> dict:
             "closedPnL": today_closed_pnl,
             "botPnL": bot_pnl,
             "closedPnLSource": today_pnl_source,
-            "closedPnLError": upstox_today_error,
-            "brokerClosedTrades": upstox_today_count,
-            "brokerClosedPnL": upstox_today_pnl,
+            "closedPnLError": None,
+            "brokerClosedTrades": 0,
+            "brokerClosedPnL": None,
             "manualOtherPnL": manual_other_pnl,
             "totalUpstoxPnL": total_upstox_pnl,
             "winRate": calculate_win_rate(
@@ -1053,7 +1003,6 @@ def build_trade_performance() -> dict:
         },
         "equityCurve": build_equity_curve(
             trades,
-            {today_text: today_closed_pnl} if use_upstox_today else None,
         ),
         "recentTrades": recent_trades,
     }
