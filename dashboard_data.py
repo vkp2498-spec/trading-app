@@ -940,15 +940,25 @@ def build_trade_performance() -> dict:
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
     average_profit, average_loss = average_trade_results(trades)
+    bot_pnl = local_today_pnl
+    total_upstox_pnl = upstox_today_pnl
+    manual_other_pnl = (
+        round(total_upstox_pnl - bot_pnl, 2)
+        if total_upstox_pnl is not None
+        else None
+    )
 
     return {
         "today": {
             "closedTrades": today_closed_trades,
             "closedPnL": today_closed_pnl,
+            "botPnL": bot_pnl,
             "closedPnLSource": today_pnl_source,
             "closedPnLError": upstox_today_error,
             "brokerClosedTrades": upstox_today_count,
             "brokerClosedPnL": upstox_today_pnl,
+            "manualOtherPnL": manual_other_pnl,
+            "totalUpstoxPnL": total_upstox_pnl,
             "winRate": calculate_win_rate(
                 today_trades
             ),
@@ -1097,6 +1107,22 @@ def broker_position_ltp(
                 continue
 
     return None
+
+
+def broker_position_pnl(position: dict) -> float:
+    for key in [
+        "pnl",
+        "day_pnl",
+        "unrealised",
+        "unrealized_pnl",
+        "profit_and_loss",
+    ]:
+        value = position.get(key)
+
+        if value is not None:
+            return safe_float(value)
+
+    return 0.0
 
 
 def broker_average_price(
@@ -1359,6 +1385,18 @@ def build_live_positions() -> dict:
         ),
         2,
     )
+    open_upstox_positions = [
+        position
+        for position in broker_positions
+        if broker_position_quantity(position) != 0
+    ]
+    total_upstox_live_pnl = round(
+        sum(
+            broker_position_pnl(position)
+            for position in open_upstox_positions
+        ),
+        2,
+    )
 
     return {
         "upstoxStatus": (
@@ -1371,6 +1409,10 @@ def build_live_positions() -> dict:
             dashboard_positions
         ),
         "totalLivePnL": total_live_pnl,
+        "upstoxOpenPositionCount": len(
+            open_upstox_positions
+        ),
+        "totalUpstoxLivePnL": total_upstox_live_pnl,
         "positions": dashboard_positions,
     }
 
@@ -1381,6 +1423,27 @@ def build_health_snapshot() -> dict:
 
     trade_performance = build_trade_performance()
     live_positions = build_live_positions()
+    today = trade_performance.get("today", {})
+    bot_pnl = round(
+        safe_float(today.get("botPnL"))
+        + safe_float(live_positions.get("totalLivePnL")),
+        2,
+    )
+    upstox_closed_pnl = today.get("totalUpstoxPnL")
+    total_upstox_pnl = (
+        round(
+            safe_float(upstox_closed_pnl)
+            + safe_float(live_positions.get("totalUpstoxLivePnL")),
+            2,
+        )
+        if upstox_closed_pnl is not None
+        else None
+    )
+    manual_other_pnl = (
+        round(total_upstox_pnl - bot_pnl, 2)
+        if total_upstox_pnl is not None
+        else None
+    )
     stock_scanner = read_json_file(
         STOCK_SCANNER_STATUS_FILE,
         {
@@ -1414,6 +1477,16 @@ def build_health_snapshot() -> dict:
         "lastRuns": latest_symbol_analyses(),
         "performance": trade_performance,
         "live": live_positions,
+        "upstoxAccount": {
+            "botPnL": bot_pnl,
+            "manualOtherPnL": manual_other_pnl,
+            "totalUpstoxPnL": total_upstox_pnl,
+            "openPositionCount": live_positions.get(
+                "upstoxOpenPositionCount",
+                0,
+            ),
+            "closedPnLError": today.get("closedPnLError"),
+        },
         "stockFuturesScanner": stock_scanner,
     }
 
