@@ -9,15 +9,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+import requests
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -85,32 +83,37 @@ def fetch_upstox_rows(day: datetime) -> list[dict]:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN is not set in .env")
 
     date_text = day.strftime("%d-%m-%Y")
-    params = urlencode(
-        {
-            "from_date": date_text,
-            "to_date": date_text,
-            "segment": "FO",
-            "financial_year": financial_year(day),
-            "page_number": 1,
-            "page_size": 5000,
-        }
-    )
-    request = Request(
-        f"{UPSTOX_TRADE_PNL_URL}?{params}",
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-    )
+    params = {
+        "from_date": date_text,
+        "to_date": date_text,
+        "segment": "FO",
+        "financial_year": financial_year(day),
+        "page_number": 1,
+        "page_size": 5000,
+    }
 
     try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        detail = error.read().decode("utf-8", errors="ignore")[:500]
-        raise RuntimeError(f"Upstox P&L request failed {error.code}: {detail}") from error
-    except URLError as error:
-        raise RuntimeError(f"Unable to contact Upstox: {error.reason}") from error
+        response = requests.get(
+            UPSTOX_TRADE_PNL_URL,
+            params=params,
+            timeout=30,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "HKTradingMobileSync/1.0",
+            },
+        )
+    except requests.RequestException as error:
+        raise RuntimeError(f"Unable to contact Upstox: {type(error).__name__}") from error
+
+    if response.status_code >= 300:
+        detail = response.text[:500]
+        raise RuntimeError(f"Upstox P&L request failed {response.status_code}: {detail}")
+
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError("Upstox returned invalid JSON") from error
 
     rows = payload.get("data", [])
     if not isinstance(rows, list):
@@ -118,7 +121,36 @@ def fetch_upstox_rows(day: datetime) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def fetch_upstox_rows_from_positions() -> list[dict]:
+    token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    if not token:
+        raise RuntimeError("UPSTOX_ACCESS_TOKEN is not set in .env")
+
+    response = requests.get(
+        "https://api.upstox.com/v2/portfolio/short-term-positions",
+        timeout=30,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "HKTradingMobileSync/1.0",
+        },
+    )
+
+    if response.status_code >= 300:
+        detail = response.text[:500]
+        raise RuntimeError(f"Upstox positions request failed {response.status_code}: {detail}")
+
+    payload = response.json()
+    rows = payload.get("data", [])
+    if not isinstance(rows, list):
+        raise RuntimeError("Upstox returned an unexpected positions response")
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def row_pnl(row: dict) -> float:
+    for key in ["pnl", "day_pnl", "unrealised", "unrealized_pnl", "profit_and_loss"]:
+        if row.get(key) is not None:
+            return round(safe_float(row.get(key)), 2)
     return round(safe_float(row.get("sell_amount")) - safe_float(row.get("buy_amount")), 2)
 
 
@@ -218,7 +250,15 @@ def adjustment_row(day: datetime, symbol: str, option: str, pnl: float) -> dict:
 
 
 def sync(day: datetime, dry_run: bool = False, show_rows: bool = False) -> None:
-    upstox_rows = fetch_upstox_rows(day)
+    source = "profit-loss"
+    try:
+        upstox_rows = fetch_upstox_rows(day)
+    except RuntimeError as error:
+        if "403" not in str(error) and "1010" not in str(error):
+            raise
+        print(f"Profit-loss endpoint blocked; falling back to positions endpoint. Detail: {error}")
+        upstox_rows = fetch_upstox_rows_from_positions()
+        source = "positions"
     trade_rows, fieldnames = read_trade_history()
     day_text = day.strftime("%Y-%m-%d")
 
@@ -245,6 +285,7 @@ def sync(day: datetime, dry_run: bool = False, show_rows: bool = False) -> None:
             adjustments.append(adjustment_row(day, key[0], key[1], delta))
 
     print(f"Date: {day_text}")
+    print(f"Upstox source: {source}")
     print(f"Upstox rows: {len(upstox_rows)}")
     print(f"Existing log P&L: {sum(logged.values()):.2f}")
     print(f"Upstox P&L: {sum(upstox.values()):.2f}")
