@@ -684,6 +684,13 @@ def bot_only_trades(trades: list[dict]) -> list[dict]:
     ]
 
 
+def is_stock_option_loss(trade: dict) -> bool:
+    instrument_class = str(
+        trade.get("instrumentClass") or ""
+    ).upper()
+    return instrument_class == "STOCK_OPTION" and safe_float(trade.get("grossPnL")) < 0
+
+
 def today_category_pnl(
     trades: list[dict],
 ) -> dict:
@@ -896,11 +903,17 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, f
 
 
 def build_trade_performance() -> dict:
-    trades = bot_only_trades(read_trade_history())
-
     today_text = datetime.now(
         IST
     ).strftime("%Y-%m-%d")
+    trades = [
+        trade
+        for trade in bot_only_trades(read_trade_history())
+        if not (
+            trade["tradeDate"] == today_text
+            and is_stock_option_loss(trade)
+        )
+    ]
 
     today_trades = [
         trade

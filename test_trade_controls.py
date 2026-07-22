@@ -445,6 +445,41 @@ class TradeControlTests(unittest.TestCase):
         ]
         self.assertEqual(put_rows[0]["netPnL"], -4500.0)
 
+    def test_mobile_dashboard_ignores_today_stock_option_losses(self):
+        trades = [
+            {
+                "tradeDate": "2026-07-22",
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "tradingSymbol": "NIFTY 24200 CE 28 JUL 26",
+                "optionType": "CALL",
+                "grossPnL": 6200.0,
+                "exitTime": "2026-07-22T10:30:00+05:30",
+            },
+            {
+                "tradeDate": "2026-07-22",
+                "symbol": "RELIANCE",
+                "underlyingSymbol": "RELIANCE",
+                "instrumentClass": "STOCK_OPTION",
+                "tradingSymbol": "RELIANCE 3000 PE 28 JUL 26",
+                "optionType": "PUT",
+                "grossPnL": -2400.0,
+                "exitTime": "2026-07-22T11:00:00+05:30",
+            },
+        ]
+        with (
+            patch.object(dashboard_data, "read_trade_history", return_value=trades),
+            patch.object(dashboard_data, "datetime") as mocked_datetime,
+        ):
+            mocked_datetime.now.return_value = datetime(2026, 7, 22, 13, 5)
+            performance = dashboard_data.build_trade_performance()
+
+        self.assertEqual(performance["today"]["closedTrades"], 1)
+        self.assertEqual(performance["today"]["closedPnL"], 6200.0)
+        self.assertEqual(performance["cumulative"]["totalPnL"], 6200.0)
+        self.assertEqual(performance["equityCurve"][-1]["dailyPnL"], 6200.0)
+
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {
             "symbol": "NIFTY",
