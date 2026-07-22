@@ -787,6 +787,7 @@ def read_trade_history() -> list[dict]:
 
 def build_equity_curve(
     trades: list[dict],
+    daily_overrides: dict[str, float] | None = None,
 ) -> list[dict]:
     daily_totals = {}
 
@@ -804,6 +805,10 @@ def build_equity_curve(
         daily_totals[trade_date] += (
             trade["grossPnL"]
         )
+
+    if daily_overrides:
+        for trade_date, pnl in daily_overrides.items():
+            daily_totals[trade_date] = pnl
 
     cumulative_pnl = 0.0
     points = []
@@ -912,10 +917,18 @@ def build_trade_performance() -> dict:
     )[:20]
     upstox_today_pnl, upstox_today_error, upstox_today_count, upstox_symbol_pnl, upstox_symbol_counts = fetch_upstox_today_pnl()
     local_today_pnl = round(sum(trade["grossPnL"] for trade in today_trades), 2)
-    if today_trades:
+    today_pnl_delta = 0.0
+    if upstox_today_pnl is not None:
+        today_closed_pnl = upstox_today_pnl
+        today_closed_trades = upstox_today_count
+        today_pnl_source = "UPSTOX"
+        today_symbol_pnl = upstox_symbol_pnl
+        today_symbol_trades = upstox_symbol_counts
+        today_pnl_delta = round(upstox_today_pnl - local_today_pnl, 2)
+    elif today_trades:
         today_closed_pnl = local_today_pnl
         today_closed_trades = len(today_trades)
-        today_pnl_source = "BOT_JOURNAL"
+        today_pnl_source = "TRADE_LOG"
         today_symbol_pnl = symbol_pnl(today_trades)
         today_symbol_trades = {
             symbol: sum(
@@ -925,12 +938,6 @@ def build_trade_performance() -> dict:
             )
             for symbol in SYMBOLS
         }
-    elif upstox_today_pnl is not None:
-        today_closed_pnl = upstox_today_pnl
-        today_closed_trades = upstox_today_count
-        today_pnl_source = "UPSTOX"
-        today_symbol_pnl = upstox_symbol_pnl
-        today_symbol_trades = upstox_symbol_counts
     else:
         today_closed_pnl = 0.0
         today_closed_trades = 0
@@ -947,6 +954,37 @@ def build_trade_performance() -> dict:
         if total_upstox_pnl is not None
         else None
     )
+    cumulative_total_pnl = round(
+        sum(
+            trade["grossPnL"]
+            for trade in trades
+        )
+        + today_pnl_delta,
+        2,
+    )
+    cumulative_symbol_pnl = symbol_pnl(trades)
+    day_of_week = day_of_week_performance(trades)
+
+    if upstox_today_pnl is not None:
+        logged_symbol_pnl = symbol_pnl(today_trades)
+        today_day = datetime.strptime(today_text, "%Y-%m-%d").strftime("%A")
+        for symbol in SYMBOLS:
+            symbol_delta = round(
+                today_symbol_pnl.get(symbol, 0.0)
+                - logged_symbol_pnl.get(symbol, 0.0),
+                2,
+            )
+            cumulative_symbol_pnl[symbol] = round(
+                cumulative_symbol_pnl.get(symbol, 0.0)
+                + symbol_delta,
+                2,
+            )
+            for row in day_of_week:
+                if row["day"] == today_day and row["symbol"] == symbol:
+                    row["netPnL"] = round(
+                        row["netPnL"] + symbol_delta,
+                        2,
+                    )
 
     return {
         "today": {
@@ -969,28 +1007,23 @@ def build_trade_performance() -> dict:
         },
         "cumulative": {
             "totalTrades": len(trades),
-            "totalPnL": round(
-                sum(
-                    trade["grossPnL"]
-                    for trade in trades
-                ),
-                2,
-            ),
+            "totalPnL": cumulative_total_pnl,
             "stockOptionsPnL": cumulative_stock_option_pnl(trades),
             "winRate": calculate_win_rate(
                 trades
             ),
             "averageProfitPerWinningTrade": average_profit,
             "averageLossPerLosingTrade": average_loss,
-            "symbolPnL": symbol_pnl(trades),
+            "symbolPnL": cumulative_symbol_pnl,
             "categoryPerformance": category_performance(
                 trades
             ),
-            "dayOfWeekPerformance": day_of_week_performance(trades),
+            "dayOfWeekPerformance": day_of_week,
             "optionTypePerformance": option_type_performance(trades),
         },
         "equityCurve": build_equity_curve(
-            trades
+            trades,
+            {today_text: today_closed_pnl} if upstox_today_pnl is not None else None,
         ),
         "recentTrades": recent_trades,
     }
