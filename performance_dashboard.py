@@ -26,8 +26,13 @@ from post_market_review import (
     summarize,
 )
 from strategy_core import now_ist
+from dashboard_data import bot_only_trades
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
+from dashboard_data import is_stock_option_loss
+from dashboard_data import normalized_underlying
+from dashboard_data import option_type
+from dashboard_data import read_trade_history
 from trade_forensics import (
     analyze_executed_trades as run_executed_trade_forensics,
     analyze_rejected_signals as run_rejected_signal_forensics,
@@ -74,11 +79,11 @@ st.markdown(
     """
     <style>
     .stApp {
-        background: linear-gradient(135deg, #07111f 0%, #0c1728 45%, #101827 100%);
-        color: #f8fafc;
+        background: #ffffff;
+        color: #0f172a;
     }
     [data-testid="stHeader"] {
-        background: rgba(7, 17, 31, 0.85);
+        background: rgba(255, 255, 255, 0.96);
     }
     .block-container {
         padding-top: 1.5rem;
@@ -88,13 +93,42 @@ st.markdown(
     .dash-title {
         font-size: 34px;
         font-weight: 800;
-        color: #f8fafc;
+        color: #061a35;
         margin-bottom: 4px;
     }
     .dash-subtitle {
-        color: #94a3b8;
+        color: #475569;
         font-size: 15px;
         margin-bottom: 20px;
+    }
+    .navy-section {
+        background: #061a35;
+        border-radius: 10px;
+        color: #ffffff;
+        font-size: 18px;
+        font-weight: 800;
+        margin: 18px 0 12px 0;
+        padding: 12px 16px;
+    }
+    .metric-card {
+        background: #f8fafc;
+        border: 1px solid #d8e0ea;
+        border-radius: 8px;
+        padding: 16px;
+        min-height: 104px;
+    }
+    .metric-label {
+        color: #061a35;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }
+    .metric-value {
+        color: #0f172a;
+        font-size: 26px;
+        font-weight: 850;
+        margin-top: 8px;
     }
     .status-card {
         border: 1px solid rgba(148, 163, 184, 0.22);
@@ -129,11 +163,11 @@ st.markdown(
         font-size: 13px;
     }
     .positive {
-        color: #22c55e;
+        color: #16a34a;
         font-weight: 800;
     }
     .negative {
-        color: #ef4444;
+        color: #dc2626;
         font-weight: 800;
     }
     .neutral {
@@ -141,9 +175,9 @@ st.markdown(
         font-weight: 800;
     }
     div[data-testid="stMetric"] {
-        background: rgba(15, 23, 42, 0.78);
-        border: 1px solid rgba(148, 163, 184, 0.18);
-        border-radius: 12px;
+        background: #f8fafc;
+        border: 1px solid #d8e0ea;
+        border-radius: 8px;
         padding: 14px;
     }
     div[data-testid="stDataFrame"] {
@@ -740,6 +774,86 @@ def money(value):
         return f"₹{float(value):,.2f}"
     except Exception:
         return "N/A"
+
+
+def pnl_class(value):
+    try:
+        return "positive" if float(value or 0) >= 0 else "negative"
+    except Exception:
+        return ""
+
+
+def metric_card(label, value, value_class=""):
+    safe_label = html.escape(str(label))
+    safe_value = html.escape(str(value))
+    class_text = f"metric-value {value_class}".strip()
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{safe_label}</div>
+            <div class="{class_text}">{safe_value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def section_header(title):
+    st.markdown(
+        f'<div class="navy-section">{html.escape(str(title))}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def dashboard_trades_for_summary():
+    today_text = now_ist().strftime("%Y-%m-%d")
+    return [
+        trade
+        for trade in bot_only_trades(read_trade_history())
+        if not (
+            trade.get("tradeDate") == today_text
+            and is_stock_option_loss(trade)
+        )
+    ]
+
+
+def symbol_summary(trades, symbol):
+    matching = [
+        trade
+        for trade in trades
+        if normalized_underlying(trade) == symbol
+    ]
+    pnl_values = [float(trade.get("grossPnL") or 0) for trade in matching]
+    wins = [value for value in pnl_values if value > 0]
+    losses = [value for value in pnl_values if value < 0]
+    return {
+        "trades": len(matching),
+        "net_pnl": round(sum(pnl_values), 2),
+        "avg_profit": round(sum(wins) / len(wins), 2) if wins else 0.0,
+        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
+    }
+
+
+def option_totals_chart_data(trades):
+    totals = {
+        symbol: {"CALL": 0.0, "PUT": 0.0}
+        for symbol in SYMBOLS
+    }
+    for trade in trades:
+        symbol = normalized_underlying(trade)
+        kind = option_type(trade)
+        if symbol in totals and kind in totals[symbol]:
+            totals[symbol][kind] += float(trade.get("grossPnL") or 0)
+    return pd.DataFrame(
+        [
+            {
+                "Symbol": symbol,
+                "CALL": round(values["CALL"], 2),
+                "PUT": round(values["PUT"], 2),
+            }
+            for symbol, values in totals.items()
+        ]
+    ).set_index("Symbol")
 
 
 def number(value):
@@ -1575,61 +1689,51 @@ def render_banknifty_post_market():
 
 load_env()
 
-dashboard_tab, forensic_report_tab, banknifty_post_market_tab = st.tabs(
-    ["Dashboard", "Trade Forensics", "BANKNIFTY Post Market"]
+if st.button("Refresh Dashboard", use_container_width=True):
+    st.rerun()
+
+st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="dash-subtitle">NIFTY and BANKNIFTY bot trade performance</div>',
+    unsafe_allow_html=True,
 )
 
-with dashboard_tab:
-    if st.button("Refresh Dashboard", use_container_width=True):
-        st.rerun()
+performance = api_build_trade_performance()
+today = performance.get("today", {})
+trades = dashboard_trades_for_summary()
+today_pnl = float(today.get("closedPnL", 0) or 0)
 
-    st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
-    st.markdown('<div class="dash-subtitle">NIFTY and BANKNIFTY option-buy performance</div>', unsafe_allow_html=True)
+section_header("Today")
+today_cols = st.columns(2)
+with today_cols[0]:
+    metric_card("Number of trades", today.get("closedTrades", 0))
+with today_cols[1]:
+    metric_card("Net P&L", money(today_pnl), pnl_class(today_pnl))
 
-    performance = api_build_trade_performance()
-    live = api_build_live_positions()
-    today = performance.get("today", {})
-    cumulative = performance.get("cumulative", {})
-    today_symbol = today.get("symbolPnL", {})
-    cumulative_symbol = cumulative.get("symbolPnL", {})
-    symbol_trades = today.get("symbolTrades", {})
-    positions = live.get("positions", [])
+section_header("Cumulative")
+summary_cols = st.columns(2)
+for column, symbol in zip(summary_cols, SYMBOLS):
+    summary = symbol_summary(trades, symbol)
+    with column:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">{symbol}</div>
+                <div class="metric-value">{summary["trades"]} trades</div>
+                <div class="{pnl_class(summary["net_pnl"])}" style="font-size:20px;margin-top:8px;">
+                    Net P&amp;L {money(summary["net_pnl"])}
+                </div>
+                <div style="margin-top:10px;color:#334155;font-weight:700;">
+                    Avg profit <span class="positive">{money(summary["avg_profit"])}</span>
+                </div>
+                <div style="margin-top:4px;color:#334155;font-weight:700;">
+                    Avg loss <span class="negative">{money(summary["avg_loss"])}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    def open_for(symbol):
-        matching = [p for p in positions if symbol in str(p.get("underlyingSymbol", "")).upper()]
-        return sum(float(p.get("livePnL") or 0) for p in matching), len(matching)
-
-    overall_today = float(today.get("closedPnL", 0) or 0) + float(live.get("totalLivePnL", 0) or 0)
-
-    st.markdown("### Overall")
-    overall_cols = st.columns(6)
-    overall_cols[0].metric("Today P&L", money(overall_today))
-    overall_cols[1].metric("Today Trades", today.get("closedTrades", 0))
-    overall_cols[2].metric("Open Trades", live.get("openTradeCount", 0))
-    overall_cols[3].metric("Cumulative P&L", money(cumulative.get("totalPnL", 0)))
-    overall_cols[4].metric("Avg Profit / Win", money(cumulative.get("averageProfitPerWinningTrade", 0)))
-    overall_cols[5].metric("Avg Loss / Loss", money(-float(cumulative.get("averageLossPerLosingTrade", 0) or 0)))
-
-    st.markdown("### NIFTY and BANKNIFTY")
-    for symbol in SYMBOLS:
-        open_pnl, open_count = open_for(symbol)
-        cols = st.columns(6)
-        cols[0].metric(f"{symbol} Today", money(today_symbol.get(symbol, 0)))
-        cols[1].metric(f"{symbol} Trades", symbol_trades.get(symbol, 0))
-        cols[2].metric(f"{symbol} Open P&L", money(open_pnl))
-        cols[3].metric(f"{symbol} Open Trades", open_count)
-        cols[4].metric(f"{symbol} Cumulative", money(cumulative_symbol.get(symbol, 0)))
-        cols[5].metric(f"{symbol} Total Today", money(float(today_symbol.get(symbol, 0) or 0) + open_pnl))
-
-    if live.get("error"):
-        st.warning(live["error"])
-    if today.get("closedPnLSource") == "BOT_JOURNAL":
-        st.caption("Today’s realized bot P&L is sourced from the local closed-trade journal.")
-    elif today.get("closedPnLSource") != "UPSTOX":
-        st.warning("Today’s realized P&L is currently unavailable.")
-
-with forensic_report_tab:
-    render_trade_forensics_dashboard()
-
-with banknifty_post_market_tab:
-    render_banknifty_post_market()
+section_header("CALL and PUT Totals")
+chart_data = option_totals_chart_data(trades)
+st.bar_chart(chart_data, use_container_width=True)
