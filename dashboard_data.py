@@ -475,6 +475,49 @@ def average_trade_results(trades: list[dict]) -> tuple[float, float]:
     )
 
 
+def approximate_other_charges(trade: dict) -> float:
+    quantity = abs(safe_int(trade.get("quantity")))
+    entry_price = abs(safe_float(trade.get("entryPrice")))
+    exit_price = abs(safe_float(trade.get("exitPrice")))
+    if quantity <= 0:
+        return 0.0
+
+    transaction_type = str(
+        trade.get("transactionType") or "BUY"
+    ).upper()
+    if transaction_type == "SELL":
+        sell_premium = quantity * entry_price
+        buy_premium = quantity * exit_price
+    else:
+        buy_premium = quantity * entry_price
+        sell_premium = quantity * exit_price
+
+    premium_turnover = buy_premium + sell_premium
+    brokerage = 40.0
+    stt = sell_premium * 0.0015
+    transaction_charges = premium_turnover * 0.0003553
+    sebi = premium_turnover * 0.000001
+    stamp_duty = buy_premium * 0.00003
+    ipft = premium_turnover * 0.000000001
+    gst = (brokerage + transaction_charges + ipft) * 0.18
+    square_off = (
+        75.0 * 1.18
+        if "SQUARE" in str(trade.get("exitReason") or "").upper()
+        else 0.0
+    )
+    return round(
+        brokerage + stt + transaction_charges + sebi + stamp_duty + ipft + gst + square_off,
+        2,
+    )
+
+
+def total_other_charges(trades: list[dict]) -> float:
+    return round(
+        sum(approximate_other_charges(trade) for trade in trades),
+        2,
+    )
+
+
 def symbol_pnl(trades: list[dict]) -> dict:
     totals = {
         symbol: 0.0
@@ -501,6 +544,36 @@ def symbol_pnl(trades: list[dict]) -> dict:
         symbol: round(value, 2)
         for symbol, value in totals.items()
     }
+
+
+def performance_stats(trades: list[dict]) -> dict:
+    gross_pnl = round(sum(trade["grossPnL"] for trade in trades), 2)
+    other_charges = total_other_charges(trades)
+    average_profit, average_loss = average_trade_results(trades)
+    return {
+        "trades": len(trades),
+        "grossPnL": gross_pnl,
+        "otherCharges": other_charges,
+        "netPnL": round(gross_pnl - other_charges, 2),
+        "winRate": calculate_win_rate(trades),
+        "averageProfit": average_profit,
+        "averageLoss": average_loss,
+    }
+
+
+def symbol_performance_stats(trades: list[dict]) -> dict:
+    stats = {
+        "OVERALL": performance_stats(trades),
+    }
+    for symbol in SYMBOLS:
+        stats[symbol] = performance_stats(
+            [
+                trade
+                for trade in trades
+                if normalized_underlying(trade) == symbol
+            ]
+        )
+    return stats
 
 
 def trade_category(trade: dict) -> str:
@@ -961,11 +1034,15 @@ def build_trade_performance() -> dict:
     )
     cumulative_symbol_pnl = symbol_pnl(trades)
     day_of_week = day_of_week_performance(trades)
+    today_stats = symbol_performance_stats(today_trades)
+    cumulative_stats = symbol_performance_stats(trades)
 
     return {
         "today": {
             "closedTrades": today_closed_trades,
             "closedPnL": today_closed_pnl,
+            "netPnL": today_stats["OVERALL"]["netPnL"],
+            "otherCharges": today_stats["OVERALL"]["otherCharges"],
             "botPnL": bot_pnl,
             "closedPnLSource": today_pnl_source,
             "closedPnLError": None,
@@ -978,18 +1055,30 @@ def build_trade_performance() -> dict:
             ),
             "symbolPnL": today_symbol_pnl,
             "symbolTrades": today_symbol_trades,
+            "symbolStats": {
+                symbol: today_stats[symbol]
+                for symbol in SYMBOLS
+            },
+            "overallStats": today_stats["OVERALL"],
             "categoryPnL": today_categories,
             "optionTypePerformance": option_type_performance(today_trades),
         },
         "cumulative": {
             "totalTrades": len(trades),
             "totalPnL": cumulative_total_pnl,
+            "netPnL": cumulative_stats["OVERALL"]["netPnL"],
+            "otherCharges": cumulative_stats["OVERALL"]["otherCharges"],
             "winRate": calculate_win_rate(
                 trades
             ),
             "averageProfitPerWinningTrade": average_profit,
             "averageLossPerLosingTrade": average_loss,
             "symbolPnL": cumulative_symbol_pnl,
+            "symbolStats": {
+                symbol: cumulative_stats[symbol]
+                for symbol in SYMBOLS
+            },
+            "overallStats": cumulative_stats["OVERALL"],
             "categoryPerformance": category_performance(
                 trades
             ),

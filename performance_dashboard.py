@@ -1796,36 +1796,67 @@ st.markdown(
 
 performance = api_build_trade_performance()
 today = performance.get("today", {})
-trades = dashboard_trades_for_summary()
-today_pnl = float(today.get("closedPnL", 0) or 0)
+cumulative = performance.get("cumulative", {})
+
+
+def summary_card_html(title, summary, show_averages=False):
+    net_pnl = float(summary.get("netPnL", summary.get("net_pnl", 0)) or 0)
+    trades = int(summary.get("trades", 0) or 0)
+    win_rate = float(summary.get("winRate", 0) or 0)
+    charges = float(summary.get("otherCharges", 0) or 0)
+    average_profit = float(summary.get("averageProfit", summary.get("avg_profit", 0)) or 0)
+    average_loss = float(summary.get("averageLoss", summary.get("avg_loss", 0)) or 0)
+    average_rows = ""
+    if show_averages:
+        average_rows = f"""
+            <div style="margin-top:8px;color:#334155;font-weight:700;">
+                Avg profit <span class="positive">{money(average_profit)}</span>
+            </div>
+            <div style="margin-top:4px;color:#334155;font-weight:700;">
+                Avg loss <span class="negative">{money(average_loss)}</span>
+            </div>
+        """
+    return f"""
+        <div class="metric-card">
+            <div class="metric-label">{html.escape(title)}</div>
+            <div class="metric-value">{trades} trades</div>
+            <div class="{pnl_class(net_pnl)}" style="font-size:20px;margin-top:8px;">
+                Net P&amp;L {money(net_pnl)}
+            </div>
+            <div style="margin-top:8px;color:#334155;font-weight:700;">
+                Win rate {win_rate:.1f}%
+            </div>
+            <div style="margin-top:4px;color:#334155;font-weight:700;">
+                Other charges {money(charges)}
+            </div>
+            {average_rows}
+        </div>
+    """
+
+
+def section_stats(payload, total_trades_key, total_pnl_key):
+    overall = payload.get("overallStats") or {
+        "trades": payload.get(total_trades_key, 0),
+        "netPnL": payload.get("netPnL", payload.get(total_pnl_key, 0)),
+        "otherCharges": payload.get("otherCharges", 0),
+        "winRate": payload.get("winRate", 0),
+        "averageProfit": payload.get("averageProfitPerWinningTrade", 0),
+        "averageLoss": payload.get("averageLossPerLosingTrade", 0),
+    }
+    symbol_stats = payload.get("symbolStats") or {}
+    return [("Overall", overall)] + [
+        (symbol, symbol_stats.get(symbol, {"trades": 0, "netPnL": 0, "otherCharges": 0, "winRate": 0}))
+        for symbol in SYMBOLS
+    ]
 
 section_header("Today")
-today_cols = st.columns(2)
-with today_cols[0]:
-    metric_card("Number of trades", today.get("closedTrades", 0))
-with today_cols[1]:
-    metric_card("Net P&L", money(today_pnl), pnl_class(today_pnl))
+today_cols = st.columns(3)
+for column, (title, summary) in zip(today_cols, section_stats(today, "closedTrades", "closedPnL")):
+    with column:
+        st.markdown(summary_card_html(title, summary), unsafe_allow_html=True)
 
 section_header("Cumulative")
-summary_cols = st.columns(2)
-for column, symbol in zip(summary_cols, SYMBOLS):
-    summary = symbol_summary(trades, symbol)
+summary_cols = st.columns(3)
+for column, (title, summary) in zip(summary_cols, section_stats(cumulative, "totalTrades", "totalPnL")):
     with column:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-label">{symbol}</div>
-                <div class="metric-value">{summary["trades"]} trades</div>
-                <div class="{pnl_class(summary["net_pnl"])}" style="font-size:20px;margin-top:8px;">
-                    Net P&amp;L {money(summary["net_pnl"])}
-                </div>
-                <div style="margin-top:10px;color:#334155;font-weight:700;">
-                    Avg profit <span class="positive">{money(summary["avg_profit"])}</span>
-                </div>
-                <div style="margin-top:4px;color:#334155;font-weight:700;">
-                    Avg loss <span class="negative">{money(summary["avg_loss"])}</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.markdown(summary_card_html(title, summary, show_averages=True), unsafe_allow_html=True)
