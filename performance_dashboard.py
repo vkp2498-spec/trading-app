@@ -1829,6 +1829,3 @@ for column, symbol in zip(summary_cols, SYMBOLS):
             """,
             unsafe_allow_html=True,
         )
-
-section_header("CALL and PUT Totals")
-render_option_totals_mini_chart(trades)
