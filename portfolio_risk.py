@@ -128,10 +128,6 @@ def _score(item):
     return _number(item.get("weighted_score"), _number(item.get("score")))
 
 
-def _is_bank_stock(item):
-    return str(item.get("underlying_symbol") or "").upper() in BANK_STOCKS
-
-
 def correlation_decision(
     proposed,
     states,
@@ -154,24 +150,6 @@ def correlation_decision(
         if str(state.get("direction") or "").upper() == direction
     ]
     proposed_symbol = str(proposed.get("symbol") or "").upper()
-
-    # BANKNIFTY and a bank-stock option are one financial-sector risk bucket.
-    for state in same_direction:
-        state_symbol = str(state.get("symbol") or "").upper()
-        if (
-            proposed_symbol == "BANKNIFTY" and _is_bank_stock(state)
-        ) or (
-            proposed_symbol == "STOCK_OPTION"
-            and _is_bank_stock(proposed)
-            and state_symbol == "BANKNIFTY"
-        ):
-            return {
-                "allowed": False,
-                "reason": (
-                    "same-direction BANKNIFTY and bank-stock option exposure is already open; "
-                    "retain the existing position instead of stacking financial-sector risk"
-                ),
-            }
 
     # NIFTY and BANKNIFTY may coexist in one direction only when both are strong.
     if proposed_symbol in {"NIFTY", "BANKNIFTY"}:

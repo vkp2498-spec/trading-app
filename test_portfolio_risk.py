@@ -47,27 +47,13 @@ class PortfolioRiskTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertIn("both scores", result["reason"])
 
-    def test_bank_stock_does_not_stack_with_banknifty(self):
-        existing = position("BANKNIFTY", "BEARISH")
-        result = correlation_decision(
-            {
-                "symbol": "STOCK_OPTION",
-                "underlying_symbol": "HDFCBANK",
-                "direction": "BEARISH",
-                "weighted_score": 92,
-            },
-            [existing],
-        )
-        self.assertFalse(result["allowed"])
-        self.assertIn("financial-sector", result["reason"])
-
     def test_third_same_direction_position_is_rejected(self):
         states = [
             position("NIFTY", "BULLISH", score=90),
-            position("STOCK_OPTION", "BULLISH", score=90, underlying="RELIANCE"),
+            position("BANKNIFTY", "BULLISH", score=90),
         ]
         result = correlation_decision(
-            {"symbol": "BANKNIFTY", "direction": "BULLISH", "weighted_score": 90},
+            {"symbol": "NIFTY", "direction": "BULLISH", "weighted_score": 90},
             states,
             max_same_direction_positions=2,
         )

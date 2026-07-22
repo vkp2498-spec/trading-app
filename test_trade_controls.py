@@ -46,11 +46,6 @@ import trade_bot
 import apns_push
 import dashboard_data
 import trade_journal
-from stock_option_scanner import (
-    choose_stock_option_expiry,
-    rank_intraday_stock_setups,
-    rank_top_movers,
-)
 from counterfactual_replay import simulate_trade
 from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
 from signal_score import nifty_neutral_chain_direction, weighted_alignment_score
@@ -58,272 +53,6 @@ from backtest_report import build_reports
 
 
 class TradeControlTests(unittest.TestCase):
-    def test_stock_option_expiry_rolls_past_near_expiry(self):
-        chosen = choose_stock_option_expiry(
-            ["2026-07-23", "2026-08-27"],
-            today=datetime(2026, 7, 21).date(),
-            minimum_days=3,
-        )
-        self.assertEqual(chosen, "2026-08-27")
-
-    def test_stock_option_movers_pick_highest_and_lowest_change(self):
-        equities = [
-            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
-            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
-            {"symbol": "CCC", "instrument_key": "NSE_EQ|3"},
-        ]
-        quotes = {
-            "data": {
-                "NSE_EQ:1": {"last_price": 110, "ohlc": {"close": 100}},
-                "NSE_EQ:2": {"last_price": 90, "ohlc": {"close": 100}},
-                "NSE_EQ:3": {"last_price": 101, "ohlc": {"close": 100}},
-            }
-        }
-        movers = rank_top_movers(equities, quotes)
-        self.assertEqual(
-            [(row["symbol"], row["direction"]) for row in movers],
-            [("AAA", "BULLISH"), ("BBB", "BEARISH")],
-        )
-
-    def test_stock_option_movers_use_net_change_for_previous_close(self):
-        equities = [
-            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
-            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
-        ]
-        quotes = {
-            "data": {
-                "NSE_EQ:1": {
-                    "last_price": 102,
-                    "net_change": 2,
-                    "ohlc": {"close": 102},
-                },
-                "NSE_EQ:2": {
-                    "last_price": 98,
-                    "net_change": -2,
-                    "ohlc": {"close": 98},
-                },
-            }
-        }
-        movers = rank_top_movers(equities, quotes)
-        self.assertEqual(movers[0]["symbol"], "AAA")
-        self.assertAlmostEqual(movers[0]["change_percent"], 2.0)
-        self.assertEqual(movers[1]["symbol"], "BBB")
-        self.assertAlmostEqual(movers[1]["change_percent"], -2.0)
-
-    def test_stock_option_movers_reject_flat_market_data(self):
-        equities = [
-            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
-            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
-        ]
-        quotes = {
-            "data": {
-                "NSE_EQ:1": {"last_price": 100, "net_change": 0},
-                "NSE_EQ:2": {"last_price": 100, "net_change": 0},
-            }
-        }
-        with patch.dict(os.environ, {"STOCK_OPTION_MIN_MOVER_PERCENT": "0.25"}):
-            self.assertEqual(rank_top_movers(equities, quotes), [])
-
-    def test_stock_option_intraday_scan_finds_strong_bullish_and_bearish_setups(self):
-        equities = [
-            {"symbol": "AAA", "instrument_key": "NSE_EQ|1"},
-            {"symbol": "BBB", "instrument_key": "NSE_EQ|2"},
-            {"symbol": "CCC", "instrument_key": "NSE_EQ|3"},
-        ]
-        quotes = {
-            "data": {
-                "NSE_EQ:1": {
-                    "last_price": 105,
-                    "net_change": 5,
-                    "average_price": 102,
-                    "ohlc": {"open": 101, "high": 106, "low": 99, "close": 100},
-                },
-                "NSE_EQ:2": {
-                    "last_price": 95,
-                    "net_change": -5,
-                    "average_price": 98,
-                    "ohlc": {"open": 99, "high": 101, "low": 94, "close": 100},
-                },
-                "NSE_EQ:3": {
-                    "last_price": 100.2,
-                    "net_change": 0.2,
-                    "average_price": 100.1,
-                    "ohlc": {"open": 100, "high": 101, "low": 99, "close": 100},
-                },
-            }
-        }
-        with patch.dict(
-            os.environ,
-            {
-                "STOCK_OPTION_MIN_INTRADAY_MOVE_PERCENT": "0.75",
-                "STOCK_OPTION_INTRADAY_RANGE_EDGE": "0.65",
-            },
-        ):
-            setups = rank_intraday_stock_setups(equities, quotes)
-        self.assertEqual(
-            {(row["symbol"], row["direction"]) for row in setups},
-            {("AAA", "BULLISH"), ("BBB", "BEARISH")},
-        )
-        self.assertTrue(all(row["intraday_score"] > 0 for row in setups))
-
-    def test_stock_option_levels_equal_configured_one_lot_rupee_risk_in_fixed_mode(self):
-        with patch.dict(
-            os.environ,
-            {
-                "STOCK_OPTION_LEVEL_MODE": "fixed",
-                "STOCK_OPTION_TARGET_RUPEES": "5000",
-                "STOCK_OPTION_STOP_RUPEES": "5000",
-            },
-        ):
-            levels = trade_bot.stock_option_rupee_levels(100, 500)
-        self.assertEqual(levels["target_price"], 110.0)
-        self.assertEqual(levels["stop_loss_price"], 90.0)
-        self.assertEqual(levels["level_mode"], "fixed")
-
-    def test_stock_option_levels_use_position_value_percent_with_guardrails(self):
-        with patch.dict(
-            os.environ,
-            {
-                "STOCK_OPTION_LEVEL_MODE": "percent",
-                "STOCK_OPTION_TARGET_VALUE_PERCENT": "6",
-                "STOCK_OPTION_STOP_VALUE_PERCENT": "4",
-                "STOCK_OPTION_MIN_TARGET_RUPEES": "2000",
-                "STOCK_OPTION_MAX_TARGET_RUPEES": "7000",
-                "STOCK_OPTION_MIN_STOP_RUPEES": "1500",
-                "STOCK_OPTION_MAX_STOP_RUPEES": "5000",
-            },
-            clear=False,
-        ):
-            levels = trade_bot.stock_option_rupee_levels(100, 500)
-        self.assertEqual(levels["target_price"], 106.0)
-        self.assertEqual(levels["stop_loss_price"], 96.0)
-        self.assertEqual(levels["target_rupees"], 3000.0)
-        self.assertEqual(levels["stop_rupees"], 2000.0)
-        self.assertEqual(levels["position_value"], 50000.0)
-        self.assertEqual(levels["level_mode"], "percent")
-
-    def test_stock_option_levels_cap_large_position_value_risk(self):
-        with patch.dict(
-            os.environ,
-            {
-                "STOCK_OPTION_LEVEL_MODE": "percent",
-                "STOCK_OPTION_TARGET_VALUE_PERCENT": "6",
-                "STOCK_OPTION_STOP_VALUE_PERCENT": "4",
-                "STOCK_OPTION_MIN_TARGET_RUPEES": "2000",
-                "STOCK_OPTION_MAX_TARGET_RUPEES": "7000",
-                "STOCK_OPTION_MIN_STOP_RUPEES": "1500",
-                "STOCK_OPTION_MAX_STOP_RUPEES": "5000",
-            },
-            clear=False,
-        ):
-            levels = trade_bot.stock_option_rupee_levels(500, 1000)
-        self.assertEqual(levels["target_price"], 507.0)
-        self.assertEqual(levels["stop_loss_price"], 495.0)
-        self.assertEqual(levels["target_rupees"], 7000.0)
-        self.assertEqual(levels["stop_rupees"], 5000.0)
-
-    def test_stock_option_execution_uses_exactly_one_lot(self):
-        chosen = {
-            "underlying_symbol": "RELIANCE",
-            "mover_type": "TOP_GAINER",
-            "mover_change_percent": 2.5,
-            "direction": "BULLISH",
-            "confidence": "HIGH",
-            "signal_score": 4,
-            "entry_price": 100,
-            "instrument": {
-                "instrument_key": "NSE_FO|TEST",
-                "trading_symbol": "RELIANCE TEST CE",
-                "lot_size": 500,
-            },
-            "option_summary": {"option_type": "CE"},
-            "technicals": {},
-            "weighted": {"score": 85},
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "stock-option-state.json"
-            guard_path = Path(temp_dir) / "stock-option-guard.json"
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "ENABLE_LIVE_TRADING": "true",
-                        "STOCK_OPTION_LEVEL_MODE": "fixed",
-                        "STOCK_OPTION_TARGET_RUPEES": "5000",
-                        "STOCK_OPTION_STOP_RUPEES": "5000",
-                    },
-                ),
-                patch.object(trade_bot, "state_file", return_value=state_path),
-                patch.object(trade_bot, "reentry_guard_file", return_value=guard_path),
-                patch.object(
-                    trade_bot,
-                    "place_market_order",
-                    return_value=(
-                        {"data": {"order_id": "ORDER-1"}},
-                        {"quantity": 500, "product": "D"},
-                    ),
-                ) as place_order,
-                patch.object(
-                    trade_bot,
-                    "wait_for_order_complete",
-                    return_value={"status": "complete", "average_price": 100},
-                ),
-                patch.object(trade_bot, "find_matching_position_for_side", return_value=None),
-                patch.object(trade_bot, "send_apple_trade_entered_alert"),
-            ):
-                result = trade_bot.execute_stock_option_candidate(chosen)
-                state = json.loads(state_path.read_text())
-
-        self.assertTrue(result)
-        self.assertEqual(place_order.call_args.args[2], 500)
-        self.assertEqual(place_order.call_args.kwargs["product"], "D")
-        self.assertEqual(state["quantity"], 500)
-        self.assertEqual(state["order_product"], "D")
-        self.assertEqual(state["target_price"], 110.0)
-        self.assertEqual(state["stop_loss_price"], 90.0)
-
-    def test_rejected_stock_option_entry_clears_state(self):
-        chosen = {
-            "underlying_symbol": "RELIANCE",
-            "direction": "BULLISH",
-            "confidence": "HIGH",
-            "signal_score": 4,
-            "entry_price": 100,
-            "instrument": {
-                "instrument_key": "NSE_FO|TEST",
-                "trading_symbol": "RELIANCE TEST CE",
-                "lot_size": 500,
-            },
-            "option_summary": {"option_type": "CE"},
-            "technicals": {},
-            "weighted": {"score": 85},
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_path = Path(temp_dir) / "stock-option-state.json"
-            guard_path = Path(temp_dir) / "stock-option-guard.json"
-            with (
-                patch.dict(os.environ, {"ENABLE_LIVE_TRADING": "true"}),
-                patch.object(trade_bot, "state_file", return_value=state_path),
-                patch.object(trade_bot, "reentry_guard_file", return_value=guard_path),
-                patch.object(
-                    trade_bot,
-                    "place_market_order",
-                    return_value=(
-                        {"data": {"order_id": "ORDER-REJECTED"}},
-                        {"quantity": 500, "product": "D"},
-                    ),
-                ),
-                patch.object(
-                    trade_bot,
-                    "wait_for_order_complete",
-                    return_value={"status": "rejected", "status_message": "Intraday buy orders can't be placed for options."},
-                ),
-            ):
-                result = trade_bot.execute_stock_option_candidate(chosen)
-
-            self.assertFalse(result)
-            self.assertEqual(json.loads(state_path.read_text()), {})
-
     def test_live_daily_first_outcome_guard_is_independent_by_index(self):
         today = datetime(2026, 7, 20, 10, 0)
         history = "\n".join([
@@ -624,28 +353,6 @@ class TradeControlTests(unittest.TestCase):
             750,
         )
 
-    def test_mobile_dashboard_calculates_cumulative_stock_option_pnl(self):
-        trades = [
-            {"instrumentClass": "STOCK_OPTION", "grossPnL": 3200},
-            {"instrumentClass": "STOCK_OPTION", "grossPnL": -1200},
-            {"instrumentClass": "INDEX_OPTION", "grossPnL": 9000},
-        ]
-        self.assertEqual(
-            dashboard_data.cumulative_stock_option_pnl(trades),
-            2000,
-        )
-
-    def test_mobile_dashboard_infers_legacy_stock_option_rows(self):
-        trades = [
-            {
-                "underlyingSymbol": "RELIANCE",
-                "tradingSymbol": "RELIANCE 3000 PE 28 JUL 26",
-                "instrumentClass": "INDEX_OPTION",
-                "grossPnL": 1750,
-            }
-        ]
-        self.assertEqual(dashboard_data.cumulative_stock_option_pnl(trades), 1750)
-
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):
         trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}
         self.assertEqual(dashboard_data.option_type(trade), "PUT")
@@ -680,7 +387,7 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertEqual(performance["today"]["closedTrades"], 1)
         self.assertEqual(performance["today"]["closedPnL"], 1984.45)
-        self.assertEqual(performance["today"]["closedPnLSource"], "BOT_JOURNAL")
+        self.assertEqual(performance["today"]["closedPnLSource"], "TRADE_LOG")
         put_rows = [
             row
             for row in performance["today"]["optionTypePerformance"]
@@ -802,7 +509,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["exit_reason"], "TARGET")
         self.assertEqual(result["gross_pnl"], 300)
 
-    def test_signal_check_executes_each_qualified_index_candidate(self):
+    def test_signal_check_executes_best_qualified_index_candidate(self):
         candidates = {
             "NIFTY": {
                 "symbol": "NIFTY",
@@ -829,11 +536,7 @@ class TradeControlTests(unittest.TestCase):
         ):
             trade_bot.run_signal_check()
 
-        self.assertEqual(execute.call_count, 2)
-        execute.assert_has_calls([
-            call(candidates["BANKNIFTY"]),
-            call(candidates["NIFTY"]),
-        ])
+        execute.assert_called_once_with(candidates["BANKNIFTY"])
 
     def test_index_point_exits_are_read_from_environment(self):
         with patch.dict(
@@ -852,7 +555,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(levels["target_points"], 30)
         self.assertEqual(levels["stop_points"], 30)
 
-    def test_active_nifty_does_not_block_banknifty_entry(self):
+    def test_active_nifty_blocks_new_index_entry(self):
         bank_candidate = {
             "symbol": "BANKNIFTY",
             "transaction_type": "BUY",
@@ -878,8 +581,8 @@ class TradeControlTests(unittest.TestCase):
         ):
             trade_bot.run_signal_check()
 
-        evaluate.assert_called_once_with("BANKNIFTY", allow_option_sell=False)
-        execute.assert_called_once_with(bank_candidate)
+        evaluate.assert_not_called()
+        execute.assert_not_called()
 
     def test_losing_setups_are_rejected_by_feasibility_gate(self):
         first = trade_bot.evaluate_trade_feasibility(
@@ -927,68 +630,41 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["adjusted_target_price"], 110)
         self.assertEqual(result["technical_reward_risk"], 1.25)
 
-    def test_low_reward_risk_selects_single_profile_without_trailing(self):
-        with patch.dict(os.environ, {"INDEX_RR_PROFILE_ENABLED": "true"}, clear=False):
-            result = trade_bot.evaluate_trade_feasibility(
-                "BEARISH",
-                100,
-                115,
-                85,
-                {
-                    "atm_option_flow": {"close": 100},
-                    "five_min": {"bias": "BEARISH", "option_target_price": 101},
-                    "fifteen_min": {"bias": "BEARISH", "option_target_price": 102},
-                },
-                symbol="NIFTY",
-            )
+    def test_low_reward_risk_is_rejected_by_fixed_one_to_one_gate(self):
+        result = trade_bot.evaluate_trade_feasibility(
+            "BULLISH",
+            100,
+            115,
+            85,
+            {
+                "atm_option_flow": {"close": 100},
+                "five_min": {"bias": "BULLISH", "option_target_price": 104},
+                "fifteen_min": {"bias": "BULLISH", "option_target_price": 106},
+            },
+            symbol="NIFTY",
+        )
 
-        self.assertTrue(result["allowed"])
-        self.assertEqual(result["technical_reward_risk"], 0.07)
-        self.assertEqual(result["exit_profile"]["name"], "SINGLE")
-        self.assertEqual(result["exit_profile"]["target_points"], 10)
-        self.assertFalse(result["exit_profile"]["trailing_enabled"])
-
-    def test_mid_reward_risk_selects_double_profile_without_trailing(self):
-        with patch.dict(os.environ, {"INDEX_RR_PROFILE_ENABLED": "true"}, clear=False):
-            result = trade_bot.evaluate_trade_feasibility(
-                "BULLISH",
-                100,
-                115,
-                85,
-                {
-                    "atm_option_flow": {"close": 100},
-                    "five_min": {"bias": "BULLISH", "option_target_price": 104},
-                    "fifteen_min": {"bias": "BULLISH", "option_target_price": 106},
-                },
-                symbol="NIFTY",
-            )
-
-        self.assertTrue(result["allowed"])
+        self.assertFalse(result["allowed"])
         self.assertEqual(result["technical_reward_risk"], 0.27)
-        self.assertEqual(result["exit_profile"]["name"], "DOUBLE")
-        self.assertEqual(result["exit_profile"]["target_points"], 20)
-        self.assertFalse(result["exit_profile"]["trailing_enabled"])
+        self.assertIn("below required 1.00", result["reasons"][0])
 
-    def test_high_reward_risk_selects_boundary_profile_with_trailing(self):
-        with patch.dict(os.environ, {"INDEX_RR_PROFILE_ENABLED": "true"}, clear=False):
-            result = trade_bot.evaluate_trade_feasibility(
-                "BULLISH",
-                100,
-                130,
-                85,
-                {
-                    "atm_option_flow": {"close": 100},
-                    "five_min": {"bias": "BULLISH", "option_target_price": 112},
-                    "fifteen_min": {"bias": "BULLISH", "option_target_price": 118},
-                },
-                symbol="BANKNIFTY",
-            )
+    def test_fixed_index_gate_accepts_one_to_one_or_better(self):
+        result = trade_bot.evaluate_trade_feasibility(
+            "BULLISH",
+            100,
+            115,
+            85,
+            {
+                "atm_option_flow": {"close": 100},
+                "five_min": {"bias": "BULLISH", "option_target_price": 115},
+                "fifteen_min": {"bias": "BULLISH", "option_target_price": 118},
+            },
+            symbol="BANKNIFTY",
+        )
 
         self.assertTrue(result["allowed"])
-        self.assertEqual(result["technical_reward_risk"], 0.8)
-        self.assertEqual(result["exit_profile"]["name"], "BOUNDARY")
-        self.assertEqual(result["exit_profile"]["target_points"], 60)
-        self.assertTrue(result["exit_profile"]["trailing_enabled"])
+        self.assertEqual(result["technical_reward_risk"], 1.0)
+        self.assertNotIn("exit_profile", result)
 
     def test_capital_allocation_rounds_down_to_whole_lots(self):
         with patch.dict(
@@ -1152,32 +828,6 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(updated["profit_protection_stage"], 1)
         self.assertEqual(updated["stop_loss_price"], 106)
         self.assertEqual(updated["target_progress_percent"], 60)
-
-    def test_stock_option_profit_protection_uses_softer_default_locks(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with (
-                patch.object(trade_bot, "BASE_DIR", Path(temp_dir)),
-                patch.dict(os.environ, {"PROFIT_PROTECTION_ENABLED": "true"}),
-            ):
-                state = {
-                    "instrument_class": "STOCK_OPTION",
-                    "entry_transaction_type": "BUY",
-                    "entry_price": 100,
-                    "target_price": 130,
-                    "planned_target_price": 130,
-                    "stop_loss_price": 90,
-                    "highest_ltp": 100,
-                    "profit_protection_stage": 0,
-                }
-                stage_one = trade_bot.apply_trailing_stop("STOCK_OPTION", state, 121)
-                stage_one_snapshot = dict(stage_one)
-                stage_two = trade_bot.apply_trailing_stop("STOCK_OPTION", stage_one, 126)
-                unchanged = trade_bot.apply_trailing_stop("STOCK_OPTION", stage_two, 119)
-        self.assertEqual(stage_one_snapshot["profit_protection_stage"], 1)
-        self.assertEqual(stage_one_snapshot["stop_loss_price"], 104.5)
-        self.assertEqual(stage_two["profit_protection_stage"], 2)
-        self.assertEqual(stage_two["stop_loss_price"], 110.5)
-        self.assertEqual(unchanged["stop_loss_price"], 110.5)
 
     def test_profit_booking_price_is_eighty_percent_of_long_target(self):
         with patch.dict(os.environ, {"PROFIT_BOOKING_TARGET_PERCENT": "80"}):

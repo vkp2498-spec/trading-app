@@ -28,7 +28,6 @@ from market_technicals import (
     convert_index_levels_to_option_premium,
     get_option_volume_vwap_analysis,
 )
-from stock_option_scanner import scan_stock_option_candidates
 from stock_futures_scanner import scan_stock_futures, write_scanner_status
 
 from option_chain_trend import get_option_chain_trend, record_option_chain_snapshot
@@ -91,8 +90,7 @@ PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
-STOCK_OPTION_STATE = "STOCK_OPTION"
-BOT_STATE_SLOTS = SYMBOLS + [STOCK_OPTION_STATE, STOCK_FUTURE_STATE]
+BOT_STATE_SLOTS = SYMBOLS + [STOCK_FUTURE_STATE]
 
 # Used only when the corresponding environment variable is not set.
 DEFAULT_LOT_MULTIPLIERS = {
@@ -117,20 +115,6 @@ DEFAULT_INDEX_EXIT_POINTS = {
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
-DEFAULT_INDEX_RR_LOW_THRESHOLD = 0.10
-DEFAULT_INDEX_RR_MID_THRESHOLD = 0.40
-DEFAULT_INDEX_RR_PROFILE_POINTS = {
-    "NIFTY": {
-        "LOW": {"target": 10.0, "stop": 10.0, "trailing": False},
-        "MID": {"target": 20.0, "stop": 20.0, "trailing": False},
-        "HIGH": {"target": 30.0, "stop": 30.0, "trailing": True},
-    },
-    "BANKNIFTY": {
-        "LOW": {"target": 20.0, "stop": 20.0, "trailing": False},
-        "MID": {"target": 30.0, "stop": 30.0, "trailing": False},
-        "HIGH": {"target": 60.0, "stop": 60.0, "trailing": True},
-    },
-}
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = 1.0
@@ -185,6 +169,32 @@ def load_env():
 
 def log(msg):
     print(f"{now_ist().strftime('%Y-%m-%d %H:%M:%S')} | {msg}", flush=True)
+
+
+def concise_trade_logs():
+    return os.getenv("CONCISE_TRADE_LOGS", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def verbose_log(msg):
+    if not concise_trade_logs():
+        log(msg)
+
+
+def format_score(value):
+    try:
+        numeric = float(value)
+        return str(int(numeric)) if numeric.is_integer() else f"{numeric:.1f}"
+    except Exception:
+        return str(value)
+
+
+def log_scan_decision(symbol, score, action):
+    log(f"{symbol} score {format_score(score)} {action}")
 
 
 def to_float(value, default=0.0):
@@ -302,62 +312,6 @@ def option_levels_from_index_points(
     }
 
 
-def index_rr_profiles_enabled():
-    return os.getenv("INDEX_RR_PROFILE_ENABLED", "true").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-
-
-def index_rr_profile_for(symbol, technical_reward_risk):
-    """Choose the index-option exit profile from reachable technical RR.
-
-    The profile changes target/stop size, not signal quality. A positive but
-    small reachable RR becomes a small fixed shot; wider headroom keeps the
-    normal runner/trailing behavior.
-    """
-    if not index_rr_profiles_enabled() or symbol not in DEFAULT_INDEX_RR_PROFILE_POINTS:
-        return None
-
-    rr = float(technical_reward_risk or 0)
-    low_threshold = configured_non_negative_float(
-        "INDEX_RR_LOW_THRESHOLD", DEFAULT_INDEX_RR_LOW_THRESHOLD
-    )
-    mid_threshold = configured_non_negative_float(
-        "INDEX_RR_MID_THRESHOLD", DEFAULT_INDEX_RR_MID_THRESHOLD
-    )
-    if rr < low_threshold:
-        profile_key = "LOW"
-        profile_name = "SINGLE"
-    elif rr < mid_threshold:
-        profile_key = "MID"
-        profile_name = "DOUBLE"
-    else:
-        profile_key = "HIGH"
-        profile_name = "BOUNDARY"
-
-    defaults = DEFAULT_INDEX_RR_PROFILE_POINTS[symbol][profile_key]
-    target_points = configured_positive_float(
-        f"{symbol}_RR_{profile_key}_TARGET_POINTS", defaults["target"]
-    )
-    stop_points = configured_positive_float(
-        f"{symbol}_RR_{profile_key}_STOP_POINTS", defaults["stop"]
-    )
-    trailing_env = os.getenv(f"{symbol}_RR_{profile_key}_TRAILING_ENABLED")
-    trailing_enabled = defaults["trailing"] if trailing_env is None else trailing_env.strip().lower() in {
-        "1", "true", "yes", "on"
-    }
-    return {
-        "key": profile_key,
-        "name": profile_name,
-        "technical_reward_risk": round(rr, 4),
-        "target_points": target_points,
-        "stop_points": stop_points,
-        "trailing_enabled": trailing_enabled,
-        "low_threshold": low_threshold,
-        "mid_threshold": mid_threshold,
-    }
-
-
 def evaluate_trade_feasibility(
     direction,
     entry_price,
@@ -457,18 +411,6 @@ def evaluate_trade_feasibility(
         result["reasons"].append(
             f"Technical reward/risk {reward_risk:.2f} has no positive reachable reward; "
             f"{limiting_timeframe} target={reachable_target:.2f}"
-        )
-        return result
-
-    exit_profile = index_rr_profile_for(symbol, reward_risk)
-    if exit_profile:
-        result["allowed"] = True
-        result["exit_profile"] = exit_profile
-        result["reasons"].append(
-            f"Technical reward/risk {reward_risk:.2f} selected {exit_profile['name']} profile; "
-            f"target_points={exit_profile['target_points']:.0f} "
-            f"stop_points={exit_profile['stop_points']:.0f} "
-            f"trailing={'on' if exit_profile['trailing_enabled'] else 'off'}"
         )
         return result
 
@@ -786,6 +728,8 @@ def first_index_trade_outcome_today(symbol):
 
 
 def daily_index_entry_block_reason(symbol):
+    if trade_count_for(symbol) >= 1:
+        return f"one {symbol} trade already used today"
     outcome = first_index_trade_outcome_today(symbol)
     if not outcome:
         return ""
@@ -889,7 +833,8 @@ def portfolio_day_circuit():
     soft_loss = configured_non_negative_float("DAILY_SOFT_LOSS", 0.0)
     pause_minutes = configured_non_negative_float("DAILY_SOFT_PAUSE_MINUTES", 30.0)
     score_penalty = configured_non_negative_float("DAILY_SOFT_SCORE_PENALTY", 10.0)
-    hard_loss = configured_non_negative_float("DAILY_HARD_LOSS", 0.0)
+    hard_loss = configured_non_negative_float("DAILY_HARD_LOSS", daily_max_loss())
+    profit_target = daily_profit_target()
     max_consecutive = max(to_int(os.getenv("MAX_CONSECUTIVE_LOSSES"), 3), 0)
     giveback_trigger = configured_non_negative_float(
         "PEAK_PROFIT_GIVEBACK_TRIGGER", 0.0
@@ -917,6 +862,12 @@ def portfolio_day_circuit():
         "score_penalty": score_penalty if state.get("soft_triggered_at") else 0.0,
     }
 
+    if profit_target > 0 and pnl >= profit_target:
+        result.update(
+            allowed=False,
+            reason=f"daily profit target reached: P&L Rs {pnl:.2f} >= Rs {profit_target:.2f}",
+        )
+        return result
     if hard_loss > 0 and pnl <= -hard_loss:
         result.update(
             allowed=False,
@@ -971,13 +922,11 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
     if not circuit["allowed"]:
         return {"allowed": False, "reason": circuit["reason"], "circuit": circuit}
 
-    symbol = str(chosen.get("symbol") or STOCK_OPTION_STATE).upper()
+    symbol = str(chosen.get("symbol") or "").upper()
     score = candidate_weighted_score(chosen)
     base_minimum = to_float(
         chosen.get("entry_minimum_score"),
-        to_float(
-            os.getenv("STOCK_OPTION_MIN_WEIGHTED_SCORE"), 80.0
-        ) if symbol == STOCK_OPTION_STATE else MIN_SCORE_BY_SYMBOL.get(symbol, 65),
+        MIN_SCORE_BY_SYMBOL.get(symbol, 65),
     )
     required_score = base_minimum + to_float(circuit.get("score_penalty"))
     if score < required_score:
@@ -1035,7 +984,7 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
 
 
 def daily_profit_target():
-    fallback = to_float(os.getenv("DAILY_PROFIT_TARGET"), 0)
+    fallback = to_float(os.getenv("DAILY_PROFIT_TARGET"), 10000)
     return to_float(active_value("dailyProfitTarget", fallback), fallback)
 
 
@@ -1053,7 +1002,7 @@ def daily_profit_target_reached():
 
 
 def daily_max_loss():
-    fallback = to_float(os.getenv("DAILY_MAX_LOSS"), 0)
+    fallback = to_float(os.getenv("DAILY_MAX_LOSS"), 10000)
     return to_float(active_value("dailyMaxLoss", fallback), fallback)
 
 
@@ -1245,90 +1194,6 @@ def option_capital_per_entry():
             "OPTION_CAPITAL_PER_ENTRY must be 1 or greater"
         )
     return capital
-
-
-def bounded_rupee_level(value, minimum, maximum):
-    value = float(value)
-    minimum = float(minimum)
-    maximum = float(maximum)
-    if minimum <= 0 or maximum <= 0:
-        raise RuntimeError("Stock-option min/max rupee levels must be positive")
-    if minimum > maximum:
-        raise RuntimeError("Stock-option min rupee level cannot exceed max rupee level")
-    return min(max(value, minimum), maximum)
-
-
-def stock_option_rupee_levels(entry_price, quantity):
-    """Convert one-lot stock-option value into premium target/stop levels."""
-    entry = float(entry_price)
-    quantity = int(quantity)
-    if entry <= 0 or quantity <= 0:
-        raise RuntimeError("Stock-option entry price and quantity must be positive")
-
-    mode = os.getenv("STOCK_OPTION_LEVEL_MODE", "percent").strip().lower()
-    position_value = entry * quantity
-    if mode == "fixed":
-        target_rupees = configured_non_negative_float("STOCK_OPTION_TARGET_RUPEES", 5000.0)
-        stop_rupees = configured_non_negative_float("STOCK_OPTION_STOP_RUPEES", 5000.0)
-        target_percent = None
-        stop_percent = None
-    elif mode in {"percent", "value_percent", "value"}:
-        target_percent = configured_positive_float("STOCK_OPTION_TARGET_VALUE_PERCENT", 6.0)
-        stop_percent = configured_positive_float("STOCK_OPTION_STOP_VALUE_PERCENT", 4.0)
-        target_rupees = bounded_rupee_level(
-            position_value * target_percent / 100.0,
-            configured_positive_float("STOCK_OPTION_MIN_TARGET_RUPEES", 2000.0),
-            configured_positive_float("STOCK_OPTION_MAX_TARGET_RUPEES", 7000.0),
-        )
-        stop_rupees = bounded_rupee_level(
-            position_value * stop_percent / 100.0,
-            configured_positive_float("STOCK_OPTION_MIN_STOP_RUPEES", 1500.0),
-            configured_positive_float("STOCK_OPTION_MAX_STOP_RUPEES", 5000.0),
-        )
-    else:
-        raise RuntimeError("STOCK_OPTION_LEVEL_MODE must be 'percent' or 'fixed'")
-
-    if target_rupees <= 0 or stop_rupees <= 0:
-        raise RuntimeError("Stock-option target and stop rupees must be positive")
-    tick = configured_non_negative_float("STOCK_OPTION_TICK_SIZE", 0.05) or 0.05
-
-    def rounded(value):
-        return round(round(value / tick) * tick, 2)
-
-    return {
-        "target_price": rounded(entry + target_rupees / quantity),
-        "stop_loss_price": max(rounded(entry - stop_rupees / quantity), tick),
-        "target_rupees": round(target_rupees, 2),
-        "stop_rupees": round(stop_rupees, 2),
-        "level_mode": "fixed" if mode == "fixed" else "percent",
-        "position_value": round(position_value, 2),
-        "target_value_percent": target_percent,
-        "stop_value_percent": stop_percent,
-    }
-
-
-def stock_option_level_state_fields(levels):
-    return {
-        "fixed_target_rupees": levels["target_rupees"],
-        "fixed_stop_rupees": levels["stop_rupees"],
-        "stock_option_level_mode": levels.get("level_mode"),
-        "stock_option_position_value": levels.get("position_value"),
-        "stock_option_target_value_percent": levels.get("target_value_percent"),
-        "stock_option_stop_value_percent": levels.get("stop_value_percent"),
-    }
-
-
-def stock_option_order_product():
-    """Return the broker product used for long stock-option orders.
-
-    Upstox rejects MIS/intraday option-buy orders for this account.  Keep the
-    product configurable, but default stock options to the normal delivery/
-    NRML-equivalent API product.  This does not change index-option orders.
-    """
-    product = os.getenv("STOCK_OPTION_ORDER_PRODUCT", "D").strip().upper()
-    if product not in {"D", "I"}:
-        raise RuntimeError("STOCK_OPTION_ORDER_PRODUCT must be D or I")
-    return product
 
 
 def max_lots_per_entry():
@@ -1770,7 +1635,7 @@ def save_open_position_state(
                 transaction_type=entry_transaction_type,
             )
         else:
-            precision = 2 if instrument_class in {"STOCK_FUTURE", "STOCK_OPTION"} else 0
+            precision = 2 if instrument_class == "STOCK_FUTURE" else 0
             target_price = round(float(target_price), precision)
             stop_loss_price = round(float(stop_loss_price), precision)
 
@@ -1836,9 +1701,8 @@ def save_open_position_state(
     write_state(symbol, state)
 
     log(
-        f"{symbol} POSITION OPEN: symbol={instrument['trading_symbol']} "
-        f"action={entry_transaction_type} qty={quantity} lots={state['lot_multiplier']} entry={state['entry_price']} "
-        f"target={target_price} stop_loss={stop_loss_price}"
+        f"{symbol} score {format_score(score)} bought {state['entry_price']} "
+        f"target {target_price} stop {stop_loss_price} qty {quantity}"
     )
     send_apple_trade_entered_alert(state)
 
@@ -1868,8 +1732,8 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
     register_losing_exit_guard(symbol, state, journal_row, exit_reason)
     send_apple_closed_trade_alert(journal_row)
     log(
-        f"{symbol} {exit_reason} exit confirmed COMPLETE: result={result} "
-        f"payload={payload} journal={journal_row}"
+        f"{symbol} bought {journal_row.get('entry_price')} closed {journal_row.get('exit_price')} "
+        f"pnl {journal_row.get('gross_pnl')} reason {exit_reason}"
     )
     clear_state(symbol)
     return journal_row
@@ -2048,11 +1912,7 @@ def handle_existing_state(symbol, state, verbose=True):
 
     entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
     exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
-    order_product = (
-        state.get("order_product")
-        if state.get("instrument_class") == "STOCK_OPTION"
-        else "I"
-    ) or stock_option_order_product()
+    order_product = state.get("order_product") or "I"
 
     needs_broker_stop = entry_transaction == "SELL" or state.get("instrument_class") == "STOCK_FUTURE"
     if needs_broker_stop and protective_stop_filled(symbol, state):
@@ -2190,12 +2050,6 @@ def handle_existing_state(symbol, state, verbose=True):
                 "lot_size": int(state.get("lot_size") or quantity),
             }
             instrument_class = state.get("instrument_class", "INDEX_OPTION")
-            pending_technical_context = state.get("technical_context") or {}
-            pending_option_type = state.get("option_type")
-            if instrument_class == "STOCK_OPTION":
-                fixed_levels = stock_option_rupee_levels(entry_price, quantity)
-                state["target_price"] = fixed_levels["target_price"]
-                state["stop_loss_price"] = fixed_levels["stop_loss_price"]
             save_open_position_state(
                 symbol, entry_order_id, instrument, state.get("direction"),
                 state.get("confidence"), state.get("score"), entry_price, quantity,
@@ -2211,21 +2065,6 @@ def handle_existing_state(symbol, state, verbose=True):
                 profit_protection_enabled_for_trade=state.get("profit_protection_enabled_for_trade", True),
             )
             state = read_state(symbol)
-            if instrument_class == "STOCK_OPTION":
-                state.update(
-                    {
-                        "option_type": pending_option_type,
-                        "technical_context": pending_technical_context,
-                        **stock_option_level_state_fields(fixed_levels),
-                    }
-                )
-                write_state(symbol, state)
-                clear_reentry_guard(symbol)
-                log(
-                    f"{symbol} delayed stock-option fill levels set: entry={entry_price} "
-                    f"target={state['target_price']} stop_loss={state['stop_loss_price']}"
-                )
-                return True
             technical_context = state.get("technical_context") or {}
             option_type = state.get("option_type") or option_type_for(
                 state.get("direction"), "BUY"
@@ -2359,70 +2198,24 @@ def env_bool_with_fallback(primary, fallback, default="true"):
 
 
 def profit_protection_settings(instrument_class=None):
-    """Return validated, staged profit-protection thresholds."""
-    is_stock_option = instrument_class == "STOCK_OPTION"
-    prefix = "STOCK_OPTION_" if is_stock_option else ""
-    enabled = env_bool_with_fallback(
-        f"{prefix}PROFIT_PROTECTION_ENABLED",
-        "PROFIT_PROTECTION_ENABLED",
-        "true",
-    )
-    def positive_setting(primary, fallback, stock_default, normal_default):
-        if os.getenv(primary) is not None:
-            return configured_positive_float(primary, stock_default)
-        if is_stock_option:
-            return stock_default
-        return configured_positive_float(fallback, normal_default)
-
-    def non_negative_setting(primary, fallback, stock_default, normal_default):
-        if os.getenv(primary) is not None:
-            return configured_non_negative_float(primary, stock_default)
-        if is_stock_option:
-            return stock_default
-        return configured_non_negative_float(fallback, normal_default)
-
-    booking_trigger = (
-        positive_setting(
-            "STOCK_OPTION_PROFIT_BOOKING_TARGET_PERCENT",
-            "PROFIT_BOOKING_TARGET_PERCENT",
-            90.0,
-            80.0,
-        )
-        if is_stock_option
-        else profit_booking_target_percent()
-    )
+    """Return validated, staged profit-protection thresholds for index options."""
     settings = {
-        "enabled": enabled,
-        "stage_one_trigger": positive_setting(
-            f"{prefix}PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT",
-            "PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT",
-            70.0,
-            60.0,
+        "enabled": configured_bool("PROFIT_PROTECTION_ENABLED", True),
+        "stage_one_trigger": configured_positive_float(
+            "PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT", 60.0
         ),
-        "stage_one_lock": non_negative_setting(
-            f"{prefix}PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT",
-            "PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT",
-            15.0,
-            20.0,
+        "stage_one_lock": configured_non_negative_float(
+            "PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT", 20.0
         ),
-        "stage_two_trigger": positive_setting(
-            f"{prefix}PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT",
-            "PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT",
-            85.0,
-            70.0,
+        "stage_two_trigger": configured_positive_float(
+            "PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT", 70.0
         ),
-        "stage_two_lock": non_negative_setting(
-            f"{prefix}PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT",
-            "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT",
-            35.0,
-            35.0,
+        "stage_two_lock": configured_non_negative_float(
+            "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT", 35.0
         ),
-        "booking_trigger": booking_trigger,
-        "runner_lock": non_negative_setting(
-            f"{prefix}PROFIT_RUNNER_LOCK_PERCENT",
-            "PROFIT_RUNNER_LOCK_PERCENT",
-            45.0,
-            55.0,
+        "booking_trigger": profit_booking_target_percent(),
+        "runner_lock": configured_non_negative_float(
+            "PROFIT_RUNNER_LOCK_PERCENT", 55.0
         ),
     }
     if not (
@@ -2450,7 +2243,6 @@ def profit_protection_settings(instrument_class=None):
         )
     return settings
 
-
 def profit_booking_price(state):
     """Return the premium that represents the configured share of target progress."""
     entry_price = float(state.get("entry_price") or 0)
@@ -2464,7 +2256,7 @@ def profit_booking_price(state):
 
     progress = profit_booking_target_percent() / 100.0
     booking_price = entry_price + (target_price - entry_price) * progress
-    precision = 2 if state.get("instrument_class") in {"STOCK_FUTURE", "STOCK_OPTION"} else 0
+    precision = 2 if state.get("instrument_class") == "STOCK_FUTURE" else 0
     return round(booking_price, precision)
 
 
@@ -2475,12 +2267,10 @@ def apply_trailing_stop(symbol, state, ltp):
     progress the stop protects 20% of the planned move, and at 70% progress it
     protects 35%. The stop never moves backwards.
     """
-    if ltp is None or state.get("instrument_class") not in {
-        "INDEX_OPTION", "STOCK_OPTION",
-    }:
+    if ltp is None or state.get("instrument_class") != "INDEX_OPTION":
         return state
 
-    settings = profit_protection_settings(state.get("instrument_class"))
+    settings = profit_protection_settings()
     if not settings["enabled"]:
         return state
     if state.get("profit_protection_enabled_for_trade") is False:
@@ -2564,7 +2354,7 @@ def minutes_since_created(state):
 
 def sentiment_check_due(state):
     """Throttle expensive option-chain sentiment checks inside the 1-second monitor."""
-    if state.get("instrument_class") in {"STOCK_FUTURE", "STOCK_OPTION"}:
+    if state.get("instrument_class") == "STOCK_FUTURE":
         return False
     interval = max(
         int(float(os.getenv("MONITOR_SENTIMENT_INTERVAL_SECONDS", "60"))),
@@ -2581,7 +2371,7 @@ def sentiment_check_due(state):
 
 
 def should_exit_on_sentiment_change(symbol, state, ltp):
-    if state.get("instrument_class") in {"STOCK_FUTURE", "STOCK_OPTION"}:
+    if state.get("instrument_class") == "STOCK_FUTURE":
         return False, ""
     if ltp is None:
         return False, ""
@@ -2748,7 +2538,7 @@ def collect_institutional_footprint(symbol, recommendation, atm_option_flow=None
             recommendation,
             atm_option_flow or {},
         )
-        log(
+        verbose_log(
             f"{symbol} institutional footprint: bias={footprint.get('bias')} "
             f"confidence={footprint.get('confidence')} score={footprint.get('score')} "
             f"reasons={footprint.get('reasons')}"
@@ -2956,34 +2746,11 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             "weighted": weighted,
         }, None
 
-    exit_profile = feasibility.get("exit_profile") or {}
-    if exit_profile:
-        levels = option_levels_from_index_points(
-            symbol,
-            entry_price,
-            target_points=exit_profile["target_points"],
-            stop_points=exit_profile["stop_points"],
-            delta=levels["delta"],
-        )
-        target = levels["target_price"]
-        stop = levels["stop_loss_price"]
-        option_summary.update(
-            {
-                "target_price": target,
-                "stop_loss_price": stop,
-                "target_points": levels["target_points"],
-                "stop_points": levels["stop_points"],
-                "option_delta_used": levels["delta"],
-                "exit_profile": exit_profile,
-            }
-        )
-
     return {
         "allowed": True,
         "reason": (
-            "qualified"
-            if not exit_profile
-            else f"qualified profile={exit_profile.get('name')} rr={exit_profile.get('technical_reward_risk')}"
+            f"qualified fixed {levels['target_points']:.0f}/{levels['stop_points']:.0f} points; "
+            f"reward_risk={feasibility.get('technical_reward_risk')}"
         ),
         "transaction_type": transaction_type,
         "instrument": instrument,
@@ -2995,10 +2762,8 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         "target_points": levels["target_points"],
         "stop_points": levels["stop_points"],
         "option_delta_used": levels["delta"],
-        "exit_profile": exit_profile,
-        "profit_protection_enabled_for_trade": (
-            bool(exit_profile.get("trailing_enabled")) if exit_profile else True
-        ),
+        "exit_profile": {},
+        "profit_protection_enabled_for_trade": True,
         "technicals": technicals,
         "option_summary": option_summary,
         "weighted": weighted,
@@ -3028,7 +2793,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
     confidence = rec["confidence"]
     score = rec["score"]
     atm = rec["atm"]
-    log(
+    verbose_log(
         f"{symbol} signal: {direction}, confidence={confidence}, score={score}, "
         f"strike={atm['strike']}, expiry={atm['expiry']}"
     )
@@ -3041,7 +2806,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
     neutral_nifty_candidate = symbol == "NIFTY" and direction == "NEUTRAL"
     if not directional_high and not neutral_banknifty_candidate and not neutral_nifty_candidate:
         collect_institutional_footprint(symbol, rec)
-        log(f"{symbol} no trade: signal is not directional HIGH confidence.")
+        log_scan_decision(symbol, score, "reject")
         return False
 
     try:
@@ -3052,7 +2817,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
             "fifteen_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(error)]},
             "five_min": {"bias": "NEUTRAL", "confidence": "LOW", "reasons": [str(error)]},
         }
-        log(f"{symbol} technical analysis failed: {error}")
+        verbose_log(f"{symbol} technical analysis failed: {error}")
 
     if symbol == "BANKNIFTY":
         try:
@@ -3065,7 +2830,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
                 "reasons": [f"BANKNIFTY breadth unavailable: {error}"],
             }
         base_technicals["banknifty_breadth"] = breadth
-        log(
+        verbose_log(
             f"BANKNIFTY breadth: bias={breadth.get('bias')} "
             f"confidence={breadth.get('confidence')} score={breadth.get('score')} "
             f"reasons={breadth.get('reasons')}"
@@ -3075,10 +2840,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         inferred_direction, blockers = banknifty_neutral_chain_direction(base_technicals)
         if not inferred_direction:
             collect_institutional_footprint(symbol, rec)
-            log(
-                "BANKNIFTY no trade: neutral option chain and strong-technical "
-                "override failed: " + "; ".join(blockers)
-            )
+            log_scan_decision(symbol, score, "reject")
             return False
         original_direction = direction
         original_confidence = confidence
@@ -3092,7 +2854,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
             }
         )
         direction = inferred_direction
-        log(
+        verbose_log(
             f"BANKNIFTY neutral-chain override candidate: direction={direction}; "
             "5M/15M, 2H and major-bank breadth passed preconditions"
         )
@@ -3100,10 +2862,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         inferred_direction, blockers = nifty_neutral_chain_direction(base_technicals)
         if not inferred_direction:
             collect_institutional_footprint(symbol, rec)
-            log(
-                "NIFTY no trade: neutral option chain and strong-technical "
-                "override failed: " + "; ".join(blockers)
-            )
+            log_scan_decision(symbol, score, "reject")
             return False
         original_direction = direction
         original_confidence = confidence
@@ -3117,7 +2876,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
             }
         )
         direction = inferred_direction
-        log(
+        verbose_log(
             f"NIFTY neutral-chain override candidate: direction={direction}; "
             "5M/15M momentum and 2H risk preconditions passed"
         )
@@ -3125,7 +2884,8 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
     observe_signal_reset(symbol, direction)
     blocked_reason = reentry_block_reason(symbol, direction)
     if blocked_reason:
-        log(f"{symbol} no trade: {blocked_reason}")
+        log_scan_decision(symbol, score, "reject")
+        verbose_log(f"{symbol} no trade: {blocked_reason}")
         return False
 
     institutional = collect_institutional_footprint(symbol, rec)
@@ -3142,13 +2902,13 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         )
         if candidate:
             candidates.append(candidate)
-            log(
+            verbose_log(
                 f"{symbol} BUY candidate: allowed={candidate.get('allowed')} "
                 f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
                 f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
             )
     except Exception as error:
-        log(f"{symbol} BUY candidate unavailable: {error}")
+        verbose_log(f"{symbol} BUY candidate unavailable: {error}")
 
     preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
     if not preferred:
@@ -3167,7 +2927,9 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
                 "reason": best.get("reason"),
             }
             record_analysis(symbol, best["option_summary"], best["technicals"], decision)
-        log(f"{symbol} no trade: BUY structure did not pass deterministic gates.")
+        reject_score = candidate_weighted_score(best) if best else score
+        log_scan_decision(symbol, reject_score, "reject")
+        verbose_log(f"{symbol} no trade: BUY structure did not pass deterministic gates.")
         return False
 
     qualified = [
@@ -3226,7 +2988,8 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         )
         return chosen
 
-    log(f"{symbol} no trade: BUY structure did not pass deterministic rules.")
+    log_scan_decision(symbol, score, "reject")
+    verbose_log(f"{symbol} no trade: BUY structure did not pass deterministic rules.")
     return False
 
 
@@ -3255,10 +3018,9 @@ def execute_selected_candidate(chosen):
         return False
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    log(
+    verbose_log(
         f"{symbol} selected {transaction_type}: {instrument['trading_symbol']} qty={quantity} "
         f"entry={entry_price} target={target} stop={stop} "
-        f"profile={(chosen.get('exit_profile') or {}).get('name', 'DEFAULT')} "
         f"trailing={chosen.get('profit_protection_enabled_for_trade', True)} live={live}"
     )
     if not live:
@@ -3274,13 +3036,14 @@ def execute_selected_candidate(chosen):
             stop,
         )
         if not portfolio_decision.get("allowed"):
-            log(
+            log_scan_decision(symbol, candidate_weighted_score(chosen), "reject")
+            verbose_log(
                 f"{symbol} portfolio gate rejected entry: "
                 f"{portfolio_decision.get('reason')}"
             )
             return False
         risk = portfolio_decision.get("risk", {})
-        log(
+        verbose_log(
             f"{symbol} portfolio gate accepted{dry_run_note}: "
             f"current_risk={risk.get('current_risk')} proposed_risk={risk.get('proposed_risk')} "
             f"projected_risk={risk.get('projected_risk')} limit={risk.get('risk_limit')}"
@@ -3317,10 +3080,15 @@ def execute_selected_candidate(chosen):
             "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
             "created_at": now_ist().isoformat(),
         })
-    increment_trade_count(symbol)
-    log(f"{symbol} MARKET {transaction_type} placed: order_id={order_id} payload={payload}")
+    verbose_log(f"{symbol} MARKET {transaction_type} placed: order_id={order_id} payload={payload}")
     details = wait_for_order_complete(order_id)
+    if order_is_rejected(details):
+        clear_state(symbol)
+        log_scan_decision(symbol, candidate_weighted_score(chosen), "reject")
+        verbose_log(f"{symbol} MARKET {transaction_type} rejected: order_id={order_id} details={details}")
+        return False
     if not order_is_complete(details):
+        increment_trade_count(symbol)
         write_state(symbol, {
             "date": now_ist().strftime("%Y-%m-%d"),
             "symbol": symbol,
@@ -3355,6 +3123,7 @@ def execute_selected_candidate(chosen):
     position = find_matching_position_for_side(instrument["instrument_key"], transaction_type)
     fill = position_avg_price(position, transaction_type) if position else None
     fill = fill or to_float(details.get("average_price")) or entry_price
+    increment_trade_count(symbol)
     save_open_position_state(
         symbol, order_id, instrument, direction, confidence, score, fill, quantity,
         target, stop, chosen["target_percent"], chosen["stop_percent"],
@@ -3424,7 +3193,7 @@ def execute_selected_candidate(chosen):
         }
     )
     write_state(symbol, state)
-    log(
+    verbose_log(
         f"{symbol} post-fill levels validated: fill={fill} "
         f"target={post_fill['target_price']} stop_loss={post_fill['stop_loss_price']} "
         f"reward_risk={post_fill['feasibility'].get('technical_reward_risk')}"
@@ -3454,223 +3223,6 @@ def execute_selected_candidate(chosen):
 def execute_stock_future_candidate(chosen):
     log("STOCK_FUTURE entry blocked: stock-futures execution is disabled.")
     return False
-
-
-def execute_stock_option_candidate(chosen):
-    """Buy exactly one lot of the selected stock option and track it independently."""
-    symbol = STOCK_OPTION_STATE
-    instrument = chosen["instrument"]
-    quantity = int(instrument.get("lot_size") or 0)
-    expected_entry = float(chosen["entry_price"])
-    if quantity <= 0:
-        raise RuntimeError("Selected stock option has no valid lot size")
-    levels = stock_option_rupee_levels(expected_entry, quantity)
-    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    log(
-        f"STOCK_OPTION selected: {chosen['direction']} "
-        f"{instrument.get('trading_symbol')} qty={quantity} entry={expected_entry} "
-        f"target={levels['target_price']} stop={levels['stop_loss_price']} "
-        f"target_rupees={levels['target_rupees']} stop_rupees={levels['stop_rupees']} "
-        f"mode={levels.get('level_mode')} score={chosen.get('weighted', {}).get('score')} live={live}"
-    )
-    chosen = dict(chosen)
-    chosen.setdefault("symbol", STOCK_OPTION_STATE)
-    chosen.setdefault("transaction_type", "BUY")
-    chosen.setdefault(
-        "entry_minimum_score",
-        to_float(os.getenv("STOCK_OPTION_MIN_WEIGHTED_SCORE"), 80.0),
-    )
-    with portfolio_entry_lock():
-        portfolio_decision = pre_order_portfolio_decision(
-            chosen,
-            quantity,
-            expected_entry,
-            levels["stop_loss_price"],
-        )
-        if not portfolio_decision.get("allowed"):
-            log(
-                "STOCK_OPTION portfolio gate rejected entry: "
-                f"{portfolio_decision.get('reason')}"
-            )
-            return False
-        risk = portfolio_decision.get("risk", {})
-        log(
-            "STOCK_OPTION portfolio gate accepted: "
-            f"current_risk={risk.get('current_risk')} proposed_risk={risk.get('proposed_risk')} "
-            f"projected_risk={risk.get('projected_risk')} limit={risk.get('risk_limit')}"
-        )
-        if not live:
-            log("STOCK_OPTION dry run only: ENABLE_LIVE_TRADING is not true; no order placed.")
-            return False
-
-        order_product = stock_option_order_product()
-        result, payload = place_market_order(
-            instrument, "BUY", quantity, product=order_product
-        )
-        order_id = result.get("data", {}).get("order_id")
-        if not order_id:
-            raise RuntimeError(f"STOCK_OPTION BUY returned no order_id: {result}")
-        write_state(
-            symbol,
-            {
-                "date": now_ist().strftime("%Y-%m-%d"),
-                "symbol": symbol,
-                "underlying_symbol": chosen["underlying_symbol"],
-                "instrument_class": "STOCK_OPTION",
-                "entry_order_id": order_id,
-                "buy_order_id": order_id,
-                "entry_transaction_type": "BUY",
-                "exit_transaction_type": "SELL",
-                "order_product": order_product,
-                "instrument_key": instrument["instrument_key"],
-                "trading_symbol": instrument.get("trading_symbol"),
-                "quantity": quantity,
-                "lot_size": quantity,
-                "entry_price": expected_entry,
-                "target_price": levels["target_price"],
-                "stop_loss_price": levels["stop_loss_price"],
-                **stock_option_level_state_fields(levels),
-                "direction": chosen["direction"],
-                "confidence": chosen["confidence"],
-                "score": chosen["signal_score"],
-                "weighted_score": candidate_weighted_score(chosen),
-                "status": "BUY_PLACED_NOT_COMPLETE",
-                "created_at": now_ist().isoformat(),
-            },
-        )
-    log(f"STOCK_OPTION MARKET BUY placed: order_id={order_id} payload={payload}")
-    details = wait_for_order_complete(order_id)
-    if not order_is_complete(details):
-        status = order_status(details)
-        if order_is_rejected(details):
-            clear_state(symbol)
-            clear_reentry_guard(symbol)
-            log(
-                f"STOCK_OPTION BUY rejected; state cleared: order_id={order_id} "
-                f"status={status} details={details}"
-            )
-            return False
-        write_state(
-            symbol,
-            {
-                "date": now_ist().strftime("%Y-%m-%d"),
-                "symbol": symbol,
-                "underlying_symbol": chosen["underlying_symbol"],
-                "instrument_class": "STOCK_OPTION",
-                "entry_order_id": order_id,
-                "buy_order_id": order_id,
-                "entry_transaction_type": "BUY",
-                "exit_transaction_type": "SELL",
-                "order_product": order_product,
-                "instrument_key": instrument["instrument_key"],
-                "trading_symbol": instrument.get("trading_symbol"),
-                "quantity": quantity,
-                "lot_size": quantity,
-                "lot_multiplier": 1,
-                "entry_price": expected_entry,
-                "target_price": levels["target_price"],
-                "stop_loss_price": levels["stop_loss_price"],
-                **stock_option_level_state_fields(levels),
-                "option_type": chosen.get("option_summary", {}).get("option_type"),
-                "technical_context": chosen.get("technicals", {}),
-                "direction": chosen["direction"],
-                "confidence": chosen["confidence"],
-                "score": chosen["signal_score"],
-                "weighted_score": candidate_weighted_score(chosen),
-                "status": "BUY_PLACED_NOT_COMPLETE",
-                "created_at": now_ist().isoformat(),
-            },
-        )
-        log(
-            f"STOCK_OPTION BUY is pending; state retained: order_id={order_id} "
-            f"status={order_status(details)}"
-        )
-        return True
-
-    position = find_matching_position_for_side(instrument["instrument_key"], "BUY")
-    fill = position_avg_price(position, "BUY") if position else None
-    fill = fill or to_float(details.get("average_price")) or expected_entry
-    order_product = stock_option_order_product()
-    levels = stock_option_rupee_levels(fill, quantity)
-    save_open_position_state(
-        symbol,
-        order_id,
-        instrument,
-        chosen["direction"],
-        chosen["confidence"],
-        chosen["signal_score"],
-        fill,
-        quantity,
-        target_price=levels["target_price"],
-        stop_loss_price=levels["stop_loss_price"],
-        entry_transaction_type="BUY",
-        instrument_class="STOCK_OPTION",
-        underlying_symbol=chosen["underlying_symbol"],
-    )
-    state = read_state(symbol)
-    state.update(
-        {
-            "order_product": order_product,
-            "option_type": chosen.get("option_summary", {}).get("option_type"),
-            "technical_context": chosen.get("technicals", {}),
-            **stock_option_level_state_fields(levels),
-            "mover_type": chosen.get("mover_type"),
-            "mover_change_percent": chosen.get("mover_change_percent"),
-            "weighted_score": candidate_weighted_score(chosen),
-        }
-    )
-    write_state(symbol, state)
-    clear_reentry_guard(symbol)
-    return True
-
-
-def run_stock_options_scan():
-    if os.getenv("ENABLE_STOCK_OPTIONS_TRADING", "false").lower() != "true":
-        return False
-    if read_state(STOCK_OPTION_STATE).get("instrument_key"):
-        log("STOCK_OPTION already has an active bot position; scanner skipped.")
-        return False
-
-    ensure_instruments_file()
-    try:
-        result = scan_stock_option_candidates(
-            INSTRUMENT_CACHE,
-            upstox_request,
-            read_market_cache,
-            log,
-        )
-    except Exception as error:
-        log(f"STOCK_OPTION scanner ERROR: {error}")
-        return False
-    qualified = result.get("qualified", [])
-    if not qualified:
-        log("STOCK_OPTION no trade: all shortlisted NIFTY-50 stocks failed deterministic gates.")
-        return False
-
-    chosen = qualified[0]
-    decision = {
-        "execute_trade": True,
-        "decision": chosen["direction"],
-        "confidence": "HIGH",
-        "target_price": None,
-        "stop_loss_price": None,
-        "reason": (
-            f"{chosen['mover_type']} passed tradeability, 5M/15M structure, "
-            "VWAP/momentum, futures OI, market context, option evidence, "
-            "and directional-score gates."
-        ),
-    }
-    record_analysis(
-        chosen["underlying_symbol"],
-        chosen["option_summary"],
-        chosen["technicals"],
-        decision,
-    )
-    try:
-        return execute_stock_option_candidate(chosen)
-    except Exception as error:
-        log(f"STOCK_OPTION order execution ERROR: {error}")
-        return False
 
 
 def _legacy_execute_stock_future_candidate(chosen):
@@ -3948,6 +3500,9 @@ def run_signal_check():
         for symbol in SYMBOLS
         if read_state(symbol).get("instrument_key")
     }
+    if active_index:
+        log("Index entry skipped: active " + "/".join(sorted(active_index)) + " position open")
+        return
 
     try:
         tracked_instrument_keys = {
@@ -3990,9 +3545,6 @@ def run_signal_check():
 
     qualified = []
     for symbol in SYMBOLS:
-        if symbol in active_index:
-            log(f"{symbol} already has an active bot position; skipping only {symbol} entry.")
-            continue
         try:
             daily_block = daily_index_entry_block_reason(symbol)
         except Exception as error:
@@ -4002,7 +3554,8 @@ def run_signal_check():
             )
             continue
         if daily_block:
-            log(f"{symbol} no trade: {daily_block}")
+            log_scan_decision(symbol, "used", "reject")
+            verbose_log(f"{symbol} no trade: {daily_block}")
             continue
         try:
             candidate = evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False)
@@ -4012,7 +3565,7 @@ def run_signal_check():
             log(f"{symbol} ERROR: {e}")
 
     if not qualified:
-        log("No new qualified NIFTY or BANKNIFTY BUY structure.")
+        verbose_log("No new qualified NIFTY or BANKNIFTY BUY structure.")
     else:
         ordered = sorted(
             qualified,
@@ -4022,20 +3575,13 @@ def run_signal_check():
             ),
             reverse=True,
         )
-        choices = [
-            (item["symbol"], item["transaction_type"], item.get("weighted", {}).get("score"))
-            for item in qualified
-        ]
-        log("Independent index selections qualified: " + str(choices))
-        for chosen in ordered:
-            try:
-                execute_selected_candidate(chosen)
-            except Exception as error:
-                log(f"{chosen['symbol']} order execution ERROR: {error}")
+        chosen = ordered[0]
+        log_scan_decision(chosen["symbol"], candidate_weighted_score(chosen), "buy")
+        try:
+            execute_selected_candidate(chosen)
+        except Exception as error:
+            log(f"{chosen['symbol']} order execution ERROR: {error}")
 
-    # Stock options use an independent state slot, so an index position does
-    # not block this lane and a stock-option position does not block an index.
-    run_stock_options_scan()
 
 
 def main():

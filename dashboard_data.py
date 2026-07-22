@@ -25,7 +25,7 @@ LOG_FILE = LOG_DIR / "trade_bot.log"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
-STATE_SLOTS = SYMBOLS + ["STOCK_OPTION", "STOCK_FUTURE"]
+STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 
 UPSTOX_POSITIONS_URL = (
@@ -432,7 +432,6 @@ def empty_trade_performance() -> dict:
         "cumulative": {
             "totalTrades": 0,
             "totalPnL": 0.0,
-            "stockOptionsPnL": 0.0,
             "winRate": 0.0,
             "averageProfitPerWinningTrade": 0.0,
             "averageLossPerLosingTrade": 0.0,
@@ -464,17 +463,6 @@ def calculate_win_rate(trades: list[dict]) -> float:
     return round(
         winning_trades / len(trades) * 100,
         1,
-    )
-
-
-def cumulative_stock_option_pnl(trades: list[dict]) -> float:
-    return round(
-        sum(
-            trade["grossPnL"]
-            for trade in trades
-            if inferred_instrument_class(trade) == "STOCK_OPTION"
-        ),
-        2,
     )
 
 
@@ -620,11 +608,6 @@ def inferred_instrument_class(trade: dict) -> str:
     underlying = normalized_underlying(trade)
     if re.search(r"(?:^|[ _-])FUT(?:$|[ _-])", trading_symbol):
         return "STOCK_FUTURE"
-    has_option_token = bool(
-        re.search(r"(?:^|[ _-]|\d)(?:CE|PE|CALL|PUT)(?:$|[ _-]|\d)", trading_symbol)
-    )
-    if has_option_token and underlying not in SYMBOLS:
-        return "STOCK_OPTION"
     return explicit or "INDEX_OPTION"
 
 
@@ -988,7 +971,6 @@ def build_trade_performance() -> dict:
         "cumulative": {
             "totalTrades": len(trades),
             "totalPnL": cumulative_total_pnl,
-            "stockOptionsPnL": cumulative_stock_option_pnl(trades),
             "winRate": calculate_win_rate(
                 trades
             ),
