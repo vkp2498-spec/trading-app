@@ -688,6 +688,56 @@ class TradeControlTests(unittest.TestCase):
         ]
         self.assertEqual(put_rows[0]["netPnL"], 1984.45)
 
+    def test_mobile_dashboard_uses_synced_upstox_rows_before_broker_pnl(self):
+        trades = [
+            {
+                "tradeDate": "2026-07-22",
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "tradingSymbol": "NIFTY 24200 PE 28 JUL 26",
+                "optionType": "PUT",
+                "grossPnL": -4500.0,
+                "exitTime": "2026-07-22T10:30:00+05:30",
+                "exitReason": "TARGET",
+            },
+            {
+                "tradeDate": "2026-07-22",
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "tradingSymbol": "UPSTOX SYNC NIFTY PUT",
+                "optionType": "PUT",
+                "grossPnL": 19500.0,
+                "exitTime": "2026-07-22T13:00:00+05:30",
+                "exitReason": "UPSTOX_SYNC_ADJUSTMENT",
+            },
+        ]
+        with (
+            patch.object(dashboard_data, "read_trade_history", return_value=trades),
+            patch.object(
+                dashboard_data,
+                "fetch_upstox_today_pnl",
+                return_value=(-4500.0, "Upstox P&L request failed with status 403", 1, {"NIFTY": -4500.0}, {"NIFTY": 1}),
+            ),
+            patch.object(dashboard_data, "datetime") as mocked_datetime,
+        ):
+            mocked_datetime.now.return_value = datetime(2026, 7, 22, 13, 5)
+            performance = dashboard_data.build_trade_performance()
+
+        self.assertEqual(performance["today"]["closedPnL"], 15000.0)
+        self.assertEqual(performance["today"]["botPnL"], -4500.0)
+        self.assertEqual(performance["today"]["manualOtherPnL"], 19500.0)
+        self.assertEqual(performance["today"]["totalUpstoxPnL"], 15000.0)
+        self.assertIsNone(performance["today"]["closedPnLError"])
+        self.assertEqual(performance["equityCurve"][-1]["dailyPnL"], 15000.0)
+        put_rows = [
+            row
+            for row in performance["cumulative"]["optionTypePerformance"]
+            if row["optionType"] == "PUT" and row["symbol"] == "NIFTY"
+        ]
+        self.assertEqual(put_rows[0]["netPnL"], 15000.0)
+
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {
             "symbol": "NIFTY",

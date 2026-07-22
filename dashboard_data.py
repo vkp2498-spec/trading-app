@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections import deque
 from pathlib import Path
 from datetime import datetime
@@ -24,6 +26,7 @@ STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_OPTION", "STOCK_FUTURE"]
+UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 
 UPSTOX_POSITIONS_URL = (
     "https://api.upstox.com/v2/"
@@ -686,6 +689,18 @@ def option_type_performance(trades: list[dict]) -> list[dict]:
     ]
 
 
+def is_upstox_sync_trade(trade: dict) -> bool:
+    return str(trade.get("exitReason") or "").upper() == UPSTOX_SYNC_EXIT_REASON
+
+
+def bot_only_trades(trades: list[dict]) -> list[dict]:
+    return [
+        trade
+        for trade in trades
+        if not is_upstox_sync_trade(trade)
+    ]
+
+
 def today_category_pnl(
     trades: list[dict],
 ) -> dict:
@@ -917,9 +932,13 @@ def build_trade_performance() -> dict:
     )[:20]
     upstox_today_pnl, upstox_today_error, upstox_today_count, upstox_symbol_pnl, upstox_symbol_counts = fetch_upstox_today_pnl()
     local_today_pnl = round(sum(trade["grossPnL"] for trade in today_trades), 2)
+    today_bot_trades = bot_only_trades(today_trades)
+    local_bot_pnl = round(sum(trade["grossPnL"] for trade in today_bot_trades), 2)
+    has_upstox_sync_rows = any(is_upstox_sync_trade(trade) for trade in today_trades)
     today_pnl_delta = 0.0
     use_upstox_today = (
-        upstox_today_pnl is not None
+        not has_upstox_sync_rows
+        and upstox_today_pnl is not None
         and (
             upstox_today_count > 0
             or abs(upstox_today_pnl) > 0
@@ -955,8 +974,11 @@ def build_trade_performance() -> dict:
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
     average_profit, average_loss = average_trade_results(trades)
-    bot_pnl = today_closed_pnl
+    bot_pnl = local_bot_pnl if has_upstox_sync_rows else today_closed_pnl
     total_upstox_pnl = upstox_today_pnl if upstox_today_pnl is not None else today_closed_pnl
+    if has_upstox_sync_rows:
+        total_upstox_pnl = today_closed_pnl
+        upstox_today_error = None
     manual_other_pnl = (
         round(total_upstox_pnl - bot_pnl, 2)
         if total_upstox_pnl is not None
