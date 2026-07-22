@@ -1809,29 +1809,27 @@ def summary_card_html(title, summary, show_averages=False):
     average_rows = ""
     if show_averages:
         average_rows = f"""
-            <div style="margin-top:8px;color:#334155;font-weight:700;">
-                Avg profit <span class="positive">{money(average_profit)}</span>
-            </div>
-            <div style="margin-top:4px;color:#334155;font-weight:700;">
-                Avg loss <span class="negative">{money(average_loss)}</span>
-            </div>
-        """
+<div style="margin-top:8px;color:#334155;font-weight:700;">
+Avg profit <span class="positive">{money(average_profit)}</span>
+</div>
+<div style="margin-top:4px;color:#334155;font-weight:700;">
+Avg loss <span class="negative">{money(average_loss)}</span>
+</div>"""
     return f"""
-        <div class="metric-card">
-            <div class="metric-label">{html.escape(title)}</div>
-            <div class="metric-value">{trades} trades</div>
-            <div class="{pnl_class(net_pnl)}" style="font-size:20px;margin-top:8px;">
-                Net P&amp;L {money(net_pnl)}
-            </div>
-            <div style="margin-top:8px;color:#334155;font-weight:700;">
-                Win rate {win_rate:.1f}%
-            </div>
-            <div style="margin-top:4px;color:#334155;font-weight:700;">
-                Other charges {money(charges)}
-            </div>
-            {average_rows}
-        </div>
-    """
+<div class="metric-card">
+<div class="metric-label">{html.escape(title)}</div>
+<div class="metric-value">{trades} trades</div>
+<div class="{pnl_class(net_pnl)}" style="font-size:20px;margin-top:8px;">
+Net P&amp;L {money(net_pnl)}
+</div>
+<div style="margin-top:8px;color:#334155;font-weight:700;">
+Win rate {win_rate:.1f}%
+</div>
+<div style="margin-top:4px;color:#334155;font-weight:700;">
+Other charges {money(charges)}
+</div>
+{average_rows}
+</div>"""
 
 
 def section_stats(payload, total_trades_key, total_pnl_key):
