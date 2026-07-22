@@ -130,6 +130,58 @@ st.markdown(
         font-weight: 850;
         margin-top: 8px;
     }
+    .mini-chart-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(220px, 1fr));
+        gap: 14px;
+        max-width: 760px;
+    }
+    .mini-chart-card {
+        background: #f8fafc;
+        border: 1px solid #d8e0ea;
+        border-radius: 8px;
+        padding: 14px 16px;
+    }
+    .mini-chart-title {
+        color: #061a35;
+        font-size: 13px;
+        font-weight: 850;
+        margin-bottom: 12px;
+    }
+    .mini-bars {
+        align-items: end;
+        display: flex;
+        gap: 14px;
+        height: 120px;
+        justify-content: center;
+    }
+    .mini-bar-wrap {
+        align-items: center;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        width: 64px;
+    }
+    .mini-bar {
+        border-radius: 5px 5px 0 0;
+        min-height: 6px;
+        width: 28px;
+    }
+    .mini-bar.call {
+        background: #061a35;
+    }
+    .mini-bar.put {
+        background: #2563eb;
+    }
+    .mini-bar-label {
+        color: #475569;
+        font-size: 11px;
+        font-weight: 800;
+    }
+    .mini-bar-value {
+        font-size: 12px;
+        font-weight: 850;
+    }
     .status-card {
         border: 1px solid rgba(148, 163, 184, 0.22);
         background: rgba(15, 23, 42, 0.88);
@@ -223,6 +275,9 @@ st.markdown(
         }
         .dash-title {
             font-size: 28px;
+        }
+        .mini-chart-grid {
+            grid-template-columns: 1fr;
         }
         .xray-verdict-title {
             font-size: 17px;
@@ -854,6 +909,47 @@ def option_totals_chart_data(trades):
             for symbol, values in totals.items()
         ]
     ).set_index("Symbol")
+
+
+def render_option_totals_mini_chart(trades):
+    values = option_totals_chart_data(trades).to_dict("index")
+    max_value = max(
+        [
+            abs(float(group.get(option, 0) or 0))
+            for group in values.values()
+            for option in ("CALL", "PUT")
+        ]
+        or [1.0]
+    )
+    max_value = max(max_value, 1.0)
+    cards = []
+    for symbol in SYMBOLS:
+        group = values.get(symbol, {})
+        bars = []
+        for option in ("CALL", "PUT"):
+            pnl = float(group.get(option, 0) or 0)
+            height = max(6, int(abs(pnl) / max_value * 100))
+            bars.append(
+                f"""
+                <div class="mini-bar-wrap">
+                    <div class="mini-bar-value {pnl_class(pnl)}">{money(pnl)}</div>
+                    <div class="mini-bar {option.lower()}" style="height:{height}px;"></div>
+                    <div class="mini-bar-label">{option}</div>
+                </div>
+                """
+            )
+        cards.append(
+            f"""
+            <div class="mini-chart-card">
+                <div class="mini-chart-title">{symbol}</div>
+                <div class="mini-bars">{''.join(bars)}</div>
+            </div>
+            """
+        )
+    st.markdown(
+        f'<div class="mini-chart-grid">{"".join(cards)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def number(value):
@@ -1735,5 +1831,4 @@ for column, symbol in zip(summary_cols, SYMBOLS):
         )
 
 section_header("CALL and PUT Totals")
-chart_data = option_totals_chart_data(trades)
-st.bar_chart(chart_data, use_container_width=True)
+render_option_totals_mini_chart(trades)
