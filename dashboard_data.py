@@ -940,8 +940,8 @@ def build_trade_performance() -> dict:
     today_categories = today_category_pnl(today_trades)
     today_categories["overall"] = today_closed_pnl
     average_profit, average_loss = average_trade_results(trades)
-    bot_pnl = local_today_pnl
-    total_upstox_pnl = upstox_today_pnl
+    bot_pnl = today_closed_pnl
+    total_upstox_pnl = upstox_today_pnl if upstox_today_pnl is not None else today_closed_pnl
     manual_other_pnl = (
         round(total_upstox_pnl - bot_pnl, 2)
         if total_upstox_pnl is not None
@@ -1429,20 +1429,24 @@ def build_health_snapshot() -> dict:
         + safe_float(live_positions.get("totalLivePnL")),
         2,
     )
-    upstox_closed_pnl = today.get("totalUpstoxPnL")
-    total_upstox_pnl = (
-        round(
-            safe_float(upstox_closed_pnl)
-            + safe_float(live_positions.get("totalUpstoxLivePnL")),
-            2,
-        )
-        if upstox_closed_pnl is not None
-        else None
+    upstox_closed_pnl = today.get(
+        "totalUpstoxPnL",
+        today.get("closedPnL"),
+    )
+    total_upstox_live_pnl = live_positions.get(
+        "totalUpstoxLivePnL",
+        live_positions.get("totalLivePnL"),
+    )
+    total_upstox_pnl = round(
+        safe_float(upstox_closed_pnl)
+        + safe_float(total_upstox_live_pnl),
+        2,
     )
     manual_other_pnl = (
-        round(total_upstox_pnl - bot_pnl, 2)
-        if total_upstox_pnl is not None
-        else None
+        round(
+            total_upstox_pnl - bot_pnl,
+            2,
+        )
     )
     stock_scanner = read_json_file(
         STOCK_SCANNER_STATUS_FILE,
