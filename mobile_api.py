@@ -16,6 +16,9 @@ from apns_push import register_device
 from apns_push import registered_device_count
 from apns_push import send_test_notification
 from apns_push import unregister_device
+from aws_control import aws_instance_status
+from aws_control import start_instance
+from aws_control import stop_instance
 from dashboard_data import build_health_snapshot
 from dashboard_data import build_trade_performance
 from dashboard_data import load_env
@@ -94,6 +97,10 @@ class LiveExitRequest(BaseModel):
     confirmation: bool = False
 
 
+class AWSInstanceAction(BaseModel):
+    confirmation: bool = False
+
+
 def require_mobile_token(
     credentials: (
         HTTPAuthorizationCredentials | None
@@ -161,6 +168,21 @@ def dashboard():
     """
     try:
         snapshot = build_health_snapshot()
+        try:
+            snapshot["aws"] = aws_instance_status()
+        except Exception as error:
+            snapshot["aws"] = {
+                "region": os.getenv("AWS_REGION", "ap-south-1"),
+                "availabilityZone": "ap-south-1a",
+                "instanceId": os.getenv("AWS_INSTANCE_ID", ""),
+                "instanceName": os.getenv("AWS_INSTANCE_NAME", "ai-trading-bot-vamsi"),
+                "state": "unavailable",
+                "publicIpAddress": None,
+                "privateIpAddress": None,
+                "lastChecked": datetime.now(IST).isoformat(),
+                "controlAvailable": False,
+                "message": str(error),
+            }
 
         snapshot["profile"] = TRADING_PROFILE
         snapshot["serverTime"] = datetime.now(
@@ -190,6 +212,58 @@ def dashboard():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Dashboard data is temporarily unavailable",
         )
+
+
+@app.get(
+    "/api/v1/aws/status",
+    dependencies=[Depends(require_mobile_token)],
+)
+def aws_status():
+    try:
+        return aws_instance_status()
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+
+
+@app.post(
+    "/api/v1/aws/start",
+    dependencies=[Depends(require_mobile_token)],
+)
+def aws_start(action: AWSInstanceAction):
+    if not action.confirmation:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Explicit confirmation is required",
+        )
+    try:
+        return start_instance()
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+
+
+@app.post(
+    "/api/v1/aws/stop",
+    dependencies=[Depends(require_mobile_token)],
+)
+def aws_stop(action: AWSInstanceAction):
+    if not action.confirmation:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Explicit confirmation is required",
+        )
+    try:
+        return stop_instance()
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
 
 
 @app.get(
