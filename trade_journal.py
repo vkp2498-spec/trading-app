@@ -29,6 +29,13 @@ COLUMNS = [
     "exit_reason",
     "gross_pnl",
     "score",
+    "trade_sequence",
+    "prior_trade_symbol",
+    "prior_trade_outcome",
+    "prior_trade_pnl",
+    "risk_per_trade_limit",
+    "remaining_index_risk_budget",
+    "planned_risk",
     "status",
 ]
 
@@ -98,6 +105,13 @@ def record_closed_trade(state, exit_price, exit_reason):
         "exit_reason": exit_reason,
         "gross_pnl": gross_pnl,
         "score": state.get("score", ""),
+        "trade_sequence": state.get("trade_sequence", ""),
+        "prior_trade_symbol": state.get("prior_trade_symbol", ""),
+        "prior_trade_outcome": state.get("prior_trade_outcome", ""),
+        "prior_trade_pnl": state.get("prior_trade_pnl", ""),
+        "risk_per_trade_limit": state.get("risk_per_trade_limit", ""),
+        "remaining_index_risk_budget": state.get("remaining_index_risk_budget", ""),
+        "planned_risk": state.get("planned_risk", ""),
         "status": "CLOSED",
     }
 

@@ -1862,3 +1862,72 @@ summary_cols = st.columns(3)
 for column, (title, summary) in zip(summary_cols, section_stats(cumulative, "totalTrades", "totalPnL")):
     with column:
         st.markdown(summary_card_html(title, summary, show_averages=True), unsafe_allow_html=True)
+
+
+def sequence_table(rows):
+    frame = pd.DataFrame(rows or [])
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "sequence",
+                "trades",
+                "netPnL",
+                "winRate",
+                "averageProfit",
+                "averageLoss",
+                "plannedRisk",
+            ]
+        )
+    keep = [
+        column
+        for column in [
+            "sequence",
+            "priorOutcome",
+            "trades",
+            "netPnL",
+            "winRate",
+            "averageProfit",
+            "averageLoss",
+        ]
+        if column in frame.columns
+    ]
+    frame = frame[keep].copy()
+    rename = {
+        "sequence": "Trade",
+        "priorOutcome": "Prior Outcome",
+        "trades": "Trades",
+        "netPnL": "Net P&L",
+        "winRate": "Win %",
+        "averageProfit": "Avg Win",
+        "averageLoss": "Avg Loss",
+    }
+    frame = frame.rename(columns=rename)
+    for column in ["Net P&L", "Avg Win", "Avg Loss"]:
+        if column in frame.columns:
+            frame[column] = frame[column].map(money)
+    if "Win %" in frame.columns:
+        frame["Win %"] = frame["Win %"].map(lambda value: f"{float(value or 0):.1f}%")
+    return frame
+
+
+section_header("Index Trade Sequence")
+seq_today, seq_cumulative = st.columns(2)
+with seq_today:
+    st.markdown("**Today**")
+    st.dataframe(
+        sequence_table(today.get("indexTradeSequencePerformance")),
+        use_container_width=True,
+        hide_index=True,
+    )
+with seq_cumulative:
+    st.markdown("**Cumulative**")
+    st.dataframe(
+        sequence_table(cumulative.get("indexTradeSequencePerformance")),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+second_context = sequence_table(cumulative.get("secondTradeContextPerformance"))
+if not second_context.empty:
+    st.markdown("**Second Trade Context**")
+    st.dataframe(second_context, use_container_width=True, hide_index=True)

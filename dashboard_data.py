@@ -444,6 +444,8 @@ def empty_trade_performance() -> dict:
             ),
             "dayOfWeekPerformance": day_of_week_performance([]),
             "optionTypePerformance": option_type_performance([]),
+            "indexTradeSequencePerformance": index_trade_sequence_performance([]),
+            "secondTradeContextPerformance": second_trade_context_performance([]),
         },
         "equityCurve": [],
         "recentTrades": [],
@@ -745,6 +747,51 @@ def option_type_performance(trades: list[dict]) -> list[dict]:
     ]
 
 
+def index_trade_sequence_performance(trades: list[dict]) -> list[dict]:
+    index_trades = [
+        trade
+        for trade in trades
+        if normalized_underlying(trade) in SYMBOLS
+        and str(trade.get("instrumentClass") or "INDEX_OPTION").upper() == "INDEX_OPTION"
+    ]
+    groups = {}
+    for trade in index_trades:
+        sequence = safe_int(trade.get("tradeSequence"))
+        if sequence <= 0:
+            sequence = 1
+        label = "Trade 1" if sequence == 1 else "Trade 2+"
+        groups.setdefault(label, []).append(trade)
+
+    return [
+        {
+            "sequence": label,
+            **performance_stats(groups.get(label, [])),
+        }
+        for label in ("Trade 1", "Trade 2+")
+    ]
+
+
+def second_trade_context_performance(trades: list[dict]) -> list[dict]:
+    rows = [
+        trade
+        for trade in trades
+        if safe_int(trade.get("tradeSequence")) >= 2
+        and normalized_underlying(trade) in SYMBOLS
+    ]
+    groups = {}
+    for trade in rows:
+        key = trade.get("priorTradeOutcome") or "UNKNOWN"
+        groups.setdefault(key, []).append(trade)
+
+    return [
+        {
+            "priorOutcome": key,
+            **performance_stats(value),
+        }
+        for key, value in sorted(groups.items())
+    ]
+
+
 def is_upstox_sync_trade(trade: dict) -> bool:
     return str(trade.get("exitReason") or "").upper() == UPSTOX_SYNC_EXIT_REASON
 
@@ -835,6 +882,13 @@ def normalize_trade(row: dict) -> dict:
             row.get("gross_pnl")
         ),
         "score": safe_float(row.get("score"), None),
+        "tradeSequence": safe_int(row.get("trade_sequence")),
+        "priorTradeSymbol": row.get("prior_trade_symbol", ""),
+        "priorTradeOutcome": row.get("prior_trade_outcome", ""),
+        "priorTradePnL": safe_float(row.get("prior_trade_pnl")),
+        "riskPerTradeLimit": safe_float(row.get("risk_per_trade_limit")),
+        "remainingIndexRiskBudget": safe_float(row.get("remaining_index_risk_budget")),
+        "plannedRisk": safe_float(row.get("planned_risk")),
         "status": row.get("status", "CLOSED"),
     }
     trade["instrumentClass"] = inferred_instrument_class(trade)
@@ -1062,6 +1116,8 @@ def build_trade_performance() -> dict:
             "overallStats": today_stats["OVERALL"],
             "categoryPnL": today_categories,
             "optionTypePerformance": option_type_performance(today_trades),
+            "indexTradeSequencePerformance": index_trade_sequence_performance(today_trades),
+            "secondTradeContextPerformance": second_trade_context_performance(today_trades),
         },
         "cumulative": {
             "totalTrades": len(trades),
@@ -1084,6 +1140,8 @@ def build_trade_performance() -> dict:
             ),
             "dayOfWeekPerformance": day_of_week,
             "optionTypePerformance": option_type_performance(trades),
+            "indexTradeSequencePerformance": index_trade_sequence_performance(trades),
+            "secondTradeContextPerformance": second_trade_context_performance(trades),
         },
         "equityCurve": build_equity_curve(
             trades,

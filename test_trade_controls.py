@@ -733,6 +733,71 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertEqual(quantity, 2145)
 
+    def test_index_quantity_is_capped_by_risk_budget(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "OPTION_CAPITAL_PER_ENTRY": "350000",
+                    "MAX_LOTS_PER_ENTRY": "0",
+                    "INDEX_RISK_PER_TRADE": "5000",
+                    "MAX_DAILY_INDEX_RISK": "10000",
+                },
+                clear=False,
+            ),
+            patch(
+                "trade_bot.active_value",
+                side_effect=lambda name, fallback: os.getenv(name, fallback),
+            ),
+            patch.object(trade_bot, "remaining_index_risk_budget", return_value=5000),
+        ):
+            quantity = trade_bot.order_quantity_for(
+                "NIFTY",
+                {"lot_size": 65},
+                entry_price=200,
+                stop_loss_price=170,
+            )
+
+        self.assertEqual(quantity, 130)
+
+    def test_second_index_trade_requires_extra_score(self):
+        chosen = {
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "transaction_type": "BUY",
+            "weighted": {"score": 82},
+            "entry_minimum_score": 80,
+        }
+        with (
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0, "reason": "ok"},
+            ),
+            patch.object(trade_bot, "index_trade_count_today", return_value=1),
+            patch.object(
+                trade_bot,
+                "last_index_trade_today",
+                return_value={"symbol": "BANKNIFTY", "gross_pnl": "1500"},
+            ),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(
+                trade_bot,
+                "aggregate_risk_decision",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+            patch.object(
+                trade_bot,
+                "correlation_decision",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+            patch.dict(os.environ, {"SECOND_INDEX_TRADE_SCORE_BONUS": "5"}, clear=False),
+        ):
+            decision = trade_bot.pre_order_portfolio_decision(chosen, 65, 200, 170)
+
+        self.assertFalse(decision["allowed"])
+        self.assertIn("85.0", decision["reason"])
+
     def test_capital_value_one_means_one_lot(self):
         with patch.dict(
             os.environ,
@@ -923,6 +988,40 @@ class TradeControlTests(unittest.TestCase):
                 )
         self.assertEqual(row["gross_pnl"], 650)
         self.assertEqual(row["transaction_type"], "SELL")
+
+    def test_trade_journal_records_index_sequence_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history = Path(temp_dir) / "trade_history.csv"
+            with (
+                patch.object(trade_journal, "DATA_DIR", Path(temp_dir)),
+                patch.object(trade_journal, "TRADE_HISTORY_FILE", history),
+            ):
+                row = trade_journal.record_closed_trade(
+                    {
+                        "symbol": "NIFTY",
+                        "trading_symbol": "NIFTY TEST PE",
+                        "direction": "BEARISH",
+                        "entry_transaction_type": "BUY",
+                        "quantity": 65,
+                        "entry_price": 100,
+                        "target_price": 130,
+                        "stop_loss_price": 70,
+                        "trade_sequence": 2,
+                        "prior_trade_symbol": "BANKNIFTY",
+                        "prior_trade_outcome": "WIN",
+                        "prior_trade_pnl": 1200,
+                        "risk_per_trade_limit": 5000,
+                        "remaining_index_risk_budget": 8000,
+                        "planned_risk": 1950,
+                    },
+                    exit_price=110,
+                    exit_reason="TARGET",
+                )
+
+        self.assertEqual(row["trade_sequence"], 2)
+        self.assertEqual(row["prior_trade_symbol"], "BANKNIFTY")
+        self.assertEqual(row["prior_trade_outcome"], "WIN")
+        self.assertEqual(row["planned_risk"], 1950)
 
     def test_volume_ratio_is_graded(self):
         score = weighted_alignment_score(

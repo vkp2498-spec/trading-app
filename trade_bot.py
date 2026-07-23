@@ -39,7 +39,9 @@ from signal_score import (
 from portfolio_risk import (
     aggregate_risk_decision,
     correlation_decision,
+    proposed_position_risk,
     state_is_active,
+    total_open_risk,
 )
 
 import requests
@@ -609,11 +611,37 @@ def register_losing_exit_guard(symbol, state, journal_row, exit_reason):
         log(f"{symbol} could not persist re-entry guard: {error}")
 
 
+def register_same_index_reset_guard(symbol, state, journal_row, exit_reason):
+    if not require_signal_reset_for_same_index_reentry():
+        return
+    if symbol not in SYMBOLS:
+        return
+    if str(state.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
+        return
+    direction = state.get("direction")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return
+    write_reentry_guard(
+        symbol,
+        {
+            "date": now_ist().strftime("%Y-%m-%d"),
+            "blocked_direction": direction,
+            "trading_symbol": state.get("trading_symbol"),
+            "stopped_at": now_ist().isoformat(),
+            "exit_reason": exit_reason,
+            "gross_pnl": journal_row.get("gross_pnl"),
+            "reset_seen": False,
+            "mode": "signal_reset",
+        },
+    )
+
+
 def observe_signal_reset(symbol, direction):
-    if loss_reentry_mode() != "reset":
+    guard = read_reentry_guard(symbol)
+    guard_mode = guard.get("mode")
+    if guard_mode != "signal_reset" and loss_reentry_mode() != "reset":
         return
 
-    guard = read_reentry_guard(symbol)
     blocked_direction = guard.get("blocked_direction")
     if not blocked_direction or guard.get("reset_seen"):
         return
@@ -630,12 +658,23 @@ def observe_signal_reset(symbol, direction):
 
 
 def reentry_block_reason(symbol, direction):
-    mode = loss_reentry_mode()
-    if mode == "off":
+    guard = read_reentry_guard(symbol)
+    if not guard:
+        return ""
+    if guard.get("blocked_direction") != direction:
         return ""
 
-    guard = read_reentry_guard(symbol)
-    if guard.get("blocked_direction") != direction:
+    if guard.get("mode") == "signal_reset":
+        if not guard.get("reset_seen"):
+            return (
+                f"same-index second trade blocked after {guard.get('exit_reason')} at "
+                f"{guard.get('stopped_at')}; wait for a neutral/opposite signal reset"
+            )
+        clear_reentry_guard(symbol)
+        return ""
+
+    mode = loss_reentry_mode()
+    if mode == "off":
         return ""
 
     if mode == "reset" and not guard.get("reset_seen"):
@@ -728,8 +767,9 @@ def first_index_trade_outcome_today(symbol):
 
 
 def daily_index_entry_block_reason(symbol):
-    if trade_count_for(symbol) >= 1:
-        return f"one {symbol} trade already used today"
+    maximum = max_index_trades_per_day()
+    if maximum > 0 and index_trade_count_today() >= maximum:
+        return f"maximum {maximum} index trades already used today"
     outcome = first_index_trade_outcome_today(symbol)
     if not outcome:
         return ""
@@ -929,6 +969,11 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         MIN_SCORE_BY_SYMBOL.get(symbol, 65),
     )
     required_score = base_minimum + to_float(circuit.get("score_penalty"))
+    if symbol in SYMBOLS and index_trade_count_today() >= 1:
+        required_score += second_index_trade_score_bonus()
+        prior_trade = last_index_trade_today()
+        if prior_trade and to_float(prior_trade.get("gross_pnl")) < 0:
+            required_score += second_trade_after_loss_score_bonus()
     if score < required_score:
         return {
             "allowed": False,
@@ -938,6 +983,26 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
             ),
             "circuit": circuit,
         }
+
+    if symbol in SYMBOLS:
+        proposed_risk = proposed_position_risk(
+            entry_price,
+            stop_loss_price,
+            quantity,
+            chosen.get("transaction_type", "BUY"),
+        )
+        remaining_budget = remaining_index_risk_budget()
+        if remaining_budget > 0 and proposed_risk > remaining_budget:
+            return {
+                "allowed": False,
+                "reason": (
+                    f"planned risk Rs {proposed_risk:.2f} exceeds remaining "
+                    f"index risk budget Rs {remaining_budget:.2f}"
+                ),
+                "circuit": circuit,
+                "proposed_risk": proposed_risk,
+                "remaining_index_risk_budget": remaining_budget,
+            }
 
     states = active_bot_states()
     risk = aggregate_risk_decision(
@@ -1077,6 +1142,106 @@ def increment_trade_count(symbol):
     counts[symbol] = int(counts.get(symbol, 0)) + 1
     write_trade_count(data)
     return counts[symbol]
+
+
+def index_trade_count_today():
+    return sum(trade_count_for(symbol) for symbol in SYMBOLS)
+
+
+def max_index_trades_per_day():
+    return max(to_int(os.getenv("MAX_INDEX_TRADES_PER_DAY"), 2), 0)
+
+
+def max_daily_index_risk():
+    value = configured_non_negative_float("MAX_DAILY_INDEX_RISK", daily_max_loss())
+    return value
+
+
+def index_risk_per_trade_limit():
+    explicit = configured_non_negative_float("INDEX_RISK_PER_TRADE", 0.0)
+    if explicit > 0:
+        return explicit
+    trades = max(max_index_trades_per_day(), 1)
+    budget = max_daily_index_risk()
+    return budget / trades if budget > 0 else 0.0
+
+
+def second_index_trade_score_bonus():
+    return configured_non_negative_float("SECOND_INDEX_TRADE_SCORE_BONUS", 5.0)
+
+
+def second_trade_after_loss_score_bonus():
+    return configured_non_negative_float("SECOND_TRADE_AFTER_LOSS_SCORE_BONUS", 10.0)
+
+
+def require_signal_reset_for_same_index_reentry():
+    return configured_bool("REQUIRE_SIGNAL_RESET_FOR_SAME_INDEX_REENTRY", True)
+
+
+def today_index_trade_rows():
+    if not TRADE_HISTORY_FILE.exists():
+        return []
+    today = now_ist().strftime("%Y-%m-%d")
+    rows = []
+    try:
+        with TRADE_HISTORY_FILE.open("r", newline="", errors="ignore") as handle:
+            for row in csv.DictReader(handle):
+                if str(row.get("trade_date")) != today:
+                    continue
+                if str(row.get("symbol") or "").upper() not in SYMBOLS:
+                    continue
+                if str(row.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
+                    continue
+                rows.append(row)
+    except Exception as error:
+        verbose_log(f"Could not read today's index trades: {error}")
+    return rows
+
+
+def last_index_trade_today():
+    rows = today_index_trade_rows()
+    if not rows:
+        return None
+    return sorted(
+        rows,
+        key=lambda row: row.get("exit_time") or row.get("entry_time") or "",
+    )[-1]
+
+
+def today_index_realized_pnl():
+    return round(sum(to_float(row.get("gross_pnl")) for row in today_index_trade_rows()), 2)
+
+
+def today_index_realized_loss():
+    return max(-today_index_realized_pnl(), 0.0)
+
+
+def current_index_open_risk():
+    return total_open_risk([read_state(symbol) for symbol in SYMBOLS])
+
+
+def remaining_index_risk_budget():
+    budget = max_daily_index_risk()
+    if budget <= 0:
+        return 0.0
+    remaining = budget - today_index_realized_loss() - current_index_open_risk()
+    return round(max(remaining, 0.0), 2)
+
+
+def planned_trade_context(symbol):
+    sequence = index_trade_count_today() + 1 if symbol in SYMBOLS else trade_count_for(symbol) + 1
+    prior = last_index_trade_today() if symbol in SYMBOLS else None
+    prior_pnl = to_float((prior or {}).get("gross_pnl"), 0.0)
+    return {
+        "trade_sequence": sequence,
+        "prior_trade_symbol": (prior or {}).get("symbol", ""),
+        "prior_trade_outcome": (
+            "WIN" if prior and prior_pnl > 0 else "LOSS" if prior and prior_pnl < 0 else "FLAT" if prior else ""
+        ),
+        "prior_trade_pnl": prior_pnl if prior else "",
+        "remaining_index_risk_budget": remaining_index_risk_budget() if symbol in SYMBOLS else "",
+        "risk_per_trade_limit": index_risk_per_trade_limit() if symbol in SYMBOLS else "",
+    }
 
 
 def upstox_headers():
@@ -1232,6 +1397,25 @@ def order_quantity_for(
     maximum = max_lots_per_entry()
     if maximum > 0:
         lots = min(lots, maximum)
+
+    if symbol in SYMBOLS and entry_price is not None and stop_loss_price is not None:
+        risk_per_lot = proposed_position_risk(
+            entry_price,
+            stop_loss_price,
+            lot_size,
+            transaction_type,
+        )
+        risk_candidates = [
+            value
+            for value in (
+                index_risk_per_trade_limit(),
+                remaining_index_risk_budget(),
+            )
+            if value > 0
+        ]
+        risk_budget = min(risk_candidates) if risk_candidates else 0.0
+        if risk_per_lot > 0 and risk_budget > 0:
+            lots = min(lots, int(risk_budget // risk_per_lot))
 
     return lot_size * max(lots, 0)
 
@@ -1602,6 +1786,7 @@ def save_open_position_state(
     option_delta_used=None,
     exit_profile=None,
     profit_protection_enabled_for_trade=None,
+    trade_metadata=None,
 ):
     entry_transaction_type = str(entry_transaction_type).upper()
     if target_percent is not None and stop_percent is not None:
@@ -1688,6 +1873,8 @@ def save_open_position_state(
         "trailing_stop_active": False,
         "trailing_stop_reason": "",
     }
+    if trade_metadata:
+        state.update(trade_metadata)
     state["profit_booking_percent"] = profit_booking_target_percent()
     state["profit_booking_mode"] = profit_booking_mode()
     if profit_booking_mode() == "runner":
@@ -1730,6 +1917,7 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
 
     journal_row = record_closed_trade(state, exit_price, exit_reason)
     register_losing_exit_guard(symbol, state, journal_row, exit_reason)
+    register_same_index_reset_guard(symbol, state, journal_row, exit_reason)
     send_apple_closed_trade_alert(journal_row)
     log(
         f"{symbol} bought {journal_row.get('entry_price')} closed {journal_row.get('exit_price')} "
@@ -2802,6 +2990,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         and confidence == "HIGH"
         and abs(score) >= 4
     )
+    observe_signal_reset(symbol, direction)
     neutral_banknifty_candidate = symbol == "BANKNIFTY" and direction == "NEUTRAL"
     neutral_nifty_candidate = symbol == "NIFTY" and direction == "NEUTRAL"
     if not directional_high and not neutral_banknifty_candidate and not neutral_nifty_candidate:
@@ -3014,8 +3203,22 @@ def execute_selected_candidate(chosen):
         transaction_type=transaction_type,
     )
     if quantity <= 0:
-        log(f"{symbol} no trade: configured option capital is insufficient for one whole lot.")
+        log(
+            f"{symbol} no trade: configured option capital/risk budget is "
+            "insufficient for one whole lot."
+        )
         return False
+    planned_risk = proposed_position_risk(
+        entry_price,
+        stop,
+        quantity,
+        transaction_type,
+    )
+    trade_context = planned_trade_context(symbol)
+    trade_metadata = {
+        **trade_context,
+        "planned_risk": round(planned_risk, 2),
+    }
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
     verbose_log(
@@ -3077,6 +3280,7 @@ def execute_selected_candidate(chosen):
             "confidence": confidence,
             "score": score,
             "weighted_score": candidate_weighted_score(chosen),
+            **trade_metadata,
             "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
             "created_at": now_ist().isoformat(),
         })
@@ -3115,6 +3319,7 @@ def execute_selected_candidate(chosen):
             "confidence": confidence,
             "score": score,
             "weighted_score": candidate_weighted_score(chosen),
+            **trade_metadata,
             "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
             "created_at": now_ist().isoformat(),
         })
@@ -3133,6 +3338,7 @@ def execute_selected_candidate(chosen):
         option_delta_used=chosen["option_delta_used"],
         exit_profile=chosen.get("exit_profile", {}),
         profit_protection_enabled_for_trade=chosen.get("profit_protection_enabled_for_trade", True),
+        trade_metadata=trade_metadata,
     )
 
     post_fill = revalidate_option_after_fill(
