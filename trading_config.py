@@ -11,16 +11,17 @@ from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfo
 
 import json
+import os
 
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "data" / "trading_config.json"
-DEFAULT_PROFILE_ID = "1_LOT"
+DEFAULT_PROFILE_ID = "100000"
 
-# Daily profit/loss fields remain in the API for mobile-client compatibility,
-# but zero means no daily P&L gate. Capital is allocated independently to each
-# eligible NIFTY and BANKNIFTY position.
+# Capital is allocated independently to each eligible NIFTY and BANKNIFTY
+# position. Rupee risk and daily P&L fields are derived from the active capital
+# profile before they are returned to the bot and mobile clients.
 CAPITAL_PROFILES = {
     "1_LOT": {
         "label": "1 Lot",
@@ -123,10 +124,88 @@ def _write(config):
     temporary_path.replace(CONFIG_FILE)
 
 
+def _configured_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _configured_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _profile_with_dynamic_limits(profile):
+    """Scale trading-day guardrails from the selected rupee allocation."""
+    values = dict(profile)
+    capital = float(values.get("optionCapitalPerEntry") or 0)
+    if capital <= 1:
+        values.update(
+            dailyMaxLoss=max(
+                _configured_float("DAILY_MAX_LOSS", 10000.0),
+                0.0,
+            ),
+            dailyProfitTarget=max(
+                _configured_float("DAILY_PROFIT_TARGET", 10000.0),
+                0.0,
+            ),
+            dailySoftLoss=max(
+                _configured_float("DAILY_SOFT_LOSS", 0.0),
+                0.0,
+            ),
+            peakProfitGivebackTrigger=max(
+                _configured_float("PEAK_PROFIT_GIVEBACK_TRIGGER", 0.0),
+                0.0,
+            ),
+            indexRiskPerTrade=max(
+                _configured_float("INDEX_RISK_PER_TRADE", 0.0),
+                0.0,
+            ),
+            maxDailyIndexRisk=max(
+                _configured_float("MAX_DAILY_INDEX_RISK", 0.0),
+                0.0,
+            ),
+            maxOpenPortfolioRisk=max(
+                _configured_float("MAX_OPEN_PORTFOLIO_RISK", 0.0),
+                0.0,
+            ),
+        )
+        return values
+    if not _configured_bool("DYNAMIC_CAPITAL_RISK_ENABLED", True):
+        return values
+
+    percentages = {
+        "dailyMaxLoss": ("DAILY_MAX_LOSS_CAPITAL_PERCENT", 15.0),
+        "dailyProfitTarget": ("DAILY_PROFIT_TARGET_CAPITAL_PERCENT", 10.0),
+        "dailySoftLoss": ("DAILY_SOFT_LOSS_CAPITAL_PERCENT", 7.5),
+        "peakProfitGivebackTrigger": (
+            "PEAK_PROFIT_GIVEBACK_TRIGGER_CAPITAL_PERCENT",
+            7.5,
+        ),
+        "indexRiskPerTrade": ("INDEX_RISK_PER_TRADE_CAPITAL_PERCENT", 15.0),
+        "maxDailyIndexRisk": ("MAX_DAILY_INDEX_RISK_CAPITAL_PERCENT", 15.0),
+        # Includes the default 15% portfolio buffer around a 15% stop-risk cap.
+        "maxOpenPortfolioRisk": ("MAX_OPEN_PORTFOLIO_RISK_CAPITAL_PERCENT", 17.25),
+    }
+    for field, (env_name, default_percent) in percentages.items():
+        percent = max(_configured_float(env_name, default_percent), 0.0)
+        values[field] = round(capital * percent / 100.0, 2)
+    return values
+
+
 def _ensure_automatic_reset(config, current=None):
     current = current or now_ist()
     today = current.date().isoformat()
-    if current.time() >= time(15, 30) and config.get("resetDoneDate") != today:
+    selected_date = str(config.get("selectedDate") or "")
+    stale_from_prior_day = selected_date < today
+    after_daily_reset = (
+        current.time() >= time(15, 30)
+        and config.get("resetDoneDate") != today
+    )
+    if stale_from_prior_day or after_daily_reset:
         config["profileId"] = DEFAULT_PROFILE_ID
         config["selectedDate"] = today
         config["selectedAt"] = current.isoformat()
@@ -139,18 +218,18 @@ def get_config():
     current = now_ist()
     config = _ensure_automatic_reset(_read(), current)
     profile_id = config["profileId"]
-    profile = CAPITAL_PROFILES[profile_id]
+    profile = _profile_with_dynamic_limits(CAPITAL_PROFILES[profile_id])
     return {
         "profileId": profile_id,
         "profile": profile,
         "options": [
-            {"id": key, **value}
+            {"id": key, **_profile_with_dynamic_limits(value)}
             for key, value in CAPITAL_PROFILES.items()
         ],
         "serverTime": current.isoformat(),
         "selectionWindowOpen": selection_window_open(current),
         "selectionWindow": "09:00-09:15 IST",
-        "automaticReset": "15:30 IST -> 1 Lot",
+        "automaticReset": "15:30 IST / next trading day -> 1L",
         "selectedDate": config.get("selectedDate"),
         "selectedAt": config.get("selectedAt"),
     }

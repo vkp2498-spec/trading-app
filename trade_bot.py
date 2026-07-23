@@ -882,14 +882,22 @@ def portfolio_day_circuit():
     state = read_day_risk_state()
     state["peak_pnl"] = round(max(to_float(state.get("peak_pnl")), pnl, 0.0), 2)
 
-    soft_loss = configured_non_negative_float("DAILY_SOFT_LOSS", 0.0)
+    soft_loss_fallback = configured_non_negative_float("DAILY_SOFT_LOSS", 0.0)
+    soft_loss = to_float(
+        active_value("dailySoftLoss", soft_loss_fallback),
+        soft_loss_fallback,
+    )
     pause_minutes = configured_non_negative_float("DAILY_SOFT_PAUSE_MINUTES", 30.0)
     score_penalty = configured_non_negative_float("DAILY_SOFT_SCORE_PENALTY", 10.0)
-    hard_loss = configured_non_negative_float("DAILY_HARD_LOSS", daily_max_loss())
+    hard_loss = daily_max_loss()
     profit_target = daily_profit_target()
     max_consecutive = max(to_int(os.getenv("MAX_CONSECUTIVE_LOSSES"), 3), 0)
-    giveback_trigger = configured_non_negative_float(
+    giveback_trigger_fallback = configured_non_negative_float(
         "PEAK_PROFIT_GIVEBACK_TRIGGER", 0.0
+    )
+    giveback_trigger = to_float(
+        active_value("peakProfitGivebackTrigger", giveback_trigger_fallback),
+        giveback_trigger_fallback,
     )
     giveback_percent = configured_non_negative_float(
         "MAX_PEAK_GIVEBACK_PERCENT", 50.0
@@ -1017,13 +1025,19 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
             }
 
     states = active_bot_states()
+    open_risk_fallback = configured_non_negative_float(
+        "MAX_OPEN_PORTFOLIO_RISK", 0.0
+    )
     risk = aggregate_risk_decision(
         states,
         entry_price,
         stop_loss_price,
         quantity,
         chosen.get("transaction_type", "BUY"),
-        configured_non_negative_float("MAX_OPEN_PORTFOLIO_RISK", 0.0),
+        to_float(
+            active_value("maxOpenPortfolioRisk", open_risk_fallback),
+            open_risk_fallback,
+        ),
         configured_non_negative_float("PORTFOLIO_RISK_BUFFER_PERCENT", 15.0),
     )
     if not risk["allowed"]:
@@ -1165,17 +1179,17 @@ def max_index_trades_per_day():
 
 
 def max_daily_index_risk():
-    value = configured_non_negative_float("MAX_DAILY_INDEX_RISK", daily_max_loss())
-    return value
+    fallback = configured_non_negative_float("MAX_DAILY_INDEX_RISK", daily_max_loss())
+    return to_float(active_value("maxDailyIndexRisk", fallback), fallback)
 
 
 def index_risk_per_trade_limit():
     explicit = configured_non_negative_float("INDEX_RISK_PER_TRADE", 0.0)
-    if explicit > 0:
-        return explicit
-    trades = max(max_index_trades_per_day(), 1)
-    budget = max_daily_index_risk()
-    return budget / trades if budget > 0 else 0.0
+    if explicit <= 0:
+        trades = max(max_index_trades_per_day(), 1)
+        budget = max_daily_index_risk()
+        explicit = budget / trades if budget > 0 else 0.0
+    return to_float(active_value("indexRiskPerTrade", explicit), explicit)
 
 
 def second_index_trade_score_bonus():
