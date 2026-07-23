@@ -573,6 +573,11 @@ class TradeControlTests(unittest.TestCase):
         with (
             patch.object(trade_bot, "market_window_ok", return_value=True),
             patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
             patch.object(trade_bot, "get_open_positions", return_value=[]),
             patch.object(
                 trade_bot,
@@ -1237,6 +1242,7 @@ class TradeControlTests(unittest.TestCase):
                 },
                 "fifteen_min": {"bias": "BEARISH", "confidence": "MEDIUM"},
                 "two_hour": {"bias": "NEUTRAL", "confidence": "LOW"},
+                "nifty_breadth": {"bias": "BEARISH", "confidence": "MEDIUM"},
             }
         )
         self.assertEqual(direction, "BEARISH")

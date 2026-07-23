@@ -444,6 +444,7 @@ def get_index_recommendation(symbol):
         "score": score,
         "reasons": reasons,
         "atm": atm.to_dict(),
+        "nearby_contracts": df_nearby.to_dict("records"),
         "levels": levels,
         "prices": prices,
         "chain_totals": chain_totals,

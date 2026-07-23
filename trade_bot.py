@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - Windows development fallback
 
 from analysis_journal import record_analysis
 from banknifty_breadth import get_banknifty_breadth
+from nifty_breadth import get_nifty_breadth
 from institutional_flow import (
     get_institutional_footprint,
     neutral_institutional_footprint,
@@ -27,6 +28,13 @@ from market_technicals import (
     get_technical_analysis,
     convert_index_levels_to_option_premium,
     get_option_volume_vwap_analysis,
+)
+from live_trade_filters import (
+    classify_market_regime,
+    entry_structure_for_direction,
+    live_entry_gate,
+    structural_invalidation,
+    underlying_exit_reason,
 )
 from stock_futures_scanner import scan_stock_futures, write_scanner_status
 
@@ -128,6 +136,10 @@ SYMBOL_CONFIG = {
     "BANKNIFTY": {
         "underlying_candidates": ["BANKNIFTY", "NIFTY BANK"],
     },
+}
+UNDERLYING_INDEX_KEYS = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
 }
 
 UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
@@ -1759,6 +1771,28 @@ def find_index_option_instrument(symbol, expiry_text, strike, option_type):
     return sorted(matches, key=lambda x: x.get("lot_size", 0))[0]
 
 
+def index_contract_rows(recommendation, direction):
+    """Return ATM and nearest one-strike-ITM rows for execution comparison."""
+    atm = dict(recommendation.get("atm") or {})
+    if not atm:
+        return []
+    if not configured_bool("INDEX_CONTRACT_SELECTION_ENABLED", True):
+        return [atm]
+    option_type = option_type_for(direction, "BUY")
+    atm_strike = to_float(atm.get("strike"))
+    nearby = [dict(row) for row in recommendation.get("nearby_contracts", []) if isinstance(row, dict)]
+    if option_type == "CE":
+        eligible = [row for row in nearby if 0 < to_float(row.get("strike")) < atm_strike]
+        itm = max(eligible, key=lambda row: to_float(row.get("strike")), default=None)
+    else:
+        eligible = [row for row in nearby if to_float(row.get("strike")) > atm_strike]
+        itm = min(eligible, key=lambda row: to_float(row.get("strike")), default=None)
+    rows = [atm]
+    if itm and to_float(itm.get("strike")) != atm_strike:
+        rows.append(itm)
+    return rows
+
+
 def market_window_ok():
     now = now_ist().time()
     return time(9, 20) <= now <= time(15, 15)
@@ -2167,9 +2201,38 @@ def handle_existing_state(symbol, state, verbose=True):
             state["last_sentiment_check_at"] = now_ist().isoformat()
             write_state(symbol, state)
             sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(symbol, state, ltp)
+        thesis_exit_reason = None
+        thesis_exit_detail = ""
+        underlying_key = state.get("underlying_instrument_key") or UNDERLYING_INDEX_KEYS.get(symbol)
+        if state.get("instrument_class") == "INDEX_OPTION" and underlying_key:
+            underlying_quote = read_market_cache(underlying_key) or {}
+            quote_age = time_module.time() - to_float(underlying_quote.get("received_at"), 0)
+            maximum_age = configured_positive_float("UNDERLYING_QUOTE_MAX_AGE_SECONDS", 20.0)
+            underlying_ltp = (
+                to_float(underlying_quote.get("ltp"), 0)
+                if 0 <= quote_age <= maximum_age
+                else 0
+            )
+            thesis_exit_reason = underlying_exit_reason(
+                state,
+                underlying_ltp,
+                minutes_since_created(state),
+                structural_enabled=configured_bool("UNDERLYING_STRUCTURAL_STOP_ENABLED", True),
+                time_stop_enabled=configured_bool("INDEX_TIME_STOP_ENABLED", True),
+                time_stop_minutes=configured_positive_float("INDEX_TIME_STOP_MINUTES", 20.0),
+                minimum_progress_percent=configured_non_negative_float(
+                    "INDEX_TIME_STOP_MIN_PROGRESS_PERCENT", 15.0
+                ),
+            )
+            if thesis_exit_reason:
+                thesis_exit_detail = (
+                    f"underlying_ltp={underlying_ltp:.2f}, "
+                    f"structural_stop={state.get('underlying_structural_stop')}, "
+                    f"age={minutes_since_created(state):.1f}m"
+                )
         target_hit = ltp is not None and (ltp <= booking_price if is_short else ltp >= booking_price)
         stop_hit = ltp is not None and (ltp >= stop_loss_price if is_short else ltp <= stop_loss_price)
-        if ltp is not None and (target_hit or stop_hit or sentiment_exit):
+        if ltp is not None and (target_hit or stop_hit or sentiment_exit or thesis_exit_reason):
             # Stock-future and short-option stops are already protected at the
             # broker. Do not send a second market exit when the local LTP also
             # reaches the stop; let the broker stop fill and confirm it here.
@@ -2180,11 +2243,16 @@ def handle_existing_state(symbol, state, verbose=True):
                 )
                 return True
 
-            if sentiment_exit:
+            if target_hit:
+                exit_reason = "TARGET"
+            elif stop_hit:
+                exit_reason = "STOP_LOSS"
+            elif thesis_exit_reason:
+                exit_reason = thesis_exit_reason
+                log(f"{symbol} {exit_reason} triggered: {thesis_exit_detail}")
+            elif sentiment_exit:
                 exit_reason = "SENTIMENT_EXIT"
                 log(f"{symbol} sentiment exit triggered: {sentiment_reason}")
-            else:
-                exit_reason = "TARGET" if target_hit else "STOP_LOSS"
 
             # Publish the exit state before making broker calls. The separate
             # entry and monitor cron jobs can overlap, so this prevents both
@@ -2737,7 +2805,15 @@ def collect_institutional_footprint(symbol, recommendation, atm_option_flow=None
         return neutral_institutional_footprint(str(error))
 
 
-def build_trade_candidate(symbol, rec, base_technicals, institutional, option_trend, transaction_type):
+def build_trade_candidate(
+    symbol,
+    rec,
+    base_technicals,
+    institutional,
+    option_trend,
+    transaction_type,
+    contract_row=None,
+):
     if str(transaction_type).upper() != "BUY":
         return {
             "allowed": False,
@@ -2745,7 +2821,7 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             "transaction_type": "BUY",
         }, None
     direction = rec["direction"]
-    atm = rec["atm"]
+    atm = dict(contract_row or rec["atm"])
     option_type = option_type_for(direction, transaction_type)
     entry_price = entry_price_for(atm, direction, transaction_type)
     if entry_price <= 0:
@@ -2792,6 +2868,19 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             f"depth {option_quality.get('depth_bias')} conflicts with {direction}"
         )
     option_quality["rejection_reasons"] = quality_reasons
+    preferred_delta_min = configured_non_negative_float("PREFERRED_OPTION_DELTA_MIN", 0.45)
+    preferred_delta_max = configured_non_negative_float("PREFERRED_OPTION_DELTA_MAX", 0.70)
+    absolute_delta = abs(to_float(option_quality.get("delta"), 0))
+    contract_rank = 0.0
+    if preferred_delta_min <= absolute_delta <= preferred_delta_max:
+        contract_rank += 5.0
+    spread_percent = option_quality.get("spread_percent")
+    if spread_percent is not None:
+        contract_rank += max(0.0, 3.0 - float(spread_percent))
+    contract_volume = to_float(atm.get(f"{option_type}_volume"), 0)
+    contract_rank += min(contract_volume / 100000.0, 2.0)
+    option_quality["selection_rank"] = round(contract_rank, 2)
+    option_quality["preferred_delta_range"] = [preferred_delta_min, preferred_delta_max]
 
     # The stream is dynamic because the ATM strike changes. The persistent
     # service will subscribe to the next set on its next refresh/restart.
@@ -2813,6 +2902,23 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
     )
     technicals["institutional_flow"] = institutional
     technicals["option_market_quality"] = option_quality
+    technicals["market_regime"] = classify_market_regime(
+        technicals,
+        compression_width_percent=configured_positive_float(
+            "REGIME_COMPRESSION_BB_WIDTH_PERCENT", 0.18
+        ),
+        extreme_atr_percent=configured_positive_float(
+            f"{symbol}_REGIME_EXTREME_ATR_PERCENT",
+            0.35 if symbol == "NIFTY" else 0.45,
+        ),
+    )
+    technicals["entry_structure"] = entry_structure_for_direction(
+        technicals,
+        direction,
+        retest_buffer_atr=configured_non_negative_float(
+            "ENTRY_RETEST_BUFFER_ATR", 0.25
+        ),
+    )
 
     for timeframe in ("two_hour", "fifteen_min", "five_min"):
         technicals[timeframe] = convert_index_levels_to_option_premium(
@@ -2892,6 +2998,50 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             "weighted": weighted,
         }, None
 
+    live_gate = live_entry_gate(
+        direction,
+        technicals,
+        score_value,
+        enabled=configured_bool("LIVE_REGIME_STRUCTURE_GATE_ENABLED", True),
+        range_minimum_score=configured_non_negative_float(
+            "RANGE_REGIME_MIN_SCORE", 85.0
+        ),
+        continuation_minimum_score=configured_non_negative_float(
+            "CONTINUATION_ENTRY_MIN_SCORE", 85.0
+        ),
+    )
+    technicals["live_entry_gate"] = live_gate
+    option_summary["live_entry_gate"] = live_gate
+    if not live_gate.get("allowed"):
+        return {
+            "allowed": False,
+            "reason": "live regime/structure rejected: " + str(live_gate.get("reason")),
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+        }, None
+
+    expiry_days = (parse_expiry(atm["expiry"]) - now_ist().date()).days
+    technicals["market_regime"]["days_to_expiry"] = expiry_days
+    if (
+        expiry_days <= int(configured_non_negative_float("EXPIRY_REGIME_MAX_DAYS", 2))
+        and score_value < configured_non_negative_float("EXPIRY_REGIME_MIN_SCORE", 85.0)
+    ):
+        return {
+            "allowed": False,
+            "reason": (
+                f"near-expiry regime requires score >= "
+                f"{configured_non_negative_float('EXPIRY_REGIME_MIN_SCORE', 85.0):.1f}"
+            ),
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+        }, None
+
     cautious = weighted.get("grade") == "CAUTIOUS_TRADE"
     levels = option_levels_from_index_points(
         symbol,
@@ -2934,6 +3084,13 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
             "weighted": weighted,
         }, None
 
+    structural = structural_invalidation(
+        technicals,
+        direction,
+        atr_buffer=configured_non_negative_float("STRUCTURAL_STOP_ATR_BUFFER", 0.20),
+    )
+    technicals["structural_invalidation"] = structural
+
     return {
         "allowed": True,
         "reason": (
@@ -2956,6 +3113,8 @@ def build_trade_candidate(symbol, rec, base_technicals, institutional, option_tr
         "option_summary": option_summary,
         "weighted": weighted,
         "entry_minimum_score": minimum,
+        "contract_selection_rank": option_quality.get("selection_rank", 0.0),
+        "structural_invalidation": structural,
     }, None
 
 
@@ -2969,7 +3128,10 @@ def select_trade_candidate(candidates, allow_sell=True):
     ]
     return max(
         qualified,
-        key=lambda item: float(item.get("weighted", {}).get("score") or 0),
+        key=lambda item: (
+            float(item.get("weighted", {}).get("score") or 0),
+            float(item.get("contract_selection_rank") or 0),
+        ),
         default=None,
     )
 
@@ -3008,6 +3170,7 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         }
         verbose_log(f"{symbol} technical analysis failed: {error}")
 
+    ensure_instruments_file()
     if symbol == "BANKNIFTY":
         try:
             breadth = get_banknifty_breadth(INSTRUMENT_CACHE, upstox_request)
@@ -3021,6 +3184,22 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         base_technicals["banknifty_breadth"] = breadth
         verbose_log(
             f"BANKNIFTY breadth: bias={breadth.get('bias')} "
+            f"confidence={breadth.get('confidence')} score={breadth.get('score')} "
+            f"reasons={breadth.get('reasons')}"
+        )
+    elif symbol == "NIFTY":
+        try:
+            breadth = get_nifty_breadth(INSTRUMENT_CACHE, upstox_request)
+        except Exception as error:
+            breadth = {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "score": 0,
+                "reasons": [f"NIFTY breadth unavailable: {error}"],
+            }
+        base_technicals["nifty_breadth"] = breadth
+        verbose_log(
+            f"NIFTY breadth: bias={breadth.get('bias')} "
             f"confidence={breadth.get('confidence')} score={breadth.get('score')} "
             f"reasons={breadth.get('reasons')}"
         )
@@ -3080,24 +3259,31 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
     institutional = collect_institutional_footprint(symbol, rec)
     option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
     candidates = []
-    try:
-        candidate, _ = build_trade_candidate(
-            symbol,
-            rec,
-            base_technicals,
-            institutional,
-            option_trend,
-            "BUY",
-        )
-        if candidate:
-            candidates.append(candidate)
-            verbose_log(
-                f"{symbol} BUY candidate: allowed={candidate.get('allowed')} "
-                f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
-                f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
+    contract_rows = index_contract_rows(rec, direction)
+    for contract_row in contract_rows:
+        try:
+            candidate, _ = build_trade_candidate(
+                symbol,
+                rec,
+                base_technicals,
+                institutional,
+                option_trend,
+                "BUY",
+                contract_row=contract_row,
             )
-    except Exception as error:
-        verbose_log(f"{symbol} BUY candidate unavailable: {error}")
+            if candidate:
+                candidates.append(candidate)
+                verbose_log(
+                    f"{symbol} BUY candidate: allowed={candidate.get('allowed')} "
+                    f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
+                    f"contract={candidate.get('instrument', {}).get('trading_symbol')} "
+                    f"contract_rank={candidate.get('contract_selection_rank', 0)}"
+                )
+        except Exception as error:
+            verbose_log(
+                f"{symbol} BUY candidate unavailable for strike "
+                f"{contract_row.get('strike')}: {error}"
+            )
 
     preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
     if not preferred:
@@ -3215,9 +3401,18 @@ def execute_selected_candidate(chosen):
         transaction_type,
     )
     trade_context = planned_trade_context(symbol)
+    structural = chosen.get("structural_invalidation") or {}
     trade_metadata = {
         **trade_context,
         "planned_risk": round(planned_risk, 2),
+        "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(symbol),
+        "underlying_entry_price": structural.get("entry_underlying"),
+        "underlying_structural_stop": structural.get("stop_underlying"),
+        "underlying_structural_reference": structural.get("reference"),
+        "underlying_structural_reference_value": structural.get("reference_value"),
+        "underlying_atr": structural.get("atr"),
+        "market_regime": (chosen.get("technicals", {}).get("market_regime") or {}).get("regime"),
+        "entry_structure": (chosen.get("technicals", {}).get("entry_structure") or {}).get("type"),
     }
 
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
@@ -3230,6 +3425,13 @@ def execute_selected_candidate(chosen):
         dry_run_note = " (dry run)"
     else:
         dry_run_note = ""
+
+    write_stream_instruments([
+        "NSE_INDEX|Nifty 50",
+        "NSE_INDEX|Nifty Bank",
+        "NSE_INDEX|India VIX",
+        instrument.get("instrument_key"),
+    ])
 
     with portfolio_entry_lock():
         portfolio_decision = pre_order_portfolio_decision(

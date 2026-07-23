@@ -357,6 +357,18 @@ def analyze_latest(df, timeframe):
     prev_close = float(close_series.iloc[-2]) if len(close_series) >= 2 else close
     recent_closes = df["close"].dropna().tail(4)
     recent_avg = float(recent_closes.mean()) if len(recent_closes) else close
+    recent_structure = valid.tail(6)
+    prior_structure = recent_structure.iloc[:-1]
+    recent_swing_high = (
+        float(prior_structure["high"].max())
+        if not prior_structure.empty
+        else float(last.get("high") or close)
+    )
+    recent_swing_low = (
+        float(prior_structure["low"].min())
+        if not prior_structure.empty
+        else float(last.get("low") or close)
+    )
 
     momentum_score = 0
     momentum_reasons = []
@@ -475,6 +487,8 @@ def analyze_latest(df, timeframe):
         "reasons": reasons,
         "prev_close": round(prev_close, 2),
         "recent_avg_close": round(recent_avg, 2),
+        "recent_swing_high": round(recent_swing_high, 2),
+        "recent_swing_low": round(recent_swing_low, 2),
         "momentum_score": momentum_score,
         "momentum_reasons": momentum_reasons,
         "volume": round(volume, 2),
@@ -578,4 +592,3 @@ def get_instrument_technical_analysis(instrument_key):
         "fifteen_min": analyze_latest(df_15, "15M"),
         "five_min": analyze_latest(df_5, "5M"),
     }
-

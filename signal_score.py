@@ -52,6 +52,7 @@ def nifty_neutral_chain_direction(technicals):
     five = technicals.get("five_min", {}) or {}
     fifteen = technicals.get("fifteen_min", {}) or {}
     two = technicals.get("two_hour", {}) or {}
+    breadth = technicals.get("nifty_breadth", {}) or {}
 
     direction = five.get("bias")
     blockers = []
@@ -66,6 +67,8 @@ def nifty_neutral_chain_direction(technicals):
         "HIGH",
     }:
         blockers.append("2H structure materially opposes the proposed direction")
+    if breadth.get("bias") != direction or breadth.get("confidence") not in {"MEDIUM", "HIGH"}:
+        blockers.append("NIFTY constituent breadth does not confirm with MEDIUM/HIGH confidence")
 
     momentum = float(five.get("momentum_score") or 0)
     if direction == "BEARISH":
@@ -318,6 +321,30 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     else:
         reasons.append("Institutional footprint is neutral (no adjustment)")
 
+    breadth_adjustment = 0.0
+    nifty_breadth = technicals.get("nifty_breadth", {}) or {}
+    if nifty_breadth:
+        if nifty_breadth.get("bias") == direction:
+            breadth_adjustment = {
+                "HIGH": 6.0,
+                "MEDIUM": 4.0,
+                "LOW": 1.0,
+            }.get(nifty_breadth.get("confidence"), 0.0)
+            reasons.append(
+                f"NIFTY constituent breadth aligns ({nifty_breadth.get('confidence')}) "
+                f"(+{breadth_adjustment:.0f})"
+            )
+        elif nifty_breadth.get("bias") in {"BULLISH", "BEARISH"}:
+            breadth_adjustment = {
+                "HIGH": -10.0,
+                "MEDIUM": -7.0,
+                "LOW": -2.0,
+            }.get(nifty_breadth.get("confidence"), 0.0)
+            reasons.append(
+                f"NIFTY constituent breadth conflicts ({nifty_breadth.get('confidence')}) "
+                f"({breadth_adjustment:.0f})"
+            )
+
     total = (
         option_component
         + fifteen_component
@@ -326,6 +353,7 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
         + flow_component
         + trend_bonus
         + institutional_adjustment
+        + breadth_adjustment
     )
     total = max(0, min(100, round(total, 1)))
 
