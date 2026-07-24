@@ -804,11 +804,11 @@ def bot_only_trades(trades: list[dict]) -> list[dict]:
     ]
 
 
-def is_stock_option_loss(trade: dict) -> bool:
+def is_stock_option_trade(trade: dict) -> bool:
     instrument_class = str(
         trade.get("instrumentClass") or ""
     ).upper()
-    return instrument_class == "STOCK_OPTION" and safe_float(trade.get("grossPnL")) < 0
+    return instrument_class == "STOCK_OPTION"
 
 
 def today_category_pnl(
@@ -1036,10 +1036,7 @@ def build_trade_performance() -> dict:
     trades = [
         trade
         for trade in bot_only_trades(read_trade_history())
-        if not (
-            trade["tradeDate"] == today_text
-            and is_stock_option_loss(trade)
-        )
+        if not is_stock_option_trade(trade)
     ]
 
     today_trades = [

@@ -445,7 +445,7 @@ class TradeControlTests(unittest.TestCase):
         ]
         self.assertEqual(put_rows[0]["netPnL"], -4500.0)
 
-    def test_mobile_dashboard_ignores_today_stock_option_losses(self):
+    def test_mobile_dashboard_excludes_stock_options_from_all_performance(self):
         trades = [
             {
                 "tradeDate": "2026-07-22",
@@ -470,6 +470,16 @@ class TradeControlTests(unittest.TestCase):
                 "optionType": "PUT",
                 "grossPnL": -2400.0,
                 "exitTime": "2026-07-22T11:00:00+05:30",
+            },
+            {
+                "tradeDate": "2026-07-21",
+                "symbol": "RELIANCE",
+                "underlyingSymbol": "RELIANCE",
+                "instrumentClass": "STOCK_OPTION",
+                "tradingSymbol": "RELIANCE 3000 CE 28 JUL 26",
+                "optionType": "CALL",
+                "grossPnL": 5100.0,
+                "exitTime": "2026-07-21T11:00:00+05:30",
             },
         ]
         with (

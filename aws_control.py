@@ -9,6 +9,8 @@ IST = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_INSTANCE_NAME = "ai-trading-bot-vamsi"
+DEFAULT_PUBLIC_IP = "13.234.86.47"
+DEFAULT_PRIVATE_IP = "172.26.8.88"
 
 
 def _client():
@@ -47,7 +49,28 @@ def _instance_id(client) -> str:
         for instance in reservation.get("Instances", [])
     ]
     if not matches:
-        raise RuntimeError(f"EC2 instance not found for Name tag {instance_name}")
+        response = client.describe_instances(
+            Filters=[
+                {
+                    "Name": "private-ip-address",
+                    "Values": [DEFAULT_PRIVATE_IP],
+                },
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                },
+            ]
+        )
+        matches = [
+            instance
+            for reservation in response.get("Reservations", [])
+            for instance in reservation.get("Instances", [])
+        ]
+    if not matches:
+        raise RuntimeError(
+            f"EC2 instance not found for Name tag {instance_name} "
+            f"or private IP {DEFAULT_PRIVATE_IP}"
+        )
     if len(matches) > 1:
         raise RuntimeError(f"Multiple EC2 instances found for Name tag {instance_name}")
     return matches[0]["InstanceId"]
@@ -81,8 +104,8 @@ def aws_instance_status() -> dict:
         "instanceId": instance_id,
         "instanceName": name,
         "state": state,
-        "publicIpAddress": instance.get("PublicIpAddress"),
-        "privateIpAddress": instance.get("PrivateIpAddress"),
+        "publicIpAddress": instance.get("PublicIpAddress") or DEFAULT_PUBLIC_IP,
+        "privateIpAddress": instance.get("PrivateIpAddress") or DEFAULT_PRIVATE_IP,
         "lastChecked": datetime.now(IST).isoformat(),
         "controlAvailable": True,
         "message": "AWS EC2 control is available",
