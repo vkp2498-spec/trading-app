@@ -29,7 +29,7 @@ from strategy_core import now_ist
 from dashboard_data import bot_only_trades
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
-from dashboard_data import is_stock_option_loss
+from dashboard_data import is_stock_option_trade
 from dashboard_data import normalized_underlying
 from dashboard_data import option_type
 from dashboard_data import read_trade_history
@@ -865,14 +865,10 @@ def section_header(title):
 
 
 def dashboard_trades_for_summary():
-    today_text = now_ist().strftime("%Y-%m-%d")
     return [
         trade
         for trade in bot_only_trades(read_trade_history())
-        if not (
-            trade.get("tradeDate") == today_text
-            and is_stock_option_loss(trade)
-        )
+        if not is_stock_option_trade(trade)
     ]
 
 
