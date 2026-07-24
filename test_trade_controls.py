@@ -353,6 +353,49 @@ class TradeControlTests(unittest.TestCase):
             750,
         )
 
+    def test_edge_analytics_groups_expectancy_by_score_and_entry_time(self):
+        trades = [
+            {
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "2026-07-20T09:35:00+05:30",
+                "score": 84,
+                "grossPnL": 1000,
+            },
+            {
+                "symbol": "BANKNIFTY",
+                "underlyingSymbol": "BANKNIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "2026-07-21T09:45:00+05:30",
+                "score": 88,
+                "grossPnL": 3000,
+            },
+            {
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "2026-07-21T10:30:00+05:30",
+                "score": 74,
+                "grossPnL": -1000,
+            },
+        ]
+
+        analytics = dashboard_data.edge_analytics(trades)
+        opening_high = next(
+            cell
+            for cell in analytics["matrix"]
+            if cell["timeBucket"] == "opening"
+            and cell["scoreBand"] == "80-90"
+        )
+
+        self.assertEqual(analytics["totalTrades"], 3)
+        self.assertEqual(analytics["symbolTrades"], {"NIFTY": 2, "BANKNIFTY": 1})
+        self.assertEqual(opening_high["expectancy"], 2000)
+        self.assertEqual(opening_high["trades"], 2)
+        self.assertEqual(analytics["bestZone"]["timeBucket"], "opening")
+        self.assertEqual(analytics["bestZone"]["scoreBand"], "80-90")
+
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):
         trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}
         self.assertEqual(dashboard_data.option_type(trade), "PUT")

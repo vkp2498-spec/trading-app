@@ -27,6 +27,19 @@ STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
+EDGE_SCORE_BANDS = (
+    ("60-70", 60.0, 70.0),
+    ("70-80", 70.0, 80.0),
+    ("80-90", 80.0, 90.0),
+    ("90+", 90.0, None),
+)
+EDGE_TIME_BUCKETS = (
+    ("opening", "09:15–10:00", 9 * 60 + 15, 10 * 60),
+    ("morning", "10:00–11:00", 10 * 60, 11 * 60),
+    ("late_morning", "11:00–13:00", 11 * 60, 13 * 60),
+    ("early_afternoon", "13:00–14:00", 13 * 60, 14 * 60),
+    ("late_afternoon", "14:00–15:30", 14 * 60, 15 * 60 + 30),
+)
 
 UPSTOX_POSITIONS_URL = (
     "https://api.upstox.com/v2/"
@@ -448,6 +461,7 @@ def empty_trade_performance() -> dict:
             "secondTradeContextPerformance": second_trade_context_performance([]),
         },
         "equityCurve": [],
+        "edgeAnalytics": edge_analytics([]),
         "recentTrades": [],
     }
 
@@ -811,6 +825,149 @@ def is_stock_option_trade(trade: dict) -> bool:
     return instrument_class == "STOCK_OPTION"
 
 
+def entry_minutes(trade: dict) -> int | None:
+    value = str(trade.get("entryTime") or "").strip()
+    if not value:
+        return None
+    match = re.search(r"(?:T|\s)(\d{1,2}):(\d{2})", value)
+    if not match:
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", value)
+    if not match:
+        return None
+    hour = safe_int(match.group(1), -1)
+    minute = safe_int(match.group(2), -1)
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour * 60 + minute
+
+
+def edge_score_band(score: float | None) -> str | None:
+    if score is None:
+        return None
+    for label, lower, upper in EDGE_SCORE_BANDS:
+        if score >= lower and (upper is None or score < upper):
+            return label
+    return None
+
+
+def edge_time_bucket(minutes: int | None) -> str | None:
+    if minutes is None:
+        return None
+    for bucket_id, _label, start, end in EDGE_TIME_BUCKETS:
+        if start <= minutes < end or (
+            bucket_id == "late_afternoon" and minutes == end
+        ):
+            return bucket_id
+    return None
+
+
+def edge_analytics(trades: list[dict]) -> dict:
+    eligible = []
+    for trade in trades:
+        if normalized_underlying(trade) not in SYMBOLS:
+            continue
+        if str(trade.get("instrumentClass") or "INDEX_OPTION").upper() != "INDEX_OPTION":
+            continue
+        score = safe_float(trade.get("score"), None)
+        score_band = edge_score_band(score)
+        time_bucket = edge_time_bucket(entry_minutes(trade))
+        if not score_band or not time_bucket:
+            continue
+        enriched = dict(trade)
+        enriched["edgeScoreBand"] = score_band
+        enriched["edgeTimeBucket"] = time_bucket
+        eligible.append(enriched)
+
+    wins = [trade for trade in eligible if safe_float(trade.get("grossPnL")) > 0]
+    losses = [trade for trade in eligible if safe_float(trade.get("grossPnL")) < 0]
+    gross_profit = sum(safe_float(trade.get("grossPnL")) for trade in wins)
+    gross_loss = abs(sum(safe_float(trade.get("grossPnL")) for trade in losses))
+    total_pnl = sum(safe_float(trade.get("grossPnL")) for trade in eligible)
+
+    matrix = []
+    for bucket_id, _label, _start, _end in EDGE_TIME_BUCKETS:
+        for score_label, _lower, _upper in EDGE_SCORE_BANDS:
+            matching = [
+                trade
+                for trade in eligible
+                if trade["edgeTimeBucket"] == bucket_id
+                and trade["edgeScoreBand"] == score_label
+            ]
+            trades_count = len(matching)
+            pnl = sum(safe_float(trade.get("grossPnL")) for trade in matching)
+            matrix.append(
+                {
+                    "timeBucket": bucket_id,
+                    "scoreBand": score_label,
+                    "expectancy": round(pnl / trades_count, 2) if trades_count else 0.0,
+                    "trades": trades_count,
+                    "winRate": calculate_win_rate(matching),
+                }
+            )
+
+    time_performance = []
+    for bucket_id, label, _start, _end in EDGE_TIME_BUCKETS:
+        matching = [
+            trade
+            for trade in eligible
+            if trade["edgeTimeBucket"] == bucket_id
+        ]
+        count = len(matching)
+        pnl = sum(safe_float(trade.get("grossPnL")) for trade in matching)
+        time_performance.append(
+            {
+                "id": bucket_id,
+                "label": label,
+                "expectancy": round(pnl / count, 2) if count else 0.0,
+                "trades": count,
+            }
+        )
+
+    populated_cells = [cell for cell in matrix if cell["trades"] > 0]
+    best_cell = max(populated_cells, key=lambda cell: cell["expectancy"], default=None)
+    labels_by_id = {
+        bucket_id: label
+        for bucket_id, label, _start, _end in EDGE_TIME_BUCKETS
+    }
+    best_zone = None
+    if best_cell:
+        best_zone = {
+            **best_cell,
+            "timeLabel": labels_by_id[best_cell["timeBucket"]],
+        }
+        key_insight = (
+            f"{best_zone['scoreBand']} score trades during {best_zone['timeLabel']} "
+            f"have the strongest expectancy at ₹{best_zone['expectancy']:,.0f} per trade."
+        )
+    else:
+        key_insight = "More scored index-option trades are needed to identify a reliable edge zone."
+
+    return {
+        "overallExpectancy": round(total_pnl / len(eligible), 2) if eligible else 0.0,
+        "winRate": calculate_win_rate(eligible),
+        "wins": len(wins),
+        "profitFactor": round(gross_profit / gross_loss, 2) if gross_loss else None,
+        "totalTrades": len(eligible),
+        "symbolTrades": {
+            symbol: sum(
+                1
+                for trade in eligible
+                if normalized_underlying(trade) == symbol
+            )
+            for symbol in SYMBOLS
+        },
+        "scoreBands": [label for label, _lower, _upper in EDGE_SCORE_BANDS],
+        "timeBuckets": [
+            {"id": bucket_id, "label": label}
+            for bucket_id, label, _start, _end in EDGE_TIME_BUCKETS
+        ],
+        "matrix": matrix,
+        "timePerformance": time_performance,
+        "bestZone": best_zone,
+        "keyInsight": key_insight,
+    }
+
+
 def today_category_pnl(
     trades: list[dict],
 ) -> dict:
@@ -1143,6 +1300,7 @@ def build_trade_performance() -> dict:
         "equityCurve": build_equity_curve(
             trades,
         ),
+        "edgeAnalytics": edge_analytics(trades),
         "recentTrades": recent_trades,
     }
 
