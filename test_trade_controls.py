@@ -360,7 +360,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-20T09:35:00+05:30",
-                "score": 84,
+                "score": 6.4,
                 "grossPnL": 1000,
             },
             {
@@ -368,7 +368,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T09:45:00+05:30",
-                "score": 88,
+                "score": -6.8,
                 "grossPnL": 3000,
             },
             {
@@ -376,7 +376,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T10:30:00+05:30",
-                "score": 74,
+                "score": 5.4,
                 "grossPnL": -1000,
             },
         ]
@@ -386,7 +386,7 @@ class TradeControlTests(unittest.TestCase):
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "opening"
-            and cell["scoreBand"] == "80-90"
+            and cell["scoreBand"] == "6-7"
         )
 
         self.assertEqual(analytics["totalTrades"], 3)
@@ -394,7 +394,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(opening_high["expectancy"], 2000)
         self.assertEqual(opening_high["trades"], 2)
         self.assertEqual(analytics["bestZone"]["timeBucket"], "opening")
-        self.assertEqual(analytics["bestZone"]["scoreBand"], "80-90")
+        self.assertEqual(analytics["bestZone"]["scoreBand"], "6-7")
 
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):
         trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}

@@ -28,10 +28,10 @@ SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 EDGE_SCORE_BANDS = (
-    ("60-70", 60.0, 70.0),
-    ("70-80", 70.0, 80.0),
-    ("80-90", 80.0, 90.0),
-    ("90+", 90.0, None),
+    ("4-5", 4.0, 5.0),
+    ("5-6", 5.0, 6.0),
+    ("6-7", 6.0, 7.0),
+    ("7+", 7.0, None),
 )
 EDGE_TIME_BUCKETS = (
     ("opening", "09:15–10:00", 9 * 60 + 15, 10 * 60),
@@ -844,8 +844,9 @@ def entry_minutes(trade: dict) -> int | None:
 def edge_score_band(score: float | None) -> str | None:
     if score is None:
         return None
+    strength = abs(score)
     for label, lower, upper in EDGE_SCORE_BANDS:
-        if score >= lower and (upper is None or score < upper):
+        if strength >= lower and (upper is None or strength < upper):
             return label
     return None
 
