@@ -85,12 +85,30 @@ def read_rows(path: Path) -> list[dict]:
 
 
 def discover_sources(target: Path) -> list[Path]:
-    backups = sorted(
-        path
-        for path in target.parent.glob("trade_history.*.bak")
-        if path.resolve() != target.resolve()
+    target = target.resolve()
+    repository = target.parent.parent
+    search_roots = (
+        target.parent,
+        target.parent / "archive",
+        target.parent / "archives",
+        repository / "archive",
+        repository / "archives",
+        repository / "logs" / "archive",
+        repository / "logs" / "archives",
     )
-    return [*backups, target] if target.exists() else backups
+    candidates = set()
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for pattern in ("trade_history*.csv", "trade_history*.bak"):
+            candidates.update(
+                path.resolve()
+                for path in root.rglob(pattern)
+                if path.is_file() and path.resolve() != target
+            )
+
+    archived = sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+    return [*archived, target] if target.exists() else archived
 
 
 def merge_sources(sources: list[Path]) -> MergeResult:
