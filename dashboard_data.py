@@ -28,17 +28,19 @@ SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 EDGE_SCORE_BANDS = (
-    ("4-5", 4.0, 5.0),
-    ("5-6", 5.0, 6.0),
-    ("6-7", 6.0, 7.0),
-    ("7+", 7.0, None),
+    ("0", 0.0, 1.0),
+    ("1-2", 1.0, 3.0),
+    ("3-4", 3.0, 5.0),
+    ("5+", 5.0, None),
 )
+EDGE_UNSCORED_BAND = "Unscored"
 EDGE_TIME_BUCKETS = (
     ("opening", "09:15–10:00", 9 * 60 + 15, 10 * 60),
     ("morning", "10:00–11:00", 10 * 60, 11 * 60),
     ("late_morning", "11:00–13:00", 11 * 60, 13 * 60),
     ("early_afternoon", "13:00–14:00", 13 * 60, 14 * 60),
     ("late_afternoon", "14:00–15:30", 14 * 60, 15 * 60 + 30),
+    ("unknown", "Unknown time", None, None),
 )
 
 UPSTOX_POSITIONS_URL = (
@@ -858,25 +860,27 @@ def entry_minutes(trade: dict) -> int | None:
     return hour * 60 + minute
 
 
-def edge_score_band(score: float | None) -> str | None:
+def edge_score_band(score: float | None) -> str:
     if score is None:
-        return None
+        return EDGE_UNSCORED_BAND
     strength = abs(score)
     for label, lower, upper in EDGE_SCORE_BANDS:
         if strength >= lower and (upper is None or strength < upper):
             return label
-    return None
+    return EDGE_UNSCORED_BAND
 
 
-def edge_time_bucket(minutes: int | None) -> str | None:
+def edge_time_bucket(minutes: int | None) -> str:
     if minutes is None:
-        return None
+        return "unknown"
     for bucket_id, _label, start, end in EDGE_TIME_BUCKETS:
+        if start is None or end is None:
+            continue
         if start <= minutes < end or (
             bucket_id == "late_afternoon" and minutes == end
         ):
             return bucket_id
-    return None
+    return "unknown"
 
 
 def edge_analytics(trades: list[dict]) -> dict:
@@ -889,8 +893,6 @@ def edge_analytics(trades: list[dict]) -> dict:
         score = safe_float(trade.get("score"), None)
         score_band = edge_score_band(score)
         time_bucket = edge_time_bucket(entry_minutes(trade))
-        if not score_band or not time_bucket:
-            continue
         enriched = dict(trade)
         enriched["edgeScoreBand"] = score_band
         enriched["edgeTimeBucket"] = time_bucket
@@ -904,7 +906,10 @@ def edge_analytics(trades: list[dict]) -> dict:
 
     matrix = []
     for bucket_id, _label, _start, _end in EDGE_TIME_BUCKETS:
-        for score_label, _lower, _upper in EDGE_SCORE_BANDS:
+        for score_label in [
+            *[label for label, _lower, _upper in EDGE_SCORE_BANDS],
+            EDGE_UNSCORED_BAND,
+        ]:
             matching = [
                 trade
                 for trade in eligible
@@ -954,7 +959,7 @@ def edge_analytics(trades: list[dict]) -> dict:
             "timeLabel": labels_by_id[best_cell["timeBucket"]],
         }
         key_insight = (
-            f"{best_zone['scoreBand']} score trades during {best_zone['timeLabel']} "
+            f"{best_zone['scoreBand']} trades during {best_zone['timeLabel']} "
             f"have the strongest expectancy at ₹{best_zone['expectancy']:,.0f} per trade."
         )
     else:
@@ -974,7 +979,10 @@ def edge_analytics(trades: list[dict]) -> dict:
             )
             for symbol in SYMBOLS
         },
-        "scoreBands": [label for label, _lower, _upper in EDGE_SCORE_BANDS],
+        "scoreBands": [
+            *[label for label, _lower, _upper in EDGE_SCORE_BANDS],
+            EDGE_UNSCORED_BAND,
+        ],
         "timeBuckets": [
             {"id": bucket_id, "label": label}
             for bucket_id, label, _start, _end in EDGE_TIME_BUCKETS

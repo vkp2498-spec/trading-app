@@ -379,6 +379,38 @@ class TradeControlTests(unittest.TestCase):
                 "score": 5.4,
                 "grossPnL": -1000,
             },
+            {
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "2026-07-21T11:30:00+05:30",
+                "score": None,
+                "grossPnL": 500,
+            },
+            {
+                "symbol": "BANKNIFTY",
+                "underlyingSymbol": "BANKNIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "2026-07-21T12:00:00+05:30",
+                "score": 0,
+                "grossPnL": -200,
+            },
+            {
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "2026-07-21T13:30:00+05:30",
+                "score": -2,
+                "grossPnL": 400,
+            },
+            {
+                "symbol": "BANKNIFTY",
+                "underlyingSymbol": "BANKNIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "entryTime": "",
+                "score": -4,
+                "grossPnL": 800,
+            },
         ]
 
         analytics = dashboard_data.edge_analytics(trades)
@@ -386,15 +418,30 @@ class TradeControlTests(unittest.TestCase):
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "opening"
-            and cell["scoreBand"] == "6-7"
+            and cell["scoreBand"] == "5+"
+        )
+        unknown_time = next(
+            cell
+            for cell in analytics["matrix"]
+            if cell["timeBucket"] == "unknown"
+            and cell["scoreBand"] == "3-4"
+        )
+        unscored = next(
+            cell
+            for cell in analytics["matrix"]
+            if cell["timeBucket"] == "late_morning"
+            and cell["scoreBand"] == "Unscored"
         )
 
-        self.assertEqual(analytics["totalTrades"], 3)
-        self.assertEqual(analytics["symbolTrades"], {"NIFTY": 2, "BANKNIFTY": 1})
+        self.assertEqual(analytics["totalTrades"], 7)
+        self.assertEqual(analytics["symbolTrades"], {"NIFTY": 4, "BANKNIFTY": 3})
+        self.assertEqual(analytics["scoreBands"], ["0", "1-2", "3-4", "5+", "Unscored"])
         self.assertEqual(opening_high["expectancy"], 2000)
         self.assertEqual(opening_high["trades"], 2)
+        self.assertEqual(unknown_time["trades"], 1)
+        self.assertEqual(unscored["trades"], 1)
         self.assertEqual(analytics["bestZone"]["timeBucket"], "opening")
-        self.assertEqual(analytics["bestZone"]["scoreBand"], "6-7")
+        self.assertEqual(analytics["bestZone"]["scoreBand"], "5+")
 
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):
         trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}
