@@ -2,43 +2,11 @@ import csv
 from pathlib import Path
 
 from strategy_core import now_ist
+from trade_history_schema import COLUMNS
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
-
-COLUMNS = [
-    "trade_date",
-    "symbol",
-    "underlying_symbol",
-    "instrument_class",
-    "trading_symbol",
-    "direction",
-    "transaction_type",
-    "position_side",
-    "quantity",
-    "entry_time",
-    "entry_price",
-    "exit_time",
-    "exit_price",
-    "target_price",
-    "stop_loss_price",
-    "original_stop_loss_price",
-    "profit_protection_stage",
-    "profit_booking_price",
-    "exit_reason",
-    "gross_pnl",
-    "score",
-    "trade_sequence",
-    "prior_trade_symbol",
-    "prior_trade_outcome",
-    "prior_trade_pnl",
-    "risk_per_trade_limit",
-    "remaining_index_risk_budget",
-    "planned_risk",
-    "status",
-]
-
 
 def ensure_trade_history_file():
     DATA_DIR.mkdir(exist_ok=True)

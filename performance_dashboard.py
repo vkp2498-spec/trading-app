@@ -26,10 +26,9 @@ from post_market_review import (
     summarize,
 )
 from strategy_core import now_ist
-from dashboard_data import bot_only_trades
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
-from dashboard_data import is_stock_option_trade
+from dashboard_data import dashboard_index_trades
 from dashboard_data import normalized_underlying
 from dashboard_data import option_type
 from dashboard_data import read_trade_history
@@ -865,11 +864,7 @@ def section_header(title):
 
 
 def dashboard_trades_for_summary():
-    return [
-        trade
-        for trade in bot_only_trades(read_trade_history())
-        if not is_stock_option_trade(trade)
-    ]
+    return dashboard_index_trades(read_trade_history())
 
 
 def symbol_summary(trades, symbol):

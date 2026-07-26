@@ -524,6 +524,26 @@ class TradeControlTests(unittest.TestCase):
                 "grossPnL": 5100.0,
                 "exitTime": "2026-07-21T11:00:00+05:30",
             },
+            {
+                "tradeDate": "2026-07-22",
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "STOCK_FUTURE",
+                "tradingSymbol": "NIFTY FUT",
+                "grossPnL": 9000.0,
+                "exitTime": "2026-07-22T12:00:00+05:30",
+            },
+            {
+                "tradeDate": "2026-07-22",
+                "symbol": "NIFTY",
+                "underlyingSymbol": "NIFTY",
+                "instrumentClass": "INDEX_OPTION",
+                "tradingSymbol": "UPSTOX SYNC NIFTY CALL",
+                "optionType": "CALL",
+                "grossPnL": 15000.0,
+                "exitTime": "2026-07-22T13:00:00+05:30",
+                "exitReason": "UPSTOX_SYNC_ADJUSTMENT",
+            },
         ]
         with (
             patch.object(dashboard_data, "read_trade_history", return_value=trades),

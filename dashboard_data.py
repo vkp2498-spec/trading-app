@@ -807,7 +807,12 @@ def second_trade_context_performance(trades: list[dict]) -> list[dict]:
 
 
 def is_upstox_sync_trade(trade: dict) -> bool:
-    return str(trade.get("exitReason") or "").upper() == UPSTOX_SYNC_EXIT_REASON
+    exit_reason = str(trade.get("exitReason") or "").upper()
+    trading_symbol = str(trade.get("tradingSymbol") or "").upper()
+    return (
+        exit_reason == UPSTOX_SYNC_EXIT_REASON
+        or trading_symbol.startswith("UPSTOX SYNC")
+    )
 
 
 def bot_only_trades(trades: list[dict]) -> list[dict]:
@@ -816,6 +821,18 @@ def bot_only_trades(trades: list[dict]) -> list[dict]:
         for trade in trades
         if not is_upstox_sync_trade(trade)
     ]
+
+
+def is_dashboard_index_trade(trade: dict) -> bool:
+    return (
+        not is_upstox_sync_trade(trade)
+        and normalized_underlying(trade) in SYMBOLS
+        and str(trade.get("instrumentClass") or "INDEX_OPTION").upper() == "INDEX_OPTION"
+    )
+
+
+def dashboard_index_trades(trades: list[dict]) -> list[dict]:
+    return [trade for trade in trades if is_dashboard_index_trade(trade)]
 
 
 def is_stock_option_trade(trade: dict) -> bool:
@@ -1193,8 +1210,7 @@ def build_trade_performance() -> dict:
     ).strftime("%Y-%m-%d")
     trades = [
         trade
-        for trade in bot_only_trades(read_trade_history())
-        if not is_stock_option_trade(trade)
+        for trade in dashboard_index_trades(read_trade_history())
     ]
 
     today_trades = [
