@@ -1626,6 +1626,34 @@ class TradeControlTests(unittest.TestCase):
         self.assertTrue(decision["allowed"])
         self.assertEqual(decision["required_score"], 75)
 
+    def test_score_cutoff_post_fill_override_keeps_soft_rr_rejection(self):
+        post_fill = {
+            "allowed": False,
+            "feasibility": {
+                "allowed": False,
+                "reasons": [
+                    "Technical reward/risk 0.07 is below required 1.00; 15M target=162.00"
+                ],
+            },
+        }
+        result = trade_bot.apply_score_cutoff_post_fill_override(post_fill, True)
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["feasibility"]["score_cutoff_override"])
+
+    def test_score_cutoff_post_fill_override_preserves_hard_extension_exit(self):
+        post_fill = {
+            "allowed": False,
+            "feasibility": {
+                "allowed": False,
+                "reasons": [
+                    "Expected entry is unfavorably extended by 2.00% versus the completed ATM option candle"
+                ],
+            },
+        }
+        result = trade_bot.apply_score_cutoff_post_fill_override(post_fill, True)
+        self.assertFalse(result["allowed"])
+        self.assertIn("hard_post_fill_reasons", result["feasibility"])
+
 
 if __name__ == "__main__":
     unittest.main()

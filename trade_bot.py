@@ -525,6 +525,43 @@ def revalidate_option_after_fill(
     }
 
 
+def apply_score_cutoff_post_fill_override(post_fill, score_cutoff_approved):
+    """Keep a score-approved fill unless a hard execution defect appeared.
+
+    Technical headroom and technical reward/risk are already represented in
+    the 100-point decision. Reapplying them after the broker fill would place
+    a trade and then immediately undo the score-cutoff decision. Invalid risk
+    geometry and materially extended fills remain hard exits.
+    """
+    if post_fill.get("allowed") or not score_cutoff_approved:
+        return post_fill
+
+    feasibility = post_fill.get("feasibility", {}) or {}
+    reasons = [str(reason) for reason in feasibility.get("reasons", [])]
+    hard_prefixes = (
+        "Stop loss does not define positive option-premium risk",
+        "Expected entry is unfavorably extended",
+    )
+    hard_reasons = [
+        reason for reason in reasons
+        if any(reason.startswith(prefix) for prefix in hard_prefixes)
+    ]
+    if hard_reasons:
+        feasibility["hard_post_fill_reasons"] = hard_reasons
+        post_fill["feasibility"] = feasibility
+        return post_fill
+
+    feasibility["original_allowed"] = False
+    feasibility["allowed"] = True
+    feasibility["score_cutoff_override"] = True
+    feasibility["reasons"] = reasons + [
+        "Post-fill technical headroom veto overridden by the approved 100-point score"
+    ]
+    post_fill["allowed"] = True
+    post_fill["feasibility"] = feasibility
+    return post_fill
+
+
 def read_json(path, default):
     if not path.exists():
         return default
@@ -2658,6 +2695,15 @@ def handle_existing_state(symbol, state, verbose=True):
                 state.get("option_delta_used"),
                 technical_context,
             )
+            post_fill = apply_score_cutoff_post_fill_override(
+                post_fill,
+                bool(state.get("score_cutoff_approved")),
+            )
+            if post_fill.get("feasibility", {}).get("score_cutoff_override"):
+                log(
+                    f"{symbol} delayed-fill score cutoff retained position; "
+                    "soft technical headroom veto ignored"
+                )
             state["post_fill_feasibility"] = post_fill["feasibility"]
             if not post_fill["allowed"]:
                 reason = "; ".join(post_fill["feasibility"].get("reasons", []))
@@ -3935,6 +3981,8 @@ def execute_selected_candidate(chosen):
     trade_metadata = {
         **trade_context,
         "planned_risk": round(planned_risk, 2),
+        "score_cutoff_approved": bool(chosen.get("score_cutoff_approved")),
+        "entry_minimum_score": to_float(chosen.get("entry_minimum_score")),
         "manual_override": bool(chosen.get("manual_override")),
         "manual_command": chosen.get("manual_command", ""),
         "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(symbol),
@@ -4108,6 +4156,15 @@ def execute_selected_candidate(chosen):
             chosen["option_delta_used"],
             chosen.get("technicals", {}),
         )
+        post_fill = apply_score_cutoff_post_fill_override(
+            post_fill,
+            bool(chosen.get("score_cutoff_approved")),
+        )
+        if post_fill.get("feasibility", {}).get("score_cutoff_override"):
+            log(
+                f"{symbol} post-fill score cutoff retained position; "
+                "soft technical headroom veto ignored"
+            )
     state = read_state(symbol)
     state["weighted_score"] = candidate_weighted_score(chosen)
     state["post_fill_feasibility"] = post_fill["feasibility"]
