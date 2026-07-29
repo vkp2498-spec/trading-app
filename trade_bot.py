@@ -121,15 +121,15 @@ DEFAULT_NORMAL_STOP_PERCENT = 7.5
 DEFAULT_CAUTIOUS_TARGET_PERCENT = 6.0
 DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
 DEFAULT_INDEX_EXIT_POINTS = {
-    "NIFTY": {"target": 30.0, "stop": 30.0},
-    "BANKNIFTY": {"target": 90.0, "stop": 90.0},
+    "NIFTY": {"target": 20.0, "stop": 20.0},
+    "BANKNIFTY": {"target": 40.0, "stop": 40.0},
 }
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
-DEFAULT_OPTION_CAPITAL_PER_ENTRY = 1.0
+DEFAULT_OPTION_CAPITAL_PER_ENTRY = "MAX"
 
 SYMBOL_CONFIG = {
     "NIFTY": {
@@ -292,6 +292,10 @@ def configured_bool(env_key, default=False):
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def score_cutoff_mode_enabled():
+    return configured_bool("SCORE_CUTOFF_MODE_ENABLED", True)
+
+
 def index_point_exit_settings(symbol):
     defaults = DEFAULT_INDEX_EXIT_POINTS[symbol]
     settings = {
@@ -308,6 +312,23 @@ def index_point_exit_settings(symbol):
     }
     if settings["delta"] > 1:
         raise RuntimeError("OPTION_DELTA_APPROXIMATION must be greater than 0 and at most 1")
+    return settings
+
+
+def score_based_exit_settings(symbol, weighted_score):
+    """Use wider profit objectives only for exceptional scored setups."""
+    settings = dict(index_point_exit_settings(symbol))
+    threshold = configured_non_negative_float("EXTREME_SETUP_MIN_SCORE", 90.0)
+    score = to_float(weighted_score)
+    settings["profile"] = "STANDARD"
+    if score < threshold:
+        return settings
+
+    settings["profile"] = "EXTREME"
+    default_target = 30.0 if symbol == "NIFTY" else 60.0
+    settings["target_points"] = configured_positive_float(
+        f"{symbol}_EXTREME_TARGET_POINTS", default_target
+    )
     return settings
 
 
@@ -572,6 +593,22 @@ def direct_entry_minimum_score(symbol):
         float(MIN_SCORE_BY_SYMBOL.get(symbol, 65)),
         configured_non_negative_float("INDEX_DIRECT_ENTRY_MIN_SCORE", 75.0),
     )
+
+
+def score_direction_from_technicals(technicals):
+    """Choose a provisional direction so a neutral chain can still be scored."""
+    five = technicals.get("five_min", {}) or {}
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    two = technicals.get("two_hour", {}) or {}
+    five_bias = five.get("bias")
+    fifteen_bias = fifteen.get("bias")
+    if five_bias in {"BULLISH", "BEARISH"}:
+        return five_bias
+    if fifteen_bias in {"BULLISH", "BEARISH"}:
+        return fifteen_bias
+    if two.get("bias") in {"BULLISH", "BEARISH"}:
+        return two.get("bias")
+    return None
 
 
 def option_flow_supports_watch(candidate):
@@ -1217,12 +1254,17 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         chosen.get("entry_minimum_score"),
         MIN_SCORE_BY_SYMBOL.get(symbol, 65),
     )
-    required_score = base_minimum + to_float(circuit.get("score_penalty"))
-    if symbol in SYMBOLS and index_trade_count_today() >= 1:
-        required_score += second_index_trade_score_bonus()
-        prior_trade = last_index_trade_today()
-        if prior_trade and to_float(prior_trade.get("gross_pnl")) < 0:
-            required_score += second_trade_after_loss_score_bonus()
+    required_score = base_minimum
+    # A direct 75+ setup has already absorbed strategy quality into one
+    # 100-point score. Keep hard day/risk/correlation gates below, but do not
+    # silently turn the score cutoff into 85 or 90 at order time.
+    if not chosen.get("score_cutoff_approved"):
+        required_score += to_float(circuit.get("score_penalty"))
+        if symbol in SYMBOLS and index_trade_count_today() >= 1:
+            required_score += second_index_trade_score_bonus()
+            prior_trade = last_index_trade_today()
+            if prior_trade and to_float(prior_trade.get("gross_pnl")) < 0:
+                required_score += second_trade_after_loss_score_bonus()
     if score < required_score:
         return {
             "allowed": False,
@@ -1594,14 +1636,17 @@ def short_structure_allowed(direction, technicals, raw_flow, weighted_score):
 def option_capital_per_entry():
     """Return the capital allocation for one index-option entry.
 
-    A value of 1 is a sentinel for exactly one lot. Larger values are treated
-    as rupees and converted to whole lots using the expected option premium.
+    ``MAX`` deploys the currently available Upstox equity balance after a
+    configurable cash buffer. A value of 1 means exactly one lot. Larger
+    numeric values are rupees and are rounded down to whole lots.
     """
     fallback = os.getenv(
         "OPTION_CAPITAL_PER_ENTRY",
         str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
     ).strip()
     raw_value = str(active_value("optionCapitalPerEntry", fallback)).strip()
+    if raw_value.upper() == "MAX" or to_float(raw_value, 0.0) < 0:
+        return "MAX"
     try:
         capital = float(raw_value)
     except ValueError as error:
@@ -1614,6 +1659,36 @@ def option_capital_per_entry():
             "OPTION_CAPITAL_PER_ENTRY must be 1 or greater"
         )
     return capital
+
+
+def maximum_available_option_capital():
+    """Return usable buying capital while retaining a cash/charges buffer."""
+    cache_key = "available_option_capital"
+    now = time_module.time()
+    cached = BROKER_READ_CACHE.get(cache_key) or {}
+    cache_seconds = configured_non_negative_float(
+        "MAX_CAPITAL_BALANCE_CACHE_SECONDS", 5.0
+    )
+    if cached and now - to_float(cached.get("timestamp")) <= cache_seconds:
+        return to_float(cached.get("value"))
+
+    try:
+        available = available_equity_margin()
+    except Exception as error:
+        log(f"MAX capital unavailable: could not read Upstox funds: {error}")
+        return 0.0
+
+    use_percent = configured_positive_float("MAX_CAPITAL_USE_PERCENT", 95.0)
+    if use_percent > 100:
+        raise RuntimeError("MAX_CAPITAL_USE_PERCENT must be at most 100")
+    reserve = configured_non_negative_float("MAX_CAPITAL_RESERVE_RUPEES", 1000.0)
+    usable = max(available - reserve, 0.0) * use_percent / 100.0
+    BROKER_READ_CACHE[cache_key] = {"timestamp": now, "value": usable}
+    verbose_log(
+        f"MAX capital sizing: available={available:.2f} reserve={reserve:.2f} "
+        f"use_percent={use_percent:.1f} usable={usable:.2f}"
+    )
+    return usable
 
 
 def max_lots_per_entry():
@@ -1642,6 +1717,9 @@ def order_quantity_for(
     # an accidental legacy caller cannot use this sizing for a short option.
     if str(transaction_type).upper() != "BUY":
         return 0
+
+    if capital == "MAX":
+        capital = maximum_available_option_capital()
 
     if capital == 1 or entry_price is None or float(entry_price) <= 0:
         lots = 1
@@ -3220,7 +3298,10 @@ def build_trade_candidate(
 
     score_value = float(weighted.get("score") or 0)
     minimum = direct_entry_minimum_score(symbol)
-    if option_summary.get("neutral_chain_override"):
+    cutoff_approved = bool(
+        score_cutoff_mode_enabled() and score_value >= minimum
+    )
+    if option_summary.get("neutral_chain_override") and not score_cutoff_mode_enabled():
         neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
         minimum = max(
             minimum,
@@ -3233,7 +3314,7 @@ def build_trade_candidate(
         and score_value >= watch_minimum_score()
         and score_value < minimum
     )
-    if (weighted.get("grade") == "SKIP" or score_value < minimum) and not watch_band:
+    if score_value < minimum and not watch_band:
         return {
             "allowed": False,
             "reason": f"weighted score {score_value:.1f} does not qualify",
@@ -3258,7 +3339,7 @@ def build_trade_candidate(
     )
     technicals["live_entry_gate"] = live_gate
     option_summary["live_entry_gate"] = live_gate
-    if not live_gate.get("allowed"):
+    if not live_gate.get("allowed") and not cutoff_approved:
         return {
             "allowed": False,
             "reason": "live regime/structure rejected: " + str(live_gate.get("reason")),
@@ -3268,12 +3349,18 @@ def build_trade_candidate(
             "option_summary": option_summary,
             "weighted": weighted,
         }, None
+    if not live_gate.get("allowed"):
+        option_summary["score_cutoff_strategy_override"] = (
+            "live regime/structure gate treated as scored context: "
+            + str(live_gate.get("reason"))
+        )
 
     expiry_days = (parse_expiry(atm["expiry"]) - now_ist().date()).days
     technicals["market_regime"]["days_to_expiry"] = expiry_days
     if (
         expiry_days <= int(configured_non_negative_float("EXPIRY_REGIME_MAX_DAYS", 2))
         and score_value < configured_non_negative_float("EXPIRY_REGIME_MIN_SCORE", 85.0)
+        and not cutoff_approved
     ):
         return {
             "allowed": False,
@@ -3289,6 +3376,7 @@ def build_trade_candidate(
         }, None
 
     cautious = weighted.get("grade") == "CAUTIOUS_TRADE"
+    exit_settings = score_based_exit_settings(symbol, score_value)
     levels = option_levels_from_index_points(
         symbol,
         entry_price,
@@ -3306,6 +3394,7 @@ def build_trade_candidate(
             "target_points": levels["target_points"],
             "stop_points": levels["stop_points"],
             "option_delta_used": levels["delta"],
+            "target_profile": exit_settings["profile"],
         }
     )
     feasibility = evaluate_trade_feasibility(
@@ -3319,7 +3408,7 @@ def build_trade_candidate(
     )
     technicals["trade_feasibility"] = feasibility
     option_summary["trade_feasibility"] = feasibility
-    if not feasibility.get("allowed"):
+    if not feasibility.get("allowed") and not cutoff_approved:
         return {
             "allowed": False,
             "reason": "entry feasibility rejected: " + "; ".join(feasibility.get("reasons", [])),
@@ -3329,6 +3418,10 @@ def build_trade_candidate(
             "option_summary": option_summary,
             "weighted": weighted,
         }, None
+    if not feasibility.get("allowed"):
+        option_summary["score_cutoff_feasibility_override"] = list(
+            feasibility.get("reasons", [])
+        )
 
     structural = structural_invalidation(
         technicals,
@@ -3360,6 +3453,8 @@ def build_trade_candidate(
             "option_summary": option_summary,
             "weighted": weighted,
             "entry_minimum_score": minimum,
+            "score_cutoff_approved": False,
+            "target_profile": exit_settings["profile"],
             "contract_selection_rank": option_quality.get("selection_rank", 0.0),
             "structural_invalidation": structural,
         }, None
@@ -3367,8 +3462,9 @@ def build_trade_candidate(
     return {
         "allowed": True,
         "reason": (
-            f"qualified fixed {levels['target_points']:.0f}/{levels['stop_points']:.0f} points; "
-            f"reward_risk={feasibility.get('technical_reward_risk')}"
+            f"score cutoff approved at {score_value:.1f}/{minimum:.1f}; "
+            f"{exit_settings['profile'].lower()} target/stop "
+            f"{levels['target_points']:.0f}/{levels['stop_points']:.0f} points"
         ),
         "transaction_type": transaction_type,
         "instrument": instrument,
@@ -3386,6 +3482,8 @@ def build_trade_candidate(
         "option_summary": option_summary,
         "weighted": weighted,
         "entry_minimum_score": minimum,
+        "score_cutoff_approved": cutoff_approved,
+        "target_profile": exit_settings["profile"],
         "contract_selection_rank": option_quality.get("selection_rank", 0.0),
         "structural_invalidation": structural,
     }, None
@@ -3424,15 +3522,14 @@ def evaluate_symbol_buy_or_sell(
         f"{symbol} signal: {direction}, confidence={confidence}, score={score}, "
         f"strike={atm['strike']}, expiry={atm['expiry']}"
     )
-    directional_high = (
-        direction in {"BULLISH", "BEARISH"}
-        and confidence == "HIGH"
-        and abs(score) >= 4
-    )
+    # Chain strength now contributes up to 25 points instead of acting as a
+    # separate veto. Any directional chain can therefore proceed to the full
+    # 100-point assessment; weak evidence simply earns fewer points.
+    directional_chain = direction in {"BULLISH", "BEARISH"}
     observe_signal_reset(symbol, direction)
     neutral_banknifty_candidate = symbol == "BANKNIFTY" and direction == "NEUTRAL"
     neutral_nifty_candidate = symbol == "NIFTY" and direction == "NEUTRAL"
-    if not directional_high and not neutral_banknifty_candidate and not neutral_nifty_candidate:
+    if not directional_chain and not neutral_banknifty_candidate and not neutral_nifty_candidate:
         collect_institutional_footprint(symbol, rec)
         log_scan_decision(symbol, score, "reject")
         return False
@@ -3482,7 +3579,11 @@ def evaluate_symbol_buy_or_sell(
         )
 
     if neutral_banknifty_candidate:
-        inferred_direction, blockers = banknifty_neutral_chain_direction(base_technicals)
+        if score_cutoff_mode_enabled():
+            inferred_direction = score_direction_from_technicals(base_technicals)
+            blockers = [] if inferred_direction else ["technical direction is unavailable"]
+        else:
+            inferred_direction, blockers = banknifty_neutral_chain_direction(base_technicals)
         if not inferred_direction:
             collect_institutional_footprint(symbol, rec)
             log_scan_decision(symbol, score, "reject")
@@ -3501,10 +3602,14 @@ def evaluate_symbol_buy_or_sell(
         direction = inferred_direction
         verbose_log(
             f"BANKNIFTY neutral-chain override candidate: direction={direction}; "
-            "5M/15M, 2H and major-bank breadth passed preconditions"
+            "the complete 100-point score will decide"
         )
     elif neutral_nifty_candidate:
-        inferred_direction, blockers = nifty_neutral_chain_direction(base_technicals)
+        if score_cutoff_mode_enabled():
+            inferred_direction = score_direction_from_technicals(base_technicals)
+            blockers = [] if inferred_direction else ["technical direction is unavailable"]
+        else:
+            inferred_direction, blockers = nifty_neutral_chain_direction(base_technicals)
         if not inferred_direction:
             collect_institutional_footprint(symbol, rec)
             log_scan_decision(symbol, score, "reject")
@@ -3523,7 +3628,7 @@ def evaluate_symbol_buy_or_sell(
         direction = inferred_direction
         verbose_log(
             f"NIFTY neutral-chain override candidate: direction={direction}; "
-            "5M/15M momentum and 2H risk preconditions passed"
+            "the complete 100-point score will decide"
         )
 
     observe_signal_reset(symbol, direction)

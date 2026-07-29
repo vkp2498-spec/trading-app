@@ -17,12 +17,20 @@ import os
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "data" / "trading_config.json"
-DEFAULT_PROFILE_ID = "100000"
+DEFAULT_PROFILE_ID = "MAX"
 
 # Capital is allocated independently to each eligible NIFTY and BANKNIFTY
 # position. Rupee risk and daily P&L fields are derived from the active capital
 # profile before they are returned to the bot and mobile clients.
 CAPITAL_PROFILES = {
+    "MAX": {
+        "label": "MAX",
+        # Negative one is a JSON-safe sentinel. The trading bot resolves it
+        # against Upstox available funds immediately before order sizing.
+        "optionCapitalPerEntry": -1.0,
+        "dailyMaxLoss": 0.0,
+        "dailyProfitTarget": 0.0,
+    },
     "1_LOT": {
         "label": "1 Lot",
         "optionCapitalPerEntry": 1.0,
@@ -229,7 +237,7 @@ def get_config():
         "serverTime": current.isoformat(),
         "selectionWindowOpen": selection_window_open(current),
         "selectionWindow": "09:00-09:15 IST",
-        "automaticReset": "15:30 IST / next trading day -> 1L",
+        "automaticReset": "15:30 IST / next trading day -> MAX",
         "selectedDate": config.get("selectedDate"),
         "selectedAt": config.get("selectedAt"),
     }

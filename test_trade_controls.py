@@ -1261,8 +1261,10 @@ class TradeControlTests(unittest.TestCase):
             {"bias": "NEUTRAL"},
         )
 
-        flow_reason = next(reason for reason in score["reasons"] if reason.startswith("ATM"))
-        self.assertIn("7.5/15", flow_reason)
+        volume_reason = next(
+            reason for reason in score["reasons"] if reason.startswith("Volume=")
+        )
+        self.assertIn("5.0/10", volume_reason)
 
     def test_losing_exit_requires_signal_reset_before_reentry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1463,6 +1465,128 @@ class TradeControlTests(unittest.TestCase):
         )
         self.assertEqual(direction, "BEARISH")
         self.assertEqual(blockers, [])
+
+    def test_score_model_uses_requested_100_point_weights(self):
+        result = weighted_alignment_score(
+            {
+                "bias": "BULLISH",
+                "chain_bias": "BULLISH",
+                "chain_confidence": "HIGH",
+            },
+            {
+                "two_hour": {"bias": "BULLISH", "confidence": "HIGH"},
+                "five_min": {
+                    "bias": "BULLISH",
+                    "confidence": "HIGH",
+                    "vwap_bias": "BULLISH",
+                },
+                "fifteen_min": {
+                    "bias": "BULLISH",
+                    "confidence": "HIGH",
+                    "open": 100,
+                    "high": 111,
+                    "low": 99,
+                    "close": 110,
+                },
+                "atm_option_flow": {
+                    "bias": "BULLISH",
+                    "volume_ratio": 1.5,
+                },
+                "market_regime": {
+                    "regime": "TREND",
+                    "direction": "BULLISH",
+                },
+            },
+            {"bias": "BULLISH"},
+        )
+
+        self.assertEqual(sum(result["weights"].values()), 100)
+        self.assertEqual(result["score"], 100)
+        self.assertEqual(result["grade"], "TRADE")
+
+    def test_standard_and_extreme_exit_points(self):
+        with patch.dict(os.environ, {}, clear=True):
+            standard_nifty = trade_bot.score_based_exit_settings("NIFTY", 89.9)
+            extreme_nifty = trade_bot.score_based_exit_settings("NIFTY", 90)
+            standard_bank = trade_bot.score_based_exit_settings("BANKNIFTY", 75)
+            extreme_bank = trade_bot.score_based_exit_settings("BANKNIFTY", 95)
+
+        self.assertEqual(
+            (standard_nifty["target_points"], standard_nifty["stop_points"]),
+            (20, 20),
+        )
+        self.assertEqual(
+            (extreme_nifty["target_points"], extreme_nifty["stop_points"]),
+            (30, 20),
+        )
+        self.assertEqual(
+            (standard_bank["target_points"], standard_bank["stop_points"]),
+            (40, 40),
+        )
+        self.assertEqual(
+            (extreme_bank["target_points"], extreme_bank["stop_points"]),
+            (60, 40),
+        )
+
+    def test_max_capital_uses_available_funds_and_rounds_down(self):
+        trade_bot.BROKER_READ_CACHE.clear()
+        with (
+            patch("trade_bot.active_value", return_value=-1.0),
+            patch.object(trade_bot, "available_equity_margin", return_value=100000),
+            patch.dict(
+                os.environ,
+                {
+                    "MAX_CAPITAL_USE_PERCENT": "95",
+                    "MAX_CAPITAL_RESERVE_RUPEES": "1000",
+                    "MAX_LOTS_PER_ENTRY": "0",
+                },
+                clear=False,
+            ),
+        ):
+            quantity = trade_bot.order_quantity_for(
+                "NIFTY", {"lot_size": 65}, entry_price=100
+            )
+
+        self.assertEqual(quantity, 910)
+
+    def test_direct_score_cutoff_is_not_raised_by_trade_sequence(self):
+        chosen = {
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "transaction_type": "BUY",
+            "weighted": {"score": 75},
+            "entry_minimum_score": 75,
+            "score_cutoff_approved": True,
+        }
+        with (
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 10, "reason": "ok"},
+            ),
+            patch.object(trade_bot, "index_trade_count_today", return_value=1),
+            patch.object(
+                trade_bot,
+                "last_index_trade_today",
+                return_value={"symbol": "BANKNIFTY", "gross_pnl": "-1000"},
+            ),
+            patch.object(trade_bot, "remaining_index_risk_budget", return_value=0),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(
+                trade_bot,
+                "aggregate_risk_decision",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+            patch.object(
+                trade_bot,
+                "correlation_decision",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+        ):
+            decision = trade_bot.pre_order_portfolio_decision(chosen, 65, 200, 170)
+
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["required_score"], 75)
 
 
 if __name__ == "__main__":

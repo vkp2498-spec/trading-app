@@ -7,11 +7,11 @@ import trading_config
 
 
 class TradingConfigTests(unittest.TestCase):
-    def test_default_profile_is_one_lakh(self):
-        self.assertEqual(trading_config.DEFAULT_PROFILE_ID, "100000")
+    def test_default_profile_is_maximum_available_balance(self):
+        self.assertEqual(trading_config.DEFAULT_PROFILE_ID, "MAX")
         self.assertEqual(
             trading_config._default_config()["profileId"],
-            "100000",
+            "MAX",
         )
 
     def test_dynamic_limits_scale_from_capital(self):
@@ -37,7 +37,7 @@ class TradingConfigTests(unittest.TestCase):
         with patch.object(trading_config, "_write"):
             result = trading_config._ensure_automatic_reset(config, current)
 
-        self.assertEqual(result["profileId"], "100000")
+        self.assertEqual(result["profileId"], "MAX")
         self.assertEqual(result["selectedDate"], "2026-07-23")
 
 
