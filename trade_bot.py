@@ -2372,9 +2372,21 @@ def run_position_monitor(log_empty=True):
             log(f"{symbol} monitor ERROR: {e}")
 
 
+def position_monitor_interval_seconds():
+    """Return the live position-monitor cadence with a one-second safety floor."""
+    return max(
+        configured_positive_float("POSITION_MONITOR_INTERVAL_SECONDS", 2.0),
+        1.0,
+    )
+
+
 def run_position_monitor_loop():
-    """Monitor bot positions every five seconds while the Indian market is open."""
-    log("Position monitor loop started: five-second checks enabled.")
+    """Monitor bot positions at the configured cadence during market hours."""
+    interval_seconds = position_monitor_interval_seconds()
+    log(
+        "Position monitor loop started: "
+        f"{interval_seconds:g}-second checks enabled."
+    )
     while True:
         current = now_ist().time()
         if current > time(15, 30):
@@ -2383,7 +2395,7 @@ def run_position_monitor_loop():
 
         if time(9, 20) <= current <= time(15, 30):
             run_position_monitor(log_empty=False)
-        time_module.sleep(5)
+        time_module.sleep(interval_seconds)
 
 def arm_protective_stop(symbol, state):
     instrument = {
