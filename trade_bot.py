@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import csv
+import random
 from copy import deepcopy
 from contextlib import contextmanager
 
@@ -61,7 +62,13 @@ from strategy_core import get_index_recommendation, now_ist, option_chain_signal
 from strategy_core import option_contract_quality
 from trade_journal import record_closed_trade
 from trading_config import active_value
-from upstox_streams import read_market_cache, read_portfolio_cache, write_stream_instruments
+from safe_storage import atomic_write_json
+from upstox_streams import (
+    read_market_cache,
+    read_portfolio_cache,
+    read_recent_ticks,
+    write_stream_instruments,
+)
 
 from apns_push import send_trade_closed_notification, send_trade_entered_notification
 
@@ -98,6 +105,7 @@ TRADE_COUNT_FILE = BASE_DIR / "daily_trade_count.json"
 TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 STOCK_SCANNER_STATUS_FILE = BASE_DIR / "data" / "stock_scanner_status.json"
 DAY_RISK_STATE_FILE = BASE_DIR / "data" / "day_risk_state.json"
+MONITOR_HEALTH_FILE = BASE_DIR / "data" / "monitor_health.json"
 PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 
@@ -149,6 +157,7 @@ UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
 UPSTOX_CANCEL_ORDER_URL = "https://api-hft.upstox.com/v2/order/cancel"
 UPSTOX_MODIFY_ORDER_URL = "https://api-hft.upstox.com/v2/order/modify"
 UPSTOX_ORDER_DETAILS_URL = "https://api.upstox.com/v2/order/details"
+UPSTOX_ORDER_BOOK_URL = "https://api.upstox.com/v2/order/retrieve-all"
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 UPSTOX_MARGIN_URL = "https://api.upstox.com/v2/charges/margin"
 UPSTOX_FUNDS_URL = "https://api.upstox.com/v2/user/get-funds-and-margin"
@@ -162,6 +171,13 @@ BROKER_READ_CACHE = {}
 
 def broker_read_cache_seconds():
     return max(to_float(os.getenv("MONITOR_BROKER_CACHE_SECONDS"), 2.0), 0.5)
+
+
+def market_protection_percent():
+    value = to_int(os.getenv("MARKET_PROTECTION_PERCENT"), 3)
+    if not 1 <= value <= 25:
+        raise RuntimeError("MARKET_PROTECTION_PERCENT must be between 1 and 25")
+    return value
 
 
 def state_file(symbol):
@@ -526,39 +542,12 @@ def revalidate_option_after_fill(
 
 
 def apply_score_cutoff_post_fill_override(post_fill, score_cutoff_approved):
-    """Keep a score-approved fill unless a hard execution defect appeared.
-
-    Technical headroom and technical reward/risk are already represented in
-    the 100-point decision. Reapplying them after the broker fill would place
-    a trade and then immediately undo the score-cutoff decision. Invalid risk
-    geometry and materially extended fills remain hard exits.
-    """
-    if post_fill.get("allowed") or not score_cutoff_approved:
-        return post_fill
-
-    feasibility = post_fill.get("feasibility", {}) or {}
-    reasons = [str(reason) for reason in feasibility.get("reasons", [])]
-    hard_prefixes = (
-        "Stop loss does not define positive option-premium risk",
-        "Expected entry is unfavorably extended",
-    )
-    hard_reasons = [
-        reason for reason in reasons
-        if any(reason.startswith(prefix) for prefix in hard_prefixes)
-    ]
-    if hard_reasons:
-        feasibility["hard_post_fill_reasons"] = hard_reasons
+    """A score may approve a setup, but it never overrides execution safety."""
+    if not post_fill.get("allowed") and score_cutoff_approved:
+        feasibility = post_fill.get("feasibility", {}) or {}
+        feasibility["score_cutoff_override"] = False
+        feasibility["hard_execution_gate"] = True
         post_fill["feasibility"] = feasibility
-        return post_fill
-
-    feasibility["original_allowed"] = False
-    feasibility["allowed"] = True
-    feasibility["score_cutoff_override"] = True
-    feasibility["reasons"] = reasons + [
-        "Post-fill technical headroom veto overridden by the approved 100-point score"
-    ]
-    post_fill["allowed"] = True
-    post_fill["feasibility"] = feasibility
     return post_fill
 
 
@@ -573,8 +562,7 @@ def read_json(path, default):
 
 
 def write_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    atomic_write_json(path, data, sort_keys=True)
 
 
 def read_state(symbol):
@@ -1183,6 +1171,24 @@ def portfolio_day_circuit():
         log(f"Portfolio circuit could not read unrealized P&L: {error}")
         unrealized = 0.0
     pnl = round(realized + unrealized, 2)
+    broker_pnl = None
+    if (
+        os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+        and configured_bool("BROKER_RECONCILIATION_REQUIRED", True)
+    ):
+        try:
+            broker_pnl = broker_derivatives_day_pnl()
+            pnl = broker_pnl
+        except Exception as error:
+            return {
+                "allowed": False,
+                "reason": f"broker P&L reconciliation failed: {error}",
+                "realized_pnl": realized,
+                "unrealized_pnl": unrealized,
+                "combined_pnl": pnl,
+                "broker_day_pnl": None,
+                "score_penalty": 0.0,
+            }
     state = read_day_risk_state()
     state["peak_pnl"] = round(max(to_float(state.get("peak_pnl")), pnl, 0.0), 2)
 
@@ -1221,6 +1227,7 @@ def portfolio_day_circuit():
         "realized_pnl": realized,
         "unrealized_pnl": unrealized,
         "combined_pnl": pnl,
+        "broker_day_pnl": broker_pnl,
         "peak_pnl": state["peak_pnl"],
         "consecutive_losses": consecutive_losses_today(),
         "score_penalty": score_penalty if state.get("soft_triggered_at") else 0.0,
@@ -1282,6 +1289,16 @@ def candidate_weighted_score(chosen):
 
 def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price):
     """Final shared gate, designed to run under ``portfolio_entry_lock``."""
+    health = monitor_health_gate()
+    if not health["allowed"]:
+        return {"allowed": False, "reason": health["reason"], "monitor_health": health}
+    reconciliation = broker_pending_order_gate()
+    if not reconciliation["allowed"]:
+        return {
+            "allowed": False,
+            "reason": reconciliation["reason"],
+            "broker_reconciliation": reconciliation,
+        }
     circuit = portfolio_day_circuit()
     if not circuit["allowed"]:
         return {"allowed": False, "reason": circuit["reason"], "circuit": circuit}
@@ -1592,12 +1609,30 @@ def upstox_headers():
 
 
 def upstox_request(method, url, **kwargs):
-    response = requests.request(method, url, headers=upstox_headers(), timeout=30, **kwargs)
-
-    if response.status_code >= 300:
-        raise RuntimeError(f"Upstox API failed {response.status_code}: {response.text[:500]}")
-
-    return response.json()
+    method = str(method).upper()
+    attempts = max(to_int(os.getenv("UPSTOX_READ_RETRY_ATTEMPTS"), 3), 1) if method == "GET" else 1
+    retry_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(attempts):
+        try:
+            response = requests.request(
+                method, url, headers=upstox_headers(), timeout=30, **kwargs
+            )
+        except requests.RequestException:
+            if attempt + 1 >= attempts:
+                raise
+            delay = min(0.5 * (2 ** attempt) + random.uniform(0, 0.2), 4.0)
+            time_module.sleep(delay)
+            continue
+        if response.status_code < 300:
+            return response.json()
+        if response.status_code not in retry_statuses or attempt + 1 >= attempts:
+            raise RuntimeError(
+                f"Upstox API failed {response.status_code}: {response.text[:500]}"
+            )
+        retry_after = to_float(response.headers.get("Retry-After"), 0)
+        delay = retry_after or min(0.5 * (2 ** attempt) + random.uniform(0, 0.2), 4.0)
+        time_module.sleep(delay)
+    raise RuntimeError("Upstox API request failed without a response")
 
 def opposite_direction(direction):
     return "BEARISH" if direction == "BULLISH" else "BULLISH"
@@ -1683,7 +1718,10 @@ def option_capital_per_entry():
         str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
     ).strip()
     raw_value = str(active_value("optionCapitalPerEntry", fallback)).strip()
+    account_cap = configured_non_negative_float("ACCOUNT_MAX_OPTION_CAPITAL", 0.0)
     if raw_value.upper() == "MAX" or to_float(raw_value, 0.0) < 0:
+        if account_cap > 0:
+            return account_cap
         return "MAX"
     try:
         capital = float(raw_value)
@@ -1696,7 +1734,7 @@ def option_capital_per_entry():
         raise RuntimeError(
             "OPTION_CAPITAL_PER_ENTRY must be 1 or greater"
         )
-    return capital
+    return min(capital, account_cap) if account_cap > 0 else capital
 
 
 def maximum_available_option_capital():
@@ -1721,6 +1759,9 @@ def maximum_available_option_capital():
         raise RuntimeError("MAX_CAPITAL_USE_PERCENT must be at most 100")
     reserve = configured_non_negative_float("MAX_CAPITAL_RESERVE_RUPEES", 1000.0)
     usable = max(available - reserve, 0.0) * use_percent / 100.0
+    account_cap = configured_non_negative_float("ACCOUNT_MAX_OPTION_CAPITAL", 0.0)
+    if account_cap > 0:
+        usable = min(usable, account_cap)
     BROKER_READ_CACHE[cache_key] = {"timestamp": now, "value": usable}
     verbose_log(
         f"MAX capital sizing: available={available:.2f} reserve={reserve:.2f} "
@@ -1738,7 +1779,11 @@ def max_lots_per_entry():
         raise RuntimeError("MAX_LOTS_PER_ENTRY must be a whole number or 0") from error
     if maximum < 0:
         raise RuntimeError("MAX_LOTS_PER_ENTRY cannot be negative")
-    return maximum
+    account_maximum = to_int(os.getenv("ACCOUNT_MAX_LOTS_PER_ENTRY"), 0)
+    if account_maximum < 0:
+        raise RuntimeError("ACCOUNT_MAX_LOTS_PER_ENTRY cannot be negative")
+    ceilings = [value for value in (maximum, account_maximum) if value > 0]
+    return min(ceilings) if ceilings else 0
 
 
 def order_quantity_for(
@@ -1805,17 +1850,17 @@ def place_market_order(instrument, transaction_type, quantity, product="I"):
         "disclosed_quantity": 0,
         "trigger_price": 0,
         "is_amo": False,
-        "market_protection": -1,
+        "market_protection": market_protection_percent(),
     }
 
     result = upstox_request("POST", UPSTOX_PLACE_ORDER_URL, json=payload)
     return result, payload
 
 
-def place_stop_market_order(instrument, transaction_type, quantity, trigger_price):
+def place_stop_market_order(instrument, transaction_type, quantity, trigger_price, product="I"):
     payload = {
         "quantity": int(quantity),
-        "product": "I",
+        "product": str(product).upper(),
         "validity": "DAY",
         "price": 0,
         "tag": "index_bot_stop",
@@ -1825,7 +1870,7 @@ def place_stop_market_order(instrument, transaction_type, quantity, trigger_pric
         "disclosed_quantity": 0,
         "trigger_price": round(float(trigger_price), 1),
         "is_amo": False,
-        "market_protection": -1,
+        "market_protection": market_protection_percent(),
     }
     result = upstox_request("POST", UPSTOX_PLACE_ORDER_URL, json=payload)
     return result, payload
@@ -1848,7 +1893,7 @@ def modify_stop_order(order_id, quantity, trigger_price):
         "order_type": "SL-M",
         "disclosed_quantity": 0,
         "trigger_price": round(float(trigger_price), 1),
-        "market_protection": -1,
+        "market_protection": market_protection_percent(),
     }
     return upstox_request("PUT", UPSTOX_MODIFY_ORDER_URL, json=payload)
 
@@ -2005,6 +2050,70 @@ def get_open_positions(force=False):
     data = result.get("data", []) or []
     BROKER_READ_CACHE[cache_key] = {"at": time_module.monotonic(), "data": deepcopy(data)}
     return data
+
+
+def broker_derivatives_day_pnl():
+    total = 0.0
+    for position in get_open_positions(force=True):
+        key = str(position.get("instrument_token") or position.get("instrument_key") or "")
+        segment = str(position.get("segment") or position.get("exchange") or "").upper()
+        if "NSE_FO" not in key and "NFO" not in segment and "FO" not in segment:
+            continue
+        realised = position.get("realised")
+        unrealised = position.get("unrealised")
+        if realised is not None or unrealised is not None:
+            total += to_float(realised) + to_float(unrealised)
+        elif position.get("day_pnl") is not None:
+            total += to_float(position.get("day_pnl"))
+        else:
+            total += to_float(position.get("pnl"))
+    return round(total, 2)
+
+
+def get_order_book(force=False):
+    cache_key = "order_book"
+    cached = BROKER_READ_CACHE.get(cache_key)
+    now = time_module.monotonic()
+    if not force and cached and now - cached["at"] < broker_read_cache_seconds():
+        return deepcopy(cached["data"])
+    result = upstox_request("GET", UPSTOX_ORDER_BOOK_URL)
+    data = result.get("data", []) or []
+    BROKER_READ_CACHE[cache_key] = {"at": now, "data": deepcopy(data)}
+    return data
+
+
+def broker_pending_order_gate():
+    if os.getenv("ENABLE_LIVE_TRADING", "false").lower() != "true":
+        return {"allowed": True, "reason": "dry-run mode"}
+    if not configured_bool("BROKER_RECONCILIATION_REQUIRED", True):
+        return {"allowed": True, "reason": "broker reconciliation disabled"}
+    try:
+        orders = get_order_book(force=True)
+    except Exception as error:
+        return {"allowed": False, "reason": f"broker order reconciliation failed: {error}"}
+    known_ids = set()
+    for state in active_bot_states():
+        for key in ("entry_order_id", "exit_order_id", "protective_stop_order_id"):
+            if state.get(key):
+                known_ids.add(str(state[key]))
+    pending_statuses = {
+        "open", "pending", "trigger pending", "put order req received",
+        "validation pending", "modify pending", "cancel pending",
+    }
+    unknown = []
+    for order in orders:
+        tag = str(order.get("tag") or "")
+        status = str(order.get("status") or "").strip().lower()
+        order_id = str(order.get("order_id") or "")
+        if tag in {"index_bot", "index_bot_stop"} and status in pending_statuses and order_id not in known_ids:
+            unknown.append(order_id or "unknown")
+    if unknown:
+        return {
+            "allowed": False,
+            "reason": "untracked pending bot orders exist at Upstox: " + ", ".join(unknown[:5]),
+            "order_ids": unknown,
+        }
+    return {"allowed": True, "reason": "broker orders reconciled"}
 
 
 def position_quantity(position):
@@ -2181,6 +2290,7 @@ def save_open_position_state(
     exit_profile=None,
     profit_protection_enabled_for_trade=None,
     trade_metadata=None,
+    order_product="I",
 ):
     entry_transaction_type = str(entry_transaction_type).upper()
     if target_percent is not None and stop_percent is not None:
@@ -2232,6 +2342,7 @@ def save_open_position_state(
             else "LONG_OPTION"
         ),
         "instrument_class": instrument_class,
+        "order_product": str(order_product).upper(),
         "underlying_symbol": underlying_symbol or instrument.get("underlying_symbol") or symbol,
         "protective_stop_order_id": protective_stop_order_id,
         "instrument_key": instrument["instrument_key"],
@@ -2309,6 +2420,11 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
     if exit_price <= 0:
         raise RuntimeError(f"{symbol} exit completed but no valid fill price was returned")
 
+    try:
+        state["broker_day_pnl_at_exit"] = broker_derivatives_day_pnl()
+    except Exception as error:
+        state["broker_day_pnl_at_exit"] = ""
+        log(f"{symbol} broker P&L snapshot unavailable at exit: {error}")
     journal_row = record_closed_trade(state, exit_price, exit_reason)
     register_losing_exit_guard(symbol, state, journal_row, exit_reason)
     register_same_index_reset_guard(symbol, state, journal_row, exit_reason)
@@ -2356,7 +2472,30 @@ def monitor_pending_exit(symbol, state):
 
     return True
 
+def monitor_health_gate():
+    if os.getenv("ENABLE_LIVE_TRADING", "false").lower() != "true":
+        return {"allowed": True, "reason": "dry-run mode"}
+    if not configured_bool("REQUIRE_HEALTHY_POSITION_MONITOR", True):
+        return {"allowed": True, "reason": "monitor health gate disabled"}
+    health = read_json(MONITOR_HEALTH_FILE, {})
+    maximum_age = configured_positive_float("MONITOR_HEALTH_MAX_AGE_SECONDS", 20.0)
+    updated_at = to_float(health.get("updated_epoch"), 0)
+    age = time_module.time() - updated_at if updated_at else 999999.0
+    if not health or age > maximum_age:
+        return {
+            "allowed": False,
+            "reason": f"position monitor heartbeat is stale ({age:.1f}s)",
+        }
+    if not health.get("healthy"):
+        return {
+            "allowed": False,
+            "reason": "position monitor is unhealthy: " + str(health.get("last_error") or "unknown error"),
+        }
+    return {"allowed": True, "reason": "position monitor healthy", "age_seconds": age}
+
+
 def run_position_monitor(log_empty=True):
+    errors = []
     for symbol in BOT_STATE_SLOTS:
         try:
             state = read_state(symbol)
@@ -2370,6 +2509,20 @@ def run_position_monitor(log_empty=True):
 
         except Exception as e:
             log(f"{symbol} monitor ERROR: {e}")
+            errors.append(f"{symbol}: {e}")
+    threshold = max(to_int(os.getenv("MONITOR_FAILURE_THRESHOLD"), 3), 1)
+    failure_count = to_int(read_json(MONITOR_HEALTH_FILE, {}).get("failure_count"), 0)
+    failure_count = failure_count + 1 if errors else 0
+    write_json(
+        MONITOR_HEALTH_FILE,
+        {
+            "healthy": failure_count < threshold,
+            "failure_count": failure_count,
+            "last_error": "; ".join(errors)[:1000] if errors else "",
+            "updated_at": now_ist().isoformat(),
+            "updated_epoch": time_module.time(),
+        },
+    )
 
 
 def position_monitor_interval_seconds():
@@ -2397,6 +2550,14 @@ def run_position_monitor_loop():
             run_position_monitor(log_empty=False)
         time_module.sleep(interval_seconds)
 
+
+def broker_protective_stop_required(state):
+    if not configured_bool("BROKER_PROTECTIVE_STOP_ENABLED", True):
+        return False
+    return state.get("instrument_class") in {
+        "INDEX_OPTION", "STOCK_OPTION", "STOCK_FUTURE"
+    }
+
 def arm_protective_stop(symbol, state):
     instrument = {
         "instrument_key": state["instrument_key"],
@@ -2410,6 +2571,7 @@ def arm_protective_stop(symbol, state):
         exit_transaction,
         int(state["quantity"]),
         float(state["stop_loss_price"]),
+        product=state.get("order_product") or "I",
     )
     order_id = result.get("data", {}).get("order_id")
     if not order_id:
@@ -2420,6 +2582,7 @@ def arm_protective_stop(symbol, state):
             f"protective {exit_transaction} stop was {order_status(details)}: {details}"
         )
     state["protective_stop_order_id"] = order_id
+    state["broker_protective_stop_price"] = float(state["stop_loss_price"])
     write_state(symbol, state)
     log(f"{symbol} broker protective {exit_transaction} stop armed: order_id={order_id} payload={payload}")
     return state
@@ -2449,6 +2612,37 @@ def ensure_protective_stop(symbol, state):
             failed_state.pop("protective_stop_pending", None)
             write_state(symbol, failed_state)
             raise
+
+
+def synchronize_broker_protective_stop(symbol, state):
+    """Move the broker stop forward after local profit protection advances."""
+    if not broker_protective_stop_required(state):
+        return state
+    order_id = state.get("protective_stop_order_id")
+    if not order_id:
+        return ensure_protective_stop(symbol, state)
+    desired = to_float(state.get("stop_loss_price"), 0)
+    broker_price = to_float(state.get("broker_protective_stop_price"), 0)
+    if desired <= 0 or abs(desired - broker_price) < 0.049:
+        return state
+    with protective_stop_lock(symbol):
+        fresh = read_state(symbol)
+        order_id = fresh.get("protective_stop_order_id")
+        if not order_id:
+            return fresh
+        desired = to_float(fresh.get("stop_loss_price"), 0)
+        broker_price = to_float(fresh.get("broker_protective_stop_price"), 0)
+        if abs(desired - broker_price) < 0.049:
+            return fresh
+        modify_stop_order(order_id, int(fresh["quantity"]), desired)
+        fresh["broker_protective_stop_price"] = desired
+        fresh["broker_protective_stop_updated_at"] = now_ist().isoformat()
+        write_state(symbol, fresh)
+        log(
+            f"{symbol} broker protective stop advanced: order_id={order_id} "
+            f"trigger={desired:.2f}"
+        )
+        return fresh
 
 
 def arm_short_protective_stop(symbol, state):
@@ -2494,6 +2688,7 @@ def cancel_protective_stop(symbol, state):
         return True
 
     state.pop("protective_stop_order_id", None)
+    state.pop("broker_protective_stop_price", None)
     write_state(symbol, state)
     log(f"{symbol} protective stop cancelled before active exit: order_id={order_id}")
     return False
@@ -2508,7 +2703,7 @@ def handle_existing_state(symbol, state, verbose=True):
     exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
     order_product = state.get("order_product") or "I"
 
-    needs_broker_stop = entry_transaction == "SELL" or state.get("instrument_class") == "STOCK_FUTURE"
+    needs_broker_stop = broker_protective_stop_required(state)
     if needs_broker_stop and protective_stop_filled(symbol, state):
         return True
 
@@ -2547,7 +2742,24 @@ def handle_existing_state(symbol, state, verbose=True):
                 complete_exit(symbol, state, details, ltp, "PROTECTION_FAILURE", result, payload)
                 return True
         if ltp is not None:
+            last_tick = to_float(state.get("last_processed_stream_tick_at"), 0)
+            recent_ticks = read_recent_ticks(instrument_key, since_epoch=last_tick)
+            for tick in recent_ticks:
+                tick_ltp = to_float(tick.get("ltp"), 0)
+                if tick_ltp > 0:
+                    state = apply_trailing_stop(symbol, state, tick_ltp)
+                state["last_processed_stream_tick_at"] = max(
+                    to_float(state.get("last_processed_stream_tick_at"), 0),
+                    to_float(tick.get("received_at"), 0),
+                )
+            if recent_ticks:
+                write_state(symbol, state)
             state = apply_trailing_stop(symbol, state, ltp)
+            if broker_protective_stop_required(state):
+                try:
+                    state = synchronize_broker_protective_stop(symbol, state)
+                except Exception as error:
+                    log(f"{symbol} protective stop synchronization pending: {error}")
         target_price = float(state.get("target_price"))
         stop_loss_price = float(state.get("stop_loss_price"))
         is_short = entry_transaction == "SELL"
@@ -2608,7 +2820,17 @@ def handle_existing_state(symbol, state, verbose=True):
             # Stock-future and short-option stops are already protected at the
             # broker. Do not send a second market exit when the local LTP also
             # reaches the stop; let the broker stop fill and confirm it here.
-            if stop_hit and needs_broker_stop and state.get("protective_stop_order_id"):
+            broker_stop = to_float(state.get("broker_protective_stop_price"), 0)
+            broker_covers_local_stop = (
+                broker_stop <= stop_loss_price + 0.05
+                if is_short
+                else broker_stop >= stop_loss_price - 0.05
+            )
+            if (
+                stop_hit and needs_broker_stop
+                and state.get("protective_stop_order_id")
+                and broker_covers_local_stop
+            ):
                 log(
                     f"{symbol} local stop reached; waiting for broker protective stop "
                     f"order_id={state['protective_stop_order_id']}"
@@ -2907,20 +3129,37 @@ def apply_trailing_stop(symbol, state, ltp):
     if ltp is None or state.get("instrument_class") != "INDEX_OPTION":
         return state
 
+    entry = to_float(state.get("entry_price"))
+    current_ltp = to_float(ltp)
+    if not entry or not current_ltp:
+        return state
+    is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
+    if is_short:
+        state["lowest_ltp"] = round(
+            min(to_float(state.get("lowest_ltp"), entry), current_ltp), 2
+        )
+        state["highest_ltp"] = round(
+            max(to_float(state.get("highest_ltp"), entry), current_ltp), 2
+        )
+    else:
+        state["highest_ltp"] = round(
+            max(to_float(state.get("highest_ltp"), entry), current_ltp), 2
+        )
+        state["lowest_ltp"] = round(
+            min(to_float(state.get("lowest_ltp"), entry), current_ltp), 2
+        )
+
     settings = profit_protection_settings()
     if not settings["enabled"]:
         return state
     if state.get("profit_protection_enabled_for_trade") is False:
         return state
 
-    entry = to_float(state.get("entry_price"))
     target = to_float(state.get("planned_target_price") or state.get("target_price"))
     current_stop = to_float(state.get("stop_loss_price"))
-    current_ltp = to_float(ltp)
     if not entry or not target or not current_stop or not current_ltp:
         return state
 
-    is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
     planned_move = entry - target if is_short else target - entry
     favorable_move = entry - current_ltp if is_short else current_ltp - entry
     if planned_move <= 0:
@@ -2944,17 +3183,7 @@ def apply_trailing_stop(symbol, state, ltp):
         new_stage = 1
         lock_percent = settings["stage_one_lock"]
 
-    state_changed = False
-    if is_short:
-        lowest = min(to_float(state.get("lowest_ltp"), entry), current_ltp)
-        if lowest != to_float(state.get("lowest_ltp"), entry):
-            state["lowest_ltp"] = round(lowest, 2)
-            state_changed = True
-    else:
-        highest = max(to_float(state.get("highest_ltp"), entry), current_ltp)
-        if highest != to_float(state.get("highest_ltp"), entry):
-            state["highest_ltp"] = round(highest, 2)
-            state_changed = True
+    state_changed = True
 
     if lock_percent is not None:
         locked_move = planned_move * lock_percent / 100.0
@@ -2965,6 +3194,7 @@ def apply_trailing_stop(symbol, state, ltp):
             state["stop_loss_price"] = improved_stop
             state_changed = True
         state["profit_protection_stage"] = new_stage
+        state.setdefault("profit_protection_activated_at", now_ist().isoformat())
         state["trailing_stop_active"] = True
         state["trailing_stop_reason"] = (
             f"stage {new_stage}: progress={progress:.1f}% lock={lock_percent:.1f}%"
@@ -3405,7 +3635,7 @@ def build_trade_candidate(
     )
     technicals["live_entry_gate"] = live_gate
     option_summary["live_entry_gate"] = live_gate
-    if not live_gate.get("allowed") and not cutoff_approved:
+    if not live_gate.get("allowed"):
         return {
             "allowed": False,
             "reason": "live regime/structure rejected: " + str(live_gate.get("reason")),
@@ -3415,18 +3645,11 @@ def build_trade_candidate(
             "option_summary": option_summary,
             "weighted": weighted,
         }, None
-    if not live_gate.get("allowed"):
-        option_summary["score_cutoff_strategy_override"] = (
-            "live regime/structure gate treated as scored context: "
-            + str(live_gate.get("reason"))
-        )
-
     expiry_days = (parse_expiry(atm["expiry"]) - now_ist().date()).days
     technicals["market_regime"]["days_to_expiry"] = expiry_days
     if (
         expiry_days <= int(configured_non_negative_float("EXPIRY_REGIME_MAX_DAYS", 2))
         and score_value < configured_non_negative_float("EXPIRY_REGIME_MIN_SCORE", 85.0)
-        and not cutoff_approved
     ):
         return {
             "allowed": False,
@@ -3495,7 +3718,7 @@ def build_trade_candidate(
     )
     technicals["trade_feasibility"] = feasibility
     option_summary["trade_feasibility"] = feasibility
-    if not feasibility.get("allowed") and not cutoff_approved:
+    if not feasibility.get("allowed"):
         return {
             "allowed": False,
             "reason": "entry feasibility rejected: " + "; ".join(feasibility.get("reasons", [])),
@@ -3505,11 +3728,6 @@ def build_trade_candidate(
             "option_summary": option_summary,
             "weighted": weighted,
         }, None
-    if not feasibility.get("allowed"):
-        option_summary["score_cutoff_feasibility_override"] = list(
-            feasibility.get("reasons", [])
-        )
-
     structural = structural_invalidation(
         technicals,
         direction,
@@ -4058,6 +4276,8 @@ def execute_selected_candidate(chosen):
             "symbol": symbol,
             "entry_order_id": order_id,
             "entry_transaction_type": transaction_type,
+            "instrument_class": "INDEX_OPTION",
+            "order_product": "I",
             "instrument_key": instrument["instrument_key"],
             "trading_symbol": instrument["trading_symbol"],
             "quantity": int(quantity),
@@ -4092,6 +4312,8 @@ def execute_selected_candidate(chosen):
             "symbol": symbol,
             "entry_order_id": order_id,
             "entry_transaction_type": transaction_type,
+            "instrument_class": "INDEX_OPTION",
+            "order_product": "I",
             "instrument_key": instrument["instrument_key"],
             "trading_symbol": instrument["trading_symbol"],
             "quantity": int(quantity),
@@ -4230,12 +4452,15 @@ def execute_selected_candidate(chosen):
         f"target={post_fill['target_price']} stop_loss={post_fill['stop_loss_price']} "
         f"reward_risk={post_fill['feasibility'].get('technical_reward_risk')}"
     )
-    if transaction_type == "SELL":
+    if broker_protective_stop_required(read_state(symbol)):
         try:
-            arm_short_protective_stop(symbol, read_state(symbol))
+            ensure_protective_stop(symbol, read_state(symbol))
         except Exception as error:
-            log(f"{symbol} CRITICAL: protective stop failed; flattening short immediately: {error}")
-            emergency, emergency_payload = place_market_order(instrument, "BUY", quantity)
+            log(f"{symbol} CRITICAL: protective stop failed; flattening immediately: {error}")
+            emergency_transaction = "BUY" if transaction_type == "SELL" else "SELL"
+            emergency, emergency_payload = place_market_order(
+                instrument, emergency_transaction, quantity
+            )
             emergency_id = emergency.get("data", {}).get("order_id")
             emergency_details = wait_for_order_complete(emergency_id) if emergency_id else {}
             complete_exit(

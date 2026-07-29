@@ -73,6 +73,17 @@ def read_market_cache(instrument_key=None):
         return {}
 
 
+def read_recent_ticks(instrument_key, since_epoch=0.0):
+    feed = read_market_cache(instrument_key) or {}
+    ticks = feed.get("recent_ticks") or []
+    return [
+        tick
+        for tick in ticks
+        if isinstance(tick, dict)
+        and float(tick.get("received_at") or 0) > float(since_epoch or 0)
+    ]
+
+
 def read_portfolio_cache():
     try:
         return json.loads(PORTFOLIO_CACHE_FILE.read_text())
@@ -90,7 +101,7 @@ def _unwrap(value):
     return value
 
 
-def _normalise_feed(feed):
+def _normalise_feed(feed, previous=None):
     feed = _unwrap(feed)
     ltpc = feed.get("ltpc") or {}
     market_level = feed.get("marketLevel") or feed.get("market_level") or {}
@@ -100,7 +111,8 @@ def _normalise_feed(feed):
     if isinstance(quotes, dict):
         quotes = [quotes]
     first_quote = quotes[0] if quotes else {}
-    return {
+    received_at = time.time()
+    normalised = {
         "ltp": ltpc.get("ltp"),
         "close": ltpc.get("cp") or extended.get("cp") or extended.get("close"),
         "ltt": ltpc.get("ltt"),
@@ -116,9 +128,17 @@ def _normalise_feed(feed):
         "volume": extended.get("vtt") or extended.get("tv"),
         "total_buy_quantity": extended.get("tbq") or extended.get("mbpBuy"),
         "total_sell_quantity": extended.get("tsq") or extended.get("mbpSell"),
-        "received_at": time.time(),
+        "received_at": received_at,
         "raw": feed,
     }
+    recent_ticks = list((previous or {}).get("recent_ticks") or [])
+    if normalised.get("ltp") is not None:
+        recent_ticks.append(
+            {"ltp": normalised["ltp"], "received_at": received_at}
+        )
+    maximum_ticks = max(int(os.getenv("UPSTOX_STREAM_RECENT_TICKS", "300")), 20)
+    normalised["recent_ticks"] = recent_ticks[-maximum_ticks:]
+    return normalised
 
 
 def _market_message(message):
@@ -138,7 +158,7 @@ def _market_message(message):
         existing = {"updated_at": None, "feeds": {}}
     feeds = existing.setdefault("feeds", {})
     for key, feed in incoming.items():
-        feeds[key] = _normalise_feed(feed)
+        feeds[key] = _normalise_feed(feed, feeds.get(key))
     existing["updated_at"] = time.time()
     _atomic_write(MARKET_CACHE_FILE, existing)
 

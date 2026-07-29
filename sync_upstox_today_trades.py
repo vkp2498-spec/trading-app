@@ -16,6 +16,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from safe_storage import file_lock
+from trade_history_schema import COLUMNS
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,32 +27,6 @@ TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 IST = ZoneInfo("Asia/Kolkata")
 UPSTOX_TRADE_PNL_URL = "https://api.upstox.com/v2/trade/profit-loss/data"
 SYNC_REASON = "UPSTOX_SYNC_ADJUSTMENT"
-
-COLUMNS = [
-    "trade_date",
-    "symbol",
-    "underlying_symbol",
-    "instrument_class",
-    "trading_symbol",
-    "direction",
-    "transaction_type",
-    "position_side",
-    "quantity",
-    "entry_time",
-    "entry_price",
-    "exit_time",
-    "exit_price",
-    "target_price",
-    "stop_loss_price",
-    "original_stop_loss_price",
-    "profit_protection_stage",
-    "profit_booking_price",
-    "exit_reason",
-    "gross_pnl",
-    "score",
-    "status",
-]
-
 
 def load_env() -> None:
     if not ENV_FILE.exists():
@@ -303,7 +279,15 @@ def sync(day: datetime, dry_run: bool = False, show_rows: bool = False) -> None:
     if TRADE_HISTORY_FILE.exists() and not backup.exists():
         backup.write_bytes(TRADE_HISTORY_FILE.read_bytes())
 
-    write_trade_history(clean_rows + adjustments, fieldnames)
+    with file_lock(TRADE_HISTORY_FILE.with_suffix(TRADE_HISTORY_FILE.suffix + ".lock")):
+        # Re-read while holding the lock so a monitor exit cannot be overwritten
+        # by a concurrent reconciliation rewrite.
+        current_rows, current_fields = read_trade_history()
+        retained = [
+            row for row in current_rows
+            if not (row.get("trade_date") == day_text and row.get("exit_reason") == SYNC_REASON)
+        ]
+        write_trade_history(retained + adjustments, current_fields)
     print(f"Wrote {len(adjustments)} adjustment rows to {TRADE_HISTORY_FILE}")
     print(f"Backup: {backup}")
 

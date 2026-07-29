@@ -55,6 +55,35 @@ from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_market_orders_use_explicit_market_protection(self):
+        instrument = {"instrument_key": "NSE_FO|1", "trading_symbol": "TEST"}
+        with (
+            patch.dict(os.environ, {"MARKET_PROTECTION_PERCENT": "3"}),
+            patch.object(
+                trade_bot,
+                "upstox_request",
+                return_value={"status": "success", "data": {"order_id": "1"}},
+            ) as request,
+        ):
+            _, payload = trade_bot.place_market_order(instrument, "BUY", 65)
+        self.assertEqual(payload["market_protection"], 3)
+        self.assertEqual(request.call_count, 1)
+
+    def test_long_index_option_requires_broker_protective_stop(self):
+        with patch.dict(os.environ, {"BROKER_PROTECTIVE_STOP_ENABLED": "true"}):
+            self.assertTrue(
+                trade_bot.broker_protective_stop_required(
+                    {"instrument_class": "INDEX_OPTION", "entry_transaction_type": "BUY"}
+                )
+            )
+
+    def test_account_cap_limits_mobile_max_profile(self):
+        with (
+            patch.dict(os.environ, {"ACCOUNT_MAX_OPTION_CAPITAL": "100000"}),
+            patch.object(trade_bot, "active_value", return_value=-1),
+        ):
+            self.assertEqual(trade_bot.option_capital_per_entry(), 100000)
+
     def test_manual_command_parses_symbol_side_and_symmetric_points(self):
         self.assertEqual(
             manual_index_trade.parse_request(["bank", "nifty", "call", "40"]),
@@ -1155,7 +1184,7 @@ class TradeControlTests(unittest.TestCase):
                     "quantity": 30,
                 }
                 updated = trade_bot.apply_trailing_stop("NIFTY", state, 121)
-        self.assertEqual(updated["highest_ltp"], 100)
+        self.assertEqual(updated["highest_ltp"], 121)
         self.assertEqual(updated["stop_loss_price"], 90)
 
     def test_trade_profile_can_disable_profit_protection(self):
@@ -1449,7 +1478,7 @@ class TradeControlTests(unittest.TestCase):
             with patch.object(engine, "_candles", return_value=candles):
                 outcomes[enabled] = engine._simulate(candidate, day)
 
-        self.assertEqual(outcomes[True]["exit_price"], 103)
+        self.assertEqual(outcomes[True]["exit_price"], 102)
         self.assertEqual(outcomes[False]["exit_price"], 90)
         self.assertTrue(outcomes[True]["trailing_stop_enabled"])
         self.assertFalse(outcomes[False]["trailing_stop_enabled"])
@@ -1626,7 +1655,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertTrue(decision["allowed"])
         self.assertEqual(decision["required_score"], 75)
 
-    def test_score_cutoff_post_fill_override_keeps_soft_rr_rejection(self):
+    def test_score_cutoff_post_fill_override_preserves_rr_rejection(self):
         post_fill = {
             "allowed": False,
             "feasibility": {
@@ -1637,8 +1666,9 @@ class TradeControlTests(unittest.TestCase):
             },
         }
         result = trade_bot.apply_score_cutoff_post_fill_override(post_fill, True)
-        self.assertTrue(result["allowed"])
-        self.assertTrue(result["feasibility"]["score_cutoff_override"])
+        self.assertFalse(result["allowed"])
+        self.assertFalse(result["feasibility"]["score_cutoff_override"])
+        self.assertTrue(result["feasibility"]["hard_execution_gate"])
 
     def test_score_cutoff_post_fill_override_preserves_hard_extension_exit(self):
         post_fill = {
@@ -1652,7 +1682,7 @@ class TradeControlTests(unittest.TestCase):
         }
         result = trade_bot.apply_score_cutoff_post_fill_override(post_fill, True)
         self.assertFalse(result["allowed"])
-        self.assertIn("hard_post_fill_reasons", result["feasibility"])
+        self.assertTrue(result["feasibility"]["hard_execution_gate"])
 
 
 if __name__ == "__main__":

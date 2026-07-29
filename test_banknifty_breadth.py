@@ -27,9 +27,13 @@ class BankNiftyBreadthTests(unittest.TestCase):
                 "confidence": "HIGH",
                 "momentum_score": 4,
                 "volume_confirmed": True,
+                "vwap_bias": "BULLISH",
             },
-            "fifteen_min": {"bias": "BULLISH", "confidence": "HIGH"},
-            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW"},
+            "fifteen_min": {
+                "bias": "BULLISH", "confidence": "HIGH",
+                "open": 100, "high": 111, "low": 99, "close": 110,
+            },
+            "two_hour": {"bias": "BULLISH", "confidence": "HIGH"},
             "atm_option_flow": {
                 "bias": "BULLISH",
                 "volume_ratio": 1.6,
@@ -40,6 +44,7 @@ class BankNiftyBreadthTests(unittest.TestCase):
                 "confidence": "HIGH",
                 "score": 70,
             },
+            "market_regime": {"regime": "TREND", "direction": "BULLISH"},
         }
 
     def test_weighted_constituents_produce_bullish_breadth(self):

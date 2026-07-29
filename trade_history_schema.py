@@ -27,5 +27,12 @@ COLUMNS = [
     "risk_per_trade_limit",
     "remaining_index_risk_budget",
     "planned_risk",
+    "highest_ltp",
+    "lowest_ltp",
+    "max_favorable_pnl",
+    "max_adverse_pnl",
+    "profit_protection_activated_at",
+    "protective_stop_order_id",
+    "broker_day_pnl_at_exit",
     "status",
 ]

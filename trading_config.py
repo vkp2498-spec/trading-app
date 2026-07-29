@@ -7,11 +7,12 @@ or changing a UI control.
 
 from datetime import datetime, time
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfo
 
 import json
 import os
+
+from safe_storage import atomic_write_json
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -82,6 +83,15 @@ CAPITAL_PROFILES = {
 }
 
 
+def configured_default_profile_id():
+    profile_id = str(os.getenv("DEFAULT_TRADING_PROFILE", DEFAULT_PROFILE_ID)).strip().upper()
+    if profile_id not in CAPITAL_PROFILES:
+        raise RuntimeError(
+            "DEFAULT_TRADING_PROFILE must be one of " + ", ".join(CAPITAL_PROFILES)
+        )
+    return profile_id
+
+
 def now_ist():
     return datetime.now(IST)
 
@@ -94,7 +104,7 @@ def selection_window_open(now=None):
 def _default_config():
     today = now_ist().date().isoformat()
     return {
-        "profileId": DEFAULT_PROFILE_ID,
+        "profileId": configured_default_profile_id(),
         "selectedDate": today,
         "selectedAt": None,
         "resetDoneDate": None,
@@ -113,23 +123,12 @@ def _read():
     config = _default_config()
     config.update(value)
     if config.get("profileId") not in CAPITAL_PROFILES:
-        config["profileId"] = DEFAULT_PROFILE_ID
+        config["profileId"] = configured_default_profile_id()
     return config
 
 
 def _write(config):
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=CONFIG_FILE.parent,
-        prefix="trading_config_",
-        delete=False,
-    ) as temporary:
-        json.dump(config, temporary, indent=2)
-        temporary.write("\n")
-        temporary_path = Path(temporary.name)
-    temporary_path.replace(CONFIG_FILE)
+    atomic_write_json(CONFIG_FILE, config)
 
 
 def _configured_float(name, default):
@@ -144,6 +143,25 @@ def _configured_bool(name, default=False):
     if raw is None:
         return bool(default)
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+ABSOLUTE_LIMIT_CAPS = {
+    "dailyMaxLoss": "DAILY_MAX_LOSS_ABSOLUTE_CAP",
+    "dailyProfitTarget": "DAILY_PROFIT_TARGET_ABSOLUTE_CAP",
+    "dailySoftLoss": "DAILY_SOFT_LOSS_ABSOLUTE_CAP",
+    "peakProfitGivebackTrigger": "PEAK_PROFIT_GIVEBACK_ABSOLUTE_CAP",
+    "indexRiskPerTrade": "INDEX_RISK_PER_TRADE_ABSOLUTE_CAP",
+    "maxDailyIndexRisk": "MAX_DAILY_INDEX_RISK_ABSOLUTE_CAP",
+    "maxOpenPortfolioRisk": "MAX_OPEN_PORTFOLIO_RISK_ABSOLUTE_CAP",
+}
+
+
+def _apply_absolute_limit_caps(values):
+    for field, env_name in ABSOLUTE_LIMIT_CAPS.items():
+        cap = max(_configured_float(env_name, 0.0), 0.0)
+        if cap > 0 and float(values.get(field) or 0) > 0:
+            values[field] = min(float(values[field]), cap)
+    return values
 
 
 def _profile_with_dynamic_limits(profile):
@@ -181,7 +199,7 @@ def _profile_with_dynamic_limits(profile):
                 0.0,
             ),
         )
-        return values
+        return _apply_absolute_limit_caps(values)
     if not _configured_bool("DYNAMIC_CAPITAL_RISK_ENABLED", True):
         return values
 
@@ -201,7 +219,8 @@ def _profile_with_dynamic_limits(profile):
     for field, (env_name, default_percent) in percentages.items():
         percent = max(_configured_float(env_name, default_percent), 0.0)
         values[field] = round(capital * percent / 100.0, 2)
-    return values
+
+    return _apply_absolute_limit_caps(values)
 
 
 def _ensure_automatic_reset(config, current=None):
@@ -214,7 +233,7 @@ def _ensure_automatic_reset(config, current=None):
         and config.get("resetDoneDate") != today
     )
     if stale_from_prior_day or after_daily_reset:
-        config["profileId"] = DEFAULT_PROFILE_ID
+        config["profileId"] = configured_default_profile_id()
         config["selectedDate"] = today
         config["selectedAt"] = current.isoformat()
         config["resetDoneDate"] = today
@@ -237,7 +256,9 @@ def get_config():
         "serverTime": current.isoformat(),
         "selectionWindowOpen": selection_window_open(current),
         "selectionWindow": "09:00-09:15 IST",
-        "automaticReset": "15:30 IST / next trading day -> MAX",
+        "automaticReset": (
+            "15:30 IST / next trading day -> " + configured_default_profile_id()
+        ),
         "selectedDate": config.get("selectedDate"),
         "selectedAt": config.get("selectedAt"),
     }

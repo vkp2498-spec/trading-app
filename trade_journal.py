@@ -3,6 +3,7 @@ from pathlib import Path
 
 from strategy_core import now_ist
 from trade_history_schema import COLUMNS
+from safe_storage import file_lock, locked_append_csv
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -33,7 +34,8 @@ def ensure_trade_history_file():
 
 
 def record_closed_trade(state, exit_price, exit_reason):
-    ensure_trade_history_file()
+    with file_lock(TRADE_HISTORY_FILE.with_suffix(TRADE_HISTORY_FILE.suffix + ".lock")):
+        ensure_trade_history_file()
 
     qty = int(float(state.get("quantity") or 0))
     entry_price = float(state.get("entry_price") or 0)
@@ -45,6 +47,14 @@ def record_closed_trade(state, exit_price, exit_reason):
         else exit_price - entry_price
     )
     gross_pnl = round(pnl_per_unit * qty, 2)
+    highest_ltp = float(state.get("highest_ltp") or entry_price)
+    lowest_ltp = float(state.get("lowest_ltp") or entry_price)
+    if transaction_type == "SELL":
+        favorable = max(entry_price - lowest_ltp, 0.0)
+        adverse = max(highest_ltp - entry_price, 0.0)
+    else:
+        favorable = max(highest_ltp - entry_price, 0.0)
+        adverse = max(entry_price - lowest_ltp, 0.0)
 
     row = {
         "trade_date": now_ist().strftime("%Y-%m-%d"),
@@ -80,11 +90,18 @@ def record_closed_trade(state, exit_price, exit_reason):
         "risk_per_trade_limit": state.get("risk_per_trade_limit", ""),
         "remaining_index_risk_budget": state.get("remaining_index_risk_budget", ""),
         "planned_risk": state.get("planned_risk", ""),
+        "highest_ltp": round(highest_ltp, 2),
+        "lowest_ltp": round(lowest_ltp, 2),
+        "max_favorable_pnl": round(favorable * qty, 2),
+        "max_adverse_pnl": round(-adverse * qty, 2),
+        "profit_protection_activated_at": state.get(
+            "profit_protection_activated_at", ""
+        ),
+        "protective_stop_order_id": state.get("protective_stop_order_id", ""),
+        "broker_day_pnl_at_exit": state.get("broker_day_pnl_at_exit", ""),
         "status": "CLOSED",
     }
 
-    with TRADE_HISTORY_FILE.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        writer.writerow(row)
+    locked_append_csv(TRADE_HISTORY_FILE, COLUMNS, row)
 
     return row

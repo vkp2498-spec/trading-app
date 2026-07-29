@@ -227,6 +227,9 @@ def bollinger_reversal_alignment_score(option_summary, technicals, option_chain_
     grade = "TRADE" if total >= 75 else "CAUTIOUS_TRADE" if total >= 65 else "SKIP"
     return {
         "score": total,
+        "score_kind": "RULES_ALIGNMENT_NOT_PROBABILITY",
+        "score_version": "2026-07-safety-1",
+        "probability_calibrated": False,
         "grade": grade,
         "strategy": "BOLLINGER_REVERSAL",
         "components": components,
@@ -308,6 +311,9 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     ]
     return {
         "score": total,
+        "score_kind": "RULES_ALIGNMENT_NOT_PROBABILITY",
+        "score_version": "2026-07-safety-1",
+        "probability_calibrated": False,
         "grade": grade,
         "components": components,
         "weights": {
