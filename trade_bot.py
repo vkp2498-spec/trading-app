@@ -1709,9 +1709,10 @@ def order_quantity_for(
     entry_price=None,
     stop_loss_price=None,
     transaction_type="BUY",
+    capital_override=None,
 ):
     lot_size = int(instrument["lot_size"])
-    capital = option_capital_per_entry()
+    capital = option_capital_per_entry() if capital_override is None else capital_override
 
     # The only supported live entry is a long option BUY. Keep this guard so
     # an accidental legacy caller cannot use this sizing for a short option.
@@ -3779,6 +3780,7 @@ def execute_selected_candidate(chosen):
         entry_price,
         stop,
         transaction_type=transaction_type,
+        capital_override=chosen.get("capital_override"),
     )
     if quantity <= 0:
         log(
@@ -3797,6 +3799,8 @@ def execute_selected_candidate(chosen):
     trade_metadata = {
         **trade_context,
         "planned_risk": round(planned_risk, 2),
+        "manual_override": bool(chosen.get("manual_override")),
+        "manual_command": chosen.get("manual_command", ""),
         "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(symbol),
         "underlying_entry_price": structural.get("entry_underlying"),
         "underlying_structural_stop": structural.get("stop_underlying"),
@@ -3935,16 +3939,39 @@ def execute_selected_candidate(chosen):
         trade_metadata=trade_metadata,
     )
 
-    post_fill = revalidate_option_after_fill(
-        symbol,
-        direction,
-        chosen.get("option_summary", {}).get("option_type"),
-        fill,
-        chosen["target_points"],
-        chosen["stop_points"],
-        chosen["option_delta_used"],
-        chosen.get("technicals", {}),
-    )
+    if chosen.get("manual_override"):
+        manual_levels = option_levels_from_index_points(
+            symbol,
+            fill,
+            target_points=chosen["target_points"],
+            stop_points=chosen["stop_points"],
+            delta=chosen["option_delta_used"],
+        )
+        post_fill = {
+            "allowed": True,
+            "target_price": manual_levels["target_price"],
+            "stop_loss_price": manual_levels["stop_loss_price"],
+            "technicals": chosen.get("technicals", {}),
+            "feasibility": {
+                "allowed": True,
+                "technical_reward_risk": round(
+                    float(chosen["target_points"]) / float(chosen["stop_points"]),
+                    3,
+                ),
+                "reasons": ["manual directional override"],
+            },
+        }
+    else:
+        post_fill = revalidate_option_after_fill(
+            symbol,
+            direction,
+            chosen.get("option_summary", {}).get("option_type"),
+            fill,
+            chosen["target_points"],
+            chosen["stop_points"],
+            chosen["option_delta_used"],
+            chosen.get("technicals", {}),
+        )
     state = read_state(symbol)
     state["weighted_score"] = candidate_weighted_score(chosen)
     state["post_fill_feasibility"] = post_fill["feasibility"]

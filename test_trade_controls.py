@@ -43,6 +43,7 @@ jwt_stub.encode = lambda *args, **kwargs: "test-token"
 sys.modules.setdefault("jwt", jwt_stub)
 
 import trade_bot
+import manual_index_trade
 import apns_push
 import dashboard_data
 import trade_journal
@@ -54,6 +55,43 @@ from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_manual_command_parses_symbol_side_and_symmetric_points(self):
+        self.assertEqual(
+            manual_index_trade.parse_request(["bank", "nifty", "call", "40"]),
+            ("BANKNIFTY", "CALL", 40.0, 40.0),
+        )
+        self.assertEqual(
+            manual_index_trade.parse_request(["nifty", "20", "15"]),
+            ("NIFTY", None, 20.0, 15.0),
+        )
+
+    def test_manual_candidate_forces_max_capital_and_preserves_score(self):
+        with patch.object(
+            trade_bot,
+            "index_point_exit_settings",
+            return_value={"target_points": 20, "stop_points": 20, "delta": 0.5},
+        ):
+            chosen = manual_index_trade.build_manual_candidate(
+                {
+                    "symbol": "NIFTY",
+                    "direction": "BEARISH",
+                    "entry_price": 100,
+                    "instrument": {"instrument_key": "NSE_FO|1", "lot_size": 65},
+                    "option_summary": {"option_type": "PE"},
+                    "technicals": {},
+                    "weighted": {"score": 68, "grade": "CAUTIOUS_TRADE"},
+                },
+                20,
+                20,
+                "nifty 20",
+            )
+
+        self.assertEqual(chosen["direction"], "BEARISH")
+        self.assertEqual(chosen["capital_override"], "MAX")
+        self.assertTrue(chosen["manual_override"])
+        self.assertEqual(chosen["target_price"], 110)
+        self.assertEqual(chosen["stop_loss_price"], 90)
+
     def test_completed_candles_excludes_still_forming_interval(self):
         index = pd.DatetimeIndex(
             ["2026-07-20 10:00:00+05:30", "2026-07-20 10:15:00+05:30"]
