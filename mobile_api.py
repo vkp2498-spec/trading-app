@@ -168,21 +168,6 @@ def dashboard():
     """
     try:
         snapshot = build_health_snapshot()
-        try:
-            snapshot["aws"] = aws_instance_status()
-        except Exception as error:
-            snapshot["aws"] = {
-                "region": os.getenv("AWS_REGION", "ap-south-1"),
-                "availabilityZone": "ap-south-1a",
-                "instanceId": os.getenv("AWS_INSTANCE_ID", ""),
-                "instanceName": os.getenv("AWS_INSTANCE_NAME", "ai-trading-bot-vamsi"),
-                "state": "unavailable",
-                "publicIpAddress": "13.234.86.47",
-                "privateIpAddress": "172.26.8.88",
-                "lastChecked": datetime.now(IST).isoformat(),
-                "controlAvailable": False,
-                "message": str(error),
-            }
 
         snapshot["profile"] = TRADING_PROFILE
         snapshot["serverTime"] = datetime.now(

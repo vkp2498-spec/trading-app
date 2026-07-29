@@ -427,6 +427,165 @@ def latest_symbol_analyses() -> list[dict]:
     return [latest.get(symbol, {"symbol": symbol, "decision": "NO DATA", "indicators": []}) for symbol in SYMBOLS]
 
 
+def parse_history_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=IST)
+    return parsed.astimezone(IST)
+
+
+def scan_bucket(timestamp: datetime) -> datetime:
+    minute = (timestamp.minute // 5) * 5
+    return timestamp.replace(minute=minute, second=0, microsecond=0)
+
+
+def short_scan_reason(reason: str, fallback: str) -> str:
+    text = " ".join(str(reason or "").split()).strip(" .")
+    lower = text.lower()
+    replacements = (
+        ("configured option capital/risk budget", "Risk budget insufficient"),
+        ("daily first-outcome", "Daily trade limit reached"),
+        ("active index position", "Another index position is active"),
+        ("weighted score", "Score below entry threshold"),
+        ("volume confirmation", "Volume confirmation below threshold"),
+        ("did not pass deterministic", "Entry rules not met"),
+    )
+    for phrase, summary in replacements:
+        if phrase in lower:
+            return summary
+    if not text:
+        return fallback
+    if len(text) <= 72:
+        return text
+    shortened = text[:69].rsplit(" ", 1)[0]
+    return f"{shortened}..."
+
+
+def build_today_scans(now: datetime | None = None) -> list[dict]:
+    current = (now or datetime.now(IST)).astimezone(IST)
+    today = current.date()
+    grouped: dict[datetime, dict] = {}
+
+    def result_for(bucket: datetime, symbol: str) -> dict:
+        row = grouped.setdefault(
+            bucket,
+            {
+                "id": bucket.isoformat(),
+                "timestamp": bucket.isoformat(),
+                "nifty": None,
+                "bankNifty": None,
+            },
+        )
+        key = "bankNifty" if symbol == "BANKNIFTY" else "nifty"
+        if row[key] is None:
+            row[key] = {
+                "decision": "REJECTED",
+                "reason": "Entry rules not met",
+                "score": None,
+            }
+        return row[key]
+
+    if ANALYSIS_HISTORY_FILE.exists():
+        try:
+            with ANALYSIS_HISTORY_FILE.open("r", newline="", errors="ignore") as file:
+                for raw_row in csv.DictReader(file):
+                    symbol = str(raw_row.get("symbol") or "").upper()
+                    timestamp = parse_history_timestamp(raw_row.get("timestamp"))
+                    if symbol not in SYMBOLS or timestamp is None or timestamp.date() != today:
+                        continue
+                    analysis = normalize_analysis(raw_row)
+                    result = result_for(scan_bucket(timestamp), symbol)
+                    entered = analysis.get("decision") == "TRADED"
+                    result.update(
+                        {
+                            "decision": "ENTERED" if entered else "REJECTED",
+                            "reason": short_scan_reason(
+                                analysis.get("reason"),
+                                "Entry signal accepted" if entered else "Entry rules not met",
+                            ),
+                            "score": analysis.get("overallScore"),
+                        }
+                    )
+        except (OSError, csv.Error):
+            pass
+
+    latest_events: dict[str, tuple[datetime, dict]] = {}
+    decision_pattern = re.compile(
+        r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| "
+        r"(NIFTY|BANKNIFTY) score ([^ ]+) (reject|buy)$",
+        re.IGNORECASE,
+    )
+    reason_patterns = (
+        re.compile(r"^(NIFTY|BANKNIFTY) no trade: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY) portfolio gate rejected entry: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY) MARKET BUY rejected: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY) order execution ERROR: (.+)$", re.IGNORECASE),
+    )
+    for raw_line in read_last_lines(LOG_FILE, max_lines=10000):
+        line = raw_line.strip()
+        match = decision_pattern.match(line)
+        if match:
+            timestamp = parse_history_timestamp(match.group(1))
+            if timestamp is None or timestamp.date() != today:
+                continue
+            symbol = match.group(2).upper()
+            score_text = match.group(3)
+            action = match.group(4).lower()
+            result = result_for(scan_bucket(timestamp), symbol)
+            score = safe_float(score_text, None)
+            result.update(
+                {
+                    "decision": "ENTERED" if action == "buy" else "REJECTED",
+                    "reason": short_scan_reason(
+                        result.get("reason"),
+                        "Entry signal accepted" if action == "buy" else "Entry rules not met",
+                    ),
+                    "score": score if score is not None else result.get("score"),
+                }
+            )
+            if score_text.lower() == "used":
+                result["reason"] = "Daily trade limit reached"
+            elif action == "buy":
+                result["reason"] = "Entered trade"
+            latest_events[symbol] = (timestamp, result)
+            continue
+
+        timestamp_match = re.match(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (.+)$",
+            line,
+        )
+        if not timestamp_match:
+            continue
+        timestamp = parse_history_timestamp(timestamp_match.group(1))
+        message = timestamp_match.group(2)
+        if timestamp is None or timestamp.date() != today:
+            continue
+        for pattern in reason_patterns:
+            reason_match = pattern.match(message)
+            if not reason_match:
+                continue
+            symbol = reason_match.group(1).upper()
+            event = latest_events.get(symbol)
+            if event and 0 <= (timestamp - event[0]).total_seconds() <= 180:
+                event[1]["decision"] = "REJECTED"
+                event[1]["reason"] = short_scan_reason(
+                    reason_match.group(2),
+                    "Entry rules not met",
+                )
+            break
+
+    return [grouped[key] for key in sorted(grouped, reverse=True)]
+
+
 def empty_trade_performance() -> dict:
     return {
         "today": {
@@ -1813,6 +1972,7 @@ def build_health_snapshot() -> dict:
         },
         "bot": bot_status,
         "lastRuns": latest_symbol_analyses(),
+        "todayScans": build_today_scans(),
         "performance": trade_performance,
         "live": live_positions,
         "upstoxAccount": {
