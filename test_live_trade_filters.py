@@ -1,12 +1,14 @@
 import unittest
 
 from live_trade_filters import (
+    bollinger_exhaustion_reversal,
     classify_market_regime,
     entry_structure_for_direction,
     live_entry_gate,
     structural_invalidation,
     underlying_exit_reason,
 )
+from signal_score import weighted_alignment_score
 
 
 class LiveTradeFilterTests(unittest.TestCase):
@@ -77,6 +79,63 @@ class LiveTradeFilterTests(unittest.TestCase):
             "TIME_STOP",
         )
         self.assertIsNone(underlying_exit_reason(state, 102, 21))
+
+    def test_upper_band_exhaustion_requires_five_minute_reversal(self):
+        technicals = {
+            "fifteen_min": {
+                "candle_time": "2026-07-29T10:15:00+05:30",
+                "open": 112,
+                "high": 115,
+                "low": 107,
+                "close": 109,
+                "upper_band": 110,
+                "lower_band": 90,
+                "atr14": 5,
+            },
+            "five_min": {
+                "open": 108,
+                "close": 106,
+                "bias": "BEARISH",
+                "momentum_score": -3,
+            },
+        }
+        result = bollinger_exhaustion_reversal(technicals)
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertGreaterEqual(result["extension_multiple"], 2)
+
+        technicals["five_min"].update(
+            open=106,
+            close=108,
+            bias="BULLISH",
+            momentum_score=3,
+        )
+        result = bollinger_exhaustion_reversal(technicals)
+        self.assertFalse(result["confirmed"])
+
+    def test_confirmed_reversal_uses_independent_score(self):
+        technicals = {
+            "bollinger_reversal": {
+                "confirmed": True,
+                "direction": "BEARISH",
+                "extension_multiple": 2.1,
+            },
+            "two_hour": {"bias": "NEUTRAL", "confidence": "LOW"},
+            "atm_option_flow": {"bias": "BULLISH", "volume_ratio": 1.5},
+        }
+        result = weighted_alignment_score(
+            {
+                "bias": "BEARISH",
+                "strategy": "BOLLINGER_REVERSAL",
+                "chain_bias": "BEARISH",
+                "chain_confidence": "MEDIUM",
+            },
+            technicals,
+            {"bias": "NEUTRAL"},
+        )
+        self.assertEqual(result["strategy"], "BOLLINGER_REVERSAL")
+        self.assertEqual(result["grade"], "TRADE")
+        self.assertGreaterEqual(result["score"], 75)
 
 
 if __name__ == "__main__":

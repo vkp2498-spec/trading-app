@@ -31,6 +31,7 @@ from market_technicals import (
     candle_confirmation,
 )
 from live_trade_filters import (
+    bollinger_exhaustion_reversal,
     classify_market_regime,
     entry_structure_for_direction,
     live_entry_gate,
@@ -3269,6 +3270,7 @@ def build_trade_candidate(
         "trading_symbol": instrument["trading_symbol"],
         "option_chain_trend": option_trend,
         "option_market_quality": option_quality,
+        "strategy": rec.get("strategy", "TREND_FOLLOWING"),
     }
     weighted = weighted_alignment_score(option_summary, technicals, option_trend)
     option_summary["weighted_alignment"] = weighted
@@ -3299,6 +3301,11 @@ def build_trade_candidate(
 
     score_value = float(weighted.get("score") or 0)
     minimum = direct_entry_minimum_score(symbol)
+    if option_summary.get("strategy") == "BOLLINGER_REVERSAL":
+        minimum = max(
+            minimum,
+            configured_non_negative_float("BOLLINGER_REVERSAL_MIN_SCORE", 75.0),
+        )
     cutoff_approved = bool(
         score_cutoff_mode_enabled() and score_value >= minimum
     )
@@ -3377,7 +3384,28 @@ def build_trade_candidate(
         }, None
 
     cautious = weighted.get("grade") == "CAUTIOUS_TRADE"
-    exit_settings = score_based_exit_settings(symbol, score_value)
+    if option_summary.get("strategy") == "BOLLINGER_REVERSAL":
+        minimum_target = 20.0 if symbol == "NIFTY" else 40.0
+        exit_settings = {
+            "target_points": max(
+                minimum_target,
+                configured_positive_float(
+                    f"{symbol}_BOLLINGER_REVERSAL_TARGET_POINTS",
+                    minimum_target,
+                ),
+            ),
+            "stop_points": configured_positive_float(
+                f"{symbol}_BOLLINGER_REVERSAL_STOP_POINTS",
+                minimum_target,
+            ),
+            "delta": configured_positive_float(
+                "OPTION_DELTA_APPROXIMATION",
+                DEFAULT_OPTION_DELTA_APPROXIMATION,
+            ),
+            "profile": "BOLLINGER_REVERSAL",
+        }
+    else:
+        exit_settings = score_based_exit_settings(symbol, score_value)
     levels = option_levels_from_index_points(
         symbol,
         entry_price,
@@ -3579,12 +3607,44 @@ def evaluate_symbol_buy_or_sell(
             f"reasons={breadth.get('reasons')}"
         )
 
+    reversal = bollinger_exhaustion_reversal(
+        base_technicals,
+        min_extension_fraction=configured_non_negative_float(
+            "BOLLINGER_REVERSAL_MIN_EXTENSION_FRACTION", 0.10
+        ),
+        min_extension_atr=configured_non_negative_float(
+            "BOLLINGER_REVERSAL_MIN_EXTENSION_ATR", 0.20
+        ),
+        min_rejection_wick_fraction=configured_non_negative_float(
+            "BOLLINGER_REVERSAL_MIN_WICK_FRACTION", 0.25
+        ),
+        min_five_minute_momentum=configured_non_negative_float(
+            "BOLLINGER_REVERSAL_MIN_5M_MOMENTUM", 2.0
+        ),
+    )
+    base_technicals["bollinger_reversal"] = reversal
+    reversal_enabled = configured_bool("BOLLINGER_REVERSAL_ENABLED", True)
+    if reversal_enabled and reversal.get("confirmed"):
+        verbose_log(
+            f"{symbol} Bollinger reversal confirmed: "
+            f"direction={reversal.get('direction')} "
+            f"extension_multiple={reversal.get('extension_multiple')} "
+            f"reasons={reversal.get('reasons')}"
+        )
+
     if neutral_banknifty_candidate:
         if score_cutoff_mode_enabled():
             inferred_direction = score_direction_from_technicals(base_technicals)
             blockers = [] if inferred_direction else ["technical direction is unavailable"]
         else:
             inferred_direction, blockers = banknifty_neutral_chain_direction(base_technicals)
+        if (
+            not inferred_direction
+            and reversal_enabled
+            and reversal.get("confirmed")
+        ):
+            inferred_direction = reversal.get("direction")
+            blockers = []
         if not inferred_direction:
             collect_institutional_footprint(symbol, rec)
             log_scan_decision(symbol, score, "reject")
@@ -3611,6 +3671,13 @@ def evaluate_symbol_buy_or_sell(
             blockers = [] if inferred_direction else ["technical direction is unavailable"]
         else:
             inferred_direction, blockers = nifty_neutral_chain_direction(base_technicals)
+        if (
+            not inferred_direction
+            and reversal_enabled
+            and reversal.get("confirmed")
+        ):
+            inferred_direction = reversal.get("direction")
+            blockers = []
         if not inferred_direction:
             collect_institutional_footprint(symbol, rec)
             log_scan_decision(symbol, score, "reject")
@@ -3638,6 +3705,14 @@ def evaluate_symbol_buy_or_sell(
         log_scan_decision(symbol, score, "reject")
         verbose_log(f"{symbol} no trade: {blocked_reason}")
         return False
+
+    if (
+        reversal_enabled
+        and reversal.get("confirmed")
+        and reversal.get("direction") == direction
+    ):
+        rec = deepcopy(rec)
+        rec["strategy"] = "BOLLINGER_REVERSAL"
 
     institutional = collect_institutional_footprint(symbol, rec)
     option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
@@ -3676,6 +3751,66 @@ def evaluate_symbol_buy_or_sell(
                 f"{contract_row.get('strike')}: {error}"
             )
 
+    reversal_direction = reversal.get("direction")
+    if (
+        reversal_enabled
+        and reversal.get("confirmed")
+        and reversal_direction in {"BULLISH", "BEARISH"}
+        and reversal_direction != direction
+    ):
+        reversal_block = reentry_block_reason(symbol, reversal_direction)
+        if reversal_block:
+            verbose_log(f"{symbol} Bollinger reversal blocked: {reversal_block}")
+        else:
+            reversal_rec = deepcopy(rec)
+            reversal_rec.update(
+                {
+                    "chain_bias": rec.get("chain_bias", direction),
+                    "chain_confidence": rec.get("chain_confidence", confidence),
+                    "direction": reversal_direction,
+                    "strategy": "BOLLINGER_REVERSAL",
+                }
+            )
+            reversal_trend = get_option_chain_trend(
+                symbol,
+                reversal_direction,
+                expiry=atm.get("expiry"),
+            )
+            for contract_row in index_contract_rows(reversal_rec, reversal_direction):
+                try:
+                    candidate, _ = build_trade_candidate(
+                        symbol,
+                        reversal_rec,
+                        base_technicals,
+                        institutional,
+                        reversal_trend,
+                        "BUY",
+                        contract_row=contract_row,
+                    )
+                    if candidate:
+                        candidate.update(
+                            {
+                                "symbol": symbol,
+                                "direction": reversal_direction,
+                                "confidence": "MEDIUM",
+                                "signal_score": score,
+                            }
+                        )
+                        candidates.append(candidate)
+                        verbose_log(
+                            f"{symbol} BOLLINGER_REVERSAL candidate: "
+                            f"allowed={candidate.get('allowed')} "
+                            f"direction={reversal_direction} "
+                            f"score={candidate.get('weighted', {}).get('score')} "
+                            f"reason={candidate.get('reason')} "
+                            f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
+                        )
+                except Exception as error:
+                    verbose_log(
+                        f"{symbol} BOLLINGER_REVERSAL candidate unavailable for strike "
+                        f"{contract_row.get('strike')}: {error}"
+                    )
+
     preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
     if not preferred:
         eligible = [
@@ -3710,6 +3845,7 @@ def evaluate_symbol_buy_or_sell(
     ordered = [preferred] + [item for item in qualified if item is not preferred]
 
     for chosen in ordered:
+        chosen_direction = chosen["direction"]
         transaction_type = chosen["transaction_type"]
         instrument = chosen["instrument"]
         quantity = order_quantity_for(
@@ -3730,7 +3866,7 @@ def evaluate_symbol_buy_or_sell(
         technicals = chosen["technicals"]
         decision = {
             "execute_trade": True,
-            "decision": direction,
+            "decision": chosen_direction,
             "confidence": (
                 "HIGH"
                 if chosen.get("weighted", {}).get("grade") == "TRADE"
@@ -3748,7 +3884,7 @@ def evaluate_symbol_buy_or_sell(
         chosen.update(
             {
                 "symbol": symbol,
-                "direction": direction,
+                "direction": chosen_direction,
                 "confidence": confidence,
                 "signal_score": score,
                 "decision": decision,

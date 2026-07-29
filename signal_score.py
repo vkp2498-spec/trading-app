@@ -172,6 +172,86 @@ def _fifteen_min_candle_component(technicals, direction):
     return 1.0, body_ratio
 
 
+def bollinger_reversal_alignment_score(option_summary, technicals, option_chain_trend):
+    """Score a confirmed exhaustion reversal without reusing trend weights."""
+    reversal = technicals.get("bollinger_reversal", {}) or {}
+    direction = option_summary.get("bias")
+    if not reversal.get("confirmed") or reversal.get("direction") != direction:
+        return None
+
+    extension_multiple = float(reversal.get("extension_multiple") or 0)
+    if extension_multiple >= 2.0:
+        extension = 30.0
+    elif extension_multiple >= 1.5:
+        extension = 25.0
+    else:
+        extension = 20.0
+
+    rejection = 15.0
+    five_confirmation = 20.0
+
+    chain_bias = option_summary.get("chain_bias", "NEUTRAL")
+    chain_confidence = option_summary.get("chain_confidence", "LOW")
+    chain_snapshot = (
+        5.0
+        * direction_score(chain_bias, direction)
+        * confidence_multiplier(chain_confidence)
+    )
+    trend_bias = (option_chain_trend or {}).get("bias", "NEUTRAL")
+    chain_trend = 5.0 * direction_score(trend_bias, direction)
+    chain = chain_snapshot + chain_trend
+
+    option_flow = technicals.get("atm_option_flow", {}) or {}
+    premium_flow = 15.0 * direction_score(option_flow.get("bias"), "BULLISH")
+    volume, volume_ratio = _volume_component(technicals)
+
+    two_hour = technicals.get("two_hour", {}) or {}
+    continuation_direction = "BEARISH" if direction == "BULLISH" else "BULLISH"
+    trend_penalty = 0.0
+    if (
+        two_hour.get("bias") == continuation_direction
+        and two_hour.get("confidence") == "HIGH"
+    ):
+        trend_penalty = 10.0
+
+    components = {
+        "bollinger_extension": round(extension, 1),
+        "fifteen_minute_rejection": round(rejection, 1),
+        "five_minute_confirmation": round(five_confirmation, 1),
+        "option_chain": round(chain, 1),
+        "option_premium_vwap": round(premium_flow, 1),
+        "option_volume": round(volume, 1),
+        "strong_2h_continuation_penalty": round(-trend_penalty, 1),
+    }
+    total = max(0.0, min(100.0, round(sum(components.values()), 1)))
+    grade = "TRADE" if total >= 75 else "CAUTIOUS_TRADE" if total >= 65 else "SKIP"
+    return {
+        "score": total,
+        "grade": grade,
+        "strategy": "BOLLINGER_REVERSAL",
+        "components": components,
+        "weights": {
+            "bollinger_extension": 30,
+            "fifteen_minute_rejection": 15,
+            "five_minute_confirmation": 20,
+            "option_chain": 10,
+            "option_premium_vwap": 15,
+            "option_volume": 10,
+        },
+        "reasons": [
+            f"Bollinger extension={extension:.1f}/30 "
+            f"(multiple={extension_multiple:.2f})",
+            "Completed 15M rejection=15.0/15",
+            "Completed 5M reversal confirmation=20.0/20",
+            f"Option chain={chain:.1f}/10 "
+            f"(snapshot={chain_bias}/{chain_confidence}, trend={trend_bias})",
+            f"Option premium VWAP={premium_flow:.1f}/15",
+            f"Option volume={volume:.1f}/10 (ratio={volume_ratio:.2f})",
+            f"Strong opposing 2H continuation penalty=-{trend_penalty:.1f}",
+        ],
+    }
+
+
 def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     """Score the setup once; callers use this as the strategy cutoff.
 
@@ -181,6 +261,15 @@ def weighted_alignment_score(option_summary, technicals, option_chain_trend):
     direction = option_summary.get("bias")
     if direction not in {"BULLISH", "BEARISH"}:
         return {"score": 0, "grade": "SKIP", "reasons": ["Direction is not defined"]}
+
+    if option_summary.get("strategy") == "BOLLINGER_REVERSAL":
+        reversal_score = bollinger_reversal_alignment_score(
+            option_summary,
+            technicals,
+            option_chain_trend,
+        )
+        if reversal_score is not None:
+            return reversal_score
 
     chain, chain_bias, chain_confidence, trend_bias = _option_chain_component(
         option_summary, option_chain_trend, direction

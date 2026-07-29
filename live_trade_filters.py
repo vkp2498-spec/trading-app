@@ -14,6 +14,125 @@ def opposite_direction(direction):
     return "BEARISH" if direction == "BULLISH" else "BULLISH"
 
 
+def bollinger_exhaustion_reversal(
+    technicals,
+    *,
+    min_extension_fraction=0.10,
+    min_extension_atr=0.20,
+    min_rejection_wick_fraction=0.25,
+    min_five_minute_momentum=2.0,
+):
+    """Identify a confirmed 15-minute Bollinger exhaustion reversal.
+
+    An outer-band excursion alone is not a reversal. The completed 15-minute
+    candle must reject the extreme and the latest completed five-minute candle
+    must confirm movement back in the proposed direction.
+    """
+    fifteen = technicals.get("fifteen_min", {}) or {}
+    five = technicals.get("five_min", {}) or {}
+
+    fifteen_open = _number(fifteen.get("open"))
+    fifteen_high = _number(fifteen.get("high"))
+    fifteen_low = _number(fifteen.get("low"))
+    fifteen_close = _number(fifteen.get("close"))
+    upper = _number(fifteen.get("upper_band"))
+    lower = _number(fifteen.get("lower_band"))
+    atr = _number(fifteen.get("atr14"))
+    band_width = upper - lower
+
+    if (
+        min(fifteen_open, fifteen_high, fifteen_low, fifteen_close) <= 0
+        or band_width <= 0
+    ):
+        return {
+            "confirmed": False,
+            "direction": None,
+            "reason": "completed 15M Bollinger values are unavailable",
+        }
+
+    upper_extension = max(0.0, fifteen_high - upper)
+    lower_extension = max(0.0, lower - fifteen_low)
+    if upper_extension <= 0 and lower_extension <= 0:
+        return {
+            "confirmed": False,
+            "direction": None,
+            "reason": "15M candle did not extend beyond an outer Bollinger band",
+        }
+
+    if upper_extension >= lower_extension:
+        direction = "BEARISH"
+        extension = upper_extension
+        rejection_wick = fifteen_high - max(fifteen_open, fifteen_close)
+        closed_back_inside = fifteen_close <= upper
+        reversal_body = fifteen_close < fifteen_open
+    else:
+        direction = "BULLISH"
+        extension = lower_extension
+        rejection_wick = min(fifteen_open, fifteen_close) - fifteen_low
+        closed_back_inside = fifteen_close >= lower
+        reversal_body = fifteen_close > fifteen_open
+
+    candle_range = max(fifteen_high - fifteen_low, 0.01)
+    wick_fraction = max(0.0, rejection_wick) / candle_range
+    required_extension = max(
+        band_width * max(_number(min_extension_fraction), 0.0),
+        atr * max(_number(min_extension_atr), 0.0),
+    )
+    extension_multiple = extension / required_extension if required_extension > 0 else 0.0
+    fifteen_rejected = (
+        closed_back_inside
+        or reversal_body
+        or wick_fraction >= max(_number(min_rejection_wick_fraction), 0.0)
+    )
+
+    five_open = _number(five.get("open"))
+    five_close = _number(five.get("close"))
+    five_momentum = _number(five.get("momentum_score"))
+    signed_momentum = five_momentum if direction == "BULLISH" else -five_momentum
+    five_body_confirms = (
+        five_close > five_open if direction == "BULLISH" else five_close < five_open
+    )
+    five_confirms = (
+        signed_momentum >= max(_number(min_five_minute_momentum), 0.0)
+        and (five.get("bias") == direction or five_body_confirms)
+    )
+    confirmed = (
+        extension >= required_extension
+        and fifteen_rejected
+        and five_confirms
+    )
+
+    reasons = [
+        f"15M extension={extension:.2f} versus required={required_extension:.2f}",
+        f"15M rejection wick={wick_fraction:.2f}; closed_back_inside={closed_back_inside}",
+        f"5M signed reversal momentum={signed_momentum:.1f}",
+    ]
+    if not confirmed:
+        if extension < required_extension:
+            reasons.append("outer-band extension is not sufficiently extreme")
+        if not fifteen_rejected:
+            reasons.append("15M candle did not reject the extreme")
+        if not five_confirms:
+            reasons.append("completed 5M candle did not confirm the reversal")
+
+    return {
+        "confirmed": confirmed,
+        "direction": direction,
+        "timeframe": "15M",
+        "candle_time": fifteen.get("candle_time"),
+        "extension": round(extension, 2),
+        "required_extension": round(required_extension, 2),
+        "extension_multiple": round(extension_multiple, 2),
+        "extension_fraction": round(extension / band_width, 4),
+        "rejection_wick_fraction": round(wick_fraction, 4),
+        "closed_back_inside": bool(closed_back_inside),
+        "reversal_body": bool(reversal_body),
+        "five_minute_signed_momentum": round(signed_momentum, 2),
+        "five_minute_confirmed": bool(five_confirms),
+        "reasons": reasons,
+    }
+
+
 def classify_market_regime(
     technicals,
     *,
