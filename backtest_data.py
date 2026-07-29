@@ -70,11 +70,16 @@ class UpstoxBacktestData:
     def __init__(self, root, token=None, progress=None, pause_seconds=0.12):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.cache_only = str(os.getenv("BACKTEST_CACHE_ONLY", "false")).lower() == "true"
+        self.cache_from_date = os.getenv("BACKTEST_CACHE_FROM_DATE", "").strip()
+        self.cache_to_date = os.getenv("BACKTEST_CACHE_TO_DATE", "").strip()
         self.token = token or os.getenv("UPSTOX_ACCESS_TOKEN") or os.getenv(
             "UPSTOX_ANALYTICS_TOKEN"
         )
-        if not self.token:
+        if not self.token and not self.cache_only:
             raise RuntimeError("UPSTOX_ACCESS_TOKEN or UPSTOX_ANALYTICS_TOKEN not set")
+        if not self.token:
+            self.token = "CACHE_ONLY"
         self.progress = progress or (lambda message: None)
         self.pause_seconds = max(float(pause_seconds), 0)
         self.session = requests.Session()
@@ -98,6 +103,11 @@ class UpstoxBacktestData:
         return folder / f"{self._key(*parts)}.csv.gz"
 
     def _get(self, url, params=None, attempts=5):
+        if self.cache_only:
+            raise FileNotFoundError(
+                "Backtest cache miss while BACKTEST_CACHE_ONLY=true. "
+                "Select a cached date range or explicitly allow downloads."
+            )
         error = None
         for attempt in range(attempts):
             response = self.session.get(url, params=params, timeout=45)
@@ -117,6 +127,8 @@ class UpstoxBacktestData:
         path = self._json_path(namespace, *parts)
         if path.exists():
             return json.loads(path.read_text())
+        if self.cache_only:
+            raise FileNotFoundError(f"Missing cached {namespace} data: {parts}")
         value = loader()
         path.write_text(json.dumps(value, indent=2, default=str))
         return value
@@ -126,6 +138,45 @@ class UpstoxBacktestData:
         if path.exists():
             frame = pd.read_csv(path, index_col="timestamp", parse_dates=["timestamp"])
             return _as_ist_index(frame)
+        if (
+            self.cache_only
+            and namespace == "candles"
+            and len(parts) == 5
+            and self.cache_from_date
+            and self.cache_to_date
+        ):
+            instrument_key, interval, requested_start, requested_end, expired = parts
+            cache_start = _date(self.cache_from_date)
+            cache_end = _date(self.cache_to_date)
+            requested_start = _date(requested_start)
+            requested_end = _date(requested_end)
+            candidate_starts = (cache_start, cache_start - timedelta(days=50))
+            if requested_end <= cache_end:
+                for candidate_start in candidate_starts:
+                    if candidate_start > requested_start:
+                        continue
+                    candidate = self._csv_path(
+                        namespace,
+                        instrument_key,
+                        interval,
+                        candidate_start,
+                        cache_end,
+                        bool(expired),
+                    )
+                    if not candidate.exists():
+                        continue
+                    frame = pd.read_csv(
+                        candidate,
+                        index_col="timestamp",
+                        parse_dates=["timestamp"],
+                    )
+                    frame = _as_ist_index(frame)
+                    dates = frame.index.date
+                    return frame[(dates >= requested_start) & (dates <= requested_end)]
+        if self.cache_only:
+            raise FileNotFoundError(
+                f"Missing cached {namespace} data for requested range: {parts}"
+            )
         frame = _as_ist_index(loader())
         if not frame.empty:
             frame.to_csv(path, index_label="timestamp", compression="gzip")
@@ -210,7 +261,11 @@ class UpstoxBacktestData:
         if self._instrument_rows is not None:
             return self._instrument_rows
         path = self.root / "complete.json.gz"
-        if not path.exists() or (time.time() - path.stat().st_mtime) > 86400:
+        if not path.exists() or (
+            not self.cache_only and (time.time() - path.stat().st_mtime) > 86400
+        ):
+            if self.cache_only:
+                raise FileNotFoundError("Cached Upstox instrument master is missing")
             self.progress("Downloading the current Upstox instrument master")
             response = self.session.get(UPSTOX_INSTRUMENTS_URL, timeout=90)
             response.raise_for_status()
@@ -278,4 +333,3 @@ class UpstoxBacktestData:
         if text in {"day", "1day"}:
             return "days", 1
         raise ValueError(f"Unsupported candle interval: {interval}")
-

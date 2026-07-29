@@ -50,9 +50,105 @@ from counterfactual_replay import simulate_trade
 from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
 from signal_score import nifty_neutral_chain_direction, weighted_alignment_score
 from backtest_report import build_reports
+from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_completed_candles_excludes_still_forming_interval(self):
+        index = pd.DatetimeIndex(
+            ["2026-07-20 10:00:00+05:30", "2026-07-20 10:15:00+05:30"]
+        )
+        frame = pd.DataFrame(
+            [{"close": 100}, {"close": 101}],
+            index=index,
+        )
+        result = completed_candles(
+            frame,
+            15,
+            current_time=pd.Timestamp("2026-07-20 10:20:00+05:30"),
+            grace_seconds=5,
+        )
+        self.assertEqual(list(result["close"]), [100])
+
+    def test_watch_confirmation_requires_directional_breakout_body_and_close(self):
+        base = {"open": 104, "high": 105, "low": 99, "close": 100}
+        confirmation = {"open": 100, "high": 112, "low": 99, "close": 111}
+        result = candle_confirmation(base, confirmation, "BULLISH")
+        self.assertTrue(result["confirmed"])
+        self.assertIn("BULLISH_ENGULFING", result["patterns"])
+
+        weak = candle_confirmation(
+            base,
+            {"open": 104, "high": 108, "low": 100, "close": 105.2},
+            "BULLISH",
+        )
+        self.assertFalse(weak["confirmed"])
+
+    def test_live_watch_confirms_only_next_completed_fifteen_minute_candle(self):
+        candidate = {
+            "allowed": False,
+            "watch_eligible": True,
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "weighted": {"score": 70},
+            "option_summary": {
+                "chain_bias": "BULLISH",
+                "chain_confidence": "HIGH",
+            },
+            "technicals": {
+                "five_min": {"bias": "BULLISH"},
+                "fifteen_min": {
+                    "bias": "BULLISH",
+                    "candle_time": "2026-07-20T10:15:00+05:30",
+                    "open": 100,
+                    "high": 112,
+                    "low": 99,
+                    "close": 111,
+                },
+                "atm_option_flow": {
+                    "close": 110,
+                    "vwap": 100,
+                    "volume_ratio": 1.5,
+                },
+            },
+        }
+        watch = {
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "base_score": 70,
+            "started_at": "2026-07-20T10:15:05+05:30",
+            "base_candle": {
+                "candle_time": "2026-07-20T10:00:00+05:30",
+                "open": 104,
+                "high": 105,
+                "low": 99,
+                "close": 100,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(trade_bot, "WATCH_STATE_DIR", Path(temp_dir)),
+                patch.object(
+                    trade_bot,
+                    "now_ist",
+                    return_value=datetime.fromisoformat("2026-07-20T10:30:10+05:30"),
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "INDEX_WATCH_MODE_ENABLED": "true",
+                        "INDEX_WATCH_MODE_SHADOW_ONLY": "false",
+                    },
+                    clear=False,
+                ),
+            ):
+                trade_bot.write_watch_state("NIFTY", watch)
+                confirmed = trade_bot.process_watch("NIFTY", candidate)
+
+        self.assertTrue(confirmed["allowed"])
+        self.assertTrue(confirmed["watch_confirmed"])
+        self.assertEqual(confirmed["entry_minimum_score"], 65)
+
     def test_live_daily_first_outcome_guard_is_independent_by_index(self):
         today = datetime(2026, 7, 20, 10, 0)
         history = "\n".join([

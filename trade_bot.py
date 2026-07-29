@@ -28,6 +28,7 @@ from market_technicals import (
     get_technical_analysis,
     convert_index_levels_to_option_premium,
     get_option_volume_vwap_analysis,
+    candle_confirmation,
 )
 from live_trade_filters import (
     classify_market_regime,
@@ -97,6 +98,7 @@ TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 STOCK_SCANNER_STATUS_FILE = BASE_DIR / "data" / "stock_scanner_status.json"
 DAY_RISK_STATE_FILE = BASE_DIR / "data" / "day_risk_state.json"
 PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
+WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
@@ -167,6 +169,10 @@ def state_file(symbol):
 
 def reentry_guard_file(symbol):
     return BASE_DIR / f"reentry_guard_{symbol}.json"
+
+
+def watch_state_file(symbol):
+    return WATCH_STATE_DIR / f"{str(symbol).upper()}.json"
 
 
 def load_env():
@@ -522,6 +528,229 @@ def write_state(symbol, state):
 
 def clear_state(symbol):
     write_state(symbol, {})
+
+
+def read_watch_state(symbol):
+    return read_json(watch_state_file(symbol), {})
+
+
+def write_watch_state(symbol, state):
+    write_json(watch_state_file(symbol), state)
+
+
+def clear_watch_state(symbol):
+    path = watch_state_file(symbol)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def configured_clock(env_key, default):
+    raw = str(os.getenv(env_key, default)).strip()
+    try:
+        hour, minute = raw.split(":", 1)
+        return time(int(hour), int(minute))
+    except Exception as error:
+        raise RuntimeError(f"{env_key} must use HH:MM format") from error
+
+
+def watch_mode_enabled():
+    return configured_bool("INDEX_WATCH_MODE_ENABLED", False)
+
+
+def watch_mode_shadow_only():
+    return configured_bool("INDEX_WATCH_MODE_SHADOW_ONLY", True)
+
+
+def watch_minimum_score():
+    return configured_non_negative_float("INDEX_WATCH_MIN_SCORE", 65.0)
+
+
+def direct_entry_minimum_score(symbol):
+    return max(
+        float(MIN_SCORE_BY_SYMBOL.get(symbol, 65)),
+        configured_non_negative_float("INDEX_DIRECT_ENTRY_MIN_SCORE", 75.0),
+    )
+
+
+def option_flow_supports_watch(candidate):
+    flow = ((candidate.get("technicals") or {}).get("atm_option_flow") or {})
+    minimum_ratio = configured_non_negative_float(
+        "INDEX_WATCH_MIN_OPTION_VOLUME_RATIO", 1.20
+    )
+    close = to_float(flow.get("close"))
+    vwap = to_float(flow.get("vwap"))
+    volume_ratio = to_float(flow.get("volume_ratio"))
+    return {
+        "allowed": bool(
+            close > 0
+            and vwap > 0
+            and close > vwap
+            and volume_ratio >= minimum_ratio
+        ),
+        "close": close,
+        "vwap": vwap,
+        "volume_ratio": volume_ratio,
+        "minimum_volume_ratio": minimum_ratio,
+    }
+
+
+def start_watch(symbol, candidate):
+    now = now_ist()
+    if now.time() >= configured_clock("INDEX_WATCH_START_CUTOFF", "14:45"):
+        return False
+    fifteen = ((candidate.get("technicals") or {}).get("fifteen_min") or {})
+    required = ("candle_time", "open", "high", "low", "close")
+    if any(fifteen.get(key) is None for key in required):
+        return False
+    direction = str(candidate.get("direction") or "").upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        return False
+
+    existing = read_watch_state(symbol)
+    if (
+        existing.get("direction") == direction
+        and existing.get("base_candle", {}).get("candle_time") == fifteen.get("candle_time")
+    ):
+        return True
+
+    state = {
+        "symbol": symbol,
+        "direction": direction,
+        "base_score": round(candidate_weighted_score(candidate), 2),
+        "started_at": now.isoformat(),
+        "base_candle": {
+            key: fifteen.get(key)
+            for key in ("candle_time", "open", "high", "low", "close")
+        },
+        "chain_bias": (candidate.get("option_summary") or {}).get("chain_bias"),
+        "chain_confidence": (candidate.get("option_summary") or {}).get("chain_confidence"),
+        "shadow_only": watch_mode_shadow_only(),
+    }
+    write_watch_state(symbol, state)
+    log(
+        f"{symbol} WATCH_STARTED direction={direction} score={state['base_score']:.1f} "
+        f"base_candle={fifteen.get('candle_time')} shadow={state['shadow_only']}"
+    )
+    return True
+
+
+def expire_watch(symbol, reason):
+    if read_watch_state(symbol):
+        log(f"{symbol} WATCH_EXPIRED reason={reason}")
+    clear_watch_state(symbol)
+
+
+def process_watch(symbol, candidate):
+    """Return a fully revalidated candidate only after one completed 15M candle."""
+    state = read_watch_state(symbol)
+    if not state:
+        return None
+    if now_ist().time() >= configured_clock("INDEX_WATCH_ACTIVATION_CUTOFF", "15:00"):
+        expire_watch(symbol, "activation cutoff reached")
+        return None
+    if not candidate:
+        expire_watch(symbol, "signal no longer qualifies for watch band")
+        return None
+    if not candidate.get("watch_eligible"):
+        expire_watch(symbol, f"live safety gate failed: {candidate.get('reason')}")
+        return None
+
+    direction = str(candidate.get("direction") or "").upper()
+    if direction != state.get("direction"):
+        expire_watch(symbol, f"direction changed to {direction or 'NEUTRAL'}")
+        return None
+    score = candidate_weighted_score(candidate)
+    if score < watch_minimum_score():
+        expire_watch(symbol, f"score fell to {score:.1f}")
+        return None
+
+    fifteen = ((candidate.get("technicals") or {}).get("fifteen_min") or {})
+    current_time_text = fifteen.get("candle_time")
+    base_time_text = (state.get("base_candle") or {}).get("candle_time")
+    if not current_time_text or not base_time_text:
+        expire_watch(symbol, "completed 15M candle unavailable")
+        return None
+    current_time = datetime.fromisoformat(current_time_text)
+    base_time = datetime.fromisoformat(base_time_text)
+    if current_time <= base_time:
+        return None
+    if current_time > base_time + timedelta(minutes=15, seconds=30):
+        expire_watch(symbol, "one-candle confirmation window elapsed")
+        return None
+
+    option_summary = candidate.get("option_summary") or {}
+    chain_bias = str(option_summary.get("chain_bias") or "NEUTRAL").upper()
+    chain_confidence = str(option_summary.get("chain_confidence") or "LOW").upper()
+    if (
+        chain_confidence == "HIGH"
+        and chain_bias in {"BULLISH", "BEARISH"}
+        and chain_bias != direction
+    ):
+        expire_watch(symbol, "strong option-chain direction is opposite")
+        return None
+
+    technicals = candidate.get("technicals") or {}
+    five = technicals.get("five_min") or {}
+    if five.get("bias") != direction or fifteen.get("bias") != direction:
+        expire_watch(symbol, "5M and 15M are not both aligned")
+        return None
+
+    candle_result = candle_confirmation(
+        state.get("base_candle"),
+        fifteen,
+        direction,
+        min_body_ratio=configured_non_negative_float(
+            "INDEX_WATCH_MIN_BODY_RATIO", 0.55
+        ),
+        close_edge_fraction=configured_non_negative_float(
+            "INDEX_WATCH_CLOSE_EDGE_FRACTION", 0.25
+        ),
+    )
+    flow_result = option_flow_supports_watch(candidate)
+    if not candle_result.get("confirmed") or not flow_result.get("allowed"):
+        reasons = []
+        if not candle_result.get("confirmed"):
+            reasons.append(candle_result.get("reason"))
+        if not flow_result.get("allowed"):
+            reasons.append(
+                "option premium/VWAP/volume confirmation failed "
+                f"(close={flow_result['close']:.2f}, vwap={flow_result['vwap']:.2f}, "
+                f"volume_ratio={flow_result['volume_ratio']:.2f})"
+            )
+        expire_watch(symbol, "; ".join(reasons))
+        return None
+
+    log(
+        f"{symbol} WATCH_CONFIRMED direction={direction} score={score:.1f} "
+        f"body_ratio={candle_result.get('body_ratio')} "
+        f"volume_ratio={flow_result.get('volume_ratio'):.2f} "
+        f"patterns={candle_result.get('patterns')} shadow={watch_mode_shadow_only()}"
+    )
+    clear_watch_state(symbol)
+    if watch_mode_shadow_only():
+        record_analysis(
+            symbol,
+            candidate.get("option_summary") or {},
+            candidate.get("technicals") or {},
+            {
+                "execute_trade": False,
+                "decision": "WATCH_CONFIRMED_SHADOW",
+                "confidence": "MEDIUM",
+                "target_price": candidate.get("target_price"),
+                "stop_loss_price": candidate.get("stop_loss_price"),
+                "reason": "Watch confirmation passed in shadow-only mode.",
+            },
+        )
+        return None
+
+    confirmed = deepcopy(candidate)
+    confirmed["allowed"] = True
+    confirmed["watch_confirmed"] = True
+    confirmed["entry_minimum_score"] = watch_minimum_score()
+    confirmed["reason"] = "watch-mode completed candle confirmation passed"
+    return confirmed
 
 
 @contextmanager
@@ -2990,7 +3219,7 @@ def build_trade_candidate(
             }, None
 
     score_value = float(weighted.get("score") or 0)
-    minimum = MIN_SCORE_BY_SYMBOL.get(symbol, 65)
+    minimum = direct_entry_minimum_score(symbol)
     if option_summary.get("neutral_chain_override"):
         neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
         minimum = max(
@@ -2999,9 +3228,12 @@ def build_trade_candidate(
                 f"{symbol}_NEUTRAL_CHAIN_MIN_SCORE", neutral_default
             ),
         )
-    if weighted.get("grade") == "SKIP" or (
-        score_value < minimum
-    ):
+    watch_band = (
+        watch_mode_enabled()
+        and score_value >= watch_minimum_score()
+        and score_value < minimum
+    )
+    if (weighted.get("grade") == "SKIP" or score_value < minimum) and not watch_band:
         return {
             "allowed": False,
             "reason": f"weighted score {score_value:.1f} does not qualify",
@@ -3105,6 +3337,33 @@ def build_trade_candidate(
     )
     technicals["structural_invalidation"] = structural
 
+    if watch_band:
+        return {
+            "allowed": False,
+            "watch_eligible": True,
+            "reason": (
+                f"watch band score {score_value:.1f}; direct entry requires {minimum:.1f}"
+            ),
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "entry_price": entry_price,
+            "target_price": float(target),
+            "stop_loss_price": float(stop),
+            "target_percent": None,
+            "stop_percent": None,
+            "target_points": levels["target_points"],
+            "stop_points": levels["stop_points"],
+            "option_delta_used": levels["delta"],
+            "exit_profile": {},
+            "profit_protection_enabled_for_trade": True,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+            "entry_minimum_score": minimum,
+            "contract_selection_rank": option_quality.get("selection_rank", 0.0),
+            "structural_invalidation": structural,
+        }, None
+
     return {
         "allowed": True,
         "reason": (
@@ -3150,7 +3409,11 @@ def select_trade_candidate(candidates, allow_sell=True):
     )
 
 
-def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
+def evaluate_symbol_buy_or_sell(
+    symbol,
+    allow_option_sell=False,
+    include_rejected=False,
+):
     rec = get_index_recommendation(symbol)
     record_option_chain_snapshot(symbol, rec)
     direction = rec["direction"]
@@ -3286,6 +3549,14 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
                 contract_row=contract_row,
             )
             if candidate:
+                candidate.update(
+                    {
+                        "symbol": symbol,
+                        "direction": direction,
+                        "confidence": confidence,
+                        "signal_score": score,
+                    }
+                )
                 candidates.append(candidate)
                 verbose_log(
                     f"{symbol} BUY candidate: allowed={candidate.get('allowed')} "
@@ -3319,6 +3590,8 @@ def evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False):
         reject_score = candidate_weighted_score(best) if best else score
         log_scan_decision(symbol, reject_score, "reject")
         verbose_log(f"{symbol} no trade: BUY structure did not pass deterministic gates.")
+        if include_rejected and best:
+            return best
         return False
 
     qualified = [
@@ -3909,6 +4182,8 @@ def run_signal_check():
         log(f"Portfolio day circuit failed; no new entry for safety: {error}")
         return
     if not day_circuit.get("allowed"):
+        for symbol in SYMBOLS:
+            expire_watch(symbol, f"portfolio day circuit: {day_circuit.get('reason')}")
         log(f"Portfolio day circuit blocked all new entries: {day_circuit.get('reason')}")
         return
     if to_float(day_circuit.get("score_penalty")) > 0:
@@ -3923,6 +4198,8 @@ def run_signal_check():
         if read_state(symbol).get("instrument_key")
     }
     if active_index:
+        for symbol in SYMBOLS:
+            expire_watch(symbol, "an index-option position is already active")
         log("Index entry skipped: active " + "/".join(sorted(active_index)) + " position open")
         return
 
@@ -3976,13 +4253,35 @@ def run_signal_check():
             )
             continue
         if daily_block:
+            expire_watch(symbol, daily_block)
             log_scan_decision(symbol, "used", "reject")
             verbose_log(f"{symbol} no trade: {daily_block}")
             continue
         try:
-            candidate = evaluate_symbol_buy_or_sell(symbol, allow_option_sell=False)
-            if candidate:
+            candidate = evaluate_symbol_buy_or_sell(
+                symbol,
+                allow_option_sell=False,
+                include_rejected=watch_mode_enabled() or bool(read_watch_state(symbol)),
+            )
+            if candidate and candidate.get("allowed", True):
+                clear_watch_state(symbol)
                 qualified.append(candidate)
+                continue
+            if watch_mode_enabled():
+                had_watch = bool(read_watch_state(symbol))
+                watched = process_watch(symbol, candidate)
+                if watched:
+                    qualified.append(watched)
+                    continue
+                if (
+                    not had_watch
+                    and candidate
+                    and candidate.get("watch_eligible")
+                    and not read_watch_state(symbol)
+                ):
+                    start_watch(symbol, candidate)
+            elif read_watch_state(symbol):
+                expire_watch(symbol, "watch mode disabled")
         except Exception as e:
             log(f"{symbol} ERROR: {e}")
 

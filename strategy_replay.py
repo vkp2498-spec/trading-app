@@ -234,6 +234,42 @@ class StrategyReplay:
         self.enable_trailing_stop = (
             os.getenv("REPLAY_ENABLE_TRAILING_STOP", "true").lower() == "true"
         )
+        self.trail_stage_one_trigger = _float(
+            os.getenv("REPLAY_TRAIL_STAGE_ONE_TRIGGER"), 60.0
+        )
+        self.trail_stage_one_lock = _float(
+            os.getenv("REPLAY_TRAIL_STAGE_ONE_LOCK"), 20.0
+        )
+        self.trail_stage_two_trigger = _float(
+            os.getenv("REPLAY_TRAIL_STAGE_TWO_TRIGGER"), 70.0
+        )
+        self.trail_stage_two_lock = _float(
+            os.getenv("REPLAY_TRAIL_STAGE_TWO_LOCK"), 35.0
+        )
+        self.trail_runner_trigger = _float(
+            os.getenv("REPLAY_TRAIL_RUNNER_TRIGGER"), 80.0
+        )
+        self.trail_runner_lock = _float(
+            os.getenv("REPLAY_TRAIL_RUNNER_LOCK"), 55.0
+        )
+        self.daily_profit_target = max(
+            _float(os.getenv("REPLAY_DAILY_PROFIT_TARGET"), 0.0), 0.0
+        )
+        self.daily_max_loss = max(
+            _float(os.getenv("REPLAY_DAILY_MAX_LOSS"), 0.0), 0.0
+        )
+        self.max_consecutive_losses = max(
+            int(_float(os.getenv("REPLAY_MAX_CONSECUTIVE_LOSSES"), 0)), 0
+        )
+        if not (
+            0 <= self.trail_stage_one_lock < self.trail_stage_one_trigger
+            < self.trail_stage_two_trigger < self.trail_runner_trigger <= 100
+            and self.trail_stage_one_lock <= self.trail_stage_two_lock
+            < self.trail_stage_two_trigger
+            and self.trail_stage_two_lock <= self.trail_runner_lock
+            < self.trail_runner_trigger
+        ):
+            raise ValueError("Invalid replay staged-trailing thresholds")
         self.candles = {}
         self.contracts = {}
         self.expiries = {}
@@ -586,17 +622,23 @@ class StrategyReplay:
             "source": "POINT_IN_TIME_REPLAY",
         }
 
-    @staticmethod
-    def _trail(entry, target, current_stop, best, is_short):
+    def _trail(self, entry, target, current_stop, best, is_short):
         gap = entry - target if is_short else target - entry
-        progress = ((entry - best) if is_short else (best - entry)) / gap if gap > 0 else 0
-        candidates = []
-        if progress >= 0.25: candidates.append(entry * (1.01 if is_short else 0.99))
-        if progress >= 0.40: candidates.append(entry)
-        if progress >= 0.60: candidates.append(entry + (-gap if is_short else gap) * 0.30)
-        if progress >= 0.75: candidates.append(entry + (-gap if is_short else gap) * 0.50)
-        if progress >= 0.90: candidates.append(entry + (-gap if is_short else gap) * 0.70)
-        for candidate in candidates:
+        progress = (
+            ((entry - best) if is_short else (best - entry)) / gap * 100
+            if gap > 0
+            else 0
+        )
+        lock_percent = None
+        if progress >= self.trail_runner_trigger:
+            lock_percent = self.trail_runner_lock
+        elif progress >= self.trail_stage_two_trigger:
+            lock_percent = self.trail_stage_two_lock
+        elif progress >= self.trail_stage_one_trigger:
+            lock_percent = self.trail_stage_one_lock
+        if lock_percent is not None:
+            locked_move = gap * lock_percent / 100
+            candidate = entry - locked_move if is_short else entry + locked_move
             current_stop = min(current_stop, candidate) if is_short else max(current_stop, candidate)
         return current_stop
 
@@ -687,11 +729,16 @@ class StrategyReplay:
                 symbol: {"trades": 0, "halted": False}
                 for symbol in ("NIFTY", "BANKNIFTY")
             }
+            daily_realized_pnl = 0.0
+            daily_consecutive_losses = 0
+            daily_portfolio_halted = False
             times = pd.date_range(
                 pd.Timestamp.combine(day, MARKET_START).tz_localize(IST),
                 pd.Timestamp.combine(day, LAST_ENTRY).tz_localize(IST), freq="5min",
             )
             for timestamp in times:
+                if daily_portfolio_halted:
+                    break
                 if (
                     self.portfolio_mode == "live"
                     and not self.allow_simultaneous_index_positions
@@ -765,12 +812,34 @@ class StrategyReplay:
                     if not trade:
                         continue
                     self.trades.append(trade)
+                    realized_pnl = _float(trade.get("gross_pnl")) - _float(
+                        trade.get("estimated_costs")
+                    )
+                    daily_realized_pnl += realized_pnl
+                    daily_consecutive_losses = (
+                        daily_consecutive_losses + 1 if realized_pnl < 0 else 0
+                    )
+                    if (
+                        self.daily_profit_target > 0
+                        and daily_realized_pnl >= self.daily_profit_target
+                    ):
+                        daily_portfolio_halted = True
+                        self.coverage["daily_profit_halts"] += 1
+                    elif (
+                        self.daily_max_loss > 0
+                        and daily_realized_pnl <= -self.daily_max_loss
+                    ):
+                        daily_portfolio_halted = True
+                        self.coverage["daily_loss_halts"] += 1
+                    elif (
+                        self.max_consecutive_losses > 0
+                        and daily_consecutive_losses >= self.max_consecutive_losses
+                    ):
+                        daily_portfolio_halted = True
+                        self.coverage["consecutive_loss_halts"] += 1
                     if candidate.symbol in daily_index_policy:
                         policy = daily_index_policy[candidate.symbol]
                         policy["trades"] += 1
-                        realized_pnl = _float(trade.get("gross_pnl")) - _float(
-                            trade.get("estimated_costs")
-                        )
                         if self.stop_after_first_win and realized_pnl > 0:
                             policy["halted"] = True
                         elif self.stop_after_first_loss and realized_pnl < 0:

@@ -1,6 +1,7 @@
 import os
 import socket
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -15,6 +16,126 @@ INDEX_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
 }
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def completed_candles(df, interval_minutes, current_time=None, grace_seconds=5):
+    """Return only candles whose full interval has elapsed.
+
+    Upstox timestamps intraday candles at the interval start. Using the latest
+    row without this guard lets a still-forming candle influence entries.
+    """
+    if df is None or df.empty:
+        return df
+
+    now = pd.Timestamp(current_time or now_ist())
+    if now.tzinfo is None:
+        now = now.tz_localize(IST)
+    else:
+        now = now.tz_convert(IST)
+
+    index = pd.DatetimeIndex(df.index)
+    if index.tz is None:
+        index = index.tz_localize(IST)
+    else:
+        index = index.tz_convert(IST)
+
+    close_times = index + pd.Timedelta(minutes=float(interval_minutes))
+    close_times += pd.Timedelta(seconds=max(float(grace_seconds), 0))
+    result = df.loc[close_times <= now].copy()
+    result.index = index[close_times <= now]
+    return result
+
+
+def candle_confirmation(
+    base_candle,
+    confirmation_candle,
+    direction,
+    min_body_ratio=0.55,
+    close_edge_fraction=0.25,
+):
+    """Evaluate a completed breakout candle for a watched setup."""
+    direction = str(direction or "").upper()
+    base = base_candle or {}
+    candle = confirmation_candle or {}
+    required = ("open", "high", "low", "close")
+    if direction not in {"BULLISH", "BEARISH"}:
+        return {"confirmed": False, "reason": "watch direction is not directional"}
+    if any(candle.get(key) is None for key in required):
+        return {"confirmed": False, "reason": "confirmation candle OHLC is incomplete"}
+    if any(base.get(key) is None for key in required):
+        return {"confirmed": False, "reason": "watched candle OHLC is incomplete"}
+
+    open_price = float(candle["open"])
+    high = float(candle["high"])
+    low = float(candle["low"])
+    close = float(candle["close"])
+    base_open = float(base["open"])
+    base_high = float(base["high"])
+    base_low = float(base["low"])
+    base_close = float(base["close"])
+    candle_range = high - low
+    if candle_range <= 0:
+        return {"confirmed": False, "reason": "confirmation candle has no range"}
+
+    body = abs(close - open_price)
+    body_ratio = body / candle_range
+    close_location = (close - low) / candle_range
+    edge = min(max(float(close_edge_fraction), 0.0), 0.5)
+    bullish_engulfing = (
+        close > open_price
+        and base_close < base_open
+        and open_price <= base_close
+        and close >= base_open
+    )
+    bearish_engulfing = (
+        close < open_price
+        and base_close > base_open
+        and open_price >= base_close
+        and close <= base_open
+    )
+    lower_wick = min(open_price, close) - low
+    upper_wick = high - max(open_price, close)
+    hammer = close > open_price and lower_wick >= max(body * 2, candle_range * 0.35)
+    shooting_star = close < open_price and upper_wick >= max(body * 2, candle_range * 0.35)
+
+    if direction == "BULLISH":
+        breakout = close > base_high
+        directional_body = close > open_price
+        edge_close = close_location >= 1.0 - edge
+        patterns = [name for name, present in (
+            ("BULLISH_ENGULFING", bullish_engulfing),
+            ("HAMMER", hammer),
+        ) if present]
+    else:
+        breakout = close < base_low
+        directional_body = close < open_price
+        edge_close = close_location <= edge
+        patterns = [name for name, present in (
+            ("BEARISH_ENGULFING", bearish_engulfing),
+            ("SHOOTING_STAR", shooting_star),
+        ) if present]
+
+    blockers = []
+    if not breakout:
+        blockers.append("close did not break the watched candle")
+    if not directional_body:
+        blockers.append("candle body is opposite to the watch direction")
+    if body_ratio < float(min_body_ratio):
+        blockers.append(
+            f"body ratio {body_ratio:.2f} is below {float(min_body_ratio):.2f}"
+        )
+    if not edge_close:
+        blockers.append("close is not near the directional edge of the candle")
+
+    return {
+        "confirmed": not blockers,
+        "reason": "; ".join(blockers) if blockers else "completed candle confirmed breakout",
+        "body_ratio": round(body_ratio, 4),
+        "close_location": round(close_location, 4),
+        "breakout": bool(breakout),
+        "patterns": patterns,
+    }
 
 
 def upstox_headers():
@@ -118,6 +239,11 @@ def get_option_volume_vwap_analysis(instrument_key, side_label="OPTION"):
             )
             df_5 = merge_candles(df_5_historical, df_5_intraday)
 
+        df_5 = completed_candles(
+            df_5,
+            5,
+            grace_seconds=float(os.getenv("COMPLETED_CANDLE_GRACE_SECONDS", "5")),
+        )
         df_5 = add_indicators(df_5)
         valid = df_5.dropna(subset=["close"])
 
@@ -474,6 +600,7 @@ def analyze_latest(df, timeframe):
         "confidence": confidence,
         "score": score,
         "candle_time": last.name.isoformat(),
+        "open": round(float(last.get("open") or close), 2),
         "close": round(close, 2),
         "high": round(float(last.get("high") or close), 2),
         "low": round(float(last.get("low") or close), 2),
@@ -542,6 +669,11 @@ def get_technical_analysis(symbol):
         )
         df_5 = merge_candles(df_5_historical, df_5_intraday)
 
+    grace = float(os.getenv("COMPLETED_CANDLE_GRACE_SECONDS", "5"))
+    df_2h = completed_candles(df_2h, 120, grace_seconds=grace)
+    df_15 = completed_candles(df_15, 15, grace_seconds=grace)
+    df_5 = completed_candles(df_5, 5, grace_seconds=grace)
+
     return {
         "two_hour": analyze_latest(df_2h, "2H"),
         "fifteen_min": analyze_latest(df_15, "15M"),
@@ -586,6 +718,11 @@ def get_instrument_technical_analysis(instrument_key):
         offset="1h15min",
     )
     df_2h = merge_candles(df_2h_historical, df_2h_intraday)
+
+    grace = float(os.getenv("COMPLETED_CANDLE_GRACE_SECONDS", "5"))
+    df_2h = completed_candles(df_2h, 120, grace_seconds=grace)
+    df_15 = completed_candles(df_15, 15, grace_seconds=grace)
+    df_5 = completed_candles(df_5, 5, grace_seconds=grace)
 
     return {
         "two_hour": analyze_latest(df_2h, "2H"),
