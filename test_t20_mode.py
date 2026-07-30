@@ -1,0 +1,123 @@
+import unittest
+from unittest.mock import patch
+
+import trade_bot
+
+
+class T20ModeTests(unittest.TestCase):
+    def candidate(self, score=51.0):
+        return {
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "transaction_type": "BUY",
+            "entry_price": 100.0,
+            "instrument": {
+                "instrument_key": "NSE_FO|T20",
+                "trading_symbol": "NIFTY TEST CE",
+                "lot_size": 65,
+            },
+            "option_summary": {"bias": "BULLISH", "entry_price": 100.0},
+            "technicals": {
+                "option_market_quality": {"entry_allowed": True},
+            },
+            "weighted": {"score": score},
+        }
+
+    def test_t20_score_must_be_strictly_above_cutoff(self):
+        with patch.dict("os.environ", {"T20_MIN_SCORE": "50"}, clear=False):
+            rejected, reason = trade_bot.prepare_t20_candidate(
+                "NIFTY", self.candidate(50.0)
+            )
+            accepted, _ = trade_bot.prepare_t20_candidate(
+                "NIFTY", self.candidate(50.1)
+            )
+        self.assertIsNone(rejected)
+        self.assertIn("not above", reason)
+        self.assertEqual(accepted["strategy"], "T20")
+
+    def test_t20_keeps_option_market_quality_as_hard_gate(self):
+        candidate = self.candidate(80.0)
+        candidate["technicals"]["option_market_quality"]["entry_allowed"] = False
+        accepted, reason = trade_bot.prepare_t20_candidate("NIFTY", candidate)
+        self.assertIsNone(accepted)
+        self.assertIn("market quality", reason)
+
+    def test_t20_levels_use_fixed_premium_points(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "T20_NIFTY_TARGET_PREMIUM_POINTS": "10",
+                "T20_NIFTY_STOP_PREMIUM_POINTS": "10",
+                "T20_BANKNIFTY_TARGET_PREMIUM_POINTS": "20",
+                "T20_BANKNIFTY_STOP_PREMIUM_POINTS": "20",
+            },
+            clear=False,
+        ):
+            nifty = trade_bot.t20_premium_levels("NIFTY", 100.0, 65)
+            banknifty = trade_bot.t20_premium_levels("BANKNIFTY", 100.0, 30)
+        self.assertEqual(nifty["target_price"], 110.0)
+        self.assertEqual(nifty["stop_loss_price"], 90.0)
+        self.assertEqual(banknifty["target_price"], 120.0)
+        self.assertEqual(banknifty["stop_loss_price"], 80.0)
+
+    def test_mobile_quantity_is_rounded_down_to_remaining_t20_risk(self):
+        instrument = {"lot_size": 65}
+        with (
+            patch.object(trade_bot, "order_quantity_for", return_value=2600),
+            patch.object(trade_bot, "today_t20_realized_pnl", return_value=0.0),
+            patch.object(trade_bot, "active_t20_states", return_value=[]),
+            patch.object(trade_bot, "total_open_risk", return_value=0.0),
+            patch.dict("os.environ", {"T20_DAILY_MAX_LOSS": "10000"}, clear=False),
+        ):
+            quantity = trade_bot.t20_risk_adjusted_quantity(
+                "NIFTY", instrument, 100.0, 90.0
+            )
+        self.assertEqual(quantity, 975)
+        self.assertLessEqual((100.0 - 90.0) * quantity, 10000.0)
+
+    def test_exact_daily_loss_is_permitted_but_sixth_trade_is_not(self):
+        candidate = self.candidate(60.0)
+        common = [
+            patch.object(trade_bot, "monitor_health_gate", return_value={"allowed": True}),
+            patch.object(trade_bot, "broker_pending_order_gate", return_value={"allowed": True}),
+            patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
+            patch.object(trade_bot, "index_underlying_has_active_state", return_value=False),
+            patch.object(trade_bot, "today_t20_realized_pnl", return_value=-9000.0),
+            patch.object(trade_bot, "active_t20_states", return_value=[]),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(
+                trade_bot,
+                "aggregate_risk_decision",
+                return_value={"allowed": True, "reason": "accepted"},
+            ),
+        ]
+        with patch.dict(
+            "os.environ",
+            {
+                "T20_MAX_TRADES_PER_DAY": "5",
+                "T20_DAILY_MAX_LOSS": "10000",
+                "MAX_OPEN_PORTFOLIO_RISK": "20000",
+            },
+            clear=False,
+        ):
+            for item in common:
+                item.start()
+            try:
+                with patch.object(trade_bot, "t20_trade_count_today", return_value=4):
+                    allowed = trade_bot.pre_order_t20_decision(
+                        candidate, 100, 100.0, 90.0
+                    )
+                with patch.object(trade_bot, "t20_trade_count_today", return_value=5):
+                    blocked = trade_bot.pre_order_t20_decision(
+                        candidate, 100, 100.0, 90.0
+                    )
+            finally:
+                for item in reversed(common):
+                    item.stop()
+        self.assertTrue(allowed["allowed"])
+        self.assertFalse(blocked["allowed"])
+        self.assertIn("trade cap", blocked["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()

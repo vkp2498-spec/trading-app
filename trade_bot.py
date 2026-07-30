@@ -111,8 +111,10 @@ PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
+T20_STATE_BY_SYMBOL = {symbol: f"T20_{symbol}" for symbol in SYMBOLS}
+T20_STATE_SLOTS = list(T20_STATE_BY_SYMBOL.values())
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
-BOT_STATE_SLOTS = SYMBOLS + [STOCK_FUTURE_STATE]
+BOT_STATE_SLOTS = SYMBOLS + T20_STATE_SLOTS + [STOCK_FUTURE_STATE]
 
 # Used only when the corresponding environment variable is not set.
 DEFAULT_LOT_MULTIPLIERS = {
@@ -1125,6 +1127,23 @@ def active_bot_states():
     ]
 
 
+def underlying_symbol_for_state_slot(state_slot, state=None):
+    state = state or {}
+    underlying = str(state.get("underlying_symbol") or state.get("symbol") or "").upper()
+    if underlying in SYMBOLS:
+        return underlying
+    if state_slot in T20_STATE_SLOTS:
+        return state_slot.removeprefix("T20_")
+    return state_slot
+
+
+def index_underlying_has_active_state(symbol):
+    return any(
+        state_is_active(read_state(slot))
+        for slot in (symbol, T20_STATE_BY_SYMBOL[symbol])
+    )
+
+
 def today_closed_trade_rows():
     if not TRADE_HISTORY_FILE.exists():
         return []
@@ -1405,6 +1424,80 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
     }
 
 
+def pre_order_t20_decision(chosen, quantity, entry_price, stop_loss_price):
+    """Independent T20 limits plus the account-wide safety gates."""
+    health = monitor_health_gate()
+    if not health["allowed"]:
+        return {"allowed": False, "reason": health["reason"]}
+    reconciliation = broker_pending_order_gate()
+    if not reconciliation["allowed"]:
+        return {"allowed": False, "reason": reconciliation["reason"]}
+    circuit = portfolio_day_circuit()
+    if not circuit["allowed"]:
+        return {"allowed": False, "reason": circuit["reason"], "circuit": circuit}
+
+    symbol = str(chosen.get("symbol") or "").upper()
+    if symbol not in SYMBOLS:
+        return {"allowed": False, "reason": "T20 supports only NIFTY and BANKNIFTY"}
+    if index_underlying_has_active_state(symbol):
+        return {
+            "allowed": False,
+            "reason": f"{symbol} already has a managed index-option position",
+        }
+    if t20_trade_count_today() >= t20_max_trades_per_day():
+        return {
+            "allowed": False,
+            "reason": f"T20 daily trade cap {t20_max_trades_per_day()} reached",
+        }
+
+    proposed_risk = proposed_position_risk(
+        entry_price,
+        stop_loss_price,
+        quantity,
+        chosen.get("transaction_type", "BUY"),
+    )
+    open_t20_risk = total_open_risk(active_t20_states())
+    worst_case_pnl = today_t20_realized_pnl() - open_t20_risk - proposed_risk
+    if worst_case_pnl < -abs(t20_daily_max_loss()):
+        return {
+            "allowed": False,
+            "reason": (
+                "T20 projected stop-cycle loss would breach the daily limit: "
+                f"worst_case=Rs {worst_case_pnl:.2f}, "
+                f"limit=-Rs {t20_daily_max_loss():.2f}"
+            ),
+        }
+
+    states = active_bot_states()
+    open_risk_fallback = configured_non_negative_float("MAX_OPEN_PORTFOLIO_RISK", 0.0)
+    risk = aggregate_risk_decision(
+        states,
+        entry_price,
+        stop_loss_price,
+        quantity,
+        chosen.get("transaction_type", "BUY"),
+        to_float(
+            active_value("maxOpenPortfolioRisk", open_risk_fallback),
+            open_risk_fallback,
+        ),
+        configured_non_negative_float("PORTFOLIO_RISK_BUFFER_PERCENT", 15.0),
+    )
+    if not risk["allowed"]:
+        return {"allowed": False, "reason": risk["reason"], "risk": risk}
+
+    return {
+        "allowed": True,
+        "reason": "T20 entry accepted",
+        "risk": risk,
+        "correlation": {
+            "allowed": True,
+            "reason": "T20 NIFTY and BANKNIFTY lanes are independently enabled",
+        },
+        "proposed_risk": proposed_risk,
+        "worst_case_pnl": worst_case_pnl,
+    }
+
+
 def daily_profit_target():
     fallback = to_float(os.getenv("DAILY_PROFIT_TARGET"), 10000)
     return to_float(active_value("dailyProfitTarget", fallback), fallback)
@@ -1505,6 +1598,96 @@ def index_trade_count_today():
     return sum(trade_count_for(symbol) for symbol in SYMBOLS)
 
 
+def t20_enabled():
+    return configured_bool("ENABLE_T20_MODE", False)
+
+
+def t20_minimum_score():
+    return configured_non_negative_float("T20_MIN_SCORE", 50.0)
+
+
+def t20_max_trades_per_day():
+    return max(to_int(os.getenv("T20_MAX_TRADES_PER_DAY"), 5), 0)
+
+
+def t20_target_premium_points(symbol):
+    default = 10.0 if symbol == "NIFTY" else 20.0
+    return configured_positive_float(
+        f"T20_{symbol}_TARGET_PREMIUM_POINTS",
+        default,
+    )
+
+
+def t20_stop_premium_points(symbol):
+    default = 10.0 if symbol == "NIFTY" else 20.0
+    return configured_positive_float(
+        f"T20_{symbol}_STOP_PREMIUM_POINTS",
+        default,
+    )
+
+
+def t20_daily_max_loss():
+    return configured_positive_float("T20_DAILY_MAX_LOSS", 10000.0)
+
+
+def t20_trade_count_today():
+    return sum(trade_count_for(slot) for slot in T20_STATE_SLOTS)
+
+
+def today_t20_trade_rows():
+    return [
+        row
+        for row in today_closed_trade_rows()
+        if str(row.get("strategy") or "").upper() == "T20"
+    ]
+
+
+def today_t20_realized_pnl():
+    return round(sum(to_float(row.get("gross_pnl")) for row in today_t20_trade_rows()), 2)
+
+
+def active_t20_states():
+    return [
+        state
+        for state in (read_state(slot) for slot in T20_STATE_SLOTS)
+        if state_is_active(state)
+    ]
+
+
+def t20_premium_levels(symbol, entry_price, quantity=None):
+    entry_price = float(entry_price)
+    return {
+        "target_price": round(entry_price + t20_target_premium_points(symbol), 2),
+        "stop_loss_price": round(
+            max(entry_price - t20_stop_premium_points(symbol), 0.05),
+            2,
+        ),
+    }
+
+
+def t20_risk_adjusted_quantity(symbol, instrument, entry_price, stop_loss_price):
+    """Use the mobile allocation as a ceiling, then fit the T20 day-loss budget."""
+    configured_quantity = order_quantity_for(
+        symbol,
+        instrument,
+        entry_price,
+        stop_loss_price,
+        transaction_type="BUY",
+    )
+    lot_size = max(int(instrument.get("lot_size") or 0), 1)
+    per_unit_risk = max(float(entry_price) - float(stop_loss_price), 0.0)
+    open_risk = total_open_risk(active_t20_states())
+    remaining_loss_capacity = max(
+        t20_daily_max_loss() + today_t20_realized_pnl() - open_risk,
+        0.0,
+    )
+    if configured_quantity <= 0 or per_unit_risk <= 0 or remaining_loss_capacity <= 0:
+        return 0
+    risk_quantity = int(remaining_loss_capacity // per_unit_risk)
+    risk_quantity = (risk_quantity // lot_size) * lot_size
+    return max(min(configured_quantity, risk_quantity), 0)
+
+
 def max_index_trades_per_day():
     return max(to_int(os.getenv("MAX_INDEX_TRADES_PER_DAY"), 2), 0)
 
@@ -1548,6 +1731,8 @@ def today_index_trade_rows():
                 if str(row.get("symbol") or "").upper() not in SYMBOLS:
                     continue
                 if str(row.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
+                    continue
+                if str(row.get("strategy") or "").upper() == "T20":
                     continue
                 rows.append(row)
     except Exception as error:
@@ -2329,7 +2514,12 @@ def save_open_position_state(
                 transaction_type=entry_transaction_type,
             )
         else:
-            precision = 2 if instrument_class == "STOCK_FUTURE" else 0
+            precision = (
+                2
+                if instrument_class == "STOCK_FUTURE"
+                or str((trade_metadata or {}).get("strategy") or "").upper() == "T20"
+                else 0
+            )
             target_price = round(float(target_price), precision)
             stop_loss_price = round(float(stop_loss_price), precision)
 
@@ -2431,8 +2621,9 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
         state["broker_day_pnl_at_exit"] = ""
         log(f"{symbol} broker P&L snapshot unavailable at exit: {error}")
     journal_row = record_closed_trade(state, exit_price, exit_reason)
-    register_losing_exit_guard(symbol, state, journal_row, exit_reason)
-    register_same_index_reset_guard(symbol, state, journal_row, exit_reason)
+    if str(state.get("strategy") or "").upper() != "T20":
+        register_losing_exit_guard(symbol, state, journal_row, exit_reason)
+        register_same_index_reset_guard(symbol, state, journal_row, exit_reason)
     send_apple_closed_trade_alert(journal_row)
     log(
         f"{symbol} bought {journal_row.get('entry_price')} closed {journal_row.get('exit_price')} "
@@ -2704,6 +2895,7 @@ def handle_existing_state(symbol, state, verbose=True):
     if not instrument_key:
         return False
 
+    underlying_symbol = underlying_symbol_for_state_slot(symbol, state)
     entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
     exit_transaction = "BUY" if entry_transaction == "SELL" else "SELL"
     order_product = state.get("order_product") or "I"
@@ -2789,10 +2981,16 @@ def handle_existing_state(symbol, state, verbose=True):
         if sentiment_check_due(state):
             state["last_sentiment_check_at"] = now_ist().isoformat()
             write_state(symbol, state)
-            sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(symbol, state, ltp)
+            sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(
+                underlying_symbol,
+                state,
+                ltp,
+            )
         thesis_exit_reason = None
         thesis_exit_detail = ""
-        underlying_key = state.get("underlying_instrument_key") or UNDERLYING_INDEX_KEYS.get(symbol)
+        underlying_key = state.get("underlying_instrument_key") or UNDERLYING_INDEX_KEYS.get(
+            underlying_symbol
+        )
         if state.get("instrument_class") == "INDEX_OPTION" and underlying_key:
             underlying_quote = read_market_cache(underlying_key) or {}
             quote_age = time_module.time() - to_float(underlying_quote.get("received_at"), 0)
@@ -2905,6 +3103,41 @@ def handle_existing_state(symbol, state, verbose=True):
                 "lot_size": int(state.get("lot_size") or quantity),
             }
             instrument_class = state.get("instrument_class", "INDEX_OPTION")
+            if str(state.get("strategy") or "").upper() == "T20":
+                finalize_t20_open_position(
+                    symbol,
+                    state,
+                    entry_price,
+                    quantity,
+                    instrument,
+                    entry_order_id,
+                )
+                if needs_broker_stop:
+                    try:
+                        ensure_protective_stop(symbol, read_state(symbol))
+                    except Exception as error:
+                        log(
+                            f"{symbol} CRITICAL: delayed T20 fill has no broker stop; "
+                            f"flattening: {error}"
+                        )
+                        result, payload = place_market_order(
+                            instrument,
+                            exit_transaction,
+                            quantity,
+                            product=order_product,
+                        )
+                        exit_order_id = result.get("data", {}).get("order_id")
+                        exit_details = wait_for_order_complete(exit_order_id) if exit_order_id else {}
+                        complete_exit(
+                            symbol,
+                            read_state(symbol),
+                            exit_details,
+                            entry_price,
+                            "PROTECTION_FAILURE",
+                            result,
+                            payload,
+                        )
+                return True
             save_open_position_state(
                 symbol, entry_order_id, instrument, state.get("direction"),
                 state.get("confidence"), state.get("score"), entry_price, quantity,
@@ -3815,6 +4048,233 @@ def select_trade_candidate(candidates, allow_sell=True):
         ),
         default=None,
     )
+
+
+def prepare_t20_candidate(symbol, candidate):
+    """Promote a directional score above the T20 cutoff without bypassing liquidity."""
+    if not candidate or not isinstance(candidate, dict):
+        return None, "no directional candidate"
+    score = candidate_weighted_score(candidate)
+    if score <= t20_minimum_score():
+        return None, f"score {score:.1f} is not above {t20_minimum_score():.1f}"
+    direction = str(
+        candidate.get("direction")
+        or (candidate.get("option_summary") or {}).get("bias")
+        or ""
+    ).upper()
+    if direction not in {"BULLISH", "BEARISH"}:
+        return None, "direction is unavailable"
+    quality = ((candidate.get("technicals") or {}).get("option_market_quality") or {})
+    if not quality.get("entry_allowed", False):
+        return None, "option market quality did not pass"
+    instrument = candidate.get("instrument") or {}
+    entry_price = to_float(
+        candidate.get("entry_price"),
+        to_float((candidate.get("option_summary") or {}).get("entry_price")),
+    )
+    if not instrument.get("instrument_key") or entry_price <= 0:
+        return None, "executable option contract or premium is unavailable"
+    prepared = dict(candidate)
+    prepared.update(
+        {
+            "symbol": symbol,
+            "direction": direction,
+            "confidence": candidate.get("confidence") or "MEDIUM",
+            "signal_score": candidate.get("signal_score", score),
+            "transaction_type": "BUY",
+            "entry_price": entry_price,
+            "strategy": "T20",
+        }
+    )
+    return prepared, "qualified"
+
+
+def finalize_t20_open_position(
+    state_slot,
+    initial_state,
+    fill,
+    quantity,
+    instrument,
+    order_id,
+):
+    underlying = underlying_symbol_for_state_slot(state_slot, initial_state)
+    levels = t20_premium_levels(underlying, fill, quantity)
+    metadata = {
+        "symbol": underlying,
+        "underlying_symbol": underlying,
+        "state_slot": state_slot,
+        "strategy": "T20",
+        "weighted_score": to_float(initial_state.get("weighted_score")),
+        "t20_target_premium_points": t20_target_premium_points(underlying),
+        "t20_stop_premium_points": t20_stop_premium_points(underlying),
+        "technical_context": initial_state.get("technical_context", {}),
+        "option_type": initial_state.get("option_type"),
+        "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(underlying),
+    }
+    save_open_position_state(
+        state_slot,
+        order_id,
+        instrument,
+        initial_state.get("direction"),
+        initial_state.get("confidence", "MEDIUM"),
+        initial_state.get("score"),
+        fill,
+        quantity,
+        levels["target_price"],
+        levels["stop_loss_price"],
+        entry_transaction_type="BUY",
+        instrument_class="INDEX_OPTION",
+        underlying_symbol=underlying,
+        profit_protection_enabled_for_trade=True,
+        trade_metadata=metadata,
+        order_product=initial_state.get("order_product") or "I",
+    )
+    state = read_state(state_slot)
+    state.update(
+        {
+            "target_price": levels["target_price"],
+            "planned_target_price": levels["target_price"],
+            "stop_loss_price": levels["stop_loss_price"],
+            "original_stop_loss_price": levels["stop_loss_price"],
+            "profit_booking_percent": profit_booking_target_percent(),
+            "profit_protection_enabled_for_trade": True,
+        }
+    )
+    if profit_booking_mode() == "runner":
+        progress = profit_booking_target_percent() / 100.0
+        state["runner_activation_price"] = round(
+            float(fill) + (levels["target_price"] - float(fill)) * progress,
+            2,
+        )
+    state["profit_booking_price"] = profit_booking_price(state)
+    write_state(state_slot, state)
+    return state
+
+
+def execute_t20_candidate(chosen):
+    symbol = chosen["symbol"]
+    state_slot = T20_STATE_BY_SYMBOL[symbol]
+    instrument = chosen["instrument"]
+    expected_entry = to_float(chosen.get("entry_price"))
+    levels = t20_premium_levels(symbol, expected_entry)
+    quantity = t20_risk_adjusted_quantity(
+        symbol,
+        instrument,
+        expected_entry,
+        levels["stop_loss_price"],
+    )
+    if quantity <= 0:
+        log(
+            f"T20 {symbol} rejected: active mobile allocation/risk budget cannot "
+            "fund one whole lot"
+        )
+        return False
+    score = candidate_weighted_score(chosen)
+    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    verbose_log(
+        f"T20 {symbol} selected: {instrument.get('trading_symbol')} score={score:.1f} "
+        f"qty={quantity} expected_entry={expected_entry:.2f} "
+        f"target={t20_target_premium_points(symbol):.2f} premium points "
+        f"stop={t20_stop_premium_points(symbol):.2f} premium points "
+        f"live={live}"
+    )
+    write_stream_instruments(
+        [
+            "NSE_INDEX|Nifty 50",
+            "NSE_INDEX|Nifty Bank",
+            "NSE_INDEX|India VIX",
+            instrument.get("instrument_key"),
+        ]
+    )
+    with portfolio_entry_lock():
+        decision = pre_order_t20_decision(
+            chosen,
+            quantity,
+            expected_entry,
+            levels["stop_loss_price"],
+        )
+        if not decision.get("allowed"):
+            verbose_log(f"T20 {symbol} rejected by safety gate: {decision.get('reason')}")
+            return False
+        if not live:
+            log(
+                f"T20 {symbol} DRY RUN: would buy qty={quantity} at approximately "
+                f"{expected_entry:.2f} using the active mobile allocation"
+            )
+            return True
+        result, payload = place_market_order(instrument, "BUY", quantity)
+        order_id = result.get("data", {}).get("order_id")
+        if not order_id:
+            raise RuntimeError(f"T20 {symbol} BUY returned no order_id: {result}")
+        pending_state = {
+            "date": now_ist().strftime("%Y-%m-%d"),
+            "symbol": symbol,
+            "underlying_symbol": symbol,
+            "state_slot": state_slot,
+            "strategy": "T20",
+            "entry_order_id": order_id,
+            "entry_transaction_type": "BUY",
+            "exit_transaction_type": "SELL",
+            "instrument_class": "INDEX_OPTION",
+            "order_product": "I",
+            "instrument_key": instrument["instrument_key"],
+            "trading_symbol": instrument["trading_symbol"],
+            "quantity": quantity,
+            "lot_size": int(instrument.get("lot_size") or quantity),
+            "entry_price": expected_entry,
+            "target_price": levels["target_price"],
+            "stop_loss_price": levels["stop_loss_price"],
+            "direction": chosen["direction"],
+            "confidence": chosen.get("confidence", "MEDIUM"),
+            "score": chosen.get("signal_score", score),
+            "weighted_score": score,
+            "option_type": (chosen.get("option_summary") or {}).get("option_type"),
+            "technical_context": chosen.get("technicals", {}),
+            "profit_protection_enabled_for_trade": True,
+            "t20_target_premium_points": t20_target_premium_points(symbol),
+            "t20_stop_premium_points": t20_stop_premium_points(symbol),
+            "status": "BUY_PLACED_NOT_COMPLETE",
+            "created_at": now_ist().isoformat(),
+        }
+        write_state(state_slot, pending_state)
+    verbose_log(f"T20 {symbol} MARKET BUY placed: order_id={order_id} payload={payload}")
+    details = wait_for_order_complete(order_id)
+    if order_is_rejected(details):
+        clear_state(state_slot)
+        verbose_log(f"T20 {symbol} MARKET BUY rejected: {details}")
+        return False
+
+    increment_trade_count(state_slot)
+    if not order_is_complete(details):
+        return True
+    position = find_matching_position_for_side(instrument["instrument_key"], "BUY")
+    fill = position_avg_price(position, "BUY") if position else None
+    fill = fill or to_float(details.get("average_price")) or expected_entry
+    state = finalize_t20_open_position(
+        state_slot,
+        pending_state,
+        fill,
+        quantity,
+        instrument,
+        order_id,
+    )
+    try:
+        ensure_protective_stop(state_slot, state)
+    except Exception as error:
+        log(f"T20 {symbol} CRITICAL: protective stop failed; flattening: {error}")
+        emergency, emergency_payload = place_market_order(instrument, "SELL", quantity)
+        emergency_id = emergency.get("data", {}).get("order_id")
+        emergency_details = wait_for_order_complete(emergency_id) if emergency_id else {}
+        complete_exit(
+            state_slot,
+            read_state(state_slot),
+            emergency_details,
+            fill,
+            "PROTECTION_FAILURE",
+            emergency,
+            emergency_payload,
+        )
+    return True
 
 
 def evaluate_symbol_buy_or_sell(
@@ -4735,13 +5195,13 @@ def run_signal_check():
         log("Outside trading window. No action.")
         return
 
-    for symbol in BOT_STATE_SLOTS:
-        state = read_state(symbol)
+    for state_slot in BOT_STATE_SLOTS:
+        state = read_state(state_slot)
         if state:
             try:
-                handle_existing_state(symbol, state)
+                handle_existing_state(state_slot, state)
             except Exception as error:
-                log(f"{symbol} existing-position check ERROR: {error}")
+                log(f"{state_slot} existing-position check ERROR: {error}")
 
     try:
         day_circuit = portfolio_day_circuit()
@@ -4759,44 +5219,47 @@ def run_signal_check():
             f"{day_circuit['score_penalty']:.1f} points"
         )
 
-    active_index = {
-        symbol
-        for symbol in SYMBOLS
-        if read_state(symbol).get("instrument_key")
+    active_selective_index = {
+        symbol for symbol in SYMBOLS if state_is_active(read_state(symbol))
     }
-    if active_index:
+    if active_selective_index:
         for symbol in SYMBOLS:
-            expire_watch(symbol, "an index-option position is already active")
-        log("Index entry skipped: active " + "/".join(sorted(active_index)) + " position open")
-        return
+            expire_watch(symbol, "a selective index-option position is already active")
+        verbose_log(
+            "Selective index lane occupied by "
+            + "/".join(sorted(active_selective_index))
+            + "; T20 fallback is paused until that position closes"
+        )
 
     try:
         tracked_instrument_keys = {
-            read_state(symbol).get("instrument_key")
-            for symbol in BOT_STATE_SLOTS
-            if read_state(symbol).get("instrument_key")
+            read_state(state_slot).get("instrument_key")
+            for state_slot in BOT_STATE_SLOTS
+            if read_state(state_slot).get("instrument_key")
         }
         untracked_derivative_positions = [
             position
             for position in get_open_positions()
             if position_quantity(position) != 0
-            and (position.get("instrument_token") or position.get("instrument_key")) not in tracked_instrument_keys
+            and (position.get("instrument_token") or position.get("instrument_key"))
+            not in tracked_instrument_keys
             and (
-                str(position.get("exchange") or position.get("segment") or "").upper() in {"NSE_FO", "NFO"}
-                or str(position.get("instrument_token") or position.get("instrument_key") or "").startswith("NSE_FO|")
+                str(position.get("exchange") or position.get("segment") or "").upper()
+                in {"NSE_FO", "NFO"}
+                or str(
+                    position.get("instrument_token")
+                    or position.get("instrument_key")
+                    or ""
+                ).startswith("NSE_FO|")
             )
         ]
         if untracked_derivative_positions:
-            allow_manual_overlap = (
-                os.getenv(
-                    "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS", "false"
-                ).lower()
-                == "true"
+            allow_manual_overlap = configured_bool(
+                "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS", False
             )
             if not allow_manual_overlap:
                 log(
-                    "An untracked NSE derivatives position "
-                    "exists; no bot entry. Set "
+                    "An untracked NSE derivatives position exists; no bot entry. Set "
                     "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true only when "
                     "manual positions are intentionally allowed to coexist."
                 )
@@ -4810,31 +5273,44 @@ def run_signal_check():
         return
 
     qualified = []
+    candidates_by_symbol = {}
     for symbol in SYMBOLS:
+        if index_underlying_has_active_state(symbol):
+            verbose_log(f"{symbol} scan skipped: a managed position is already active")
+            continue
         try:
             daily_block = daily_index_entry_block_reason(symbol)
         except Exception as error:
+            daily_block = "daily guard unavailable"
             log(
                 f"{symbol} daily first-outcome guard could not read trade history; "
-                f"no new entry for safety: {error}"
+                f"selective entry disabled for safety: {error}"
             )
-            continue
         if daily_block:
             expire_watch(symbol, daily_block)
-            log_scan_decision(symbol, "used", "reject")
-            verbose_log(f"{symbol} no trade: {daily_block}")
-            continue
+            verbose_log(f"{symbol} no selective trade: {daily_block}")
+
         try:
             candidate = evaluate_symbol_buy_or_sell(
                 symbol,
                 allow_option_sell=False,
-                include_rejected=watch_mode_enabled() or bool(read_watch_state(symbol)),
+                include_rejected=(
+                    t20_enabled()
+                    or watch_mode_enabled()
+                    or bool(read_watch_state(symbol))
+                ),
             )
-            if candidate and candidate.get("allowed", True):
+            candidates_by_symbol[symbol] = candidate
+            if (
+                not active_selective_index
+                and not daily_block
+                and candidate
+                and candidate.get("allowed", True)
+            ):
                 clear_watch_state(symbol)
                 qualified.append(candidate)
                 continue
-            if watch_mode_enabled():
+            if not active_selective_index and not daily_block and watch_mode_enabled():
                 had_watch = bool(read_watch_state(symbol))
                 watched = process_watch(symbol, candidate)
                 if watched:
@@ -4848,17 +5324,17 @@ def run_signal_check():
                 ):
                     start_watch(symbol, candidate)
             elif read_watch_state(symbol):
-                expire_watch(symbol, "watch mode disabled")
-        except Exception as e:
-            log(f"{symbol} ERROR: {e}")
+                expire_watch(symbol, "watch mode disabled or selective lane occupied")
+        except Exception as error:
+            log(f"{symbol} ERROR: {error}")
 
     if not qualified:
-        verbose_log("No new qualified NIFTY or BANKNIFTY BUY structure.")
+        verbose_log("No new qualified NIFTY or BANKNIFTY selective BUY structure.")
     else:
         ordered = sorted(
             qualified,
             key=lambda item: (
-                float(item.get("weighted", {}).get("score") or 0),
+                candidate_weighted_score(item),
                 1 if item.get("transaction_type") == "BUY" else 0,
             ),
             reverse=True,
@@ -4869,6 +5345,33 @@ def run_signal_check():
             execute_selected_candidate(chosen)
         except Exception as error:
             log(f"{chosen['symbol']} order execution ERROR: {error}")
+
+    if not t20_enabled():
+        return
+    if qualified:
+        verbose_log("T20 fallback skipped: a selective setup qualified on this scan")
+        return
+    if active_selective_index:
+        verbose_log("T20 fallback skipped: a selective index position is already active")
+        return
+    if t20_trade_count_today() >= t20_max_trades_per_day():
+        verbose_log(f"T20 lane stopped: daily trade cap {t20_max_trades_per_day()} reached")
+        return
+
+    # With no selective setup or position, NIFTY and BANKNIFTY are independent
+    # T20 candidates and may coexist when both pass the score and safety gates.
+    for symbol in SYMBOLS:
+        if index_underlying_has_active_state(symbol):
+            continue
+        candidate, reason = prepare_t20_candidate(symbol, candidates_by_symbol.get(symbol))
+        if not candidate:
+            verbose_log(f"T20 {symbol} reject: {reason}")
+            continue
+        try:
+            if execute_t20_candidate(candidate):
+                log_scan_decision(symbol, candidate_weighted_score(candidate), "t20_buy")
+        except Exception as error:
+            log(f"T20 {symbol} order execution ERROR: {error}")
 
 
 

@@ -3,6 +3,7 @@ COLUMNS = [
     "symbol",
     "underlying_symbol",
     "instrument_class",
+    "strategy",
     "trading_symbol",
     "direction",
     "transaction_type",
