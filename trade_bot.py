@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - Windows development fallback
     fcntl = None
 
 from analysis_journal import record_analysis
+from scan_journal import record_scan_decision
 from banknifty_breadth import get_banknifty_breadth
 from nifty_breadth import get_nifty_breadth
 from institutional_flow import (
@@ -232,6 +233,10 @@ def format_score(value):
 
 def log_scan_decision(symbol, score, action):
     log(f"{symbol} score {format_score(score)} {action}")
+    try:
+        record_scan_decision(symbol, score, action)
+    except Exception as error:
+        verbose_log(f"{symbol} scan journal write failed: {error}")
 
 
 def to_float(value, default=0.0):

@@ -25,6 +25,13 @@ from post_market_review import (
     enrich_replay_decisions,
     summarize,
 )
+from post_market_score_audit import (
+    SCORE_BUCKETS,
+    STATUS_FILE as SCORE_AUDIT_STATUS_FILE,
+    build_bucket_summary as build_score_bucket_summary,
+    build_reason_summary as build_score_reason_summary,
+    read_audit as read_score_audit,
+)
 from strategy_core import now_ist
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
@@ -719,6 +726,162 @@ def load_env():
             continue
         key, value = line.split("=", 1)
         os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+
+def render_score_followthrough_review():
+    st.markdown("### Score Follow-Through")
+    st.caption(
+        "One non-overlapping observation per index every 15 minutes. Movement is measured "
+        "from the scan minute through the following 15 minutes; it is research evidence, "
+        "not an automatic reason to loosen live gates."
+    )
+
+    audit = read_score_audit()
+    status = read_backtest_json(SCORE_AUDIT_STATUS_FILE, {})
+    if audit.empty:
+        st.info(
+            "No evening score audit is available yet. The first completed trading-day run "
+            "will create it automatically."
+        )
+        if status:
+            st.caption(f"Last audit: {status.get('status', 'UNKNOWN')} | {status.get('message', '')}")
+        return
+
+    audit = audit.copy()
+    audit["trading_date_dt"] = pd.to_datetime(audit["trading_date"], errors="coerce")
+    audit = audit.dropna(subset=["trading_date_dt"])
+    minimum_date = audit["trading_date_dt"].min().date()
+    maximum_date = audit["trading_date_dt"].max().date()
+
+    f1, f2, f3 = st.columns([1.2, 1.2, 1])
+    start_date = f1.date_input(
+        "From date",
+        value=max(minimum_date, maximum_date - pd.Timedelta(days=30)),
+        min_value=minimum_date,
+        max_value=maximum_date,
+        key="score_audit_start_date",
+    )
+    end_date = f2.date_input(
+        "To date",
+        value=maximum_date,
+        min_value=minimum_date,
+        max_value=maximum_date,
+        key="score_audit_end_date",
+    )
+    minimum_samples = f3.number_input(
+        "Usable sample size",
+        min_value=5,
+        max_value=100,
+        value=20,
+        step=5,
+        key="score_audit_minimum_samples",
+    )
+
+    if start_date > end_date:
+        st.warning("From date must be before or equal to To date.")
+        return
+
+    filtered = audit[
+        audit["trading_date_dt"].dt.date.between(start_date, end_date)
+    ].copy()
+    directional = filtered[filtered["direction"].isin(["BULLISH", "BEARISH"])]
+    high_score = directional[pd.to_numeric(directional["score"], errors="coerce") >= 75]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Observations", len(filtered))
+    c2.metric("Trading Days", filtered["trading_date"].nunique())
+    c3.metric(
+        "75+ Avg Favorable",
+        f"{pd.to_numeric(high_score.get('favorable_points'), errors='coerce').mean():.1f} pts"
+        if not high_score.empty
+        else "N/A",
+    )
+    direction_values = high_score.get("direction_correct", pd.Series(dtype=object))
+    direction_rate = direction_values.astype(str).str.lower().map({"true": 1, "false": 0}).mean()
+    c4.metric(
+        "75+ Direction Right",
+        f"{direction_rate * 100:.1f}%" if pd.notna(direction_rate) else "N/A",
+    )
+
+    summary = build_score_bucket_summary(filtered, minimum_samples=minimum_samples)
+    if summary.empty:
+        st.info("No observations match this date range.")
+        return
+
+    metrics = [
+        "samples",
+        "avg_up_points",
+        "avg_down_points",
+        "avg_favorable_points",
+        "avg_adverse_points",
+        "direction_accuracy",
+        "evidence",
+    ]
+    wide = summary.pivot(index="score_bucket", columns="symbol", values=metrics)
+    wide = wide.reindex(SCORE_BUCKETS)
+    wide.columns = [f"{symbol} {metric.replace('_', ' ').title()}" for metric, symbol in wide.columns]
+    wide = wide.reset_index().rename(columns={"score_bucket": "Score Bucket"})
+    numeric_columns = [
+        column
+        for column in wide.columns
+        if any(term in column for term in ("Avg ", "Accuracy"))
+    ]
+    for column in numeric_columns:
+        wide[column] = pd.to_numeric(wide[column], errors="coerce").round(1)
+
+    st.markdown("#### NIFTY and BANKNIFTY by Score Bucket")
+    st.dataframe(wide, use_container_width=True, hide_index=True)
+    st.caption(
+        f"BUILDING means fewer than {int(minimum_samples)} observations. Do not change live "
+        "thresholds from a BUILDING row."
+    )
+
+    reason_summary = build_score_reason_summary(filtered, minimum_samples=minimum_samples)
+    if not reason_summary.empty:
+        st.markdown("#### Rejection Reason Follow-Through")
+        reason_summary = reason_summary.rename(
+            columns={
+                "symbol": "Index",
+                "reason_category": "Reason",
+                "samples": "Samples",
+                "avg_favorable_points": "Avg Favorable Points",
+                "avg_adverse_points": "Avg Adverse Points",
+                "evidence": "Evidence",
+            }
+        )
+        st.dataframe(reason_summary, use_container_width=True, hide_index=True)
+
+    with st.expander("Observation ledger"):
+        columns = [
+            "trading_date",
+            "signal_time",
+            "symbol",
+            "score",
+            "score_bucket",
+            "action",
+            "direction",
+            "reason_category",
+            "reason",
+            "reference_price",
+            "up_points",
+            "down_points",
+            "favorable_points",
+            "adverse_points",
+            "direction_correct",
+        ]
+        st.dataframe(
+            filtered[[column for column in columns if column in filtered.columns]].sort_values(
+                "signal_time", ascending=False
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if status:
+        st.caption(
+            f"Last evening audit: {status.get('status', 'UNKNOWN')} | "
+            f"{status.get('message', '')} | {str(status.get('updated_at', ''))[:19]}"
+        )
 
 
 def read_backtest_json(path, default):
@@ -1783,12 +1946,6 @@ load_env()
 if st.button("Refresh Dashboard", use_container_width=True):
     st.rerun()
 
-st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="dash-subtitle">NIFTY and BANKNIFTY bot trade performance</div>',
-    unsafe_allow_html=True,
-)
-
 performance = api_build_trade_performance()
 today = performance.get("today", {})
 cumulative = performance.get("cumulative", {})
@@ -1842,19 +1999,6 @@ def section_stats(payload, total_trades_key, total_pnl_key):
         for symbol in SYMBOLS
     ]
 
-section_header("Today")
-today_cols = st.columns(3)
-for column, (title, summary) in zip(today_cols, section_stats(today, "closedTrades", "closedPnL")):
-    with column:
-        st.markdown(summary_card_html(title, summary), unsafe_allow_html=True)
-
-section_header("Cumulative")
-summary_cols = st.columns(3)
-for column, (title, summary) in zip(summary_cols, section_stats(cumulative, "totalTrades", "totalPnL")):
-    with column:
-        st.markdown(summary_card_html(title, summary, show_averages=True), unsafe_allow_html=True)
-
-
 def sequence_table(rows):
     frame = pd.DataFrame(rows or [])
     if frame.empty:
@@ -1901,24 +2045,57 @@ def sequence_table(rows):
     return frame
 
 
-section_header("Index Trade Sequence")
-seq_today, seq_cumulative = st.columns(2)
-with seq_today:
-    st.markdown("**Today**")
-    st.dataframe(
-        sequence_table(today.get("indexTradeSequencePerformance")),
-        use_container_width=True,
-        hide_index=True,
-    )
-with seq_cumulative:
-    st.markdown("**Cumulative**")
-    st.dataframe(
-        sequence_table(cumulative.get("indexTradeSequencePerformance")),
-        use_container_width=True,
-        hide_index=True,
-    )
+st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="dash-subtitle">NIFTY and BANKNIFTY performance and score follow-through research</div>',
+    unsafe_allow_html=True,
+)
 
-second_context = sequence_table(cumulative.get("secondTradeContextPerformance"))
-if not second_context.empty:
-    st.markdown("**Second Trade Context**")
-    st.dataframe(second_context, use_container_width=True, hide_index=True)
+performance_tab, score_review_tab = st.tabs(["Performance", "Post Market Review"])
+
+with performance_tab:
+    section_header("Today")
+    today_cols = st.columns(3)
+    for column, (title, summary) in zip(
+        today_cols,
+        section_stats(today, "closedTrades", "closedPnL"),
+    ):
+        with column:
+            st.markdown(summary_card_html(title, summary), unsafe_allow_html=True)
+
+    section_header("Cumulative")
+    summary_cols = st.columns(3)
+    for column, (title, summary) in zip(
+        summary_cols,
+        section_stats(cumulative, "totalTrades", "totalPnL"),
+    ):
+        with column:
+            st.markdown(
+                summary_card_html(title, summary, show_averages=True),
+                unsafe_allow_html=True,
+            )
+
+    section_header("Index Trade Sequence")
+    seq_today, seq_cumulative = st.columns(2)
+    with seq_today:
+        st.markdown("**Today**")
+        st.dataframe(
+            sequence_table(today.get("indexTradeSequencePerformance")),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with seq_cumulative:
+        st.markdown("**Cumulative**")
+        st.dataframe(
+            sequence_table(cumulative.get("indexTradeSequencePerformance")),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    second_context = sequence_table(cumulative.get("secondTradeContextPerformance"))
+    if not second_context.empty:
+        st.markdown("**Second Trade Context**")
+        st.dataframe(second_context, use_container_width=True, hide_index=True)
+
+with score_review_tab:
+    render_score_followthrough_review()
