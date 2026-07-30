@@ -1625,7 +1625,7 @@ def t20_max_trades_per_day():
 
 
 def t20_target_premium_points(symbol):
-    default = 10.0 if symbol == "NIFTY" else 20.0
+    default = 5.0 if symbol == "NIFTY" else 10.0
     return configured_positive_float(
         f"T20_{symbol}_TARGET_PREMIUM_POINTS",
         default,
@@ -1633,7 +1633,7 @@ def t20_target_premium_points(symbol):
 
 
 def t20_stop_premium_points(symbol):
-    default = 10.0 if symbol == "NIFTY" else 20.0
+    default = 5.0 if symbol == "NIFTY" else 10.0
     return configured_positive_float(
         f"T20_{symbol}_STOP_PREMIUM_POINTS",
         default,
@@ -1642,6 +1642,13 @@ def t20_stop_premium_points(symbol):
 
 def t20_daily_max_loss():
     return configured_positive_float("T20_DAILY_MAX_LOSS", 10000.0)
+
+
+def sentiment_exit_enabled_for_state(state):
+    """Keep fast T20 trades independent of slower option-chain reversals."""
+    if str((state or {}).get("strategy") or "").upper() == "T20":
+        return configured_bool("T20_SENTIMENT_EXIT_ENABLED", False)
+    return True
 
 
 def t20_trade_count_today():
@@ -3075,7 +3082,7 @@ def handle_existing_state(symbol, state, verbose=True):
 
         sentiment_exit = False
         sentiment_reason = ""
-        if sentiment_check_due(state):
+        if sentiment_exit_enabled_for_state(state) and sentiment_check_due(state):
             state["last_sentiment_check_at"] = now_ist().isoformat()
             write_state(symbol, state)
             sentiment_exit, sentiment_reason = should_exit_on_sentiment_change(

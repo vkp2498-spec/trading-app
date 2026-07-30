@@ -47,19 +47,36 @@ class T20ModeTests(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
-                "T20_NIFTY_TARGET_PREMIUM_POINTS": "10",
-                "T20_NIFTY_STOP_PREMIUM_POINTS": "10",
-                "T20_BANKNIFTY_TARGET_PREMIUM_POINTS": "20",
-                "T20_BANKNIFTY_STOP_PREMIUM_POINTS": "20",
+                "T20_NIFTY_TARGET_PREMIUM_POINTS": "5",
+                "T20_NIFTY_STOP_PREMIUM_POINTS": "5",
+                "T20_BANKNIFTY_TARGET_PREMIUM_POINTS": "10",
+                "T20_BANKNIFTY_STOP_PREMIUM_POINTS": "10",
             },
             clear=False,
         ):
             nifty = trade_bot.t20_premium_levels("NIFTY", 100.0, 65)
             banknifty = trade_bot.t20_premium_levels("BANKNIFTY", 100.0, 30)
-        self.assertEqual(nifty["target_price"], 110.0)
-        self.assertEqual(nifty["stop_loss_price"], 90.0)
-        self.assertEqual(banknifty["target_price"], 120.0)
-        self.assertEqual(banknifty["stop_loss_price"], 80.0)
+        self.assertEqual(nifty["target_price"], 105.0)
+        self.assertEqual(nifty["stop_loss_price"], 95.0)
+        self.assertEqual(banknifty["target_price"], 110.0)
+        self.assertEqual(banknifty["stop_loss_price"], 90.0)
+
+    def test_t20_sentiment_exit_is_disabled_by_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(
+                trade_bot.sentiment_exit_enabled_for_state({"strategy": "T20"})
+            )
+            self.assertTrue(
+                trade_bot.sentiment_exit_enabled_for_state({"strategy": "SELECTIVE"})
+            )
+
+    def test_t20_sentiment_exit_can_be_explicitly_enabled(self):
+        with patch.dict(
+            "os.environ", {"T20_SENTIMENT_EXIT_ENABLED": "true"}, clear=False
+        ):
+            self.assertTrue(
+                trade_bot.sentiment_exit_enabled_for_state({"strategy": "T20"})
+            )
 
     def test_mobile_quantity_is_rounded_down_to_remaining_t20_risk(self):
         instrument = {"lot_size": 65}
