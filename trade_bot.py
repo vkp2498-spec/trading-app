@@ -838,6 +838,20 @@ def protective_stop_lock(symbol):
 
 
 @contextmanager
+def position_finalization_lock(symbol):
+    """Serialize fill finalization between the entry and monitor processes."""
+    lock_path = BASE_DIR / f".{symbol.lower()}_position_finalization.lock"
+    with lock_path.open("a+") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
 def portfolio_entry_lock():
     """Serialize the final portfolio check and broker entry submission."""
     with PORTFOLIO_ENTRY_LOCK_FILE.open("a+") as lock_file:
@@ -2917,12 +2931,63 @@ def handle_existing_state(symbol, state, verbose=True):
             write_state(symbol, state)
 
     if state.get("status") == "EXIT_PENDING":
+        if state.get("exit_submission_in_progress"):
+            return True
         if monitor_pending_exit(symbol, state):
             return True
         state = read_state(symbol)
 
+    # A broker position can become visible before the entry process has saved
+    # its actual fill. Finalize T20 entries first so the monitor cannot arm a
+    # stop from the estimated premium or race the entry process into a second
+    # protective order/emergency exit.
+    entry_order_id = state.get("entry_order_id") or state.get("buy_order_id")
+    pending_status = f"{entry_transaction}_PLACED_NOT_COMPLETE"
+    is_pending_entry = bool(
+        entry_order_id
+        and state.get("status") in {pending_status, "BUY_PLACED_NOT_COMPLETE"}
+    )
+    if is_pending_entry and str(state.get("strategy") or "").upper() == "T20":
+        details = wait_for_order_complete(entry_order_id, attempts=1, delay_seconds=0)
+        status = order_status(details)
+        log(
+            f"{symbol} pending {entry_transaction} check: "
+            f"order_id={entry_order_id} status={status}"
+        )
+        if order_is_rejected(details):
+            clear_state(symbol)
+            return True
+        if not order_is_complete(details):
+            return True
+
+        position = find_matching_position_for_side(instrument_key, entry_transaction)
+        entry_price = position_avg_price(position, entry_transaction) if position else None
+        entry_price = (
+            entry_price
+            or to_float(details.get("average_price"))
+            or to_float(details.get("price"))
+        )
+        if not entry_price:
+            log(f"{symbol} {entry_transaction} complete but entry price not found. Keeping state.")
+            return True
+        quantity = int(state.get("quantity") or abs(position_quantity(position)) or 0)
+        instrument = {
+            "instrument_key": instrument_key,
+            "trading_symbol": state.get("trading_symbol"),
+            "lot_size": int(state.get("lot_size") or quantity),
+        }
+        finalize_and_protect_t20_position(
+            symbol,
+            state,
+            entry_price,
+            quantity,
+            instrument,
+            entry_order_id,
+        )
+        return True
+
     position = find_matching_position_for_side(instrument_key, entry_transaction)
-    if position:
+    if position and not is_pending_entry:
         ltp = position_ltp(position)
         qty = abs(position_quantity(position))
         if needs_broker_stop and not state.get("protective_stop_order_id"):
@@ -2931,12 +2996,44 @@ def handle_existing_state(symbol, state, verbose=True):
             except Exception as error:
                 log(f"{symbol} CRITICAL: position has no broker stop; flattening now: {error}")
                 instrument = {"instrument_key": instrument_key, "trading_symbol": state.get("trading_symbol")}
-                result, payload = place_market_order(
-                    instrument, exit_transaction, qty, product=order_product
-                )
+                state["status"] = "EXIT_PENDING"
+                state["exit_reason"] = "PROTECTION_FAILURE"
+                state["exit_submission_in_progress"] = True
+                write_state(symbol, state)
+                try:
+                    result, payload = place_market_order(
+                        instrument, exit_transaction, qty, product=order_product
+                    )
+                except Exception:
+                    state["status"] = "POSITION_OPEN"
+                    state.pop("exit_submission_in_progress", None)
+                    write_state(symbol, state)
+                    raise
                 order_id = result.get("data", {}).get("order_id")
-                details = wait_for_order_complete(order_id) if order_id else {}
-                complete_exit(symbol, state, details, ltp, "PROTECTION_FAILURE", result, payload)
+                if not order_id:
+                    raise RuntimeError(
+                        f"{symbol} emergency {exit_transaction} returned no order_id: {result}"
+                    )
+                details = wait_for_order_complete(order_id)
+                if order_is_complete(details):
+                    complete_exit(
+                        symbol,
+                        state,
+                        details,
+                        ltp,
+                        "PROTECTION_FAILURE",
+                        result,
+                        payload,
+                    )
+                else:
+                    state.pop("exit_submission_in_progress", None)
+                    state["exit_order_id"] = order_id
+                    state["exit_fallback_price"] = ltp
+                    write_state(symbol, state)
+                    log(
+                        f"{symbol} emergency {exit_transaction} pending: "
+                        f"order_id={order_id} status={order_status(details)}"
+                    )
                 return True
         if ltp is not None:
             last_tick = to_float(state.get("last_processed_stream_tick_at"), 0)
@@ -3080,8 +3177,6 @@ def handle_existing_state(symbol, state, verbose=True):
                 log(f"{symbol} {exit_transaction} exit pending: order_id={exit_order_id}")
         return True
 
-    entry_order_id = state.get("entry_order_id") or state.get("buy_order_id")
-    pending_status = f"{entry_transaction}_PLACED_NOT_COMPLETE"
     if entry_order_id and state.get("status") in {pending_status, "BUY_PLACED_NOT_COMPLETE"}:
         details = wait_for_order_complete(entry_order_id, attempts=1, delay_seconds=0)
         status = order_status(details)
@@ -3104,7 +3199,7 @@ def handle_existing_state(symbol, state, verbose=True):
             }
             instrument_class = state.get("instrument_class", "INDEX_OPTION")
             if str(state.get("strategy") or "").upper() == "T20":
-                finalize_t20_open_position(
+                finalize_and_protect_t20_position(
                     symbol,
                     state,
                     entry_price,
@@ -3112,31 +3207,6 @@ def handle_existing_state(symbol, state, verbose=True):
                     instrument,
                     entry_order_id,
                 )
-                if needs_broker_stop:
-                    try:
-                        ensure_protective_stop(symbol, read_state(symbol))
-                    except Exception as error:
-                        log(
-                            f"{symbol} CRITICAL: delayed T20 fill has no broker stop; "
-                            f"flattening: {error}"
-                        )
-                        result, payload = place_market_order(
-                            instrument,
-                            exit_transaction,
-                            quantity,
-                            product=order_product,
-                        )
-                        exit_order_id = result.get("data", {}).get("order_id")
-                        exit_details = wait_for_order_complete(exit_order_id) if exit_order_id else {}
-                        complete_exit(
-                            symbol,
-                            read_state(symbol),
-                            exit_details,
-                            entry_price,
-                            "PROTECTION_FAILURE",
-                            result,
-                            payload,
-                        )
                 return True
             save_open_position_state(
                 symbol, entry_order_id, instrument, state.get("direction"),
@@ -4151,6 +4221,83 @@ def finalize_t20_open_position(
     return state
 
 
+def finalize_and_protect_t20_position(
+    state_slot,
+    initial_state,
+    fill,
+    quantity,
+    instrument,
+    order_id,
+):
+    """Finalize a T20 fill and arm exactly one stop across concurrent processes."""
+    with position_finalization_lock(state_slot):
+        fresh = read_state(state_slot)
+        if not fresh or str(fresh.get("entry_order_id")) != str(order_id):
+            return fresh
+        if fresh.get("status") == "EXIT_PENDING":
+            return fresh
+        if (
+            fresh.get("status") == "POSITION_OPEN"
+            and fresh.get("protective_stop_order_id")
+        ):
+            return fresh
+
+        if fresh.get("status") == "POSITION_OPEN":
+            state = fresh
+        else:
+            state = finalize_t20_open_position(
+                state_slot,
+                fresh or initial_state,
+                fill,
+                quantity,
+                instrument,
+                order_id,
+            )
+        try:
+            return ensure_protective_stop(state_slot, state)
+        except Exception as error:
+            log(f"{state_slot} CRITICAL: protective stop failed; flattening: {error}")
+            state = read_state(state_slot)
+            state["status"] = "EXIT_PENDING"
+            state["exit_reason"] = "PROTECTION_FAILURE"
+            state["exit_submission_in_progress"] = True
+            write_state(state_slot, state)
+            try:
+                emergency, emergency_payload = place_market_order(
+                    instrument,
+                    "SELL",
+                    quantity,
+                    product=state.get("order_product") or "I",
+                )
+            except Exception:
+                state["status"] = "POSITION_OPEN"
+                state.pop("exit_submission_in_progress", None)
+                write_state(state_slot, state)
+                raise
+            emergency_id = emergency.get("data", {}).get("order_id")
+            if not emergency_id:
+                raise RuntimeError(
+                    f"{state_slot} emergency SELL returned no order_id: {emergency}"
+                ) from error
+            emergency_details = wait_for_order_complete(emergency_id)
+            if order_is_complete(emergency_details):
+                complete_exit(
+                    state_slot,
+                    state,
+                    emergency_details,
+                    fill,
+                    "PROTECTION_FAILURE",
+                    emergency,
+                    emergency_payload,
+                )
+            else:
+                state.pop("exit_submission_in_progress", None)
+                state["exit_order_id"] = emergency_id
+                state["exit_fallback_price"] = fill
+                write_state(state_slot, state)
+            return read_state(state_slot)
+
+
 def execute_t20_candidate(chosen):
     symbol = chosen["symbol"]
     state_slot = T20_STATE_BY_SYMBOL[symbol]
@@ -4250,7 +4397,7 @@ def execute_t20_candidate(chosen):
     position = find_matching_position_for_side(instrument["instrument_key"], "BUY")
     fill = position_avg_price(position, "BUY") if position else None
     fill = fill or to_float(details.get("average_price")) or expected_entry
-    state = finalize_t20_open_position(
+    finalize_and_protect_t20_position(
         state_slot,
         pending_state,
         fill,
@@ -4258,22 +4405,6 @@ def execute_t20_candidate(chosen):
         instrument,
         order_id,
     )
-    try:
-        ensure_protective_stop(state_slot, state)
-    except Exception as error:
-        log(f"T20 {symbol} CRITICAL: protective stop failed; flattening: {error}")
-        emergency, emergency_payload = place_market_order(instrument, "SELL", quantity)
-        emergency_id = emergency.get("data", {}).get("order_id")
-        emergency_details = wait_for_order_complete(emergency_id) if emergency_id else {}
-        complete_exit(
-            state_slot,
-            read_state(state_slot),
-            emergency_details,
-            fill,
-            "PROTECTION_FAILURE",
-            emergency,
-            emergency_payload,
-        )
     return True
 
 

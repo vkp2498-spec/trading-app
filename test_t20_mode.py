@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import trade_bot
@@ -117,6 +118,56 @@ class T20ModeTests(unittest.TestCase):
         self.assertTrue(allowed["allowed"])
         self.assertFalse(blocked["allowed"])
         self.assertIn("trade cap", blocked["reason"])
+
+    def test_t20_fill_is_finalized_and_protected_only_once(self):
+        pending = {
+            "entry_order_id": "ENTRY-1",
+            "status": "BUY_PLACED_NOT_COMPLETE",
+        }
+        opened = {
+            "entry_order_id": "ENTRY-1",
+            "status": "POSITION_OPEN",
+        }
+        protected = {
+            **opened,
+            "protective_stop_order_id": "STOP-1",
+        }
+        current = pending
+
+        def read_state(_symbol):
+            return current
+
+        def finalize(*_args, **_kwargs):
+            nonlocal current
+            current = opened
+            return current
+
+        def protect(_symbol, _state):
+            nonlocal current
+            current = protected
+            return current
+
+        instrument = {
+            "instrument_key": "NSE_FO|T20",
+            "trading_symbol": "NIFTY TEST CE",
+        }
+        with (
+            patch.object(trade_bot, "position_finalization_lock", return_value=nullcontext()),
+            patch.object(trade_bot, "read_state", side_effect=read_state),
+            patch.object(trade_bot, "finalize_t20_open_position", side_effect=finalize) as finalize_mock,
+            patch.object(trade_bot, "ensure_protective_stop", side_effect=protect) as protect_mock,
+        ):
+            first = trade_bot.finalize_and_protect_t20_position(
+                "T20_NIFTY", pending, 100.0, 65, instrument, "ENTRY-1"
+            )
+            second = trade_bot.finalize_and_protect_t20_position(
+                "T20_NIFTY", pending, 100.0, 65, instrument, "ENTRY-1"
+            )
+
+        self.assertEqual(first["protective_stop_order_id"], "STOP-1")
+        self.assertEqual(second["protective_stop_order_id"], "STOP-1")
+        finalize_mock.assert_called_once()
+        protect_mock.assert_called_once()
 
 
 if __name__ == "__main__":
