@@ -622,6 +622,7 @@ def empty_trade_performance() -> dict:
             "secondTradeContextPerformance": second_trade_context_performance([]),
         },
         "equityCurve": [],
+        "pnlCalendar": [],
         "edgeAnalytics": edge_analytics([]),
         "recentTrades": [],
     }
@@ -1309,6 +1310,33 @@ def build_equity_curve(
     return points
 
 
+def build_pnl_calendar(trades: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for trade in trades:
+        trade_date = str(trade.get("tradeDate") or "").strip()
+        if trade_date:
+            grouped.setdefault(trade_date, []).append(trade)
+
+    calendar = []
+    for trade_date in sorted(grouped):
+        daily_trades = grouped[trade_date]
+        gross_pnl = round(
+            sum(safe_float(trade.get("grossPnL")) for trade in daily_trades),
+            2,
+        )
+        other_charges = total_other_charges(daily_trades)
+        calendar.append(
+            {
+                "date": trade_date,
+                "trades": len(daily_trades),
+                "grossPnL": gross_pnl,
+                "otherCharges": other_charges,
+                "netPnL": round(gross_pnl - other_charges, 2),
+            }
+        )
+    return calendar
+
+
 def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, float], dict[str, int]]:
     """Fetch today's realized gross P&L directly from Upstox."""
     headers = upstox_headers()
@@ -1484,6 +1512,7 @@ def build_trade_performance() -> dict:
         "equityCurve": build_equity_curve(
             trades,
         ),
+        "pnlCalendar": build_pnl_calendar(trades),
         "edgeAnalytics": edge_analytics(trades),
         "recentTrades": recent_trades,
     }
