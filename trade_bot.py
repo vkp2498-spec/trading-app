@@ -1644,6 +1644,10 @@ def t20_daily_max_loss():
     return configured_positive_float("T20_DAILY_MAX_LOSS", 10000.0)
 
 
+def t20_trailing_stop_enabled():
+    return configured_bool("T20_TRAILING_STOP_ENABLED", False)
+
+
 def sentiment_exit_enabled_for_state(state):
     """Keep fast T20 trades independent of slower option-chain reversals."""
     if str((state or {}).get("strategy") or "").upper() == "T20":
@@ -3464,6 +3468,12 @@ def apply_trailing_stop(symbol, state, ltp):
             min(to_float(state.get("lowest_ltp"), entry), current_ltp), 2
         )
 
+    if (
+        str(state.get("strategy") or "").upper() == "T20"
+        and not t20_trailing_stop_enabled()
+    ):
+        return state
+
     settings = profit_protection_settings()
     if not settings["enabled"]:
         return state
@@ -4176,6 +4186,7 @@ def finalize_t20_open_position(
 ):
     underlying = underlying_symbol_for_state_slot(state_slot, initial_state)
     levels = t20_premium_levels(underlying, fill, quantity)
+    trailing_enabled = t20_trailing_stop_enabled()
     metadata = {
         "symbol": underlying,
         "underlying_symbol": underlying,
@@ -4202,7 +4213,7 @@ def finalize_t20_open_position(
         entry_transaction_type="BUY",
         instrument_class="INDEX_OPTION",
         underlying_symbol=underlying,
-        profit_protection_enabled_for_trade=True,
+        profit_protection_enabled_for_trade=trailing_enabled,
         trade_metadata=metadata,
         order_product=initial_state.get("order_product") or "I",
     )
@@ -4214,7 +4225,7 @@ def finalize_t20_open_position(
             "stop_loss_price": levels["stop_loss_price"],
             "original_stop_loss_price": levels["stop_loss_price"],
             "profit_booking_percent": profit_booking_target_percent(),
-            "profit_protection_enabled_for_trade": True,
+            "profit_protection_enabled_for_trade": trailing_enabled,
         }
     )
     if profit_booking_mode() == "runner":
@@ -4384,7 +4395,7 @@ def execute_t20_candidate(chosen):
             "weighted_score": score,
             "option_type": (chosen.get("option_summary") or {}).get("option_type"),
             "technical_context": chosen.get("technicals", {}),
-            "profit_protection_enabled_for_trade": True,
+            "profit_protection_enabled_for_trade": t20_trailing_stop_enabled(),
             "t20_target_premium_points": t20_target_premium_points(symbol),
             "t20_stop_premium_points": t20_stop_premium_points(symbol),
             "status": "BUY_PLACED_NOT_COMPLETE",

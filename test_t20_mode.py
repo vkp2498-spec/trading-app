@@ -78,6 +78,40 @@ class T20ModeTests(unittest.TestCase):
                 trade_bot.sentiment_exit_enabled_for_state({"strategy": "T20"})
             )
 
+    def test_t20_trailing_stop_is_disabled_by_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(trade_bot.t20_trailing_stop_enabled())
+
+    def test_t20_trailing_stop_can_be_explicitly_enabled(self):
+        with patch.dict(
+            "os.environ", {"T20_TRAILING_STOP_ENABLED": "true"}, clear=False
+        ):
+            self.assertTrue(trade_bot.t20_trailing_stop_enabled())
+
+    def test_disabled_t20_trailing_does_not_move_stop(self):
+        state = {
+            "strategy": "T20",
+            "instrument_class": "INDEX_OPTION",
+            "entry_transaction_type": "BUY",
+            "entry_price": 100.0,
+            "planned_target_price": 105.0,
+            "target_price": 105.0,
+            "stop_loss_price": 95.0,
+            "profit_protection_stage": 0,
+            "profit_protection_enabled_for_trade": True,
+        }
+        with patch.dict(
+            "os.environ",
+            {
+                "T20_TRAILING_STOP_ENABLED": "false",
+                "PROFIT_PROTECTION_ENABLED": "true",
+            },
+            clear=False,
+        ):
+            updated = trade_bot.apply_trailing_stop("T20_NIFTY", state, 104.0)
+        self.assertEqual(updated["profit_protection_stage"], 0)
+        self.assertEqual(updated["stop_loss_price"], 95.0)
+
     def test_mobile_quantity_is_rounded_down_to_remaining_t20_risk(self):
         instrument = {"lot_size": 65}
         with (
