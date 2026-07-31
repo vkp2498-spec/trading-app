@@ -112,6 +112,38 @@ class T20ModeTests(unittest.TestCase):
         self.assertEqual(updated["profit_protection_stage"], 0)
         self.assertEqual(updated["stop_loss_price"], 95.0)
 
+    def test_t20_books_at_eighty_percent_even_in_global_runner_mode(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "T20_PROFIT_BOOKING_TARGET_PERCENT": "80",
+                "PROFIT_BOOKING_MODE": "runner",
+            },
+            clear=False,
+        ):
+            nifty_price = trade_bot.profit_booking_price(
+                {
+                    "strategy": "T20",
+                    "instrument_class": "INDEX_OPTION",
+                    "entry_transaction_type": "BUY",
+                    "entry_price": 100.0,
+                    "planned_target_price": 105.0,
+                    "target_price": 105.0,
+                }
+            )
+            bank_price = trade_bot.profit_booking_price(
+                {
+                    "strategy": "T20",
+                    "instrument_class": "INDEX_OPTION",
+                    "entry_transaction_type": "BUY",
+                    "entry_price": 100.0,
+                    "planned_target_price": 110.0,
+                    "target_price": 110.0,
+                }
+            )
+        self.assertEqual(nifty_price, 104.0)
+        self.assertEqual(bank_price, 108.0)
+
     def test_mobile_quantity_is_rounded_down_to_remaining_t20_risk(self):
         instrument = {"lot_size": 65}
         with (

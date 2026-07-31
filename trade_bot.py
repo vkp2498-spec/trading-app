@@ -1648,6 +1648,18 @@ def t20_trailing_stop_enabled():
     return configured_bool("T20_TRAILING_STOP_ENABLED", False)
 
 
+def t20_profit_booking_target_percent():
+    value = configured_non_negative_float(
+        "T20_PROFIT_BOOKING_TARGET_PERCENT",
+        80.0,
+    )
+    if value <= 0 or value > 100:
+        raise RuntimeError(
+            "T20_PROFIT_BOOKING_TARGET_PERCENT must be greater than 0 and at most 100"
+        )
+    return value
+
+
 def sentiment_exit_enabled_for_state(state):
     """Keep fast T20 trades independent of slower option-chain reversals."""
     if str((state or {}).get("strategy") or "").upper() == "T20":
@@ -2600,10 +2612,10 @@ def save_open_position_state(
     }
     if trade_metadata:
         state.update(trade_metadata)
-    state["profit_booking_percent"] = profit_booking_target_percent()
-    state["profit_booking_mode"] = profit_booking_mode()
-    if profit_booking_mode() == "runner":
-        progress = profit_booking_target_percent() / 100.0
+    state["profit_booking_percent"] = profit_booking_percent_for_state(state)
+    state["profit_booking_mode"] = profit_booking_mode_for_state(state)
+    if state["profit_booking_mode"] == "runner":
+        progress = state["profit_booking_percent"] / 100.0
         state["runner_activation_price"] = round(
             float(entry_price) + (float(target_price) - float(entry_price)) * progress,
             2,
@@ -3070,7 +3082,8 @@ def handle_existing_state(symbol, state, verbose=True):
         is_short = entry_transaction == "SELL"
         booking_price = profit_booking_price(state)
         if to_float(state.get("profit_booking_price")) != booking_price:
-            state["profit_booking_percent"] = profit_booking_target_percent()
+            state["profit_booking_percent"] = profit_booking_percent_for_state(state)
+            state["profit_booking_mode"] = profit_booking_mode_for_state(state)
             state["profit_booking_price"] = booking_price
             state["trailing_stop_active"] = False
             state["trailing_stop_reason"] = ""
@@ -3367,6 +3380,18 @@ def profit_booking_mode():
     return mode
 
 
+def profit_booking_percent_for_state(state):
+    if str((state or {}).get("strategy") or "").upper() == "T20":
+        return t20_profit_booking_target_percent()
+    return profit_booking_target_percent()
+
+
+def profit_booking_mode_for_state(state):
+    if str((state or {}).get("strategy") or "").upper() == "T20":
+        return "exit"
+    return profit_booking_mode()
+
+
 def env_bool_with_fallback(primary, fallback, default="true"):
     raw = os.getenv(primary)
     if raw is None:
@@ -3429,10 +3454,10 @@ def profit_booking_price(state):
     if entry_price <= 0 or (target_price >= entry_price if is_short else target_price <= entry_price):
         return target_price
 
-    if profit_booking_mode() == "runner":
+    if profit_booking_mode_for_state(state) == "runner":
         return round(target_price, 2)
 
-    progress = profit_booking_target_percent() / 100.0
+    progress = profit_booking_percent_for_state(state) / 100.0
     booking_price = entry_price + (target_price - entry_price) * progress
     precision = 2 if state.get("instrument_class") == "STOCK_FUTURE" else 0
     return round(booking_price, precision)
@@ -4224,16 +4249,12 @@ def finalize_t20_open_position(
             "planned_target_price": levels["target_price"],
             "stop_loss_price": levels["stop_loss_price"],
             "original_stop_loss_price": levels["stop_loss_price"],
-            "profit_booking_percent": profit_booking_target_percent(),
+            "profit_booking_percent": t20_profit_booking_target_percent(),
+            "profit_booking_mode": "exit",
             "profit_protection_enabled_for_trade": trailing_enabled,
         }
     )
-    if profit_booking_mode() == "runner":
-        progress = profit_booking_target_percent() / 100.0
-        state["runner_activation_price"] = round(
-            float(fill) + (levels["target_price"] - float(fill)) * progress,
-            2,
-        )
+    state.pop("runner_activation_price", None)
     state["profit_booking_price"] = profit_booking_price(state)
     write_state(state_slot, state)
     return state
