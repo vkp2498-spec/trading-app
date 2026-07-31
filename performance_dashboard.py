@@ -63,7 +63,7 @@ BACKTEST_STATUS_FILE = BACKTEST_DIR / "status.json"
 BACKTEST_LATEST_FILE = BACKTEST_DIR / "latest.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
-STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE"]
+STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE", "GANESH_GAP_NIFTY"]
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
 st.set_page_config(
