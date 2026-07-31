@@ -621,6 +621,7 @@ def empty_trade_performance() -> dict:
             "indexTradeSequencePerformance": index_trade_sequence_performance([]),
             "secondTradeContextPerformance": second_trade_context_performance([]),
         },
+        "t20": performance_stats([]),
         "equityCurve": [],
         "pnlCalendar": [],
         "edgeAnalytics": edge_analytics([]),
@@ -997,6 +998,26 @@ def dashboard_index_trades(trades: list[dict]) -> list[dict]:
     return [trade for trade in trades if is_dashboard_index_trade(trade)]
 
 
+def normalized_strategy(trade: dict) -> str:
+    return str(trade.get("strategy") or "SELECTIVE").strip().upper()
+
+
+def selective_index_trades(trades: list[dict]) -> list[dict]:
+    return [
+        trade
+        for trade in dashboard_index_trades(trades)
+        if normalized_strategy(trade) != "T20"
+    ]
+
+
+def t20_index_trades(trades: list[dict]) -> list[dict]:
+    return [
+        trade
+        for trade in dashboard_index_trades(trades)
+        if normalized_strategy(trade) == "T20"
+    ]
+
+
 def is_stock_option_trade(trade: dict) -> bool:
     instrument_class = str(
         trade.get("instrumentClass") or ""
@@ -1192,6 +1213,7 @@ def normalize_trade(row: dict) -> dict:
         "symbol": row.get("symbol", ""),
         "underlyingSymbol": row.get("underlying_symbol", row.get("symbol", "")),
         "instrumentClass": row.get("instrument_class", "INDEX_OPTION"),
+        "strategy": str(row.get("strategy") or "SELECTIVE").strip().upper(),
         "tradingSymbol": row.get(
             "trading_symbol",
             "",
@@ -1403,10 +1425,9 @@ def build_trade_performance() -> dict:
     today_text = datetime.now(
         IST
     ).strftime("%Y-%m-%d")
-    trades = [
-        trade
-        for trade in dashboard_index_trades(read_trade_history())
-    ]
+    history = read_trade_history()
+    trades = selective_index_trades(history)
+    t20_trades = t20_index_trades(history)
 
     today_trades = [
         trade
@@ -1509,6 +1530,7 @@ def build_trade_performance() -> dict:
             "indexTradeSequencePerformance": index_trade_sequence_performance(trades),
             "secondTradeContextPerformance": second_trade_context_performance(trades),
         },
+        "t20": performance_stats(t20_trades),
         "equityCurve": build_equity_curve(
             trades,
         ),

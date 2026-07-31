@@ -1949,6 +1949,7 @@ if st.button("Refresh Dashboard", use_container_width=True):
 performance = api_build_trade_performance()
 today = performance.get("today", {})
 cumulative = performance.get("cumulative", {})
+t20 = performance.get("t20", {})
 
 
 def summary_card_html(title, summary, show_averages=False):
@@ -2074,6 +2075,12 @@ with performance_tab:
                 summary_card_html(title, summary, show_averages=True),
                 unsafe_allow_html=True,
             )
+
+    section_header("T20 Cumulative")
+    st.markdown(
+        summary_card_html("T20 Overall", t20),
+        unsafe_allow_html=True,
+    )
 
     section_header("Index Trade Sequence")
     seq_today, seq_cumulative = st.columns(2)
