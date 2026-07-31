@@ -144,10 +144,11 @@ class T20ModeTests(unittest.TestCase):
         self.assertEqual(nifty_price, 104.0)
         self.assertEqual(bank_price, 108.0)
 
-    def test_mobile_quantity_is_rounded_down_to_remaining_t20_risk(self):
+    def test_t20_quantity_uses_dedicated_cap_and_remaining_risk(self):
         instrument = {"lot_size": 65}
         with (
-            patch.object(trade_bot, "order_quantity_for", return_value=2600),
+            patch.object(trade_bot, "effective_t20_capital", return_value=50000),
+            patch.object(trade_bot, "order_quantity_for", return_value=2600) as sizing,
             patch.object(trade_bot, "today_t20_realized_pnl", return_value=0.0),
             patch.object(trade_bot, "active_t20_states", return_value=[]),
             patch.object(trade_bot, "total_open_risk", return_value=0.0),
@@ -156,8 +157,56 @@ class T20ModeTests(unittest.TestCase):
             quantity = trade_bot.t20_risk_adjusted_quantity(
                 "NIFTY", instrument, 100.0, 90.0
             )
+        sizing.assert_called_once_with(
+            "NIFTY",
+            instrument,
+            100.0,
+            90.0,
+            transaction_type="BUY",
+            capital_override=50000,
+        )
         self.assertEqual(quantity, 975)
         self.assertLessEqual((100.0 - 90.0) * quantity, 10000.0)
+
+    def test_live_t20_cap_shrinks_to_available_broker_funds(self):
+        instrument = {"lot_size": 65}
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ENABLE_LIVE_TRADING": "true",
+                    "T20_OPTION_CAPITAL_PER_ENTRY": "50000",
+                    "T20_DAILY_MAX_LOSS": "10000",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "maximum_available_option_capital", return_value=30000),
+            patch.object(trade_bot, "index_risk_per_trade_limit", return_value=100000),
+            patch.object(trade_bot, "remaining_index_risk_budget", return_value=100000),
+            patch.object(trade_bot, "today_t20_realized_pnl", return_value=0.0),
+            patch.object(trade_bot, "active_t20_states", return_value=[]),
+            patch.object(trade_bot, "total_open_risk", return_value=0.0),
+        ):
+            quantity = trade_bot.t20_risk_adjusted_quantity(
+                "NIFTY", instrument, 100.0, 95.0
+            )
+        self.assertEqual(quantity, 260)
+
+    def test_one_lot_t20_is_rejected_when_broker_funds_are_insufficient(self):
+        instrument = {"lot_size": 65}
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "ENABLE_LIVE_TRADING": "true",
+                    "T20_OPTION_CAPITAL_PER_ENTRY": "1",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "maximum_available_option_capital", return_value=5000),
+        ):
+            capital = trade_bot.effective_t20_capital(instrument, 100.0)
+        self.assertEqual(capital, 0.0)
 
     def test_exact_daily_loss_is_permitted_but_sixth_trade_is_not(self):
         candidate = self.candidate(60.0)

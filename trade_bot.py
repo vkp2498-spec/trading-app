@@ -1644,6 +1644,25 @@ def t20_daily_max_loss():
     return configured_positive_float("T20_DAILY_MAX_LOSS", 10000.0)
 
 
+def t20_option_capital_per_entry():
+    """Return the T20-only capital ceiling, independent of the mobile profile."""
+    raw_value = os.getenv("T20_OPTION_CAPITAL_PER_ENTRY", "50000").strip()
+    account_cap = configured_non_negative_float("ACCOUNT_MAX_OPTION_CAPITAL", 0.0)
+    if raw_value.upper() == "MAX":
+        return account_cap if account_cap > 0 else "MAX"
+    try:
+        capital = float(raw_value)
+    except ValueError as error:
+        raise RuntimeError(
+            "T20_OPTION_CAPITAL_PER_ENTRY must be 1, MAX, or a positive rupee amount"
+        ) from error
+    if capital < 1:
+        raise RuntimeError(
+            "T20_OPTION_CAPITAL_PER_ENTRY must be 1 or greater"
+        )
+    return min(capital, account_cap) if account_cap > 0 else capital
+
+
 def t20_trailing_stop_enabled():
     return configured_bool("T20_TRAILING_STOP_ENABLED", False)
 
@@ -1702,14 +1721,35 @@ def t20_premium_levels(symbol, entry_price, quantity=None):
     }
 
 
+def effective_t20_capital(instrument, entry_price):
+    """Cap T20 sizing by its own setting and live broker buying power."""
+    configured = t20_option_capital_per_entry()
+    if not configured_bool("ENABLE_LIVE_TRADING", False):
+        return configured
+
+    available = maximum_available_option_capital(force_refresh=True)
+    if available <= 0:
+        return 0.0
+    if configured == "MAX":
+        return available
+    if configured == 1:
+        lot_value = float(entry_price) * int(instrument.get("lot_size") or 0)
+        return 1 if lot_value > 0 and lot_value <= available else 0.0
+    return min(float(configured), available)
+
+
 def t20_risk_adjusted_quantity(symbol, instrument, entry_price, stop_loss_price):
-    """Use the mobile allocation as a ceiling, then fit the T20 day-loss budget."""
+    """Use the T20-only capital ceiling, then fit the T20 day-loss budget."""
+    capital = effective_t20_capital(instrument, entry_price)
+    if capital == 0:
+        return 0
     configured_quantity = order_quantity_for(
         symbol,
         instrument,
         entry_price,
         stop_loss_price,
         transaction_type="BUY",
+        capital_override=capital,
     )
     lot_size = max(int(instrument.get("lot_size") or 0), 1)
     per_unit_risk = max(float(entry_price) - float(stop_loss_price), 0.0)
@@ -1964,7 +2004,7 @@ def option_capital_per_entry():
     return min(capital, account_cap) if account_cap > 0 else capital
 
 
-def maximum_available_option_capital():
+def maximum_available_option_capital(force_refresh=False):
     """Return usable buying capital while retaining a cash/charges buffer."""
     cache_key = "available_option_capital"
     now = time_module.time()
@@ -1972,7 +2012,11 @@ def maximum_available_option_capital():
     cache_seconds = configured_non_negative_float(
         "MAX_CAPITAL_BALANCE_CACHE_SECONDS", 5.0
     )
-    if cached and now - to_float(cached.get("timestamp")) <= cache_seconds:
+    if (
+        not force_refresh
+        and cached
+        and now - to_float(cached.get("timestamp")) <= cache_seconds
+    ):
         return to_float(cached.get("value"))
 
     try:
@@ -2081,6 +2125,8 @@ def place_market_order(instrument, transaction_type, quantity, product="I"):
     }
 
     result = upstox_request("POST", UPSTOX_PLACE_ORDER_URL, json=payload)
+    if str(transaction_type).upper() == "BUY":
+        BROKER_READ_CACHE.pop("available_option_capital", None)
     return result, payload
 
 
@@ -4343,27 +4389,8 @@ def execute_t20_candidate(chosen):
     instrument = chosen["instrument"]
     expected_entry = to_float(chosen.get("entry_price"))
     levels = t20_premium_levels(symbol, expected_entry)
-    quantity = t20_risk_adjusted_quantity(
-        symbol,
-        instrument,
-        expected_entry,
-        levels["stop_loss_price"],
-    )
-    if quantity <= 0:
-        log(
-            f"T20 {symbol} rejected: active mobile allocation/risk budget cannot "
-            "fund one whole lot"
-        )
-        return False
     score = candidate_weighted_score(chosen)
     live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    verbose_log(
-        f"T20 {symbol} selected: {instrument.get('trading_symbol')} score={score:.1f} "
-        f"qty={quantity} expected_entry={expected_entry:.2f} "
-        f"target={t20_target_premium_points(symbol):.2f} premium points "
-        f"stop={t20_stop_premium_points(symbol):.2f} premium points "
-        f"live={live}"
-    )
     write_stream_instruments(
         [
             "NSE_INDEX|Nifty 50",
@@ -4373,6 +4400,25 @@ def execute_t20_candidate(chosen):
         ]
     )
     with portfolio_entry_lock():
+        quantity = t20_risk_adjusted_quantity(
+            symbol,
+            instrument,
+            expected_entry,
+            levels["stop_loss_price"],
+        )
+        if quantity <= 0:
+            log(
+                f"T20 {symbol} rejected: T20 capital, available broker funds, "
+                "or risk budget cannot fund one whole lot"
+            )
+            return False
+        verbose_log(
+            f"T20 {symbol} selected: {instrument.get('trading_symbol')} "
+            f"score={score:.1f} qty={quantity} expected_entry={expected_entry:.2f} "
+            f"capital_limit={t20_option_capital_per_entry()} "
+            f"target={t20_target_premium_points(symbol):.2f} premium points "
+            f"stop={t20_stop_premium_points(symbol):.2f} premium points live={live}"
+        )
         decision = pre_order_t20_decision(
             chosen,
             quantity,
@@ -5398,7 +5444,7 @@ def run_signal_check():
         verbose_log(
             "Selective index lane occupied by "
             + "/".join(sorted(active_selective_index))
-            + "; T20 fallback is paused until that position closes"
+            + "; T20 remains available for the other underlying"
         )
 
     try:
@@ -5521,15 +5567,13 @@ def run_signal_check():
     if qualified:
         verbose_log("T20 fallback skipped: a selective setup qualified on this scan")
         return
-    if active_selective_index:
-        verbose_log("T20 fallback skipped: a selective index position is already active")
-        return
     if t20_trade_count_today() >= t20_max_trades_per_day():
         verbose_log(f"T20 lane stopped: daily trade cap {t20_max_trades_per_day()} reached")
         return
 
-    # With no selective setup or position, NIFTY and BANKNIFTY are independent
-    # T20 candidates and may coexist when both pass the score and safety gates.
+    # T20 may coexist with a selective position on the other underlying. The
+    # per-symbol state gate below prevents two strategies from managing the
+    # same NIFTY or BANKNIFTY broker position.
     for symbol in SYMBOLS:
         if index_underlying_has_active_state(symbol):
             continue
