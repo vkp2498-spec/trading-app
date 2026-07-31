@@ -10,6 +10,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import csv
 import random
+import pandas as pd
 from copy import deepcopy
 from contextlib import contextmanager
 
@@ -31,6 +32,25 @@ from market_technicals import (
     convert_index_levels_to_option_premium,
     get_option_volume_vwap_analysis,
     candle_confirmation,
+    fetch_v3_historical_hours,
+    fetch_v3_historical_minutes,
+    fetch_v3_intraday_minutes,
+)
+from ganesh_gap_reversal import (
+    BULLISH as GANESH_BULLISH,
+    BEARISH as GANESH_BEARISH,
+    NO_GAP as GANESH_NO_GAP,
+    active_two_hour_start,
+    advance_entry_confirmation,
+    advance_exit_confirmation,
+    atm_strike,
+    bollinger_bands,
+    candle_colour,
+    classic_pivots,
+    nearest_target,
+    opening_gap,
+    target_reached,
+    transition_for_gap,
 )
 from live_trade_filters import (
     bollinger_exhaustion_reversal,
@@ -59,11 +79,16 @@ from portfolio_risk import (
 import requests
 import urllib3.util.connection as urllib3_cn
 
-from strategy_core import get_index_recommendation, now_ist, option_chain_signal
+from strategy_core import (
+    fetch_upstox_option_chain,
+    get_index_recommendation,
+    now_ist,
+    option_chain_signal,
+)
 from strategy_core import option_contract_quality
 from trade_journal import record_closed_trade
 from trading_config import active_value
-from safe_storage import atomic_write_json
+from safe_storage import atomic_write_json, locked_append_csv
 from upstox_streams import (
     read_market_cache,
     read_portfolio_cache,
@@ -113,8 +138,11 @@ WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 T20_STATE_BY_SYMBOL = {symbol: f"T20_{symbol}" for symbol in SYMBOLS}
 T20_STATE_SLOTS = list(T20_STATE_BY_SYMBOL.values())
+GANESH_GAP_STATE = "GANESH_GAP_NIFTY"
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
-BOT_STATE_SLOTS = SYMBOLS + T20_STATE_SLOTS + [STOCK_FUTURE_STATE]
+VAMSI_STATE_SLOTS = SYMBOLS + T20_STATE_SLOTS + [STOCK_FUTURE_STATE]
+BOT_STATE_SLOTS = VAMSI_STATE_SLOTS + [GANESH_GAP_STATE]
+GANESH_GAP_SCAN_FILE = BASE_DIR / "data" / "ganesh_gap_scans.csv"
 
 # Used only when the corresponding environment variable is not set.
 DEFAULT_LOT_MULTIPLIERS = {
@@ -314,6 +342,13 @@ def configured_bool(env_key, default=False):
     if raw is None:
         return bool(default)
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def trading_engine():
+    engine = str(os.getenv("TRADING_ENGINE", "VAMSI")).strip().upper()
+    if engine not in {"VAMSI", "GANESH"}:
+        raise RuntimeError("TRADING_ENGINE must be VAMSI or GANESH")
+    return engine
 
 
 def score_cutoff_mode_enabled():
@@ -582,6 +617,193 @@ def write_state(symbol, state):
 
 def clear_state(symbol):
     write_state(symbol, {})
+
+
+def ganesh_gap_max_trades_per_day():
+    return max(to_int(os.getenv("GANESH_GAP_MAX_TRADES_PER_DAY"), 1), 0)
+
+
+def ganesh_gap_live_enabled():
+    return configured_bool("ENABLE_LIVE_TRADING", False) and configured_bool(
+        "GANESH_GAP_LIVE_TRADING", False
+    )
+
+
+def _frame_in_ist(frame):
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    result = frame.copy()
+    index = pd.DatetimeIndex(result.index)
+    if index.tz is None:
+        index = index.tz_localize(IST)
+    else:
+        index = index.tz_convert(IST)
+    result.index = index
+    return result.sort_index()
+
+
+def _latest_stream_ltp(instrument_key, maximum_age_seconds):
+    quote = read_market_cache(instrument_key) or {}
+    received_at = to_float(quote.get("received_at"), 0)
+    age = time_module.time() - received_at if received_at else None
+    ltp = to_float(quote.get("ltp"), 0)
+    if ltp > 0 and age is not None and 0 <= age <= maximum_age_seconds:
+        return ltp, age
+    return 0.0, age
+
+
+def ganesh_gap_market_snapshot(current_time=None):
+    """Build the live NIFTY gap/2H/pivot/Bollinger snapshot."""
+    current_time = current_time or now_ist()
+    instrument_key = UNDERLYING_INDEX_KEYS["NIFTY"]
+    intraday = _frame_in_ist(fetch_v3_intraday_minutes(instrument_key, minutes=1))
+    if intraday.empty:
+        raise RuntimeError("NIFTY one-minute intraday candles are unavailable")
+    today_rows = intraday[intraday.index.date == current_time.date()]
+    if today_rows.empty:
+        raise RuntimeError("Today's NIFTY intraday candles are unavailable")
+
+    history_15 = _frame_in_ist(
+        fetch_v3_historical_minutes(instrument_key, minutes=15, lookback_days=12)
+    )
+    previous_rows = history_15[history_15.index.date < current_time.date()]
+    if previous_rows.empty:
+        raise RuntimeError("Previous trading-day NIFTY OHLC is unavailable")
+    previous_date = previous_rows.index.date[-1]
+    previous_day = previous_rows[previous_rows.index.date == previous_date]
+    previous_ohlc = {
+        "high": float(previous_day["high"].max()),
+        "low": float(previous_day["low"].min()),
+        "close": float(previous_day.iloc[-1]["close"]),
+    }
+
+    maximum_age = configured_positive_float("GANESH_DATA_MAX_AGE_SECONDS", 120.0)
+    stream_spot, stream_age = _latest_stream_ltp(instrument_key, maximum_age)
+    spot = stream_spot or float(today_rows.iloc[-1]["close"])
+    latest_candle_age = max(
+        (pd.Timestamp(current_time) - pd.Timestamp(today_rows.index[-1])).total_seconds(),
+        0.0,
+    )
+    data_age = stream_age if stream_spot else latest_candle_age
+    if data_age is not None and data_age > maximum_age:
+        raise RuntimeError(f"NIFTY market data is stale ({data_age:.1f}s)")
+
+    candle_start = active_two_hour_start(current_time)
+    active_rows = today_rows[today_rows.index >= candle_start]
+    if active_rows.empty:
+        raise RuntimeError("Active two-hour NIFTY candle is unavailable")
+    candle_open = float(active_rows.iloc[0]["open"])
+    active_high = max(float(active_rows["high"].max()), spot)
+    active_low = min(float(active_rows["low"].min()), spot)
+    active_volume = float(active_rows["volume"].sum())
+
+    historical_2h = _frame_in_ist(
+        fetch_v3_historical_hours(instrument_key, hours=2, lookback_days=60)
+    )
+    prior_2h = historical_2h[historical_2h.index < candle_start]
+    closes = [float(value) for value in prior_2h.get("close", pd.Series(dtype=float)).dropna()]
+    closes.append(spot)
+    bands = bollinger_bands(
+        closes,
+        period=max(to_int(os.getenv("GANESH_BB_PERIOD"), 20), 2),
+        standard_deviations=configured_positive_float("GANESH_BB_STDDEV", 2.0),
+    )
+    if not bands:
+        raise RuntimeError("Insufficient two-hour candles for Bollinger Bands")
+    recent_volumes = [
+        float(value)
+        for value in prior_2h.get("volume", pd.Series(dtype=float)).dropna().tail(20)
+    ]
+    average_volume = sum(recent_volumes) / len(recent_volumes) if recent_volumes else 0.0
+    volume_ratio = active_volume / average_volume if average_volume > 0 else 0.0
+
+    gap = opening_gap(
+        previous_ohlc["close"],
+        float(today_rows.iloc[0]["open"]),
+        configured_non_negative_float("GANESH_MIN_GAP_PERCENT", 0.20),
+    )
+    pivots = classic_pivots(
+        previous_ohlc["high"],
+        previous_ohlc["low"],
+        previous_ohlc["close"],
+    )
+    colour = candle_colour(
+        candle_open,
+        spot,
+        configured_non_negative_float("GANESH_COLOUR_NEUTRAL_BUFFER_POINTS", 0.0),
+    )
+    return {
+        "timestamp": current_time.isoformat(),
+        "spot": round(spot, 2),
+        "data_age_seconds": round(float(data_age or 0), 2),
+        "previous_date": str(previous_date),
+        "previous_high": round(previous_ohlc["high"], 2),
+        "previous_low": round(previous_ohlc["low"], 2),
+        "previous_close": round(previous_ohlc["close"], 2),
+        "today_open": round(float(today_rows.iloc[0]["open"]), 2),
+        "gap": gap,
+        "candle_start": candle_start.isoformat(),
+        "candle_open": round(candle_open, 2),
+        "candle_high": round(active_high, 2),
+        "candle_low": round(active_low, 2),
+        "candle_colour": colour,
+        "bollinger": bands,
+        "pivots": pivots,
+        "active_volume": round(active_volume, 2),
+        "volume_average_20": round(average_volume, 2),
+        "volume_ratio": round(volume_ratio, 3),
+        "volume_confirmed": average_volume > 0 and active_volume > average_volume,
+    }
+
+
+GANESH_GAP_SCAN_COLUMNS = [
+    "timestamp", "spot", "previous_close", "today_open", "gap_direction",
+    "gap_points", "gap_percent", "candle_start", "candle_open", "candle_colour",
+    "previous_confirmed_colour", "bb_upper", "bb_middle", "bb_lower", "P", "R1",
+    "R2", "R3", "S1", "S2", "S3", "target_type", "target_level",
+    "target_distance", "atm_strike", "expiry", "option_type", "option_ltp", "bid",
+    "ask", "spread_percent", "volume_ratio", "entry_eligible", "reason", "phase",
+]
+
+
+def record_ganesh_gap_scan(snapshot, state, eligible, reason, option=None, target=None):
+    option = option or {}
+    target = target or {}
+    gap = snapshot.get("gap") or {}
+    bands = snapshot.get("bollinger") or {}
+    pivots = snapshot.get("pivots") or {}
+    row = {
+        "timestamp": snapshot.get("timestamp") or now_ist().isoformat(),
+        "spot": snapshot.get("spot"),
+        "previous_close": snapshot.get("previous_close"),
+        "today_open": snapshot.get("today_open"),
+        "gap_direction": gap.get("direction"),
+        "gap_points": gap.get("points"),
+        "gap_percent": gap.get("percent"),
+        "candle_start": snapshot.get("candle_start"),
+        "candle_open": snapshot.get("candle_open"),
+        "candle_colour": snapshot.get("candle_colour"),
+        "previous_confirmed_colour": state.get("previous_confirmed_colour"),
+        "bb_upper": bands.get("upper"),
+        "bb_middle": bands.get("middle"),
+        "bb_lower": bands.get("lower"),
+        **{key: pivots.get(key) for key in ("P", "R1", "R2", "R3", "S1", "S2", "S3")},
+        "target_type": target.get("type"),
+        "target_level": target.get("level"),
+        "target_distance": target.get("distance"),
+        "atm_strike": option.get("strike"),
+        "expiry": option.get("expiry"),
+        "option_type": option.get("option_type"),
+        "option_ltp": option.get("ltp"),
+        "bid": option.get("bid_price"),
+        "ask": option.get("ask_price"),
+        "spread_percent": option.get("spread_percent"),
+        "volume_ratio": snapshot.get("volume_ratio"),
+        "entry_eligible": bool(eligible),
+        "reason": reason,
+        "phase": state.get("phase"),
+    }
+    locked_append_csv(GANESH_GAP_SCAN_FILE, GANESH_GAP_SCAN_COLUMNS, row)
 
 
 def read_watch_state(symbol):
@@ -2570,6 +2792,92 @@ def index_contract_rows(recommendation, direction):
     return rows
 
 
+def ganesh_gap_option_candidate(snapshot, transition):
+    """Select a liquid next-week ATM NIFTY option without using chain direction."""
+    _, _, chain = fetch_upstox_option_chain("NIFTY", nearby=5)
+    strike = atm_strike(
+        snapshot["spot"],
+        interval=max(to_int(os.getenv("GANESH_NIFTY_STRIKE_INTERVAL"), 50), 1),
+    )
+    exact = chain[chain["strike"] == float(strike)]
+    if exact.empty:
+        row = chain.loc[(chain["strike"] - float(strike)).abs().idxmin()]
+        strike = int(float(row["strike"]))
+    else:
+        row = exact.iloc[0]
+    option_type = transition["option_type"]
+    prefix = "CE" if option_type == "CE" else "PE"
+    expiry = row.get("expiry")
+    instrument = find_index_option_instrument(
+        "NIFTY",
+        expiry,
+        strike,
+        option_type,
+    )
+    stream = read_market_cache(instrument.get("instrument_key")) or {}
+    quality = option_contract_quality(row.to_dict(), option_type, stream)
+    ltp = to_float(quality.get("ltp"), to_float(row.get(f"{prefix}_ltp")))
+    bid = to_float(quality.get("bid_price"), to_float(row.get(f"{prefix}_bid_price")))
+    ask = to_float(quality.get("ask_price"), to_float(row.get(f"{prefix}_ask_price")))
+    spread_percent = quality.get("spread_percent")
+    maximum_spread = configured_positive_float("GANESH_MAX_OPTION_SPREAD_PERCENT", 2.5)
+    blockers = []
+    if ltp <= 0:
+        blockers.append("option LTP is unavailable")
+    if bid <= 0 or ask <= 0:
+        blockers.append("option bid/ask is unavailable")
+    if spread_percent is None:
+        blockers.append("option spread cannot be calculated")
+    elif float(spread_percent) > maximum_spread:
+        blockers.append(
+            f"option spread {float(spread_percent):.2f}% exceeds {maximum_spread:.2f}%"
+        )
+    return {
+        "allowed": not blockers,
+        "reason": "; ".join(blockers) if blockers else "next-week ATM option is tradeable",
+        "strike": strike,
+        "expiry": str(expiry),
+        "option_type": option_type,
+        "ltp": round(ltp, 2),
+        "bid_price": round(bid, 2),
+        "ask_price": round(ask, 2),
+        "spread_percent": round(float(spread_percent), 3) if spread_percent is not None else None,
+        "instrument": instrument,
+        "quality": quality,
+    }
+
+
+def ganesh_gap_quantity(instrument, option_price):
+    lot_size = int(instrument.get("lot_size") or 0)
+    lots = max(to_int(os.getenv("GANESH_LOTS_PER_ENTRY"), 1), 1)
+    quantity = lot_size * lots
+    if lot_size <= 0 or option_price <= 0:
+        return 0
+    if ganesh_gap_live_enabled():
+        available = maximum_available_option_capital(force_refresh=True)
+        if float(option_price) * quantity > available:
+            return 0
+    return quantity
+
+
+def ganesh_gap_option_levels(entry_price, quantity, target_distance):
+    stop_percent = configured_positive_float("GANESH_OPTION_STOP_PERCENT", 20.0)
+    stop_distance = float(entry_price) * stop_percent / 100.0
+    maximum_loss = configured_non_negative_float("GANESH_MAX_RISK_PER_TRADE", 0.0)
+    if maximum_loss > 0 and quantity > 0:
+        stop_distance = min(stop_distance, maximum_loss / quantity)
+    stop = max(float(entry_price) - stop_distance, 0.05)
+    delta = configured_positive_float("GANESH_OPTION_DELTA_APPROXIMATION", 0.50)
+    if delta > 1:
+        raise RuntimeError("GANESH_OPTION_DELTA_APPROXIMATION must be at most 1")
+    target = float(entry_price) + float(target_distance) * delta
+    return {
+        "target_price": round(target, 2),
+        "stop_loss_price": round(stop, 2),
+        "delta": delta,
+    }
+
+
 def market_window_ok():
     now = now_ist().time()
     return time(9, 20) <= now <= time(15, 15)
@@ -2635,7 +2943,8 @@ def save_open_position_state(
             precision = (
                 2
                 if instrument_class == "STOCK_FUTURE"
-                or str((trade_metadata or {}).get("strategy") or "").upper() == "T20"
+                or str((trade_metadata or {}).get("strategy") or "").upper()
+                in {"T20", "GANESH_GAP_REVERSAL"}
                 else 0
             )
             target_price = round(float(target_price), precision)
@@ -3008,7 +3317,211 @@ def cancel_protective_stop(symbol, state):
     return False
 
 
+def close_ganesh_gap_paper_position(state, option_ltp, exit_reason):
+    state["highest_ltp"] = max(
+        to_float(state.get("highest_ltp"), option_ltp), float(option_ltp)
+    )
+    state["lowest_ltp"] = min(
+        to_float(state.get("lowest_ltp"), option_ltp), float(option_ltp)
+    )
+    journal_row = record_closed_trade(state, option_ltp, exit_reason)
+    send_apple_closed_trade_alert(journal_row)
+    log(
+        f"GANESH GAP paper bought {journal_row.get('entry_price')} "
+        f"closed {journal_row.get('exit_price')} pnl {journal_row.get('gross_pnl')} "
+        f"reason {exit_reason}"
+    )
+    clear_state(GANESH_GAP_STATE)
+    return True
+
+
+def submit_ganesh_gap_exit(state, option_ltp, exit_reason, quantity):
+    """Publish exit intent before broker calls so overlapping monitors cannot duplicate it."""
+    state["status"] = "EXIT_PENDING"
+    state["exit_reason"] = exit_reason
+    state["exit_fallback_price"] = option_ltp
+    write_state(GANESH_GAP_STATE, state)
+
+    if state.get("paper_trade"):
+        return close_ganesh_gap_paper_position(state, option_ltp, exit_reason)
+    if state.get("protective_stop_order_id") and cancel_protective_stop(
+        GANESH_GAP_STATE, state
+    ):
+        return True
+
+    instrument = {
+        "instrument_key": state["instrument_key"],
+        "trading_symbol": state.get("trading_symbol"),
+    }
+    try:
+        result, payload = place_market_order(
+            instrument,
+            "SELL",
+            quantity,
+            product=state.get("order_product") or "I",
+        )
+    except Exception:
+        state["status"] = "POSITION_OPEN"
+        state.pop("exit_reason", None)
+        state.pop("exit_fallback_price", None)
+        write_state(GANESH_GAP_STATE, state)
+        raise
+    order_id = result.get("data", {}).get("order_id")
+    if not order_id:
+        state["status"] = "POSITION_OPEN"
+        write_state(GANESH_GAP_STATE, state)
+        raise RuntimeError(f"GANESH GAP SELL returned no order_id: {result}")
+    details = wait_for_order_complete(order_id)
+    if order_is_complete(details):
+        complete_exit(
+            GANESH_GAP_STATE,
+            state,
+            details,
+            option_ltp,
+            exit_reason,
+            result,
+            payload,
+        )
+    else:
+        state["exit_order_id"] = order_id
+        write_state(GANESH_GAP_STATE, state)
+        log(f"GANESH GAP SELL pending: order_id={order_id} status={order_status(details)}")
+    return True
+
+
+def handle_ganesh_gap_position(state, verbose=True):
+    instrument_key = state.get("instrument_key")
+    if not instrument_key:
+        return False
+    if state.get("status") == "EXIT_PENDING":
+        return monitor_pending_exit(GANESH_GAP_STATE, state)
+
+    entry_order_id = state.get("entry_order_id") or state.get("buy_order_id")
+    if entry_order_id and state.get("status") == "BUY_PLACED_NOT_COMPLETE":
+        details = wait_for_order_complete(entry_order_id, attempts=1, delay_seconds=0)
+        if order_is_rejected(details):
+            log(f"GANESH GAP pending BUY was {order_status(details)}; clearing state")
+            clear_state(GANESH_GAP_STATE)
+            return True
+        if not order_is_complete(details):
+            return True
+        position = find_matching_position_for_side(instrument_key, "BUY")
+        fill = position_avg_price(position, "BUY") if position else None
+        fill = fill or to_float(details.get("average_price")) or to_float(state.get("entry_price"))
+        if fill <= 0:
+            log("GANESH GAP BUY completed but fill price is unavailable; retaining state")
+            return True
+        instrument = {
+            "instrument_key": instrument_key,
+            "trading_symbol": state.get("trading_symbol"),
+            "lot_size": int(state.get("lot_size") or state.get("quantity") or 1),
+        }
+        finalize_and_protect_ganesh_gap_position(
+            state,
+            fill,
+            int(state.get("quantity") or 0),
+            instrument,
+            entry_order_id,
+        )
+        return True
+
+    if not state.get("paper_trade") and protective_stop_filled(GANESH_GAP_STATE, state):
+        return True
+
+    position = None
+    if not state.get("paper_trade"):
+        position = find_matching_position_for_side(instrument_key, "BUY")
+        if not position:
+            log("GANESH GAP state exists but matching broker position is not visible")
+            return True
+        if broker_protective_stop_required(state) and not state.get("protective_stop_order_id"):
+            state = ensure_protective_stop(GANESH_GAP_STATE, state)
+
+    option_quote = read_market_cache(instrument_key) or {}
+    option_ltp = position_ltp(position) if position else to_float(option_quote.get("ltp"), 0)
+    option_ltp = option_ltp or to_float(state.get("entry_price"), 0)
+    if option_ltp <= 0:
+        log("GANESH GAP option LTP is unavailable; broker stop remains active")
+        return True
+    state["highest_ltp"] = max(to_float(state.get("highest_ltp"), option_ltp), option_ltp)
+    state["lowest_ltp"] = min(to_float(state.get("lowest_ltp"), option_ltp), option_ltp)
+
+    underlying_quote = read_market_cache(UNDERLYING_INDEX_KEYS["NIFTY"]) or {}
+    received_at = to_float(underlying_quote.get("received_at"), 0)
+    quote_age = time_module.time() - received_at if received_at else 999999.0
+    spot = to_float(underlying_quote.get("ltp"), 0)
+    stale_after = configured_positive_float("GANESH_DATA_STALE_EXIT_SECONDS", 60.0)
+    exit_reason = "DAILY_MAX_LOSS" if daily_max_loss_reached() else None
+    if not exit_reason and (spot <= 0 or quote_age > stale_after):
+        created_at = state.get("created_at")
+        try:
+            state_age = max((now_ist() - datetime.fromisoformat(created_at)).total_seconds(), 0)
+        except Exception:
+            state_age = stale_after + 1
+        if state_age > stale_after:
+            exit_reason = "STALE_MARKET_DATA"
+    elif not exit_reason:
+        current_time = now_ist()
+        candle_start = active_two_hour_start(current_time)
+        candle_key = candle_start.isoformat()
+        if state.get("monitor_candle_start") != candle_key:
+            intraday = _frame_in_ist(
+                fetch_v3_intraday_minutes(UNDERLYING_INDEX_KEYS["NIFTY"], minutes=1)
+            )
+            active_rows = intraday[
+                (intraday.index.date == current_time.date()) & (intraday.index >= candle_start)
+            ]
+            if active_rows.empty:
+                log("GANESH GAP new two-hour candle open is unavailable; broker stop remains active")
+                write_state(GANESH_GAP_STATE, state)
+                return True
+            state["monitor_candle_start"] = candle_key
+            state["monitor_candle_open"] = float(active_rows.iloc[0]["open"])
+            state["exit_confirmation_scans"] = 0
+        colour = candle_colour(
+            state.get("monitor_candle_open", state.get("entry_candle_open")),
+            spot,
+            configured_non_negative_float("GANESH_COLOUR_NEUTRAL_BUFFER_POINTS", 0.0),
+        )
+        state, opposite_confirmed = advance_exit_confirmation(
+            state,
+            colour,
+            state.get("direction"),
+            required_scans=max(to_int(os.getenv("GANESH_EXIT_CONFIRMATION_SCANS"), 2), 1),
+        )
+        state["current_candle_colour"] = colour
+        state["last_underlying_ltp"] = round(spot, 2)
+        state["last_underlying_quote_at"] = datetime.fromtimestamp(received_at, IST).isoformat()
+        if target_reached(state.get("direction"), spot, state.get("nifty_target_level")):
+            exit_reason = "UNDERLYING_TARGET"
+        elif opposite_confirmed:
+            exit_reason = "CONFIRMED_OPPOSITE_2H_COLOUR"
+
+    write_state(GANESH_GAP_STATE, state)
+    if verbose:
+        log(
+            f"GANESH GAP open: {state.get('trading_symbol')} qty={state.get('quantity')} "
+            f"option_ltp={option_ltp:.2f} nifty={spot:.2f} "
+            f"target={state.get('nifty_target_type')}@{state.get('nifty_target_level')} "
+            f"colour={state.get('current_candle_colour')}"
+        )
+    if exit_reason:
+        log(f"GANESH GAP exit triggered: {exit_reason}")
+        quantity = int(state.get("quantity") or 0)
+        if position:
+            quantity = quantity or abs(position_quantity(position))
+        return submit_ganesh_gap_exit(
+            state,
+            option_ltp,
+            exit_reason,
+            quantity,
+        )
+    return True
+
+
 def handle_existing_state(symbol, state, verbose=True):
+    if str(state.get("strategy") or "").upper() == "GANESH_GAP_REVERSAL":
+        return handle_ganesh_gap_position(state, verbose=verbose)
     instrument_key = state.get("instrument_key")
     if not instrument_key:
         return False
@@ -3748,6 +4261,21 @@ def run_squareoff():
 
         if state.get("status") == "EXIT_PENDING":
             monitor_pending_exit(symbol, state)
+            continue
+
+        if state.get("paper_trade"):
+            quote = read_market_cache(state["instrument_key"]) or {}
+            ltp = to_float(quote.get("ltp"), to_float(state.get("entry_price")))
+            if str(state.get("strategy") or "").upper() == "GANESH_GAP_REVERSAL":
+                close_ganesh_gap_paper_position(state, ltp, "SQUAREOFF")
+            else:
+                journal_row = record_closed_trade(state, ltp, "SQUAREOFF")
+                log(
+                    f"{symbol} paper bought {journal_row.get('entry_price')} "
+                    f"closed {journal_row.get('exit_price')} "
+                    f"pnl {journal_row.get('gross_pnl')} reason SQUAREOFF"
+                )
+                clear_state(symbol)
             continue
 
         entry_transaction = str(state.get("entry_transaction_type") or "BUY").upper()
@@ -5330,6 +5858,347 @@ def run_stock_futures_fallback():
     return False
 
 
+def finalize_ganesh_gap_position(initial_state, fill, quantity, instrument, order_id):
+    levels = ganesh_gap_option_levels(
+        fill,
+        quantity,
+        initial_state.get("nifty_target_distance"),
+    )
+    metadata = {
+        **initial_state,
+        "symbol": "NIFTY",
+        "underlying_symbol": "NIFTY",
+        "state_slot": GANESH_GAP_STATE,
+        "strategy": "GANESH_GAP_REVERSAL",
+        "underlying_instrument_key": UNDERLYING_INDEX_KEYS["NIFTY"],
+        "profit_protection_enabled_for_trade": False,
+    }
+    save_open_position_state(
+        GANESH_GAP_STATE,
+        order_id,
+        instrument,
+        initial_state.get("direction"),
+        "HIGH",
+        100,
+        fill,
+        quantity,
+        levels["target_price"],
+        levels["stop_loss_price"],
+        entry_transaction_type="BUY",
+        instrument_class="INDEX_OPTION",
+        underlying_symbol="NIFTY",
+        target_points=initial_state.get("nifty_target_distance"),
+        stop_points=None,
+        option_delta_used=levels["delta"],
+        profit_protection_enabled_for_trade=False,
+        trade_metadata=metadata,
+        order_product="I",
+    )
+    state = read_state(GANESH_GAP_STATE)
+    state.update(
+        {
+            "target_price": levels["target_price"],
+            "planned_target_price": levels["target_price"],
+            "stop_loss_price": levels["stop_loss_price"],
+            "original_stop_loss_price": levels["stop_loss_price"],
+            "profit_booking_mode": "runner",
+            "profit_booking_price": levels["target_price"],
+        }
+    )
+    write_state(GANESH_GAP_STATE, state)
+    return state
+
+
+def finalize_and_protect_ganesh_gap_position(initial_state, fill, quantity, instrument, order_id):
+    with position_finalization_lock(GANESH_GAP_STATE):
+        fresh = read_state(GANESH_GAP_STATE)
+        if not fresh or str(fresh.get("entry_order_id")) != str(order_id):
+            return fresh
+        if fresh.get("status") == "EXIT_PENDING":
+            return fresh
+        if fresh.get("status") == "POSITION_OPEN" and fresh.get("protective_stop_order_id"):
+            return fresh
+        state = (
+            fresh
+            if fresh.get("status") == "POSITION_OPEN"
+            else finalize_ganesh_gap_position(fresh or initial_state, fill, quantity, instrument, order_id)
+        )
+        try:
+            return ensure_protective_stop(GANESH_GAP_STATE, state)
+        except Exception as error:
+            log(f"GANESH GAP CRITICAL: protective stop failed; flattening: {error}")
+            state = read_state(GANESH_GAP_STATE)
+            state["status"] = "EXIT_PENDING"
+            state["exit_reason"] = "PROTECTION_FAILURE"
+            write_state(GANESH_GAP_STATE, state)
+            result, payload = place_market_order(instrument, "SELL", quantity, product="I")
+            exit_order_id = result.get("data", {}).get("order_id")
+            if not exit_order_id:
+                state["status"] = "POSITION_OPEN"
+                write_state(GANESH_GAP_STATE, state)
+                raise RuntimeError("GANESH GAP emergency SELL returned no order_id") from error
+            details = wait_for_order_complete(exit_order_id)
+            if order_is_complete(details):
+                complete_exit(
+                    GANESH_GAP_STATE,
+                    state,
+                    details,
+                    fill,
+                    "PROTECTION_FAILURE",
+                    result,
+                    payload,
+                )
+            else:
+                state["exit_order_id"] = exit_order_id
+                state["exit_fallback_price"] = fill
+                write_state(GANESH_GAP_STATE, state)
+            return read_state(GANESH_GAP_STATE)
+
+
+def execute_ganesh_gap_entry(state, snapshot, option, target):
+    instrument = option["instrument"]
+    expected_entry = float(option["ltp"])
+    quantity = ganesh_gap_quantity(instrument, expected_entry)
+    if quantity <= 0:
+        return False, "configured lots or available funds cannot buy one complete lot"
+    levels = ganesh_gap_option_levels(expected_entry, quantity, target["distance"])
+    candidate = {
+        "symbol": "NIFTY",
+        "underlying_symbol": "NIFTY",
+        "direction": transition_for_gap(state["gap_direction"])["direction"],
+        "transaction_type": "BUY",
+        "instrument": instrument,
+        "entry_minimum_score": 0,
+        "score_cutoff_approved": True,
+        "weighted": {"score": 100},
+    }
+    live = ganesh_gap_live_enabled()
+    with portfolio_entry_lock():
+        decision = pre_order_portfolio_decision(
+            candidate,
+            quantity,
+            expected_entry,
+            levels["stop_loss_price"],
+        )
+        if not decision.get("allowed"):
+            return False, f"portfolio safety gate: {decision.get('reason')}"
+        entry_state = {
+            **state,
+            "date": now_ist().strftime("%Y-%m-%d"),
+            "symbol": "NIFTY",
+            "underlying_symbol": "NIFTY",
+            "state_slot": GANESH_GAP_STATE,
+            "strategy": "GANESH_GAP_REVERSAL",
+            "direction": candidate["direction"],
+            "option_type": option["option_type"],
+            "strike": option["strike"],
+            "expiry": option["expiry"],
+            "instrument_key": instrument["instrument_key"],
+            "trading_symbol": instrument["trading_symbol"],
+            "lot_size": int(instrument["lot_size"]),
+            "quantity": quantity,
+            "entry_transaction_type": "BUY",
+            "exit_transaction_type": "SELL",
+            "instrument_class": "INDEX_OPTION",
+            "order_product": "I",
+            "nifty_entry_price": snapshot["spot"],
+            "nifty_target_type": target["type"],
+            "nifty_target_level": target["level"],
+            "nifty_target_distance": target["distance"],
+            "entry_candle_start": snapshot["candle_start"],
+            "entry_candle_open": snapshot["candle_open"],
+            "entry_transition": (
+                "RED_TO_GREEN" if candidate["direction"] == GANESH_BULLISH else "GREEN_TO_RED"
+            ),
+            "entry_volume_confirmed": snapshot.get("volume_confirmed"),
+            "entry_volume_ratio": snapshot.get("volume_ratio"),
+            "target_price": levels["target_price"],
+            "stop_loss_price": levels["stop_loss_price"],
+            "entry_price": expected_entry,
+            "score": 100,
+            "weighted_score": 100,
+            "status": "POSITION_OPEN" if not live else "BUY_PLACED_NOT_COMPLETE",
+            "phase": "POSITION_OPEN" if not live else "ENTRY_PENDING",
+            "created_at": now_ist().isoformat(),
+            "paper_trade": not live,
+        }
+        write_stream_instruments(
+            [UNDERLYING_INDEX_KEYS["NIFTY"], instrument.get("instrument_key")]
+        )
+        if not live:
+            entry_state.update(
+                {
+                    "highest_ltp": expected_entry,
+                    "lowest_ltp": expected_entry,
+                    "original_stop_loss_price": levels["stop_loss_price"],
+                    "profit_protection_enabled_for_trade": False,
+                }
+            )
+            write_state(GANESH_GAP_STATE, entry_state)
+            increment_trade_count(GANESH_GAP_STATE)
+            return True, "paper position opened"
+        result, payload = place_market_order(instrument, "BUY", quantity, product="I")
+        order_id = result.get("data", {}).get("order_id")
+        if not order_id:
+            return False, "broker BUY returned no order_id"
+        entry_state["entry_order_id"] = order_id
+        write_state(GANESH_GAP_STATE, entry_state)
+
+    details = wait_for_order_complete(order_id)
+    if order_is_rejected(details):
+        state.update({"phase": "WAITING_FOR_REVERSAL", "reversal_triggered": False})
+        write_state(GANESH_GAP_STATE, state)
+        return False, f"broker rejected BUY: {details.get('status_message') or details.get('status')}"
+    increment_trade_count(GANESH_GAP_STATE)
+    if not order_is_complete(details):
+        return True, f"entry pending order_id={order_id}"
+    position = find_matching_position_for_side(instrument["instrument_key"], "BUY")
+    fill = position_avg_price(position, "BUY") if position else None
+    fill = fill or to_float(details.get("average_price")) or expected_entry
+    finalize_and_protect_ganesh_gap_position(entry_state, fill, quantity, instrument, order_id)
+    return True, f"live position opened order_id={order_id}"
+
+
+def run_ganesh_gap_signal_check():
+    now = now_ist()
+    start = configured_clock("GANESH_STRATEGY_START_TIME", "09:30")
+    end = configured_clock("GANESH_LAST_ENTRY_TIME", "15:15")
+    if not start <= now.time() <= end:
+        log("GANESH GAP outside entry window. No action.")
+        return
+    state = read_state(GANESH_GAP_STATE)
+    if state_is_active(state):
+        log("GANESH GAP position already active; no new entry.")
+        return
+    other_active = [
+        active
+        for active in active_bot_states()
+        if active.get("state_slot") != GANESH_GAP_STATE
+    ]
+    if other_active:
+        log("GANESH GAP no trade: another bot-managed position is active.")
+        return
+    if ganesh_gap_max_trades_per_day() <= trade_count_for(GANESH_GAP_STATE):
+        state.update({"date": now.strftime("%Y-%m-%d"), "phase": "DISABLED_FOR_DAY"})
+        write_state(GANESH_GAP_STATE, state)
+        log("GANESH GAP maximum daily trade count reached.")
+        return
+    circuit = portfolio_day_circuit()
+    if not circuit.get("allowed"):
+        log(f"GANESH GAP blocked by daily circuit: {circuit.get('reason')}")
+        return
+
+    try:
+        snapshot = ganesh_gap_market_snapshot(now)
+    except Exception as error:
+        log(f"GANESH GAP market snapshot unavailable: {error}")
+        return
+    if state.get("date") != now.strftime("%Y-%m-%d"):
+        state = {
+            "date": now.strftime("%Y-%m-%d"),
+            "phase": "DETECTING_GAP",
+            "gap_direction": snapshot["gap"]["direction"],
+            "gap_points": snapshot["gap"]["points"],
+            "gap_percent": snapshot["gap"]["percent"],
+            "previous_high": snapshot["previous_high"],
+            "previous_low": snapshot["previous_low"],
+            "previous_close": snapshot["previous_close"],
+            "today_open": snapshot["today_open"],
+            "pivots": snapshot["pivots"],
+        }
+    if state.get("gap_direction") == GANESH_NO_GAP:
+        state["phase"] = "DISABLED_FOR_DAY"
+        write_state(GANESH_GAP_STATE, state)
+        reason = f"opening gap {state.get('gap_percent')}% is below threshold"
+        record_ganesh_gap_scan(snapshot, state, False, reason)
+        log(f"GANESH GAP no trade: {reason}")
+        return
+
+    transition = transition_for_gap(state["gap_direction"])
+    reversal_distance = abs(snapshot["spot"] - snapshot["candle_open"])
+    minimum_reversal = configured_non_negative_float("GANESH_MIN_REVERSAL_POINTS", 0.0)
+    buffer_confirmed = minimum_reversal > 0 and reversal_distance >= minimum_reversal
+    state, transition_confirmed = advance_entry_confirmation(
+        state,
+        active_two_hour_start(now),
+        snapshot["candle_colour"],
+        state["gap_direction"],
+        required_scans=max(to_int(os.getenv("GANESH_ENTRY_CONFIRMATION_SCANS"), 2), 1),
+        buffer_confirmed=buffer_confirmed,
+    )
+    state.update(
+        {
+            "last_scan_at": now.isoformat(),
+            "current_candle_open": snapshot["candle_open"],
+            "current_candle_colour": snapshot["candle_colour"],
+            "bollinger": snapshot["bollinger"],
+        }
+    )
+    target = nearest_target(
+        transition["direction"],
+        snapshot["spot"],
+        snapshot["bollinger"]["middle"],
+        state["pivots"],
+        minimum_distance=configured_non_negative_float("GANESH_MIN_TARGET_POINTS", 15.0),
+    )
+    option = {}
+    reason = "waiting for confirmed colour reversal"
+    eligible = bool(transition_confirmed and target)
+    if transition_confirmed and not target:
+        reason = "no valid technical target beyond the minimum distance"
+
+    if eligible:
+        try:
+            option = ganesh_gap_option_candidate(snapshot, transition)
+        except Exception as error:
+            option = {"allowed": False, "reason": str(error)}
+        if not option.get("allowed"):
+            eligible = False
+            reason = option.get("reason") or "ATM option is unavailable"
+
+    mode = str(os.getenv("GANESH_GAP_MODE", "FAITHFUL")).strip().upper()
+    if mode not in {"FAITHFUL", "ENHANCED"}:
+        raise RuntimeError("GANESH_GAP_MODE must be FAITHFUL or ENHANCED")
+    if eligible and mode == "ENHANCED":
+        if configured_bool("GANESH_REQUIRE_VOLUME_CONFIRMATION", False) and not snapshot.get("volume_confirmed"):
+            eligible = False
+            reason = "enhanced volume confirmation failed"
+        if eligible and configured_bool("GANESH_REQUIRE_BB_DIRECTION", False):
+            middle = snapshot["bollinger"]["middle"]
+            moving_toward = (
+                snapshot["spot"] <= middle if transition["direction"] == GANESH_BULLISH
+                else snapshot["spot"] >= middle
+            )
+            if not moving_toward:
+                eligible = False
+                reason = "enhanced Bollinger-direction filter failed"
+        if eligible and configured_bool("GANESH_REQUIRE_MIN_REWARD_RISK", False):
+            spot_stop = configured_positive_float("GANESH_SPOT_STOP_POINTS", 15.0)
+            reward_risk = target["distance"] / spot_stop
+            minimum_rr = configured_positive_float("GANESH_MIN_REWARD_RISK", 1.20)
+            if reward_risk < minimum_rr:
+                eligible = False
+                reason = f"expected reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
+
+    if eligible:
+        reason = "confirmed opening-gap reversal with a valid locked target"
+
+    write_state(GANESH_GAP_STATE, state)
+    record_ganesh_gap_scan(snapshot, state, eligible, reason, option=option, target=target)
+    if not eligible:
+        log(
+            f"GANESH GAP {state.get('phase')} gap={state.get('gap_direction')} "
+            f"colour={snapshot['candle_colour']} spot={snapshot['spot']} reject: {reason}"
+        )
+        return
+    opened, result_reason = execute_ganesh_gap_entry(state, snapshot, option, target)
+    log(
+        f"GANESH GAP {'entered' if opened else 'rejected'}: {option.get('option_type')} "
+        f"strike={option.get('strike')} target={target.get('type')}@{target.get('level')} "
+        f"reason={result_reason}"
+    )
+
+
 def _legacy_run_stock_futures_fallback():
     if os.getenv("ENABLE_STOCK_FUTURES_SCANNER", "false").lower() != "true":
         write_scanner_status(
@@ -5469,6 +6338,10 @@ def run_signal_check():
                 handle_existing_state(state_slot, state)
             except Exception as error:
                 log(f"{state_slot} existing-position check ERROR: {error}")
+
+    if trading_engine() == "GANESH":
+        run_ganesh_gap_signal_check()
+        return
 
     try:
         day_circuit = portfolio_day_circuit()
