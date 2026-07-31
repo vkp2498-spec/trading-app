@@ -358,8 +358,8 @@ def clean_num(x):
     return float(m.group(0)) if m else None
 
 
-def should_use_next_week_expiry():
-    return now_ist().weekday() in [0, 1]
+def should_use_next_week_expiry(symbol):
+    return str(symbol or "").upper() == "NIFTY"
 
 
 def parse_oi_with_change(text):
@@ -387,7 +387,7 @@ def parse_oi_with_change(text):
     return current_oi, previous_oi, change_oi, change_pct
 
 
-def detect_expiry(all_text):
+def detect_expiry(all_text, symbol):
     matches = re.findall(r"\b\d{2}\s+[A-Z][a-z]{2}\b", all_text)
 
     if not matches:
@@ -398,8 +398,8 @@ def detect_expiry(all_text):
         if expiry not in unique_expiries:
             unique_expiries.append(expiry)
 
-    if should_use_next_week_expiry() and len(unique_expiries) >= 2:
-        return unique_expiries[1]
+    if should_use_next_week_expiry(symbol):
+        return unique_expiries[1] if len(unique_expiries) >= 2 else None
 
     return unique_expiries[0]
 
@@ -706,7 +706,7 @@ async def fetch_groww_options(symbol, nearby=5, option_url=None):
 
         await browser.close()
 
-    expiry = detect_expiry(all_text)
+    expiry = detect_expiry(all_text, symbol)
     spot = detect_spot(all_text, symbol)
 
     strike_re = re.compile(r"^\d{1,3}(,\d{3})*(\.\d+)?$")

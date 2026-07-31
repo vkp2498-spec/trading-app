@@ -24,11 +24,11 @@ UPSTOX_OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
 INDEX_CONFIG = {
     "NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty 50",
-        "use_next_expiry_on_mon_tue": True,
+        "expiry_offset": 1,
     },
     "BANKNIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Bank",
-        "use_next_expiry_on_mon_tue": False,
+        "expiry_offset": 0,
     },
 }
 
@@ -54,10 +54,7 @@ def now_ist():
 
 
 def should_use_next_week_expiry(symbol):
-    return (
-        INDEX_CONFIG[symbol]["use_next_expiry_on_mon_tue"]
-        and now_ist().weekday() in [0, 1]
-    )
+    return int(INDEX_CONFIG[symbol].get("expiry_offset", 0)) == 1
 
 
 def choose_expiry(symbol, expiries):
@@ -66,10 +63,14 @@ def choose_expiry(symbol, expiries):
     if not expiries:
         raise RuntimeError(f"No expiries available for {symbol}")
 
-    if should_use_next_week_expiry(symbol) and len(expiries) >= 2:
-        return expiries[1]
+    expiry_offset = int(INDEX_CONFIG[symbol].get("expiry_offset", 0))
+    if len(expiries) <= expiry_offset:
+        label = "next-week" if expiry_offset == 1 else "nearest"
+        raise RuntimeError(
+            f"No {label} expiry available for {symbol}; received {expiries}"
+        )
 
-    return expiries[0]
+    return expiries[expiry_offset]
 
 
 def upstox_market_token():

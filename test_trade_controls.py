@@ -4,7 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -48,13 +48,34 @@ import apns_push
 import dashboard_data
 import trade_journal
 from counterfactual_replay import simulate_trade
-from strategy_replay import Candidate, StrategyReplay, capital_sized_option_quantity
+from strategy_replay import Candidate, StrategyReplay, _choose_expiry, capital_sized_option_quantity
+from strategy_core import choose_expiry
 from signal_score import nifty_neutral_chain_direction, weighted_alignment_score
 from backtest_report import build_reports
 from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_nifty_always_uses_second_available_expiry(self):
+        expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
+        self.assertEqual(choose_expiry("NIFTY", expiries), "2026-08-11")
+
+    def test_nifty_does_not_fall_back_when_next_expiry_is_missing(self):
+        with self.assertRaisesRegex(RuntimeError, "No next-week expiry"):
+            choose_expiry("NIFTY", ["2026-08-04"])
+
+    def test_banknifty_keeps_nearest_expiry(self):
+        expiries = ["2026-08-25", "2026-09-29"]
+        self.assertEqual(choose_expiry("BANKNIFTY", expiries), "2026-08-25")
+
+    def test_replay_uses_next_nifty_expiry_on_every_weekday(self):
+        session_date = datetime(2026, 7, 29).date()
+        expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
+        self.assertEqual(
+            _choose_expiry("NIFTY", expiries, session_date),
+            datetime(2026, 8, 11).date(),
+        )
+
     def test_market_orders_use_explicit_market_protection(self):
         instrument = {"instrument_key": "NSE_FO|1", "trading_symbol": "TEST"}
         with (
@@ -284,7 +305,7 @@ class TradeControlTests(unittest.TestCase):
 
         class ReplayData:
             def get_expiries(self, instrument_key):
-                return [day]
+                return [day, day + timedelta(days=7)]
 
         engine = StrategyReplay(
             ReplayData(),
@@ -345,7 +366,7 @@ class TradeControlTests(unittest.TestCase):
 
         class ReplayData:
             def get_expiries(self, instrument_key):
-                return [day]
+                return [day, day + timedelta(days=7)]
 
         def run_policy(
             max_trades=0,

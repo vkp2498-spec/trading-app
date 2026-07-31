@@ -176,8 +176,8 @@ def _choose_expiry(symbol, expiries, session_date):
     valid = sorted(_expiry(value) for value in expiries if _expiry(value) >= session_date)
     if not valid:
         return None
-    if symbol == "NIFTY" and session_date.weekday() in {0, 1} and len(valid) >= 2:
-        return valid[1]
+    if symbol == "NIFTY":
+        return valid[1] if len(valid) >= 2 else None
     return valid[0]
 
 
