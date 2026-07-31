@@ -101,6 +101,7 @@ def run_reset(confirm: bool = False, force: bool = False) -> tuple[Path, list[Pa
         shutil.move(str(source), str(destination))
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / "trade_bot.log").touch()
     return archive_root, candidates
 
 
