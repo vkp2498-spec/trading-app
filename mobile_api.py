@@ -6,6 +6,7 @@ import os
 from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi import Query
 from fastapi import status
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.security import HTTPBearer
@@ -22,6 +23,7 @@ from aws_control import stop_instance
 from dashboard_data import build_health_snapshot
 from dashboard_data import build_trade_performance
 from dashboard_data import load_env
+from dashboard_data import normalize_live_positions_per_lakh
 from trading_config import get_config
 from trading_config import select_profile
 from stock_screener import get_screener
@@ -162,12 +164,24 @@ def health():
         Depends(require_mobile_token)
     ],
 )
-def dashboard():
+def dashboard(
+    scale: str = Query(default="per_lakh", pattern="^(per_lakh|raw)$"),
+):
     """
     Authenticated, read-only dashboard snapshot.
     """
     try:
         snapshot = build_health_snapshot()
+
+        if scale == "per_lakh":
+            performance = snapshot.get("performance", {})
+            snapshot["performance"] = performance.get(
+                "normalizedPerLakh",
+                performance,
+            )
+            snapshot["live"] = normalize_live_positions_per_lakh(
+                snapshot.get("live", {})
+            )
 
         snapshot["profile"] = TRADING_PROFILE
         snapshot["serverTime"] = datetime.now(
@@ -255,9 +269,13 @@ def aws_stop(action: AWSInstanceAction):
     "/api/v1/watch-summary",
     dependencies=[Depends(require_mobile_token)],
 )
-def watch_summary():
+def watch_summary(
+    scale: str = Query(default="per_lakh", pattern="^(per_lakh|raw)$"),
+):
     """Return only the two values needed by the Apple Watch app."""
     performance = build_trade_performance()
+    if scale == "per_lakh":
+        performance = performance.get("normalizedPerLakh", performance)
     recent_trades = performance.get("recentTrades", [])
     latest_trade = recent_trades[0] if recent_trades else None
 

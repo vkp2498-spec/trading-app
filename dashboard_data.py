@@ -684,8 +684,11 @@ def approximate_other_charges(trade: dict) -> float:
         if "SQUARE" in str(trade.get("exitReason") or "").upper()
         else 0.0
     )
+    raw_charges = (
+        brokerage + stt + transaction_charges + sebi + stamp_duty + ipft + gst + square_off
+    )
     return round(
-        brokerage + stt + transaction_charges + sebi + stamp_duty + ipft + gst + square_off,
+        raw_charges * safe_float(trade.get("normalizationFactor"), 1.0),
         2,
     )
 
@@ -695,6 +698,41 @@ def total_other_charges(trades: list[dict]) -> float:
         sum(approximate_other_charges(trade) for trade in trades),
         2,
     )
+
+
+PER_LAKH = 100_000.0
+
+
+def trade_value_at_entry(trade: dict) -> float:
+    return round(
+        abs(safe_float(trade.get("entryPrice")))
+        * abs(safe_int(trade.get("quantity"))),
+        2,
+    )
+
+
+def normalize_trade_per_lakh(trade: dict) -> dict:
+    trade_value = trade_value_at_entry(trade)
+    factor = PER_LAKH / trade_value if trade_value > 0 else 1.0
+    normalized = dict(trade)
+    normalized["tradeValueAtEntry"] = trade_value
+    normalized["normalizationFactor"] = factor
+    for field in (
+        "grossPnL",
+        "priorTradePnL",
+        "riskPerTradeLimit",
+        "remainingIndexRiskBudget",
+        "plannedRisk",
+        "maxFavorablePnL",
+        "maxAdversePnL",
+    ):
+        if field in normalized:
+            normalized[field] = round(safe_float(normalized.get(field)) * factor, 2)
+    return normalized
+
+
+def normalize_trades_per_lakh(trades: list[dict]) -> list[dict]:
+    return [normalize_trade_per_lakh(trade) for trade in trades]
 
 
 def symbol_pnl(trades: list[dict]) -> dict:
@@ -1421,14 +1459,11 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, f
         return None, f"Upstox P&L request failed: {type(error).__name__}", 0, {}, {}
 
 
-def build_trade_performance() -> dict:
-    today_text = datetime.now(
-        IST
-    ).strftime("%Y-%m-%d")
-    history = read_trade_history()
-    trades = selective_index_trades(history)
-    t20_trades = t20_index_trades(history)
-
+def _build_trade_performance_payload(
+    trades: list[dict],
+    t20_trades: list[dict],
+    today_text: str,
+) -> dict:
     today_trades = [
         trade
         for trade in trades
@@ -1538,6 +1573,20 @@ def build_trade_performance() -> dict:
         "edgeAnalytics": edge_analytics(trades),
         "recentTrades": recent_trades,
     }
+
+
+def build_trade_performance() -> dict:
+    today_text = datetime.now(IST).strftime("%Y-%m-%d")
+    history = read_trade_history()
+    trades = selective_index_trades(history)
+    t20_trades = t20_index_trades(history)
+    raw = _build_trade_performance_payload(trades, t20_trades, today_text)
+    raw["normalizedPerLakh"] = _build_trade_performance_payload(
+        normalize_trades_per_lakh(trades),
+        normalize_trades_per_lakh(t20_trades),
+        today_text,
+    )
+    return raw
 
 def state_file(symbol: str) -> Path:
     return BASE_DIR / f"trade_state_{symbol}.json"
@@ -1959,6 +2008,30 @@ def build_live_positions() -> dict:
         "totalUpstoxLivePnL": total_upstox_live_pnl,
         "positions": dashboard_positions,
     }
+
+
+def normalize_live_positions_per_lakh(live: dict) -> dict:
+    normalized = dict(live)
+    positions = []
+    for position in live.get("positions", []):
+        scaled = dict(position)
+        trade_value = abs(safe_float(position.get("entryPrice"))) * abs(
+            safe_int(position.get("quantity"))
+        )
+        factor = PER_LAKH / trade_value if trade_value > 0 else 1.0
+        scaled["tradeValueAtEntry"] = round(trade_value, 2)
+        scaled["normalizationFactor"] = factor
+        for field in ("livePnL", "riskToStop", "rewardLeft"):
+            value = position.get(field)
+            if value is not None:
+                scaled[field] = round(safe_float(value) * factor, 2)
+        positions.append(scaled)
+    normalized["positions"] = positions
+    normalized["totalLivePnL"] = round(
+        sum(safe_float(position.get("livePnL")) for position in positions),
+        2,
+    )
+    return normalized
 
 def build_health_snapshot() -> dict:
     load_env()

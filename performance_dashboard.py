@@ -1946,10 +1946,7 @@ load_env()
 if st.button("Refresh Dashboard", use_container_width=True):
     st.rerun()
 
-performance = api_build_trade_performance()
-today = performance.get("today", {})
-cumulative = performance.get("cumulative", {})
-t20 = performance.get("t20", {})
+raw_performance = api_build_trade_performance()
 
 
 def summary_card_html(title, summary, show_averages=False):
@@ -2055,6 +2052,21 @@ st.markdown(
 performance_tab, score_review_tab = st.tabs(["Performance", "Post Market Review"])
 
 with performance_tab:
+    scale_mode = st.radio(
+        "P&L scale",
+        ["Per ₹1L", "Raw"],
+        horizontal=True,
+        index=0,
+    )
+    performance = (
+        raw_performance.get("normalizedPerLakh", raw_performance)
+        if scale_mode == "Per ₹1L"
+        else raw_performance
+    )
+    today = performance.get("today", {})
+    cumulative = performance.get("cumulative", {})
+    t20 = performance.get("t20", {})
+
     section_header("Today")
     today_cols = st.columns(3)
     for column, (title, summary) in zip(
