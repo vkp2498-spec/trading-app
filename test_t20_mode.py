@@ -214,7 +214,7 @@ class T20ModeTests(unittest.TestCase):
             patch.object(trade_bot, "monitor_health_gate", return_value={"allowed": True}),
             patch.object(trade_bot, "broker_pending_order_gate", return_value={"allowed": True}),
             patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
-            patch.object(trade_bot, "index_underlying_has_active_state", return_value=False),
+            patch.object(trade_bot, "read_state", return_value={}),
             patch.object(trade_bot, "today_t20_realized_pnl", return_value=-9000.0),
             patch.object(trade_bot, "active_t20_states", return_value=[]),
             patch.object(trade_bot, "active_bot_states", return_value=[]),
@@ -250,6 +250,62 @@ class T20ModeTests(unittest.TestCase):
         self.assertTrue(allowed["allowed"])
         self.assertFalse(blocked["allowed"])
         self.assertIn("trade cap", blocked["reason"])
+
+    def test_t20_can_coexist_with_selective_on_different_contract(self):
+        candidate = self.candidate(60.0)
+
+        def state_for(slot):
+            if slot == "NIFTY":
+                return {
+                    "instrument_key": "NSE_FO|SELECTIVE",
+                    "status": "POSITION_OPEN",
+                }
+            return {}
+
+        with (
+            patch.object(trade_bot, "monitor_health_gate", return_value={"allowed": True}),
+            patch.object(trade_bot, "broker_pending_order_gate", return_value={"allowed": True}),
+            patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
+            patch.object(trade_bot, "read_state", side_effect=state_for),
+            patch.object(trade_bot, "t20_trade_count_today", return_value=0),
+            patch.object(trade_bot, "today_t20_realized_pnl", return_value=0.0),
+            patch.object(trade_bot, "active_t20_states", return_value=[]),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(
+                trade_bot,
+                "aggregate_risk_decision",
+                return_value={"allowed": True, "reason": "accepted"},
+            ),
+        ):
+            decision = trade_bot.pre_order_t20_decision(
+                candidate, 65, 100.0, 95.0
+            )
+
+        self.assertTrue(decision["allowed"])
+
+    def test_t20_rejects_contract_already_owned_by_selective_lane(self):
+        candidate = self.candidate(60.0)
+
+        def state_for(slot):
+            if slot == "NIFTY":
+                return {
+                    "instrument_key": "NSE_FO|T20",
+                    "status": "POSITION_OPEN",
+                }
+            return {}
+
+        with (
+            patch.object(trade_bot, "monitor_health_gate", return_value={"allowed": True}),
+            patch.object(trade_bot, "broker_pending_order_gate", return_value={"allowed": True}),
+            patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
+            patch.object(trade_bot, "read_state", side_effect=state_for),
+        ):
+            decision = trade_bot.pre_order_t20_decision(
+                candidate, 65, 100.0, 95.0
+            )
+
+        self.assertFalse(decision["allowed"])
+        self.assertIn("alternate ATM/ITM contract", decision["reason"])
 
     def test_t20_fill_is_finalized_and_protected_only_once(self):
         pending = {

@@ -1151,11 +1151,22 @@ def underlying_symbol_for_state_slot(state_slot, state=None):
     return state_slot
 
 
-def index_underlying_has_active_state(symbol):
-    return any(
-        state_is_active(read_state(slot))
-        for slot in (symbol, T20_STATE_BY_SYMBOL[symbol])
-    )
+def selective_index_has_active_state(symbol):
+    return state_is_active(read_state(symbol))
+
+
+def t20_index_has_active_state(symbol):
+    return state_is_active(read_state(T20_STATE_BY_SYMBOL[symbol]))
+
+
+def active_index_instrument_keys(symbol):
+    """Return contracts already managed by either lane for one underlying."""
+    keys = set()
+    for slot in (symbol, T20_STATE_BY_SYMBOL[symbol]):
+        state = read_state(slot)
+        if state_is_active(state) and state.get("instrument_key"):
+            keys.add(state["instrument_key"])
+    return keys
 
 
 def today_closed_trade_rows():
@@ -1342,6 +1353,21 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         return {"allowed": False, "reason": circuit["reason"], "circuit": circuit}
 
     symbol = str(chosen.get("symbol") or "").upper()
+    instrument_key = (chosen.get("instrument") or {}).get("instrument_key")
+    if symbol in SYMBOLS:
+        if selective_index_has_active_state(symbol):
+            return {
+                "allowed": False,
+                "reason": f"{symbol} already has an active selective position",
+            }
+        if instrument_key and instrument_key in active_index_instrument_keys(symbol):
+            return {
+                "allowed": False,
+                "reason": (
+                    f"{symbol} contract {instrument_key} is already managed by "
+                    "the T20 lane; an alternate ATM/ITM contract is required"
+                ),
+            }
     score = candidate_weighted_score(chosen)
     base_minimum = to_float(
         chosen.get("entry_minimum_score"),
@@ -1453,10 +1479,19 @@ def pre_order_t20_decision(chosen, quantity, entry_price, stop_loss_price):
     symbol = str(chosen.get("symbol") or "").upper()
     if symbol not in SYMBOLS:
         return {"allowed": False, "reason": "T20 supports only NIFTY and BANKNIFTY"}
-    if index_underlying_has_active_state(symbol):
+    if t20_index_has_active_state(symbol):
         return {
             "allowed": False,
-            "reason": f"{symbol} already has a managed index-option position",
+            "reason": f"{symbol} already has an active T20 position",
+        }
+    instrument_key = (chosen.get("instrument") or {}).get("instrument_key")
+    if instrument_key and instrument_key in active_index_instrument_keys(symbol):
+        return {
+            "allowed": False,
+            "reason": (
+                f"{symbol} contract {instrument_key} is already managed by "
+                "the selective lane; an alternate ATM/ITM contract is required"
+            ),
         }
     if t20_trade_count_today() >= t20_max_trades_per_day():
         return {
@@ -4497,7 +4532,9 @@ def evaluate_symbol_buy_or_sell(
     symbol,
     allow_option_sell=False,
     include_rejected=False,
+    excluded_instrument_keys=None,
 ):
+    excluded_instrument_keys = set(excluded_instrument_keys or [])
     rec = get_index_recommendation(symbol)
     record_option_chain_snapshot(symbol, rec)
     direction = rec["direction"]
@@ -4687,6 +4724,13 @@ def evaluate_symbol_buy_or_sell(
                 contract_row=contract_row,
             )
             if candidate:
+                instrument_key = (candidate.get("instrument") or {}).get("instrument_key")
+                if instrument_key in excluded_instrument_keys:
+                    verbose_log(
+                        f"{symbol} contract skipped: {instrument_key} is already "
+                        "managed by the other index lane"
+                    )
+                    continue
                 candidate.update(
                     {
                         "symbol": symbol,
@@ -4745,6 +4789,13 @@ def evaluate_symbol_buy_or_sell(
                         contract_row=contract_row,
                     )
                     if candidate:
+                        instrument_key = (candidate.get("instrument") or {}).get("instrument_key")
+                        if instrument_key in excluded_instrument_keys:
+                            verbose_log(
+                                f"{symbol} reversal contract skipped: {instrument_key} "
+                                "is already managed by the other index lane"
+                            )
+                            continue
                         candidate.update(
                             {
                                 "symbol": symbol,
@@ -5491,9 +5542,14 @@ def run_signal_check():
     qualified = []
     candidates_by_symbol = {}
     for symbol in SYMBOLS:
-        if index_underlying_has_active_state(symbol):
-            verbose_log(f"{symbol} scan skipped: a managed position is already active")
+        selective_active = selective_index_has_active_state(symbol)
+        t20_active = t20_index_has_active_state(symbol)
+        if selective_active and t20_active:
+            verbose_log(
+                f"{symbol} scan skipped: selective and T20 lanes are both occupied"
+            )
             continue
+        occupied_contracts = active_index_instrument_keys(symbol)
         try:
             daily_block = daily_index_entry_block_reason(symbol)
         except Exception as error:
@@ -5515,6 +5571,7 @@ def run_signal_check():
                     or watch_mode_enabled()
                     or bool(read_watch_state(symbol))
                 ),
+                excluded_instrument_keys=occupied_contracts,
             )
             candidates_by_symbol[symbol] = candidate
             if (
@@ -5571,11 +5628,11 @@ def run_signal_check():
         verbose_log(f"T20 lane stopped: daily trade cap {t20_max_trades_per_day()} reached")
         return
 
-    # T20 may coexist with a selective position on the other underlying. The
-    # per-symbol state gate below prevents two strategies from managing the
-    # same NIFTY or BANKNIFTY broker position.
+    # T20 and selective lanes may coexist on either underlying. Candidate
+    # construction excludes occupied instrument keys so each lane owns a
+    # different ATM/ITM contract and can manage its own broker stop safely.
     for symbol in SYMBOLS:
-        if index_underlying_has_active_state(symbol):
+        if t20_index_has_active_state(symbol):
             continue
         candidate, reason = prepare_t20_candidate(symbol, candidates_by_symbol.get(symbol))
         if not candidate:
