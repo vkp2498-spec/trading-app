@@ -54,7 +54,11 @@ def record_option_chain_snapshot(symbol, rec):
     row = {
         "timestamp": now_ist().isoformat(),
         "symbol": symbol,
-        "expiry": (rec.get("atm", {}) or {}).get("expiry"),
+        "expiry": (
+            rec.get("analysis_expiry")
+            or (rec.get("analysis_atm", {}) or {}).get("expiry")
+            or (rec.get("atm", {}) or {}).get("expiry")
+        ),
         "bias": rec.get("direction"),
         "confidence": rec.get("confidence"),
         "score": rec.get("score"),

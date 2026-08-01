@@ -24,11 +24,13 @@ UPSTOX_OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
 INDEX_CONFIG = {
     "NIFTY": {
         "instrument_key": "NSE_INDEX|Nifty 50",
-        "expiry_offset": 1,
+        "analysis_expiry_offset": 0,
+        "execution_expiry_offset": 1,
     },
     "BANKNIFTY": {
         "instrument_key": "NSE_INDEX|Nifty Bank",
-        "expiry_offset": 0,
+        "analysis_expiry_offset": 0,
+        "execution_expiry_offset": 0,
     },
 }
 
@@ -54,22 +56,36 @@ def now_ist():
 
 
 def should_use_next_week_expiry(symbol):
-    return int(INDEX_CONFIG[symbol].get("expiry_offset", 0)) == 1
+    return int(INDEX_CONFIG[symbol].get("execution_expiry_offset", 0)) == 1
 
 
 def choose_expiry(symbol, expiries):
+    """Choose the contract that may actually be traded."""
     expiries = sorted([e for e in expiries if e])
 
     if not expiries:
         raise RuntimeError(f"No expiries available for {symbol}")
 
-    expiry_offset = int(INDEX_CONFIG[symbol].get("expiry_offset", 0))
+    expiry_offset = int(INDEX_CONFIG[symbol].get("execution_expiry_offset", 0))
     if len(expiries) <= expiry_offset:
         label = "next-week" if expiry_offset == 1 else "nearest"
         raise RuntimeError(
             f"No {label} expiry available for {symbol}; received {expiries}"
         )
 
+    return expiries[expiry_offset]
+
+
+def choose_analysis_expiry(symbol, expiries):
+    """Choose the liquid front expiry used as the directional evidence source."""
+    expiries = sorted([e for e in expiries if e])
+    if not expiries:
+        raise RuntimeError(f"No expiries available for {symbol}")
+    expiry_offset = int(INDEX_CONFIG[symbol].get("analysis_expiry_offset", 0))
+    if len(expiries) <= expiry_offset:
+        raise RuntimeError(
+            f"No analysis expiry available for {symbol}; received {expiries}"
+        )
     return expiries[expiry_offset]
 
 
@@ -109,9 +125,22 @@ def get_expiries_from_upstox(symbol):
     return expiries
 
 
-def fetch_upstox_option_chain(symbol, nearby=5):
-    expiries = get_expiries_from_upstox(symbol)
-    expiry = choose_expiry(symbol, expiries)
+def fetch_upstox_option_chain(
+    symbol,
+    nearby=5,
+    *,
+    expiry_role="execution",
+    expiry=None,
+):
+    """Fetch one explicit expiry without conflating analysis and execution."""
+    if expiry is None:
+        expiries = get_expiries_from_upstox(symbol)
+        if expiry_role == "analysis":
+            expiry = choose_analysis_expiry(symbol, expiries)
+        elif expiry_role == "execution":
+            expiry = choose_expiry(symbol, expiries)
+        else:
+            raise ValueError("expiry_role must be analysis or execution")
 
     payload = upstox_get(
         UPSTOX_OPTION_CHAIN_URL,
@@ -408,25 +437,57 @@ def option_contract_quality(atm, option_type, stream_quote=None):
 
 
 def get_index_recommendation(symbol):
-    df_atm, df_nearby, df_chain = fetch_upstox_option_chain(symbol, nearby=5)
+    expiries = get_expiries_from_upstox(symbol)
+    analysis_expiry = choose_analysis_expiry(symbol, expiries)
+    execution_expiry = choose_expiry(symbol, expiries)
+    analysis_atm_df, analysis_nearby_df, analysis_chain_df = fetch_upstox_option_chain(
+        symbol,
+        nearby=5,
+        expiry_role="analysis",
+        expiry=analysis_expiry,
+    )
+    if execution_expiry == analysis_expiry:
+        execution_atm_df = analysis_atm_df.copy()
+        execution_nearby_df = analysis_nearby_df.copy()
+        execution_chain_df = analysis_chain_df.copy()
+    else:
+        execution_atm_df, execution_nearby_df, execution_chain_df = (
+            fetch_upstox_option_chain(
+                symbol,
+                nearby=5,
+                expiry_role="execution",
+                expiry=execution_expiry,
+            )
+        )
 
-    atm = df_atm.iloc[0]
+    analysis_atm = analysis_atm_df.iloc[0]
+    execution_atm = execution_atm_df.iloc[0]
 
-    direction, confidence, score, reasons = option_chain_signal(atm)
-    levels = option_chain_target_stoploss(df_nearby, atm["strike"], direction)
-    prices = expected_atm_option_prices(atm, levels, direction, confidence, score)
-    total_ce_oi = float(df_chain["CE_oi"].fillna(0).sum())
-    total_pe_oi = float(df_chain["PE_oi"].fillna(0).sum())
-    total_ce_volume = float(df_chain["CE_volume"].fillna(0).sum())
-    total_pe_volume = float(df_chain["PE_volume"].fillna(0).sum())
+    direction, confidence, score, reasons = option_chain_signal(analysis_atm)
+    levels = option_chain_target_stoploss(
+        analysis_nearby_df,
+        analysis_atm["strike"],
+        direction,
+    )
+    prices = expected_atm_option_prices(
+        execution_atm,
+        levels,
+        direction,
+        confidence,
+        score,
+    )
+    total_ce_oi = float(analysis_chain_df["CE_oi"].fillna(0).sum())
+    total_pe_oi = float(analysis_chain_df["PE_oi"].fillna(0).sum())
+    total_ce_volume = float(analysis_chain_df["CE_volume"].fillna(0).sum())
+    total_pe_volume = float(analysis_chain_df["PE_volume"].fillna(0).sum())
 
     nearby_flow = {
-        "ce_oi": float(df_nearby["CE_oi"].fillna(0).sum()),
-        "pe_oi": float(df_nearby["PE_oi"].fillna(0).sum()),
-        "ce_change_oi": float(df_nearby["CE_change_oi"].fillna(0).sum()),
-        "pe_change_oi": float(df_nearby["PE_change_oi"].fillna(0).sum()),
-        "ce_volume": float(df_nearby["CE_volume"].fillna(0).sum()),
-        "pe_volume": float(df_nearby["PE_volume"].fillna(0).sum()),
+        "ce_oi": float(analysis_nearby_df["CE_oi"].fillna(0).sum()),
+        "pe_oi": float(analysis_nearby_df["PE_oi"].fillna(0).sum()),
+        "ce_change_oi": float(analysis_nearby_df["CE_change_oi"].fillna(0).sum()),
+        "pe_change_oi": float(analysis_nearby_df["PE_change_oi"].fillna(0).sum()),
+        "ce_volume": float(analysis_nearby_df["CE_volume"].fillna(0).sum()),
+        "pe_volume": float(analysis_nearby_df["PE_volume"].fillna(0).sum()),
     }
 
     chain_totals = {
@@ -444,8 +505,17 @@ def get_index_recommendation(symbol):
         "confidence": confidence,
         "score": score,
         "reasons": reasons,
-        "atm": atm.to_dict(),
-        "nearby_contracts": df_nearby.to_dict("records"),
+        # The traditional keys remain execution-facing so every downstream
+        # order path buys the next NIFTY expiry without needing special cases.
+        "atm": execution_atm.to_dict(),
+        "nearby_contracts": execution_nearby_df.to_dict("records"),
+        "execution_chain": execution_chain_df.to_dict("records"),
+        "execution_expiry": str(execution_expiry),
+        # Direction, OI, PCR, support/resistance and option-flow evidence are
+        # deliberately sourced from the front expiry.
+        "analysis_atm": analysis_atm.to_dict(),
+        "analysis_nearby_contracts": analysis_nearby_df.to_dict("records"),
+        "analysis_expiry": str(analysis_expiry),
         "levels": levels,
         "prices": prices,
         "chain_totals": chain_totals,

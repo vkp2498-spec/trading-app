@@ -43,19 +43,24 @@ jwt_stub.encode = lambda *args, **kwargs: "test-token"
 sys.modules.setdefault("jwt", jwt_stub)
 
 import trade_bot
+import strategy_core
 import manual_index_trade
 import apns_push
 import dashboard_data
 import trade_journal
 from counterfactual_replay import simulate_trade
 from strategy_replay import Candidate, StrategyReplay, _choose_expiry, capital_sized_option_quantity
-from strategy_core import choose_expiry
+from strategy_core import choose_analysis_expiry, choose_expiry
 from signal_score import nifty_neutral_chain_direction, weighted_alignment_score
 from backtest_report import build_reports
 from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_nifty_analysis_uses_nearest_expiry(self):
+        expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
+        self.assertEqual(choose_analysis_expiry("NIFTY", expiries), "2026-08-04")
+
     def test_nifty_always_uses_second_available_expiry(self):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
         self.assertEqual(choose_expiry("NIFTY", expiries), "2026-08-11")
@@ -67,6 +72,214 @@ class TradeControlTests(unittest.TestCase):
     def test_banknifty_keeps_nearest_expiry(self):
         expiries = ["2026-08-25", "2026-09-29"]
         self.assertEqual(choose_expiry("BANKNIFTY", expiries), "2026-08-25")
+
+    def test_nifty_recommendation_separates_analysis_and_execution_expiries(self):
+        def chain(expiry, *, bullish):
+            row = {
+                "expiry": expiry,
+                "spot": 24310,
+                "strike": 24300,
+                "CE_ltp": 120 if bullish else 80,
+                "PE_ltp": 100 if bullish else 140,
+                "CE_oi": 100 if bullish else 400,
+                "PE_oi": 400 if bullish else 100,
+                "CE_previous_oi": 100,
+                "PE_previous_oi": 100,
+                "CE_change_oi": 0 if bullish else 300,
+                "PE_change_oi": 300 if bullish else 0,
+                "CE_volume": 1000,
+                "PE_volume": 1200,
+            }
+            frame = pd.DataFrame([row])
+            return frame.copy(), frame.copy(), frame.copy()
+
+        nearest = chain("2026-08-04", bullish=True)
+        next_week = chain("2026-08-11", bullish=False)
+
+        def fetch(_symbol, nearby=5, *, expiry_role="execution", expiry=None):
+            return nearest if expiry == "2026-08-04" else next_week
+
+        with (
+            patch.object(
+                strategy_core,
+                "get_expiries_from_upstox",
+                return_value=["2026-08-04", "2026-08-11", "2026-08-18"],
+            ),
+            patch.object(strategy_core, "fetch_upstox_option_chain", side_effect=fetch),
+        ):
+            recommendation = strategy_core.get_index_recommendation("NIFTY")
+
+        self.assertEqual(recommendation["direction"], "BULLISH")
+        self.assertEqual(recommendation["analysis_expiry"], "2026-08-04")
+        self.assertEqual(recommendation["analysis_atm"]["expiry"], "2026-08-04")
+        self.assertEqual(recommendation["execution_expiry"], "2026-08-11")
+        self.assertEqual(recommendation["atm"]["expiry"], "2026-08-11")
+
+    def test_nifty_execution_contract_rows_are_atm_only(self):
+        atm = {"strike": 24300, "expiry": "2026-08-11"}
+        recommendation = {
+            "symbol": "NIFTY",
+            "atm": atm,
+            "nearby_contracts": [
+                {"strike": 24250, "expiry": "2026-08-11"},
+                atm,
+                {"strike": 24350, "expiry": "2026-08-11"},
+            ],
+        }
+        self.assertEqual(
+            trade_bot.index_contract_rows(recommendation, "BULLISH"),
+            [atm],
+        )
+
+    def test_candidate_scores_near_expiry_flow_but_checks_execution_flow(self):
+        rec = {
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "score": 4,
+            "reasons": ["nearest chain bullish"],
+            "analysis_atm": {
+                "strike": 24300,
+                "expiry": "2026-08-04",
+                "CE_ltp": 100,
+                "CE_volume": 1000,
+            },
+            "atm": {
+                "strike": 24300,
+                "expiry": "2026-08-11",
+                "CE_ltp": 150,
+                "CE_volume": 800,
+            },
+        }
+        technicals = {
+            "two_hour": {"bias": "BULLISH"},
+            "fifteen_min": {"bias": "BULLISH"},
+            "five_min": {"bias": "BULLISH"},
+        }
+
+        def instrument(_symbol, expiry, strike, option_type):
+            return {
+                "instrument_key": f"NSE_FO|{expiry}",
+                "trading_symbol": f"NIFTY {strike} {option_type} {expiry}",
+                "lot_size": 65,
+            }
+
+        near_flow = {"close": 101, "vwap": 99, "volume_ratio": 1.5, "bias": "BULLISH"}
+        execution_flow = {"close": 151, "vwap": 149, "volume_ratio": 0.8, "bias": "NEUTRAL"}
+        with (
+            patch.object(trade_bot, "find_index_option_instrument", side_effect=instrument),
+            patch.object(trade_bot, "read_market_cache", return_value={}),
+            patch.object(
+                trade_bot,
+                "option_contract_quality",
+                return_value={
+                    "spread_percent": 1.0,
+                    "delta": 0.5,
+                    "depth_bias": "NEUTRAL",
+                },
+            ),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                side_effect=[near_flow, execution_flow],
+            ),
+            patch.object(trade_bot, "write_stream_instruments"),
+            patch.object(trade_bot, "classify_market_regime", return_value={"regime": "TREND"}),
+            patch.object(trade_bot, "entry_structure_for_direction", return_value={"type": "TEST"}),
+            patch.object(
+                trade_bot,
+                "convert_index_levels_to_option_premium",
+                side_effect=lambda value, **_kwargs: value,
+            ),
+            patch.object(
+                trade_bot,
+                "weighted_alignment_score",
+                return_value={"score": 0, "grade": "SKIP", "reasons": []},
+            ),
+        ):
+            candidate, _ = trade_bot.build_trade_candidate(
+                "NIFTY",
+                rec,
+                technicals,
+                {},
+                {},
+                "BUY",
+            )
+
+        scored_flow = candidate["technicals"]["atm_option_flow"]
+        checked_flow = candidate["technicals"]["execution_atm_option_flow"]
+        self.assertEqual(scored_flow["vwap"], near_flow["vwap"])
+        self.assertEqual(scored_flow["volume_ratio"], near_flow["volume_ratio"])
+        self.assertEqual(checked_flow["vwap"], execution_flow["vwap"])
+        self.assertEqual(checked_flow["volume_ratio"], execution_flow["volume_ratio"])
+        self.assertEqual(candidate["option_summary"]["analysis_expiry"], "2026-08-04")
+        self.assertEqual(candidate["option_summary"]["execution_expiry"], "2026-08-11")
+
+    def test_ganesh_analyzes_nearest_and_executes_next_expiry_atm(self):
+        recommendation = {
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "score": 4,
+            "reasons": ["nearest chain bullish"],
+            "analysis_expiry": "2026-08-04",
+            "analysis_atm": {
+                "strike": 24300,
+                "expiry": "2026-08-04",
+            },
+            "execution_chain": [
+                {
+                    "strike": 24300,
+                    "expiry": "2026-08-11",
+                    "CE_ltp": 150,
+                    "CE_bid_price": 149,
+                    "CE_ask_price": 151,
+                }
+            ],
+        }
+
+        def instrument(_symbol, expiry, strike, option_type):
+            return {
+                "instrument_key": f"NSE_FO|{expiry}",
+                "trading_symbol": f"NIFTY {strike} {option_type} {expiry}",
+                "lot_size": 65,
+            }
+
+        with (
+            patch.object(trade_bot, "get_index_recommendation", return_value=recommendation),
+            patch.object(trade_bot, "find_index_option_instrument", side_effect=instrument),
+            patch.object(trade_bot, "read_market_cache", return_value={}),
+            patch.object(
+                trade_bot,
+                "option_contract_quality",
+                return_value={
+                    "ltp": 150,
+                    "bid_price": 149,
+                    "ask_price": 151,
+                    "spread_percent": 1.33,
+                },
+            ),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                return_value={"close": 100, "vwap": 98, "volume_ratio": 1.4},
+            ),
+            patch.object(trade_bot, "write_stream_instruments"),
+        ):
+            candidate = trade_bot.ganesh_gap_option_candidate(
+                {"spot": 24310},
+                {"option_type": "CE"},
+            )
+
+        self.assertEqual(candidate["expiry"], "2026-08-11")
+        self.assertEqual(candidate["strike"], 24300)
+        self.assertEqual(
+            candidate["near_expiry_analysis"]["expiry"],
+            "2026-08-04",
+        )
+        self.assertEqual(
+            candidate["near_expiry_analysis"]["option_flow"]["vwap"],
+            98,
+        )
 
     def test_replay_uses_next_nifty_expiry_on_every_weekday(self):
         session_date = datetime(2026, 7, 29).date()
@@ -940,7 +1153,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(levels["target_points"], 30)
         self.assertEqual(levels["stop_points"], 30)
 
-    def test_active_nifty_blocks_new_index_entry(self):
+    def test_active_selective_position_scans_for_t20_but_blocks_selective_entry(self):
         bank_candidate = {
             "symbol": "BANKNIFTY",
             "transaction_type": "BUY",
@@ -956,6 +1169,11 @@ class TradeControlTests(unittest.TestCase):
             patch.object(trade_bot, "market_window_ok", return_value=True),
             patch.object(trade_bot, "read_state", side_effect=state_for),
             patch.object(trade_bot, "handle_existing_state"),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
             patch.object(trade_bot, "get_open_positions", return_value=[]),
             patch.object(
                 trade_bot,
@@ -963,10 +1181,17 @@ class TradeControlTests(unittest.TestCase):
                 return_value=bank_candidate,
             ) as evaluate,
             patch.object(trade_bot, "execute_selected_candidate") as execute,
+            patch.object(trade_bot, "t20_enabled", return_value=False),
         ):
             trade_bot.run_signal_check()
 
-        evaluate.assert_not_called()
+        self.assertEqual(evaluate.call_count, 2)
+        nifty_call = evaluate.call_args_list[0]
+        self.assertEqual(nifty_call.args[0], "NIFTY")
+        self.assertEqual(
+            nifty_call.kwargs["excluded_instrument_keys"],
+            {"NSE_FO|NIFTY_OPEN"},
+        )
         execute.assert_not_called()
 
     def test_losing_setups_are_rejected_by_feasibility_gate(self):

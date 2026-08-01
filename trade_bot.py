@@ -450,7 +450,14 @@ def evaluate_trade_feasibility(
         result["reasons"].append("Stop loss does not define positive option-premium risk")
         return result
 
-    option_flow = technicals.get("atm_option_flow", {}) or {}
+    # Directional scoring deliberately uses the front-expiry ATM flow, while
+    # execution extension must compare like-for-like against the next-expiry
+    # contract that will actually be bought.
+    option_flow = (
+        technicals.get("execution_atm_option_flow")
+        or technicals.get("atm_option_flow")
+        or {}
+    )
     completed_candle_close = to_float(option_flow.get("close"), 0)
     if completed_candle_close > 0:
         entry_extension = (
@@ -2775,6 +2782,10 @@ def index_contract_rows(recommendation, direction):
     atm = dict(recommendation.get("atm") or {})
     if not atm:
         return []
+    # NIFTY signal evidence comes from the nearest expiry, but both selective
+    # and T20 execution must use the next-expiry ATM contract exactly.
+    if recommendation.get("symbol") == "NIFTY":
+        return [atm]
     if not configured_bool("INDEX_CONTRACT_SELECTION_ENABLED", True):
         return [atm]
     option_type = option_type_for(direction, "BUY")
@@ -2793,8 +2804,11 @@ def index_contract_rows(recommendation, direction):
 
 
 def ganesh_gap_option_candidate(snapshot, transition):
-    """Select a liquid next-week ATM NIFTY option without using chain direction."""
-    _, _, chain = fetch_upstox_option_chain("NIFTY", nearby=5)
+    """Analyze front-expiry NIFTY and select a liquid next-expiry ATM option."""
+    recommendation = get_index_recommendation("NIFTY")
+    chain = pd.DataFrame(recommendation.get("execution_chain") or [])
+    if chain.empty:
+        raise RuntimeError("Next-expiry NIFTY execution chain is unavailable")
     strike = atm_strike(
         snapshot["spot"],
         interval=max(to_int(os.getenv("GANESH_NIFTY_STRIKE_INTERVAL"), 50), 1),
@@ -2832,6 +2846,24 @@ def ganesh_gap_option_candidate(snapshot, transition):
         blockers.append(
             f"option spread {float(spread_percent):.2f}% exceeds {maximum_spread:.2f}%"
         )
+    analysis_row = dict(recommendation.get("analysis_atm") or {})
+    analysis_instrument = find_index_option_instrument(
+        "NIFTY",
+        analysis_row.get("expiry"),
+        analysis_row.get("strike"),
+        option_type,
+    )
+    analysis_flow = get_option_volume_vwap_analysis(
+        analysis_instrument["instrument_key"],
+        side_label=analysis_instrument["trading_symbol"],
+    )
+    write_stream_instruments(
+        [
+            UNDERLYING_INDEX_KEYS["NIFTY"],
+            analysis_instrument.get("instrument_key"),
+            instrument.get("instrument_key"),
+        ]
+    )
     return {
         "allowed": not blockers,
         "reason": "; ".join(blockers) if blockers else "next-week ATM option is tradeable",
@@ -2844,6 +2876,18 @@ def ganesh_gap_option_candidate(snapshot, transition):
         "spread_percent": round(float(spread_percent), 3) if spread_percent is not None else None,
         "instrument": instrument,
         "quality": quality,
+        "near_expiry_analysis": {
+            "expiry": recommendation.get("analysis_expiry"),
+            "strike": analysis_row.get("strike"),
+            "option_type": option_type,
+            "instrument_key": analysis_instrument.get("instrument_key"),
+            "trading_symbol": analysis_instrument.get("trading_symbol"),
+            "chain_bias": recommendation.get("direction"),
+            "chain_confidence": recommendation.get("confidence"),
+            "chain_score": recommendation.get("score"),
+            "chain_reasons": recommendation.get("reasons", []),
+            "option_flow": analysis_flow,
+        },
     }
 
 
@@ -4392,6 +4436,7 @@ def build_trade_candidate(
         }, None
     direction = rec["direction"]
     atm = dict(contract_row or rec["atm"])
+    analysis_atm = dict(rec.get("analysis_atm") or atm)
     option_type = option_type_for(direction, transaction_type)
     entry_price = entry_price_for(atm, direction, transaction_type)
     if entry_price <= 0:
@@ -4402,6 +4447,12 @@ def build_trade_candidate(
         symbol,
         atm["expiry"],
         atm["strike"],
+        option_type,
+    )
+    analysis_instrument = find_index_option_instrument(
+        symbol,
+        analysis_atm["expiry"],
+        analysis_atm["strike"],
         option_type,
     )
     stream_quote = read_market_cache(instrument.get("instrument_key"))
@@ -4458,18 +4509,42 @@ def build_trade_candidate(
         "NSE_INDEX|Nifty 50",
         "NSE_INDEX|Nifty Bank",
         "NSE_INDEX|India VIX",
+        analysis_instrument.get("instrument_key"),
         instrument.get("instrument_key"),
     ])
-    raw_flow = get_option_volume_vwap_analysis(
-        instrument["instrument_key"],
-        side_label=instrument["trading_symbol"],
+    analysis_raw_flow = get_option_volume_vwap_analysis(
+        analysis_instrument["instrument_key"],
+        side_label=analysis_instrument["trading_symbol"],
     )
-    technicals = deepcopy(base_technicals)
-    technicals["raw_atm_option_flow"] = raw_flow
-    technicals["atm_option_flow"] = normalize_option_flow_for_position(
-        raw_flow,
+    if analysis_instrument["instrument_key"] == instrument["instrument_key"]:
+        execution_raw_flow = analysis_raw_flow
+    else:
+        execution_raw_flow = get_option_volume_vwap_analysis(
+            instrument["instrument_key"],
+            side_label=instrument["trading_symbol"],
+        )
+    raw_flow = analysis_raw_flow
+    analysis_flow = normalize_option_flow_for_position(
+        analysis_raw_flow,
         transaction_type,
     )
+    execution_flow = normalize_option_flow_for_position(
+        execution_raw_flow,
+        transaction_type,
+    )
+    technicals = deepcopy(base_technicals)
+    technicals["raw_atm_option_flow"] = analysis_raw_flow
+    technicals["atm_option_flow"] = analysis_flow
+    technicals["raw_execution_atm_option_flow"] = execution_raw_flow
+    technicals["execution_atm_option_flow"] = execution_flow
+    technicals["option_expiry_context"] = {
+        "analysis_expiry": str(analysis_atm.get("expiry")),
+        "analysis_strike": analysis_atm.get("strike"),
+        "analysis_trading_symbol": analysis_instrument.get("trading_symbol"),
+        "execution_expiry": str(atm.get("expiry")),
+        "execution_strike": atm.get("strike"),
+        "execution_trading_symbol": instrument.get("trading_symbol"),
+    }
     technicals["institutional_flow"] = institutional
     technicals["option_market_quality"] = option_quality
     technicals["market_regime"] = classify_market_regime(
@@ -4509,6 +4584,11 @@ def build_trade_candidate(
         "score": rec["score"],
         "strike": atm["strike"],
         "expiry": atm["expiry"],
+        "analysis_strike": analysis_atm.get("strike"),
+        "analysis_expiry": analysis_atm.get("expiry"),
+        "analysis_trading_symbol": analysis_instrument.get("trading_symbol"),
+        "execution_strike": atm.get("strike"),
+        "execution_expiry": atm.get("expiry"),
         "entry_price": round(entry_price, 2),
         "reasons": rec.get("reasons", []),
         "trade_action": f"{transaction_type}_OPTION",
@@ -5069,9 +5149,11 @@ def evaluate_symbol_buy_or_sell(
     confidence = rec["confidence"]
     score = rec["score"]
     atm = rec["atm"]
+    analysis_atm = rec.get("analysis_atm") or atm
     verbose_log(
         f"{symbol} signal: {direction}, confidence={confidence}, score={score}, "
-        f"strike={atm['strike']}, expiry={atm['expiry']}"
+        f"analysis_strike={analysis_atm['strike']}, analysis_expiry={analysis_atm['expiry']}, "
+        f"execution_strike={atm['strike']}, execution_expiry={atm['expiry']}"
     )
     # Chain strength now contributes up to 25 points instead of acting as a
     # separate veto. Any directional chain can therefore proceed to the full
@@ -5237,7 +5319,11 @@ def evaluate_symbol_buy_or_sell(
         rec["strategy"] = "BOLLINGER_REVERSAL"
 
     institutional = collect_institutional_footprint(symbol, rec)
-    option_trend = get_option_chain_trend(symbol, direction, expiry=atm.get("expiry"))
+    option_trend = get_option_chain_trend(
+        symbol,
+        direction,
+        expiry=rec.get("analysis_expiry") or analysis_atm.get("expiry"),
+    )
     candidates = []
     contract_rows = index_contract_rows(rec, direction)
     for contract_row in contract_rows:
@@ -5303,7 +5389,7 @@ def evaluate_symbol_buy_or_sell(
             reversal_trend = get_option_chain_trend(
                 symbol,
                 reversal_direction,
-                expiry=atm.get("expiry"),
+                expiry=rec.get("analysis_expiry") or analysis_atm.get("expiry"),
             )
             for contract_row in index_contract_rows(reversal_rec, reversal_direction):
                 try:
@@ -6012,6 +6098,7 @@ def execute_ganesh_gap_entry(state, snapshot, option, target):
             ),
             "entry_volume_confirmed": snapshot.get("volume_confirmed"),
             "entry_volume_ratio": snapshot.get("volume_ratio"),
+            "near_expiry_analysis": option.get("near_expiry_analysis", {}),
             "target_price": levels["target_price"],
             "stop_loss_price": levels["stop_loss_price"],
             "entry_price": expected_entry,
@@ -6155,6 +6242,17 @@ def run_ganesh_gap_signal_check():
         if not option.get("allowed"):
             eligible = False
             reason = option.get("reason") or "ATM option is unavailable"
+        else:
+            analysis = option.get("near_expiry_analysis") or {}
+            flow = analysis.get("option_flow") or {}
+            verbose_log(
+                "GANESH GAP NIFTY expiry split: "
+                f"analysis={analysis.get('expiry')} {analysis.get('trading_symbol')} "
+                f"chain={analysis.get('chain_bias')}/{analysis.get('chain_confidence')} "
+                f"vwap={flow.get('vwap')} volume_ratio={flow.get('volume_ratio')}; "
+                f"execution={option.get('expiry')} strike={option.get('strike')} "
+                f"{option.get('option_type')}"
+            )
 
     mode = str(os.getenv("GANESH_GAP_MODE", "FAITHFUL")).strip().upper()
     if mode not in {"FAITHFUL", "ENHANCED"}:

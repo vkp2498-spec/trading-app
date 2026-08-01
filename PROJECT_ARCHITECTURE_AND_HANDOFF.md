@@ -185,7 +185,13 @@ The chain is evidence, not infallible truth. A strongly opposite chain can veto 
 
 ### 7.3 Contract selection
 
-- The engine compares suitable ATM and nearby one-strike-ITM contracts when enabled.
+- NIFTY deliberately separates evidence from execution: nearest-expiry ATM
+  option-chain, OI/PCR, VWAP, volume, and trend data drive the analysis, while
+  Vamsi selective/Test and optional T20 orders buy the next-expiry ATM contract.
+- Ganesh uses the same NIFTY expiry split. In FAITHFUL mode the nearest-expiry
+  evidence is recorded as context without silently adding a new entry veto.
+- BANKNIFTY continues to analyze and execute the configured nearest contract.
+- Non-NIFTY contract comparison can include suitable ATM and nearby one-strike-ITM contracts when enabled.
 - Both candidates must pass spread, Greek, structure, and feasibility checks.
 - Capital allocation is converted into whole lots and rounded down.
 - `ACCOUNT_MAX_OPTION_CAPITAL` and `ACCOUNT_MAX_LOTS_PER_ENTRY` remain hard account ceilings.
