@@ -9,6 +9,7 @@ from post_market_score_audit import (
     evaluate_followthrough,
     non_overlapping_scans,
     parse_log_scans,
+    read_audit,
     reason_category,
     score_bucket,
     upsert_audit,
@@ -16,12 +17,37 @@ from post_market_score_audit import (
 
 
 class PostMarketScoreAuditTests(unittest.TestCase):
-    def test_score_buckets_have_extra_resolution_near_entry_threshold(self):
-        self.assertEqual(score_bucket(49.9), "00-49")
+    def test_score_buckets_use_five_point_resolution_below_fifty(self):
+        self.assertEqual(score_bucket(0), "00-04")
+        self.assertEqual(score_bucket(4.9), "00-04")
+        self.assertEqual(score_bucket(5), "05-09")
+        self.assertEqual(score_bucket(19.9), "15-19")
+        self.assertEqual(score_bucket(20), "20-24")
+        self.assertEqual(score_bucket(24.9), "20-24")
+        self.assertEqual(score_bucket(25), "25-29")
+        self.assertEqual(score_bucket(49.9), "45-49")
+        self.assertEqual(score_bucket(50), "50-59")
         self.assertEqual(score_bucket(65), "65-69")
         self.assertEqual(score_bucket(74.9), "70-74")
         self.assertEqual(score_bucket(75), "75-79")
         self.assertEqual(score_bucket(92.5), "90-100")
+
+    def test_read_audit_rebuckets_existing_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audit_file = Path(temp_dir) / "score_followthrough_audit.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "observation_id": "legacy-1",
+                        "score": 22.5,
+                        "score_bucket": "00-49",
+                    }
+                ]
+            ).to_csv(audit_file, index=False)
+
+            audit = read_audit(audit_file)
+
+        self.assertEqual(audit.iloc[0]["score_bucket"], "20-24")
 
     def test_log_parser_keeps_final_score_direction_and_reason(self):
         with tempfile.TemporaryDirectory() as temp_dir:

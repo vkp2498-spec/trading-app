@@ -22,7 +22,16 @@ STATUS_FILE = DATA_DIR / "score_followthrough_status.json"
 IST = ZoneInfo("Asia/Kolkata")
 SYMBOLS = ("NIFTY", "BANKNIFTY")
 SCORE_BUCKETS = (
-    "00-49",
+    "00-04",
+    "05-09",
+    "10-14",
+    "15-19",
+    "20-24",
+    "25-29",
+    "30-34",
+    "35-39",
+    "40-44",
+    "45-49",
     "50-59",
     "60-64",
     "65-69",
@@ -90,8 +99,26 @@ AUDIT_COLUMNS = [
 
 def score_bucket(score):
     value = float(score)
+    if value < 5:
+        return "00-04"
+    if value < 10:
+        return "05-09"
+    if value < 15:
+        return "10-14"
+    if value < 20:
+        return "15-19"
+    if value < 25:
+        return "20-24"
+    if value < 30:
+        return "25-29"
+    if value < 35:
+        return "30-34"
+    if value < 40:
+        return "35-39"
+    if value < 45:
+        return "40-44"
     if value < 50:
-        return "00-49"
+        return "45-49"
     if value < 60:
         return "50-59"
     if value < 65:
@@ -107,6 +134,17 @@ def score_bucket(score):
     if value < 90:
         return "85-89"
     return "90-100"
+
+
+def normalize_score_buckets(frame):
+    """Rebucket stored rows so older audit files use the current definitions."""
+    if frame.empty or "score" not in frame.columns:
+        return frame
+    normalized = frame.copy()
+    scores = pd.to_numeric(normalized["score"], errors="coerce")
+    valid = scores.notna()
+    normalized.loc[valid, "score_bucket"] = scores.loc[valid].map(score_bucket)
+    return normalized
 
 
 def reason_category(reason):
@@ -443,6 +481,7 @@ def upsert_audit(rows, audit_file=AUDIT_FILE):
     else:
         combined = incoming
     combined = combined.drop_duplicates("observation_id", keep="last")
+    combined = normalize_score_buckets(combined)
     combined = combined.reindex(columns=AUDIT_COLUMNS).sort_values(
         ["trading_date", "signal_time", "symbol"]
     )
@@ -457,7 +496,7 @@ def read_audit(audit_file=AUDIT_FILE):
     path = Path(audit_file)
     if not path.exists():
         return pd.DataFrame(columns=AUDIT_COLUMNS)
-    return pd.read_csv(path)
+    return normalize_score_buckets(pd.read_csv(path))
 
 
 def build_bucket_summary(frame, minimum_samples=20):

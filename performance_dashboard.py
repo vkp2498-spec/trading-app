@@ -832,6 +832,7 @@ def render_score_followthrough_review():
     st.markdown("#### NIFTY and BANKNIFTY by Score Bucket")
     st.dataframe(wide, use_container_width=True, hide_index=True)
     st.caption(
+        "Scores from 0 through 49 use five-point buckets for additional resolution. "
         f"BUILDING means fewer than {int(minimum_samples)} observations. Do not change live "
         "thresholds from a BUILDING row."
     )
