@@ -1,4 +1,4 @@
-"""Pure rules for Ganesh's NIFTY opening-gap reversal strategy."""
+"""Pure rules for Ganesh's NIFTY/BANKNIFTY opening-gap reversal strategy."""
 
 from __future__ import annotations
 

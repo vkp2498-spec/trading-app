@@ -1,6 +1,6 @@
 # Hare Krishna Trading Bot: Architecture and Project Handoff
 
-Last updated: 2026-08-01 IST  
+Last updated: 2026-08-03 IST
 Repository: `git@github.com:vkp2498-spec/trading-app.git`  
 Primary branch: `main`
 
@@ -159,7 +159,7 @@ TRADING_ENGINE=GANESH
 
 Only the selected engine may create new entries. The monitor and square-off layers always inspect every known bot state slot. This is important: changing the selected engine must not orphan a position created by the other engine.
 
-Current state slots include the Vamsi NIFTY/BANKNIFTY lanes, optional historical T20 lanes, legacy compatibility slots, and `GANESH_GAP_NIFTY`.
+Current state slots include the Vamsi NIFTY/BANKNIFTY lanes, optional historical T20 lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
 
 ## 7. Vamsi engine
 
@@ -258,7 +258,7 @@ It is not part of the recommended production baseline. Earlier live experiments 
 
 ### 8.1 Intent
 
-The Ganesh engine is a focused NIFTY opening-gap reversal strategy. It is deliberately simpler than the Vamsi engine and uses one next-week ATM option by default.
+The Ganesh engine is a focused NIFTY/BANKNIFTY opening-gap reversal strategy. It is deliberately simpler than the Vamsi engine. It evaluates both indices independently but permits at most one combined Ganesh trade per day.
 
 Current Ganesh AWS selection:
 
@@ -284,8 +284,8 @@ ENABLE_LIVE_TRADING=true
 - For a gap down, first observe a red active candle, then a confirmed red-to-green reversal, and buy an ATM CE.
 - For a gap up, first observe a green active candle, then a confirmed green-to-red reversal, and buy an ATM PE.
 - Require two confirmation scans by default, unless a configured reversal-distance buffer confirms earlier.
-- Use next-week NIFTY options and one lot by default.
-- Allow at most one Ganesh trade per day.
+- Use a next-week NIFTY option or the nearest supported BANKNIFTY expiry, and one lot by default.
+- Allow at most one combined Ganesh trade per day across NIFTY and BANKNIFTY.
 - Do not re-enter after the daily trade is completed.
 
 ### 8.3 Targets and exits
@@ -301,7 +301,7 @@ ENABLE_LIVE_TRADING=true
 
 `FAITHFUL` implements the requested gap/color/target system without adding optional confirmation gates. `ENHANCED` can require volume, Bollinger direction, and minimum reward/risk. Do not switch modes during an open position.
 
-Ganesh scans are written to `data/ganesh_gap_scans.csv`, and its live state uses `trade_state_GANESH_GAP_NIFTY.json`.
+NIFTY scans are written to `data/ganesh_gap_scans.csv`; BANKNIFTY scans use `data/ganesh_gap_banknifty_scans.csv`. Live state uses `trade_state_GANESH_GAP_NIFTY.json` or `trade_state_GANESH_GAP_BANKNIFTY.json` for the selected opportunity.
 
 ## 9. Shared execution and safety layer
 
@@ -351,6 +351,7 @@ Typical persistent files include:
 - `data/analysis_history.csv`: Detailed signal snapshots.
 - `data/scan_decisions.csv`: Compact scan results.
 - `data/ganesh_gap_scans.csv`: Ganesh gap-state evidence.
+- `data/ganesh_gap_banknifty_scans.csv`: Ganesh BANKNIFTY gap-state evidence.
 - `data/day_risk_state.json`: Day-level risk/circuit state.
 - `data/monitor_health.json`: Monitor heartbeat/failure state.
 - `data/trading_config.json`: Active mobile capital profile.
@@ -750,7 +751,7 @@ Use the example for local paper/research defaults. Do not copy production creden
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
 ```
 
-At the time this handoff was prepared, the latest full suite had 148 passing tests after the Ganesh/reset work. The number will change as tests are added.
+At the time this handoff was last updated, the latest full suite had 158 passing tests. The number will change as tests are added.
 
 ### 20.3 Run dashboard locally
 
@@ -772,7 +773,7 @@ Live dashboard features require a valid token and expected data files. Offline/p
 
 ## 21. Known gaps and open work
 
-- Ganesh's strategy has unit-tested rules but does not yet have a fully validated multi-month next-week-option replay with realistic spreads, fills, and costs.
+- Ganesh's NIFTY/BANKNIFTY strategy has unit-tested rules but does not yet have a fully validated multi-month option replay with realistic spreads, fills, and costs.
 - Neither engine has a demonstrated out-of-sample profitable edge.
 - Account-specific AWS `.env`, systemd units, Nginx files, DNS, and certificates are not versioned in this repository.
 - Exchange-holiday scheduling needs a maintained NSE holiday calendar if true holiday skipping is required.

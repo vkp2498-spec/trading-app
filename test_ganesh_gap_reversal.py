@@ -4,6 +4,8 @@ from datetime import datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 import trade_bot
 from strategy_core import choose_expiry
 from ganesh_gap_reversal import (
@@ -117,6 +119,88 @@ class GaneshGapReversalTests(unittest.TestCase):
         self.assertTrue(target_reached(BULLISH, 24250, 24240))
         self.assertTrue(target_reached(BEARISH, 24190, 24200))
 
+    def test_candle_freshness_is_measured_from_interval_end(self):
+        current = datetime(2026, 8, 3, 10, 2, 30, tzinfo=IST)
+        candle_start = datetime(2026, 8, 3, 10, 1, tzinfo=IST)
+        self.assertEqual(
+            trade_bot._ganesh_candle_age_seconds(candle_start, current),
+            30.0,
+        )
+
+    def test_ganesh_dispatch_checks_nifty_and_banknifty(self):
+        current = datetime(2026, 8, 3, 10, 0, tzinfo=IST)
+        with (
+            patch.object(trade_bot, "now_ist", return_value=current),
+            patch.object(trade_bot, "write_stream_instruments") as subscriptions,
+            patch.object(trade_bot, "run_ganesh_gap_symbol_signal_check") as check,
+            patch.object(trade_bot, "read_state", return_value={}),
+        ):
+            trade_bot.run_ganesh_gap_signal_check()
+
+        self.assertEqual(
+            [call.args[0] for call in check.call_args_list],
+            ["NIFTY", "BANKNIFTY"],
+        )
+        subscriptions.assert_called_once()
+        subscribed = set(subscriptions.call_args.args[0])
+        self.assertIn(trade_bot.UNDERLYING_INDEX_KEYS["NIFTY"], subscribed)
+        self.assertIn(trade_bot.UNDERLYING_INDEX_KEYS["BANKNIFTY"], subscribed)
+
+    def test_ganesh_daily_trade_cap_is_combined_across_both_indices(self):
+        with patch.object(
+            trade_bot,
+            "trade_count_for",
+            side_effect=lambda slot: 1 if slot == "GANESH_GAP_NIFTY" else 0,
+        ):
+            self.assertEqual(trade_bot.ganesh_gap_trade_count_today(), 1)
+
+    def test_banknifty_contract_selection_uses_banknifty_chain(self):
+        chain = pd.DataFrame(
+            [
+                {
+                    "strike": 55500.0,
+                    "expiry": "2026-08-25",
+                    "CE_ltp": 320.0,
+                    "CE_bid_price": 319.0,
+                    "CE_ask_price": 321.0,
+                }
+            ]
+        )
+        instrument = {
+            "instrument_key": "NSE_FO|BANK_OPTION",
+            "trading_symbol": "BANKNIFTY 55500 CE",
+            "lot_size": 30,
+        }
+        quality = {
+            "ltp": 320.0,
+            "bid_price": 319.0,
+            "ask_price": 321.0,
+            "spread_percent": 0.625,
+        }
+        with (
+            patch.object(
+                trade_bot,
+                "fetch_upstox_option_chain",
+                return_value=(None, None, chain),
+            ) as fetch,
+            patch.object(
+                trade_bot,
+                "find_index_option_instrument",
+                return_value=instrument,
+            ) as find,
+            patch.object(trade_bot, "read_market_cache", return_value={}),
+            patch.object(trade_bot, "option_contract_quality", return_value=quality),
+        ):
+            candidate = trade_bot.ganesh_gap_option_candidate(
+                {"symbol": "BANKNIFTY", "spot": 55525.0},
+                {"option_type": "CE"},
+            )
+
+        self.assertTrue(candidate["allowed"])
+        fetch.assert_called_once_with("BANKNIFTY", nearby=5)
+        self.assertEqual(find.call_args.args[0], "BANKNIFTY")
+        self.assertEqual(candidate["strike"], 55500)
+
     def test_nifty_contract_selection_uses_expiry_after_nearest(self):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
         self.assertEqual(choose_expiry("NIFTY", expiries), "2026-08-11")
@@ -179,6 +263,51 @@ class GaneshGapReversalTests(unittest.TestCase):
         record.assert_called_once()
         self.assertEqual(record.call_args.args[2], "UNDERLYING_TARGET")
         clear.assert_called_once_with(trade_bot.GANESH_GAP_STATE)
+
+    def test_banknifty_paper_position_uses_bank_feed_and_state_slot(self):
+        now = trade_bot.now_ist()
+        candle_start = active_two_hour_start(now)
+        bank_slot = trade_bot.GANESH_GAP_STATE_BY_SYMBOL["BANKNIFTY"]
+        state = {
+            "strategy": "GANESH_GAP_REVERSAL",
+            "state_slot": bank_slot,
+            "paper_trade": True,
+            "status": "POSITION_OPEN",
+            "instrument_key": "NSE_FO|BANK_OPTION",
+            "trading_symbol": "BANKNIFTY ATM CE",
+            "symbol": "BANKNIFTY",
+            "underlying_symbol": "BANKNIFTY",
+            "underlying_instrument_key": trade_bot.UNDERLYING_INDEX_KEYS["BANKNIFTY"],
+            "direction": BULLISH,
+            "quantity": 30,
+            "entry_price": 300.0,
+            "underlying_target_type": "R1",
+            "underlying_target_level": 55600.0,
+            "monitor_candle_start": candle_start.isoformat(),
+            "monitor_candle_open": 55500.0,
+            "created_at": now.isoformat(),
+        }
+
+        def quote_for(key):
+            if key == "NSE_FO|BANK_OPTION":
+                return {"ltp": 330.0, "received_at": now.timestamp()}
+            if key == trade_bot.UNDERLYING_INDEX_KEYS["BANKNIFTY"]:
+                return {"ltp": 55610.0, "received_at": now.timestamp()}
+            self.fail(f"unexpected market cache key {key}")
+
+        journal = {"entry_price": 300.0, "exit_price": 330.0, "gross_pnl": 900.0}
+        with (
+            patch.object(trade_bot, "daily_max_loss_reached", return_value=False),
+            patch.object(trade_bot, "read_market_cache", side_effect=quote_for),
+            patch.object(trade_bot, "write_state"),
+            patch.object(trade_bot, "record_closed_trade", return_value=journal),
+            patch.object(trade_bot, "send_apple_closed_trade_alert"),
+            patch.object(trade_bot, "clear_state") as clear,
+        ):
+            handled = trade_bot.handle_ganesh_gap_position(state, verbose=False)
+
+        self.assertTrue(handled)
+        clear.assert_called_once_with(bank_slot)
 
 
 if __name__ == "__main__":
