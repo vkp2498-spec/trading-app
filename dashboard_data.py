@@ -621,7 +621,6 @@ def empty_trade_performance() -> dict:
             "indexTradeSequencePerformance": index_trade_sequence_performance([]),
             "secondTradeContextPerformance": second_trade_context_performance([]),
         },
-        "t20": performance_stats([]),
         "equityCurve": [],
         "pnlCalendar": [],
         "edgeAnalytics": edge_analytics([]),
@@ -1036,24 +1035,8 @@ def dashboard_index_trades(trades: list[dict]) -> list[dict]:
     return [trade for trade in trades if is_dashboard_index_trade(trade)]
 
 
-def normalized_strategy(trade: dict) -> str:
-    return str(trade.get("strategy") or "SELECTIVE").strip().upper()
-
-
 def selective_index_trades(trades: list[dict]) -> list[dict]:
-    return [
-        trade
-        for trade in dashboard_index_trades(trades)
-        if normalized_strategy(trade) != "T20"
-    ]
-
-
-def t20_index_trades(trades: list[dict]) -> list[dict]:
-    return [
-        trade
-        for trade in dashboard_index_trades(trades)
-        if normalized_strategy(trade) == "T20"
-    ]
+    return dashboard_index_trades(trades)
 
 
 def is_stock_option_trade(trade: dict) -> bool:
@@ -1461,7 +1444,6 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, f
 
 def _build_trade_performance_payload(
     trades: list[dict],
-    t20_trades: list[dict],
     today_text: str,
 ) -> dict:
     today_trades = [
@@ -1565,7 +1547,6 @@ def _build_trade_performance_payload(
             "indexTradeSequencePerformance": index_trade_sequence_performance(trades),
             "secondTradeContextPerformance": second_trade_context_performance(trades),
         },
-        "t20": performance_stats(t20_trades),
         "equityCurve": build_equity_curve(
             trades,
         ),
@@ -1579,11 +1560,9 @@ def build_trade_performance() -> dict:
     today_text = datetime.now(IST).strftime("%Y-%m-%d")
     history = read_trade_history()
     trades = selective_index_trades(history)
-    t20_trades = t20_index_trades(history)
-    raw = _build_trade_performance_payload(trades, t20_trades, today_text)
+    raw = _build_trade_performance_payload(trades, today_text)
     raw["normalizedPerLakh"] = _build_trade_performance_payload(
         normalize_trades_per_lakh(trades),
-        normalize_trades_per_lakh(t20_trades),
         today_text,
     )
     return raw

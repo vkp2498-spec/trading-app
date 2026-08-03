@@ -54,6 +54,20 @@ class PerLakhDashboardTests(unittest.TestCase):
         self.assertEqual(normalized["cumulative"]["winRate"], 100.0)
         self.assertEqual(normalized["recentTrades"][0]["grossPnL"], 5_000.0)
 
+    def test_index_history_does_not_filter_retired_strategy_labels(self):
+        historical = trade(pnl=2_500.0)
+        historical["strategy"] = "RETIRED_EXPERIMENT"
+
+        with patch.object(
+            dashboard_data,
+            "read_trade_history",
+            return_value=[historical],
+        ):
+            performance = dashboard_data.build_trade_performance()
+
+        self.assertEqual(performance["cumulative"]["totalTrades"], 1)
+        self.assertEqual(performance["cumulative"]["totalPnL"], 2_500.0)
+
     def test_live_pnl_uses_the_same_entry_value_factor(self):
         live = {
             "totalLivePnL": 4_000.0,

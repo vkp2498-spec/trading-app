@@ -159,7 +159,7 @@ TRADING_ENGINE=GANESH
 
 Only the selected engine may create new entries. The monitor and square-off layers always inspect every known bot state slot. This is important: changing the selected engine must not orphan a position created by the other engine.
 
-Current state slots include the Vamsi NIFTY/BANKNIFTY lanes, optional historical T20 lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
+Current state slots include the Vamsi NIFTY/BANKNIFTY lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
 
 ## 7. Vamsi engine
 
@@ -189,7 +189,7 @@ The live Vamsi weighted-score entry band is an inclusive 55-60 (`VAMSI_MIN_WEIGH
 
 - NIFTY deliberately separates evidence from execution: nearest-expiry ATM
   option-chain, OI/PCR, VWAP, volume, and trend data drive the analysis, while
-  Vamsi selective/Test and optional T20 orders buy the next-expiry ATM contract.
+  Vamsi selective/Test orders buy the next-expiry ATM contract.
 - Ganesh uses the same NIFTY expiry split. In FAITHFUL mode the nearest-expiry
   evidence is recorded as context without silently adding a new entry veto.
 - BANKNIFTY continues to analyze and execute the configured nearest contract.
@@ -246,15 +246,9 @@ planned risk = abs(entry premium - stop premium) * actual quantity
 
 Never raise an account cap merely because a larger mobile profile was selected.
 
-### 7.6 Optional T20 lane
+### 7.6 Retired T20 experiment
 
-The repository still contains an optional T20 fallback lane from an experiment designed to take smaller, more frequent trades. It has separate capital, target, stop, trade-count, and daily-loss settings. It is disabled in `.env.example`:
-
-```dotenv
-ENABLE_T20_MODE=false
-```
-
-It is not part of the recommended production baseline. Earlier live experiments exposed broker-stop margin behavior and duplicate-finalization risks. Re-enable it only after an explicit review and dedicated tests.
+The experimental T20 fallback lane has been removed from runtime code, configuration, state monitoring, dashboards, and tests. Historical journal rows remain readable as ordinary index-option history. Do not add its old environment variables back to AWS `.env` files.
 
 ## 8. Ganesh engine
 
@@ -572,7 +566,7 @@ No simulation should be selected only because it is the best among several losin
 - Overnight gap-up/gap-down holding: removed from the Vamsi production path. Ganesh's strategy is an intraday opening-gap reversal, not an overnight position.
 - WhatsApp/Twilio alerts: removed after template-window complexity; Apple push remains.
 - LLM trade approval: removed from the primary live engine after replay did not justify its role.
-- T20 mode: remains optional in code but disabled by default.
+- T20 mode: removed from runtime code and configuration.
 
 ## 15. Important incidents and fixes
 
@@ -586,7 +580,7 @@ A one-second monitor generated HTTP 429 errors. Broker-read caching, stream data
 
 ### Protective stop margin rejection
 
-Upstox rejected a T20 protective option stop as if it required large additional margin. The bot flattened for safety, and duplicate failure paths worsened the recorded loss. This is one reason T20 remains disabled by default.
+Upstox rejected a protective option stop from the retired T20 experiment as if it required large additional margin. The bot flattened for safety, and duplicate failure paths worsened the recorded loss. The experiment was later removed.
 
 ### Post-fill guardrail
 
@@ -783,7 +777,7 @@ Live dashboard features require a valid token and expected data files. Offline/p
 - Historical option data can be incomplete or use contracts unavailable at the simulated timestamp.
 - The monitor still depends on API/stream health and cannot eliminate network or broker risk.
 - Manual trades can complicate broker reconciliation and dashboard attribution.
-- T20, legacy stock-futures, and older LLM code may remain import-compatible in the repository even though disabled.
+- Legacy stock-futures and older LLM code may remain import-compatible in the repository even though disabled.
 - The separate Mac research dashboard/folder may not be part of this repository. Locate and version it separately if it is still needed.
 
 ## 22. Rules for future changes

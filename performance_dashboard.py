@@ -2065,7 +2065,6 @@ with performance_tab:
     )
     today = performance.get("today", {})
     cumulative = performance.get("cumulative", {})
-    t20 = performance.get("t20", {})
 
     section_header("Today")
     today_cols = st.columns(3)
@@ -2087,12 +2086,6 @@ with performance_tab:
                 summary_card_html(title, summary, show_averages=True),
                 unsafe_allow_html=True,
             )
-
-    section_header("T20 Cumulative")
-    st.markdown(
-        summary_card_html("T20 Overall", t20),
-        unsafe_allow_html=True,
-    )
 
     section_header("Index Trade Sequence")
     seq_today, seq_cumulative = st.columns(2)

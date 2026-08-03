@@ -1146,35 +1146,6 @@ class TradeControlTests(unittest.TestCase):
 
         execute.assert_called_once_with(candidates["BANKNIFTY"])
 
-    def test_selective_pre_order_rejects_contract_owned_by_t20_lane(self):
-        candidate = {
-            "symbol": "NIFTY",
-            "transaction_type": "BUY",
-            "instrument": {"instrument_key": "NSE_FO|SHARED"},
-            "weighted": {"score": 90},
-        }
-
-        def state_for(slot):
-            if slot == "T20_NIFTY":
-                return {
-                    "instrument_key": "NSE_FO|SHARED",
-                    "status": "POSITION_OPEN",
-                }
-            return {}
-
-        with (
-            patch.object(trade_bot, "monitor_health_gate", return_value={"allowed": True}),
-            patch.object(trade_bot, "broker_pending_order_gate", return_value={"allowed": True}),
-            patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
-            patch.object(trade_bot, "read_state", side_effect=state_for),
-        ):
-            decision = trade_bot.pre_order_portfolio_decision(
-                candidate, 65, 100.0, 90.0
-            )
-
-        self.assertFalse(decision["allowed"])
-        self.assertIn("alternate ATM/ITM contract", decision["reason"])
-
     def test_index_point_exits_are_read_from_environment(self):
         with patch.dict(
             os.environ,
@@ -1192,16 +1163,13 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(levels["target_points"], 30)
         self.assertEqual(levels["stop_points"], 30)
 
-    def test_active_selective_position_scans_for_t20_but_blocks_selective_entry(self):
-        bank_candidate = {
-            "symbol": "BANKNIFTY",
-            "transaction_type": "BUY",
-            "weighted": {"score": 82},
-        }
-
+    def test_active_selective_position_blocks_new_index_scan(self):
         def state_for(symbol):
             if symbol == "NIFTY":
-                return {"instrument_key": "NSE_FO|NIFTY_OPEN"}
+                return {
+                    "instrument_key": "NSE_FO|NIFTY_OPEN",
+                    "status": "POSITION_OPEN",
+                }
             return {}
 
         with (
@@ -1213,24 +1181,15 @@ class TradeControlTests(unittest.TestCase):
                 "portfolio_day_circuit",
                 return_value={"allowed": True, "score_penalty": 0},
             ),
-            patch.object(trade_bot, "get_open_positions", return_value=[]),
             patch.object(
                 trade_bot,
                 "evaluate_symbol_buy_or_sell",
-                return_value=bank_candidate,
             ) as evaluate,
             patch.object(trade_bot, "execute_selected_candidate") as execute,
-            patch.object(trade_bot, "t20_enabled", return_value=False),
         ):
             trade_bot.run_signal_check()
 
-        self.assertEqual(evaluate.call_count, 2)
-        nifty_call = evaluate.call_args_list[0]
-        self.assertEqual(nifty_call.args[0], "NIFTY")
-        self.assertEqual(
-            nifty_call.kwargs["excluded_instrument_keys"],
-            {"NSE_FO|NIFTY_OPEN"},
-        )
+        evaluate.assert_not_called()
         execute.assert_not_called()
 
     def test_losing_setups_are_rejected_by_feasibility_gate(self):

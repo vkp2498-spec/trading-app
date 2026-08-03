@@ -136,8 +136,6 @@ PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
-T20_STATE_BY_SYMBOL = {symbol: f"T20_{symbol}" for symbol in SYMBOLS}
-T20_STATE_SLOTS = list(T20_STATE_BY_SYMBOL.values())
 GANESH_GAP_STATE_BY_SYMBOL = {
     symbol: f"GANESH_GAP_{symbol}" for symbol in SYMBOLS
 }
@@ -145,7 +143,7 @@ GANESH_GAP_STATE_BY_SYMBOL = {
 GANESH_GAP_STATE = GANESH_GAP_STATE_BY_SYMBOL["NIFTY"]
 GANESH_GAP_STATE_SLOTS = list(GANESH_GAP_STATE_BY_SYMBOL.values())
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
-VAMSI_STATE_SLOTS = SYMBOLS + T20_STATE_SLOTS + [STOCK_FUTURE_STATE]
+VAMSI_STATE_SLOTS = SYMBOLS + [STOCK_FUTURE_STATE]
 BOT_STATE_SLOTS = VAMSI_STATE_SLOTS + GANESH_GAP_STATE_SLOTS
 GANESH_GAP_SCAN_FILE = BASE_DIR / "data" / "ganesh_gap_scans.csv"
 GANESH_GAP_BANKNIFTY_SCAN_FILE = BASE_DIR / "data" / "ganesh_gap_banknifty_scans.csv"
@@ -1452,8 +1450,6 @@ def underlying_symbol_for_state_slot(state_slot, state=None):
     underlying = str(state.get("underlying_symbol") or state.get("symbol") or "").upper()
     if underlying in SYMBOLS:
         return underlying
-    if state_slot in T20_STATE_SLOTS:
-        return state_slot.removeprefix("T20_")
     return state_slot
 
 
@@ -1461,18 +1457,12 @@ def selective_index_has_active_state(symbol):
     return state_is_active(read_state(symbol))
 
 
-def t20_index_has_active_state(symbol):
-    return state_is_active(read_state(T20_STATE_BY_SYMBOL[symbol]))
-
-
 def active_index_instrument_keys(symbol):
-    """Return contracts already managed by either lane for one underlying."""
-    keys = set()
-    for slot in (symbol, T20_STATE_BY_SYMBOL[symbol]):
-        state = read_state(slot)
-        if state_is_active(state) and state.get("instrument_key"):
-            keys.add(state["instrument_key"])
-    return keys
+    """Return the selective contract already managed for one underlying."""
+    state = read_state(symbol)
+    if state_is_active(state) and state.get("instrument_key"):
+        return {state["instrument_key"]}
+    return set()
 
 
 def today_closed_trade_rows():
@@ -1669,10 +1659,7 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         if instrument_key and instrument_key in active_index_instrument_keys(symbol):
             return {
                 "allowed": False,
-                "reason": (
-                    f"{symbol} contract {instrument_key} is already managed by "
-                    "the T20 lane; an alternate ATM/ITM contract is required"
-                ),
+                "reason": f"{symbol} contract {instrument_key} is already managed",
             }
     score = candidate_weighted_score(chosen)
     base_minimum = to_float(
@@ -1767,89 +1754,6 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         "correlation": correlation,
         "circuit": circuit,
         "required_score": required_score,
-    }
-
-
-def pre_order_t20_decision(chosen, quantity, entry_price, stop_loss_price):
-    """Independent T20 limits plus the account-wide safety gates."""
-    health = monitor_health_gate()
-    if not health["allowed"]:
-        return {"allowed": False, "reason": health["reason"]}
-    reconciliation = broker_pending_order_gate()
-    if not reconciliation["allowed"]:
-        return {"allowed": False, "reason": reconciliation["reason"]}
-    circuit = portfolio_day_circuit()
-    if not circuit["allowed"]:
-        return {"allowed": False, "reason": circuit["reason"], "circuit": circuit}
-
-    symbol = str(chosen.get("symbol") or "").upper()
-    if symbol not in SYMBOLS:
-        return {"allowed": False, "reason": "T20 supports only NIFTY and BANKNIFTY"}
-    if t20_index_has_active_state(symbol):
-        return {
-            "allowed": False,
-            "reason": f"{symbol} already has an active T20 position",
-        }
-    instrument_key = (chosen.get("instrument") or {}).get("instrument_key")
-    if instrument_key and instrument_key in active_index_instrument_keys(symbol):
-        return {
-            "allowed": False,
-            "reason": (
-                f"{symbol} contract {instrument_key} is already managed by "
-                "the selective lane; an alternate ATM/ITM contract is required"
-            ),
-        }
-    if t20_trade_count_today() >= t20_max_trades_per_day():
-        return {
-            "allowed": False,
-            "reason": f"T20 daily trade cap {t20_max_trades_per_day()} reached",
-        }
-
-    proposed_risk = proposed_position_risk(
-        entry_price,
-        stop_loss_price,
-        quantity,
-        chosen.get("transaction_type", "BUY"),
-    )
-    open_t20_risk = total_open_risk(active_t20_states())
-    worst_case_pnl = today_t20_realized_pnl() - open_t20_risk - proposed_risk
-    if worst_case_pnl < -abs(t20_daily_max_loss()):
-        return {
-            "allowed": False,
-            "reason": (
-                "T20 projected stop-cycle loss would breach the daily limit: "
-                f"worst_case=Rs {worst_case_pnl:.2f}, "
-                f"limit=-Rs {t20_daily_max_loss():.2f}"
-            ),
-        }
-
-    states = active_bot_states()
-    open_risk_fallback = configured_non_negative_float("MAX_OPEN_PORTFOLIO_RISK", 0.0)
-    risk = aggregate_risk_decision(
-        states,
-        entry_price,
-        stop_loss_price,
-        quantity,
-        chosen.get("transaction_type", "BUY"),
-        to_float(
-            active_value("maxOpenPortfolioRisk", open_risk_fallback),
-            open_risk_fallback,
-        ),
-        configured_non_negative_float("PORTFOLIO_RISK_BUFFER_PERCENT", 15.0),
-    )
-    if not risk["allowed"]:
-        return {"allowed": False, "reason": risk["reason"], "risk": risk}
-
-    return {
-        "allowed": True,
-        "reason": "T20 entry accepted",
-        "risk": risk,
-        "correlation": {
-            "allowed": True,
-            "reason": "T20 NIFTY and BANKNIFTY lanes are independently enabled",
-        },
-        "proposed_risk": proposed_risk,
-        "worst_case_pnl": worst_case_pnl,
     }
 
 
@@ -1953,157 +1857,8 @@ def index_trade_count_today():
     return sum(trade_count_for(symbol) for symbol in SYMBOLS)
 
 
-def t20_enabled():
-    return configured_bool("ENABLE_T20_MODE", False)
-
-
-def t20_minimum_score():
-    return configured_non_negative_float("T20_MIN_SCORE", 50.0)
-
-
-def t20_max_trades_per_day():
-    return max(to_int(os.getenv("T20_MAX_TRADES_PER_DAY"), 5), 0)
-
-
-def t20_target_premium_points(symbol):
-    default = 5.0 if symbol == "NIFTY" else 10.0
-    return configured_positive_float(
-        f"T20_{symbol}_TARGET_PREMIUM_POINTS",
-        default,
-    )
-
-
-def t20_stop_premium_points(symbol):
-    default = 5.0 if symbol == "NIFTY" else 10.0
-    return configured_positive_float(
-        f"T20_{symbol}_STOP_PREMIUM_POINTS",
-        default,
-    )
-
-
-def t20_daily_max_loss():
-    return configured_positive_float("T20_DAILY_MAX_LOSS", 10000.0)
-
-
-def t20_option_capital_per_entry():
-    """Return the T20-only capital ceiling, independent of the mobile profile."""
-    raw_value = os.getenv("T20_OPTION_CAPITAL_PER_ENTRY", "50000").strip()
-    account_cap = configured_non_negative_float("ACCOUNT_MAX_OPTION_CAPITAL", 0.0)
-    if raw_value.upper() == "MAX":
-        return account_cap if account_cap > 0 else "MAX"
-    try:
-        capital = float(raw_value)
-    except ValueError as error:
-        raise RuntimeError(
-            "T20_OPTION_CAPITAL_PER_ENTRY must be 1, MAX, or a positive rupee amount"
-        ) from error
-    if capital < 1:
-        raise RuntimeError(
-            "T20_OPTION_CAPITAL_PER_ENTRY must be 1 or greater"
-        )
-    return min(capital, account_cap) if account_cap > 0 else capital
-
-
-def t20_trailing_stop_enabled():
-    return configured_bool("T20_TRAILING_STOP_ENABLED", False)
-
-
-def t20_profit_booking_target_percent():
-    value = configured_non_negative_float(
-        "T20_PROFIT_BOOKING_TARGET_PERCENT",
-        80.0,
-    )
-    if value <= 0 or value > 100:
-        raise RuntimeError(
-            "T20_PROFIT_BOOKING_TARGET_PERCENT must be greater than 0 and at most 100"
-        )
-    return value
-
-
 def sentiment_exit_enabled_for_state(state):
-    """Keep fast T20 trades independent of slower option-chain reversals."""
-    if str((state or {}).get("strategy") or "").upper() == "T20":
-        return configured_bool("T20_SENTIMENT_EXIT_ENABLED", False)
     return True
-
-
-def t20_trade_count_today():
-    return sum(trade_count_for(slot) for slot in T20_STATE_SLOTS)
-
-
-def today_t20_trade_rows():
-    return [
-        row
-        for row in today_closed_trade_rows()
-        if str(row.get("strategy") or "").upper() == "T20"
-    ]
-
-
-def today_t20_realized_pnl():
-    return round(sum(to_float(row.get("gross_pnl")) for row in today_t20_trade_rows()), 2)
-
-
-def active_t20_states():
-    return [
-        state
-        for state in (read_state(slot) for slot in T20_STATE_SLOTS)
-        if state_is_active(state)
-    ]
-
-
-def t20_premium_levels(symbol, entry_price, quantity=None):
-    entry_price = float(entry_price)
-    return {
-        "target_price": round(entry_price + t20_target_premium_points(symbol), 2),
-        "stop_loss_price": round(
-            max(entry_price - t20_stop_premium_points(symbol), 0.05),
-            2,
-        ),
-    }
-
-
-def effective_t20_capital(instrument, entry_price):
-    """Cap T20 sizing by its own setting and live broker buying power."""
-    configured = t20_option_capital_per_entry()
-    if not configured_bool("ENABLE_LIVE_TRADING", False):
-        return configured
-
-    available = maximum_available_option_capital(force_refresh=True)
-    if available <= 0:
-        return 0.0
-    if configured == "MAX":
-        return available
-    if configured == 1:
-        lot_value = float(entry_price) * int(instrument.get("lot_size") or 0)
-        return 1 if lot_value > 0 and lot_value <= available else 0.0
-    return min(float(configured), available)
-
-
-def t20_risk_adjusted_quantity(symbol, instrument, entry_price, stop_loss_price):
-    """Use the T20-only capital ceiling, then fit the T20 day-loss budget."""
-    capital = effective_t20_capital(instrument, entry_price)
-    if capital == 0:
-        return 0
-    configured_quantity = order_quantity_for(
-        symbol,
-        instrument,
-        entry_price,
-        stop_loss_price,
-        transaction_type="BUY",
-        capital_override=capital,
-    )
-    lot_size = max(int(instrument.get("lot_size") or 0), 1)
-    per_unit_risk = max(float(entry_price) - float(stop_loss_price), 0.0)
-    open_risk = total_open_risk(active_t20_states())
-    remaining_loss_capacity = max(
-        t20_daily_max_loss() + today_t20_realized_pnl() - open_risk,
-        0.0,
-    )
-    if configured_quantity <= 0 or per_unit_risk <= 0 or remaining_loss_capacity <= 0:
-        return 0
-    risk_quantity = int(remaining_loss_capacity // per_unit_risk)
-    risk_quantity = (risk_quantity // lot_size) * lot_size
-    return max(min(configured_quantity, risk_quantity), 0)
 
 
 def max_index_trades_per_day():
@@ -2149,8 +1904,6 @@ def today_index_trade_rows():
                 if str(row.get("symbol") or "").upper() not in SYMBOLS:
                     continue
                 if str(row.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
-                    continue
-                if str(row.get("strategy") or "").upper() == "T20":
                     continue
                 rows.append(row)
     except Exception as error:
@@ -2859,8 +2612,8 @@ def index_contract_rows(recommendation, direction):
     atm = dict(recommendation.get("atm") or {})
     if not atm:
         return []
-    # NIFTY signal evidence comes from the nearest expiry, but both selective
-    # and T20 execution must use the next-expiry ATM contract exactly.
+    # NIFTY signal evidence comes from the nearest expiry, but execution uses
+    # the next-expiry ATM contract exactly.
     if recommendation.get("symbol") == "NIFTY":
         return [atm]
     if not configured_bool("INDEX_CONTRACT_SELECTION_ENABLED", True):
@@ -3077,7 +2830,7 @@ def save_open_position_state(
                 2
                 if instrument_class == "STOCK_FUTURE"
                 or str((trade_metadata or {}).get("strategy") or "").upper()
-                in {"T20", "GANESH_GAP_REVERSAL"}
+                == "GANESH_GAP_REVERSAL"
                 else 0
             )
             target_price = round(float(target_price), precision)
@@ -3181,9 +2934,8 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
         state["broker_day_pnl_at_exit"] = ""
         log(f"{symbol} broker P&L snapshot unavailable at exit: {error}")
     journal_row = record_closed_trade(state, exit_price, exit_reason)
-    if str(state.get("strategy") or "").upper() != "T20":
-        register_losing_exit_guard(symbol, state, journal_row, exit_reason)
-        register_same_index_reset_guard(symbol, state, journal_row, exit_reason)
+    register_losing_exit_guard(symbol, state, journal_row, exit_reason)
+    register_same_index_reset_guard(symbol, state, journal_row, exit_reason)
     send_apple_closed_trade_alert(journal_row)
     log(
         f"{symbol} bought {journal_row.get('entry_price')} closed {journal_row.get('exit_price')} "
@@ -3714,55 +3466,12 @@ def handle_existing_state(symbol, state, verbose=True):
             return True
         state = read_state(symbol)
 
-    # A broker position can become visible before the entry process has saved
-    # its actual fill. Finalize T20 entries first so the monitor cannot arm a
-    # stop from the estimated premium or race the entry process into a second
-    # protective order/emergency exit.
     entry_order_id = state.get("entry_order_id") or state.get("buy_order_id")
     pending_status = f"{entry_transaction}_PLACED_NOT_COMPLETE"
     is_pending_entry = bool(
         entry_order_id
         and state.get("status") in {pending_status, "BUY_PLACED_NOT_COMPLETE"}
     )
-    if is_pending_entry and str(state.get("strategy") or "").upper() == "T20":
-        details = wait_for_order_complete(entry_order_id, attempts=1, delay_seconds=0)
-        status = order_status(details)
-        log(
-            f"{symbol} pending {entry_transaction} check: "
-            f"order_id={entry_order_id} status={status}"
-        )
-        if order_is_rejected(details):
-            clear_state(symbol)
-            return True
-        if not order_is_complete(details):
-            return True
-
-        position = find_matching_position_for_side(instrument_key, entry_transaction)
-        entry_price = position_avg_price(position, entry_transaction) if position else None
-        entry_price = (
-            entry_price
-            or to_float(details.get("average_price"))
-            or to_float(details.get("price"))
-        )
-        if not entry_price:
-            log(f"{symbol} {entry_transaction} complete but entry price not found. Keeping state.")
-            return True
-        quantity = int(state.get("quantity") or abs(position_quantity(position)) or 0)
-        instrument = {
-            "instrument_key": instrument_key,
-            "trading_symbol": state.get("trading_symbol"),
-            "lot_size": int(state.get("lot_size") or quantity),
-        }
-        finalize_and_protect_t20_position(
-            symbol,
-            state,
-            entry_price,
-            quantity,
-            instrument,
-            entry_order_id,
-        )
-        return True
-
     position = find_matching_position_for_side(instrument_key, entry_transaction)
     if position and not is_pending_entry:
         ltp = position_ltp(position)
@@ -3976,16 +3685,6 @@ def handle_existing_state(symbol, state, verbose=True):
                 "lot_size": int(state.get("lot_size") or quantity),
             }
             instrument_class = state.get("instrument_class", "INDEX_OPTION")
-            if str(state.get("strategy") or "").upper() == "T20":
-                finalize_and_protect_t20_position(
-                    symbol,
-                    state,
-                    entry_price,
-                    quantity,
-                    instrument,
-                    entry_order_id,
-                )
-                return True
             save_open_position_state(
                 symbol, entry_order_id, instrument, state.get("direction"),
                 state.get("confidence"), state.get("score"), entry_price, quantity,
@@ -4135,14 +3834,10 @@ def profit_booking_mode():
 
 
 def profit_booking_percent_for_state(state):
-    if str((state or {}).get("strategy") or "").upper() == "T20":
-        return t20_profit_booking_target_percent()
     return profit_booking_target_percent()
 
 
 def profit_booking_mode_for_state(state):
-    if str((state or {}).get("strategy") or "").upper() == "T20":
-        return "exit"
     return profit_booking_mode()
 
 
@@ -4246,12 +3941,6 @@ def apply_trailing_stop(symbol, state, ltp):
         state["lowest_ltp"] = round(
             min(to_float(state.get("lowest_ltp"), entry), current_ltp), 2
         )
-
-    if (
-        str(state.get("strategy") or "").upper() == "T20"
-        and not t20_trailing_stop_enabled()
-    ):
-        return state
 
     settings = profit_protection_settings()
     if not settings["enabled"]:
@@ -4972,291 +4661,6 @@ def select_trade_candidate(candidates, allow_sell=True):
         ),
         default=None,
     )
-
-
-def prepare_t20_candidate(symbol, candidate):
-    """Promote a directional score above the T20 cutoff without bypassing liquidity."""
-    if not candidate or not isinstance(candidate, dict):
-        return None, "no directional candidate"
-    score = candidate_weighted_score(candidate)
-    if score <= t20_minimum_score():
-        return None, f"score {score:.1f} is not above {t20_minimum_score():.1f}"
-    direction = str(
-        candidate.get("direction")
-        or (candidate.get("option_summary") or {}).get("bias")
-        or ""
-    ).upper()
-    if direction not in {"BULLISH", "BEARISH"}:
-        return None, "direction is unavailable"
-    quality = ((candidate.get("technicals") or {}).get("option_market_quality") or {})
-    if not quality.get("entry_allowed", False):
-        return None, "option market quality did not pass"
-    instrument = candidate.get("instrument") or {}
-    entry_price = to_float(
-        candidate.get("entry_price"),
-        to_float((candidate.get("option_summary") or {}).get("entry_price")),
-    )
-    if not instrument.get("instrument_key") or entry_price <= 0:
-        return None, "executable option contract or premium is unavailable"
-    prepared = dict(candidate)
-    prepared.update(
-        {
-            "symbol": symbol,
-            "direction": direction,
-            "confidence": candidate.get("confidence") or "MEDIUM",
-            "signal_score": candidate.get("signal_score", score),
-            "transaction_type": "BUY",
-            "entry_price": entry_price,
-            "strategy": "T20",
-        }
-    )
-    return prepared, "qualified"
-
-
-def finalize_t20_open_position(
-    state_slot,
-    initial_state,
-    fill,
-    quantity,
-    instrument,
-    order_id,
-):
-    underlying = underlying_symbol_for_state_slot(state_slot, initial_state)
-    levels = t20_premium_levels(underlying, fill, quantity)
-    trailing_enabled = t20_trailing_stop_enabled()
-    metadata = {
-        "symbol": underlying,
-        "underlying_symbol": underlying,
-        "state_slot": state_slot,
-        "strategy": "T20",
-        "weighted_score": to_float(initial_state.get("weighted_score")),
-        "t20_target_premium_points": t20_target_premium_points(underlying),
-        "t20_stop_premium_points": t20_stop_premium_points(underlying),
-        "technical_context": initial_state.get("technical_context", {}),
-        "option_type": initial_state.get("option_type"),
-        "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(underlying),
-    }
-    save_open_position_state(
-        state_slot,
-        order_id,
-        instrument,
-        initial_state.get("direction"),
-        initial_state.get("confidence", "MEDIUM"),
-        initial_state.get("score"),
-        fill,
-        quantity,
-        levels["target_price"],
-        levels["stop_loss_price"],
-        entry_transaction_type="BUY",
-        instrument_class="INDEX_OPTION",
-        underlying_symbol=underlying,
-        profit_protection_enabled_for_trade=trailing_enabled,
-        trade_metadata=metadata,
-        order_product=initial_state.get("order_product") or "I",
-    )
-    state = read_state(state_slot)
-    state.update(
-        {
-            "target_price": levels["target_price"],
-            "planned_target_price": levels["target_price"],
-            "stop_loss_price": levels["stop_loss_price"],
-            "original_stop_loss_price": levels["stop_loss_price"],
-            "profit_booking_percent": t20_profit_booking_target_percent(),
-            "profit_booking_mode": "exit",
-            "profit_protection_enabled_for_trade": trailing_enabled,
-        }
-    )
-    state.pop("runner_activation_price", None)
-    state["profit_booking_price"] = profit_booking_price(state)
-    write_state(state_slot, state)
-    return state
-
-
-def finalize_and_protect_t20_position(
-    state_slot,
-    initial_state,
-    fill,
-    quantity,
-    instrument,
-    order_id,
-):
-    """Finalize a T20 fill and arm exactly one stop across concurrent processes."""
-    with position_finalization_lock(state_slot):
-        fresh = read_state(state_slot)
-        if not fresh or str(fresh.get("entry_order_id")) != str(order_id):
-            return fresh
-        if fresh.get("status") == "EXIT_PENDING":
-            return fresh
-        if (
-            fresh.get("status") == "POSITION_OPEN"
-            and fresh.get("protective_stop_order_id")
-        ):
-            return fresh
-
-        if fresh.get("status") == "POSITION_OPEN":
-            state = fresh
-        else:
-            state = finalize_t20_open_position(
-                state_slot,
-                fresh or initial_state,
-                fill,
-                quantity,
-                instrument,
-                order_id,
-            )
-        try:
-            return ensure_protective_stop(state_slot, state)
-        except Exception as error:
-            log(f"{state_slot} CRITICAL: protective stop failed; flattening: {error}")
-            state = read_state(state_slot)
-            state["status"] = "EXIT_PENDING"
-            state["exit_reason"] = "PROTECTION_FAILURE"
-            state["exit_submission_in_progress"] = True
-            write_state(state_slot, state)
-            try:
-                emergency, emergency_payload = place_market_order(
-                    instrument,
-                    "SELL",
-                    quantity,
-                    product=state.get("order_product") or "I",
-                )
-            except Exception:
-                state["status"] = "POSITION_OPEN"
-                state.pop("exit_submission_in_progress", None)
-                write_state(state_slot, state)
-                raise
-            emergency_id = emergency.get("data", {}).get("order_id")
-            if not emergency_id:
-                raise RuntimeError(
-                    f"{state_slot} emergency SELL returned no order_id: {emergency}"
-                ) from error
-            emergency_details = wait_for_order_complete(emergency_id)
-            if order_is_complete(emergency_details):
-                complete_exit(
-                    state_slot,
-                    state,
-                    emergency_details,
-                    fill,
-                    "PROTECTION_FAILURE",
-                    emergency,
-                    emergency_payload,
-                )
-            else:
-                state.pop("exit_submission_in_progress", None)
-                state["exit_order_id"] = emergency_id
-                state["exit_fallback_price"] = fill
-                write_state(state_slot, state)
-            return read_state(state_slot)
-
-
-def execute_t20_candidate(chosen):
-    symbol = chosen["symbol"]
-    state_slot = T20_STATE_BY_SYMBOL[symbol]
-    instrument = chosen["instrument"]
-    expected_entry = to_float(chosen.get("entry_price"))
-    levels = t20_premium_levels(symbol, expected_entry)
-    score = candidate_weighted_score(chosen)
-    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    write_stream_instruments(
-        [
-            "NSE_INDEX|Nifty 50",
-            "NSE_INDEX|Nifty Bank",
-            "NSE_INDEX|India VIX",
-            instrument.get("instrument_key"),
-        ]
-    )
-    with portfolio_entry_lock():
-        quantity = t20_risk_adjusted_quantity(
-            symbol,
-            instrument,
-            expected_entry,
-            levels["stop_loss_price"],
-        )
-        if quantity <= 0:
-            log(
-                f"T20 {symbol} rejected: T20 capital, available broker funds, "
-                "or risk budget cannot fund one whole lot"
-            )
-            return False
-        verbose_log(
-            f"T20 {symbol} selected: {instrument.get('trading_symbol')} "
-            f"score={score:.1f} qty={quantity} expected_entry={expected_entry:.2f} "
-            f"capital_limit={t20_option_capital_per_entry()} "
-            f"target={t20_target_premium_points(symbol):.2f} premium points "
-            f"stop={t20_stop_premium_points(symbol):.2f} premium points live={live}"
-        )
-        decision = pre_order_t20_decision(
-            chosen,
-            quantity,
-            expected_entry,
-            levels["stop_loss_price"],
-        )
-        if not decision.get("allowed"):
-            verbose_log(f"T20 {symbol} rejected by safety gate: {decision.get('reason')}")
-            return False
-        if not live:
-            log(
-                f"T20 {symbol} DRY RUN: would buy qty={quantity} at approximately "
-                f"{expected_entry:.2f} using the active mobile allocation"
-            )
-            return True
-        result, payload = place_market_order(instrument, "BUY", quantity)
-        order_id = result.get("data", {}).get("order_id")
-        if not order_id:
-            raise RuntimeError(f"T20 {symbol} BUY returned no order_id: {result}")
-        pending_state = {
-            "date": now_ist().strftime("%Y-%m-%d"),
-            "symbol": symbol,
-            "underlying_symbol": symbol,
-            "state_slot": state_slot,
-            "strategy": "T20",
-            "entry_order_id": order_id,
-            "entry_transaction_type": "BUY",
-            "exit_transaction_type": "SELL",
-            "instrument_class": "INDEX_OPTION",
-            "order_product": "I",
-            "instrument_key": instrument["instrument_key"],
-            "trading_symbol": instrument["trading_symbol"],
-            "quantity": quantity,
-            "lot_size": int(instrument.get("lot_size") or quantity),
-            "entry_price": expected_entry,
-            "target_price": levels["target_price"],
-            "stop_loss_price": levels["stop_loss_price"],
-            "direction": chosen["direction"],
-            "confidence": chosen.get("confidence", "MEDIUM"),
-            "score": chosen.get("signal_score", score),
-            "weighted_score": score,
-            "option_type": (chosen.get("option_summary") or {}).get("option_type"),
-            "technical_context": chosen.get("technicals", {}),
-            "profit_protection_enabled_for_trade": t20_trailing_stop_enabled(),
-            "t20_target_premium_points": t20_target_premium_points(symbol),
-            "t20_stop_premium_points": t20_stop_premium_points(symbol),
-            "status": "BUY_PLACED_NOT_COMPLETE",
-            "created_at": now_ist().isoformat(),
-        }
-        write_state(state_slot, pending_state)
-    verbose_log(f"T20 {symbol} MARKET BUY placed: order_id={order_id} payload={payload}")
-    details = wait_for_order_complete(order_id)
-    if order_is_rejected(details):
-        clear_state(state_slot)
-        verbose_log(f"T20 {symbol} MARKET BUY rejected: {details}")
-        return False
-
-    increment_trade_count(state_slot)
-    if not order_is_complete(details):
-        return True
-    position = find_matching_position_for_side(instrument["instrument_key"], "BUY")
-    fill = position_avg_price(position, "BUY") if position else None
-    fill = fill or to_float(details.get("average_price")) or expected_entry
-    finalize_and_protect_t20_position(
-        state_slot,
-        pending_state,
-        fill,
-        quantity,
-        instrument,
-        order_id,
-    )
-    return True
 
 
 def evaluate_symbol_buy_or_sell(
@@ -6651,8 +6055,9 @@ def run_signal_check():
         verbose_log(
             "Selective index lane occupied by "
             + "/".join(sorted(active_selective_index))
-            + "; T20 remains available for the other underlying"
+            + "; no new index-option entry will be evaluated"
         )
+        return
 
     try:
         tracked_instrument_keys = {
@@ -6696,15 +6101,7 @@ def run_signal_check():
         return
 
     qualified = []
-    candidates_by_symbol = {}
     for symbol in SYMBOLS:
-        selective_active = selective_index_has_active_state(symbol)
-        t20_active = t20_index_has_active_state(symbol)
-        if selective_active and t20_active:
-            verbose_log(
-                f"{symbol} scan skipped: selective and T20 lanes are both occupied"
-            )
-            continue
         occupied_contracts = active_index_instrument_keys(symbol)
         try:
             daily_block = daily_index_entry_block_reason(symbol)
@@ -6723,13 +6120,10 @@ def run_signal_check():
                 symbol,
                 allow_option_sell=False,
                 include_rejected=(
-                    t20_enabled()
-                    or watch_mode_enabled()
-                    or bool(read_watch_state(symbol))
+                    watch_mode_enabled() or bool(read_watch_state(symbol))
                 ),
                 excluded_instrument_keys=occupied_contracts,
             )
-            candidates_by_symbol[symbol] = candidate
             if (
                 not active_selective_index
                 and not daily_block
@@ -6774,31 +6168,6 @@ def run_signal_check():
             execute_selected_candidate(chosen)
         except Exception as error:
             log(f"{chosen['symbol']} order execution ERROR: {error}")
-
-    if not t20_enabled():
-        return
-    if qualified:
-        verbose_log("T20 fallback skipped: a selective setup qualified on this scan")
-        return
-    if t20_trade_count_today() >= t20_max_trades_per_day():
-        verbose_log(f"T20 lane stopped: daily trade cap {t20_max_trades_per_day()} reached")
-        return
-
-    # T20 and selective lanes may coexist on either underlying. Candidate
-    # construction excludes occupied instrument keys so each lane owns a
-    # different ATM/ITM contract and can manage its own broker stop safely.
-    for symbol in SYMBOLS:
-        if t20_index_has_active_state(symbol):
-            continue
-        candidate, reason = prepare_t20_candidate(symbol, candidates_by_symbol.get(symbol))
-        if not candidate:
-            verbose_log(f"T20 {symbol} reject: {reason}")
-            continue
-        try:
-            if execute_t20_candidate(candidate):
-                log_scan_decision(symbol, candidate_weighted_score(candidate), "t20_buy")
-        except Exception as error:
-            log(f"T20 {symbol} order execution ERROR: {error}")
 
 
 
