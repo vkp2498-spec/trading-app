@@ -1063,6 +1063,41 @@ class TradeControlTests(unittest.TestCase):
         self.assertIn("Target ₹165.00", payload["aps"]["alert"]["body"])
         self.assertIn("Stop ₹142.50", payload["aps"]["alert"]["body"])
 
+    def test_entry_notification_is_sent_only_once_per_broker_order(self):
+        position_state = {
+            "date": "2026-08-03",
+            "entry_order_id": "ORDER-123",
+            "symbol": "NIFTY",
+            "instrument_key": "NSE_FO|123",
+            "created_at": "2026-08-03T11:50:00+05:30",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_file = Path(temp_dir) / "receipts.json"
+            receipt_lock = Path(temp_dir) / "receipts.lock"
+            with (
+                patch.object(
+                    trade_bot,
+                    "ENTRY_NOTIFICATION_RECEIPTS_FILE",
+                    receipt_file,
+                ),
+                patch.object(
+                    trade_bot,
+                    "ENTRY_NOTIFICATION_RECEIPTS_LOCK_FILE",
+                    receipt_lock,
+                ),
+                patch.object(
+                    trade_bot,
+                    "send_trade_entered_notification",
+                    return_value={"sent": 2, "failed": 0},
+                ) as send,
+            ):
+                first = trade_bot.send_apple_trade_entered_alert(position_state)
+                second = trade_bot.send_apple_trade_entered_alert(position_state)
+
+        self.assertEqual(first, {"sent": 2, "failed": 0})
+        self.assertTrue(second["duplicate"])
+        send.assert_called_once_with(position_state)
+
     def test_counterfactual_replay_uses_conservative_candle_ordering(self):
         signal_time = pd.Timestamp("2026-07-15 10:20:00", tz="Asia/Kolkata")
         candles = pd.DataFrame(
@@ -1730,7 +1765,10 @@ class TradeControlTests(unittest.TestCase):
     def test_fill_recalculation_preserves_nearer_technical_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(trade_bot, "BASE_DIR", Path(temp_dir)):
-                with patch.dict(os.environ, {"NIFTY_LOTS": "1"}, clear=False):
+                with (
+                    patch.dict(os.environ, {"NIFTY_LOTS": "1"}, clear=False),
+                    patch.object(trade_bot, "send_apple_trade_entered_alert"),
+                ):
                     trade_bot.save_open_position_state(
                         symbol="NIFTY",
                         order_id="test-order",

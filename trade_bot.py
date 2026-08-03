@@ -88,7 +88,7 @@ from strategy_core import (
 from strategy_core import option_contract_quality
 from trade_journal import record_closed_trade
 from trading_config import active_value
-from safe_storage import atomic_write_json, locked_append_csv
+from safe_storage import atomic_write_json, file_lock, locked_append_csv
 from upstox_streams import (
     read_market_cache,
     read_portfolio_cache,
@@ -109,12 +109,41 @@ def send_apple_closed_trade_alert(journal_row):
 
 
 def send_apple_trade_entered_alert(position_state):
-    """Never allow a notification failure to interrupt position tracking."""
-    try:
-        result = send_trade_entered_notification(position_state)
-        log(f"Apple trade-entry notification result: {result}")
-    except Exception as error:
-        log(f"Apple trade-entry notification failed: {error}")
+    """Send at most one entry alert for each broker entry order."""
+    order_id = str(
+        position_state.get("entry_order_id")
+        or position_state.get("buy_order_id")
+        or ""
+    ).strip()
+    if not order_id:
+        order_id = "|".join(
+            str(position_state.get(key) or "")
+            for key in ("strategy", "instrument_key", "created_at")
+        )
+    receipt_key = f"{position_state.get('date') or now_ist().date()}:{order_id}"
+
+    with file_lock(ENTRY_NOTIFICATION_RECEIPTS_LOCK_FILE):
+        receipts = read_json(ENTRY_NOTIFICATION_RECEIPTS_FILE, {})
+        if receipt_key in receipts:
+            verbose_log(
+                "Apple trade-entry notification suppressed as duplicate: "
+                f"order_id={order_id}"
+            )
+            return {"sent": 0, "failed": 0, "duplicate": True}
+        try:
+            result = send_trade_entered_notification(position_state)
+            receipts[receipt_key] = now_ist().isoformat()
+            receipts = dict(list(receipts.items())[-500:])
+            atomic_write_json(
+                ENTRY_NOTIFICATION_RECEIPTS_FILE,
+                receipts,
+                sort_keys=True,
+            )
+            log(f"Apple trade-entry notification result: {result}")
+            return result
+        except Exception as error:
+            log(f"Apple trade-entry notification failed: {error}")
+            return {"sent": 0, "failed": 1}
 
 
 def allowed_gai_family():
@@ -132,6 +161,8 @@ TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 STOCK_SCANNER_STATUS_FILE = BASE_DIR / "data" / "stock_scanner_status.json"
 DAY_RISK_STATE_FILE = BASE_DIR / "data" / "day_risk_state.json"
 MONITOR_HEALTH_FILE = BASE_DIR / "data" / "monitor_health.json"
+ENTRY_NOTIFICATION_RECEIPTS_FILE = BASE_DIR / "data" / "entry_notification_receipts.json"
+ENTRY_NOTIFICATION_RECEIPTS_LOCK_FILE = BASE_DIR / ".entry_notification_receipts.lock"
 PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 
