@@ -183,6 +183,8 @@ The Vamsi engine is the evolved multi-signal intraday long-option engine. Its pr
 
 The chain is evidence, not infallible truth. A strongly opposite chain can veto a trade. A neutral/low-confidence chain contributes little or no evidence and may be overridden only by an unusually strong aligned technical setup using the configured neutral-chain threshold.
 
+The live Vamsi weighted-score entry band is an inclusive 55-60 (`VAMSI_MIN_WEIGHTED_SCORE` / `VAMSI_MAX_WEIGHTED_SCORE`). Scores below 55 or above 60 are rejected by the score rule. Scores inside the band proceed only if regime direction, completed-candle structure, breadth conflicts, option quality, reward/risk, entry extension, broker reconciliation, monitor health, account caps, and portfolio/day-risk controls all pass.
+
 ### 7.3 Contract selection
 
 - NIFTY deliberately separates evidence from execution: nearest-expiry ATM
@@ -751,7 +753,7 @@ Use the example for local paper/research defaults. Do not copy production creden
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
 ```
 
-At the time this handoff was last updated, the latest full suite had 158 passing tests. The number will change as tests are added.
+At the time this handoff was last updated, the latest full suite had 162 passing tests. The number will change as tests are added.
 
 ### 20.3 Run dashboard locally
 

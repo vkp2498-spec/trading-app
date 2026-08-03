@@ -58,6 +58,27 @@ class LiveTradeFilterTests(unittest.TestCase):
         self.assertFalse(decision["allowed"])
         self.assertIn("breadth", decision["reason"])
 
+    def test_score_58_does_not_bypass_directional_breadth_rejection(self):
+        technicals = self.bullish_technicals()
+        technicals["nifty_breadth"] = {"bias": "BEARISH", "confidence": "HIGH"}
+        technicals["market_regime"] = classify_market_regime(
+            technicals, extreme_atr_percent=2.0
+        )
+        technicals["entry_structure"] = entry_structure_for_direction(
+            technicals, "BULLISH"
+        )
+
+        decision = live_entry_gate(
+            "BULLISH",
+            technicals,
+            58,
+            range_minimum_score=55,
+            continuation_minimum_score=55,
+        )
+
+        self.assertFalse(decision["allowed"])
+        self.assertIn("breadth", decision["reason"])
+
     def test_structural_stop_uses_nearest_defensible_level(self):
         result = structural_invalidation(self.bullish_technicals(), "BULLISH", atr_buffer=0.2)
         self.assertEqual(result["reference"], "VWAP")

@@ -57,6 +57,44 @@ from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_vamsi_direct_entry_score_band_is_inclusive_55_to_60(self):
+        with patch.dict(
+            os.environ,
+            {
+                "VAMSI_MIN_WEIGHTED_SCORE": "55",
+                "VAMSI_MAX_WEIGHTED_SCORE": "60",
+                "INDEX_DIRECT_ENTRY_MIN_SCORE": "75",
+                "RANGE_REGIME_MIN_SCORE": "85",
+            },
+            clear=False,
+        ):
+            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 55)
+            self.assertEqual(trade_bot.direct_entry_maximum_score("NIFTY"), 60)
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(54.9, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(55, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(60, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(60.1, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(75, "NIFTY"))
+            self.assertEqual(
+                trade_bot.vamsi_score_only_minimum(
+                    "RANGE_REGIME_MIN_SCORE", 85, "NIFTY"
+                ),
+                55,
+            )
+
+    def test_vamsi_score_band_configuration_must_be_ordered(self):
+        with patch.dict(
+            os.environ,
+            {
+                "VAMSI_MIN_WEIGHTED_SCORE": "61",
+                "VAMSI_MAX_WEIGHTED_SCORE": "60",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "greater than or equal"):
+                trade_bot.direct_entry_maximum_score("BANKNIFTY")
+
     def test_nifty_analysis_uses_nearest_expiry(self):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
         self.assertEqual(choose_analysis_expiry("NIFTY", expiries), "2026-08-04")
@@ -391,7 +429,7 @@ class TradeControlTests(unittest.TestCase):
             "watch_eligible": True,
             "symbol": "NIFTY",
             "direction": "BULLISH",
-            "weighted": {"score": 70},
+            "weighted": {"score": 58},
             "option_summary": {
                 "chain_bias": "BULLISH",
                 "chain_confidence": "HIGH",
@@ -416,7 +454,7 @@ class TradeControlTests(unittest.TestCase):
         watch = {
             "symbol": "NIFTY",
             "direction": "BULLISH",
-            "base_score": 70,
+            "base_score": 58,
             "started_at": "2026-07-20T10:15:05+05:30",
             "base_candle": {
                 "candle_time": "2026-07-20T10:00:00+05:30",
@@ -448,7 +486,8 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertTrue(confirmed["allowed"])
         self.assertTrue(confirmed["watch_confirmed"])
-        self.assertEqual(confirmed["entry_minimum_score"], 65)
+        self.assertEqual(confirmed["entry_minimum_score"], 55)
+        self.assertTrue(confirmed["score_cutoff_approved"])
 
     def test_live_daily_first_outcome_guard_is_independent_by_index(self):
         today = datetime(2026, 7, 20, 10, 0)
@@ -1258,6 +1297,32 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(result["technical_reward_risk"], 0.27)
         self.assertIn("below required 1.00", result["reasons"][0])
 
+    def test_score_58_does_not_bypass_reward_risk_rejection(self):
+        with patch.dict(
+            os.environ,
+            {
+                "VAMSI_MIN_WEIGHTED_SCORE": "55",
+                "VAMSI_MAX_WEIGHTED_SCORE": "60",
+            },
+            clear=False,
+        ):
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))
+            result = trade_bot.evaluate_trade_feasibility(
+                "BULLISH",
+                100,
+                115,
+                85,
+                {
+                    "atm_option_flow": {"close": 100},
+                    "five_min": {"bias": "BULLISH", "option_target_price": 104},
+                    "fifteen_min": {"bias": "BULLISH", "option_target_price": 106},
+                },
+                symbol="NIFTY",
+            )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("below required 1.00", result["reasons"][0])
+
     def test_fixed_index_gate_accepts_one_to_one_or_better(self):
         result = trade_bot.evaluate_trade_feasibility(
             "BULLISH",
@@ -1891,13 +1956,13 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertEqual(quantity, 910)
 
-    def test_direct_score_cutoff_is_not_raised_by_trade_sequence(self):
+    def test_vamsi_score_band_approval_is_not_raised_by_trade_sequence(self):
         chosen = {
             "symbol": "NIFTY",
             "direction": "BULLISH",
             "transaction_type": "BUY",
-            "weighted": {"score": 75},
-            "entry_minimum_score": 75,
+            "weighted": {"score": 55},
+            "entry_minimum_score": 55,
             "score_cutoff_approved": True,
         }
         with (
@@ -1928,7 +1993,7 @@ class TradeControlTests(unittest.TestCase):
             decision = trade_bot.pre_order_portfolio_decision(chosen, 65, 200, 170)
 
         self.assertTrue(decision["allowed"])
-        self.assertEqual(decision["required_score"], 75)
+        self.assertEqual(decision["required_score"], 55)
 
     def test_score_cutoff_post_fill_override_preserves_rr_rejection(self):
         post_fill = {

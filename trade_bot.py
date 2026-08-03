@@ -173,6 +173,8 @@ DEFAULT_INDEX_EXIT_POINTS = {
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
+DEFAULT_VAMSI_MIN_WEIGHTED_SCORE = 55.0
+DEFAULT_VAMSI_MAX_WEIGHTED_SCORE = 60.0
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = "MAX"
@@ -883,9 +885,46 @@ def watch_minimum_score():
 
 
 def direct_entry_minimum_score(symbol):
-    return max(
-        float(MIN_SCORE_BY_SYMBOL.get(symbol, 65)),
-        configured_non_negative_float("INDEX_DIRECT_ENTRY_MIN_SCORE", 75.0),
+    """Return the lower boundary of Vamsi's direct-entry score band."""
+    minimum = configured_non_negative_float(
+        "VAMSI_MIN_WEIGHTED_SCORE",
+        DEFAULT_VAMSI_MIN_WEIGHTED_SCORE,
+    )
+    if minimum > 100:
+        raise RuntimeError("VAMSI_MIN_WEIGHTED_SCORE must be at most 100")
+    return minimum
+
+
+def direct_entry_maximum_score(symbol):
+    maximum = configured_non_negative_float(
+        "VAMSI_MAX_WEIGHTED_SCORE",
+        DEFAULT_VAMSI_MAX_WEIGHTED_SCORE,
+    )
+    if maximum > 100:
+        raise RuntimeError("VAMSI_MAX_WEIGHTED_SCORE must be at most 100")
+    minimum = direct_entry_minimum_score(symbol)
+    if maximum < minimum:
+        raise RuntimeError(
+            "VAMSI_MAX_WEIGHTED_SCORE must be greater than or equal to "
+            "VAMSI_MIN_WEIGHTED_SCORE"
+        )
+    return maximum
+
+
+def vamsi_weighted_score_qualifies(score, symbol):
+    value = to_float(score)
+    return (
+        direct_entry_minimum_score(symbol)
+        <= value
+        <= direct_entry_maximum_score(symbol)
+    )
+
+
+def vamsi_score_only_minimum(env_key, default, symbol):
+    """Cap secondary score-only gates at the Vamsi direct-entry floor."""
+    return min(
+        configured_non_negative_float(env_key, default),
+        direct_entry_minimum_score(symbol),
     )
 
 
@@ -993,8 +1032,13 @@ def process_watch(symbol, candidate):
         expire_watch(symbol, f"direction changed to {direction or 'NEUTRAL'}")
         return None
     score = candidate_weighted_score(candidate)
-    if score < watch_minimum_score():
-        expire_watch(symbol, f"score fell to {score:.1f}")
+    if not vamsi_weighted_score_qualifies(score, symbol):
+        expire_watch(
+            symbol,
+            f"score {score:.1f} is outside Vamsi entry band "
+            f"{direct_entry_minimum_score(symbol):.1f}-"
+            f"{direct_entry_maximum_score(symbol):.1f}",
+        )
         return None
 
     fifteen = ((candidate.get("technicals") or {}).get("fifteen_min") or {})
@@ -1079,7 +1123,8 @@ def process_watch(symbol, candidate):
     confirmed = deepcopy(candidate)
     confirmed["allowed"] = True
     confirmed["watch_confirmed"] = True
-    confirmed["entry_minimum_score"] = watch_minimum_score()
+    confirmed["entry_minimum_score"] = direct_entry_minimum_score(symbol)
+    confirmed["score_cutoff_approved"] = True
     confirmed["reason"] = "watch-mode completed candle confirmation passed"
     return confirmed
 
@@ -1635,9 +1680,9 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         MIN_SCORE_BY_SYMBOL.get(symbol, 65),
     )
     required_score = base_minimum
-    # A direct 75+ setup has already absorbed strategy quality into one
-    # 100-point score. Keep hard day/risk/correlation gates below, but do not
-    # silently turn the score cutoff into 85 or 90 at order time.
+    # A Vamsi score-band-approved setup has already passed the configured
+    # weighted-score rule. Keep hard day/risk/correlation gates below, but do
+    # not silently raise the approved lower boundary again at order time.
     if not chosen.get("score_cutoff_approved"):
         required_score += to_float(circuit.get("score_penalty"))
         if symbol in SYMBOLS and index_trade_count_today() >= 1:
@@ -4701,13 +4746,11 @@ def build_trade_candidate(
 
     score_value = float(weighted.get("score") or 0)
     minimum = direct_entry_minimum_score(symbol)
-    if option_summary.get("strategy") == "BOLLINGER_REVERSAL":
-        minimum = max(
-            minimum,
-            configured_non_negative_float("BOLLINGER_REVERSAL_MIN_SCORE", 75.0),
-        )
+    maximum = direct_entry_maximum_score(symbol)
+    score_band_approved = vamsi_weighted_score_qualifies(score_value, symbol)
     cutoff_approved = bool(
-        score_cutoff_mode_enabled() and score_value >= minimum
+        score_cutoff_mode_enabled()
+        and score_band_approved
     )
     if option_summary.get("neutral_chain_override") and not score_cutoff_mode_enabled():
         neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
@@ -4722,10 +4765,13 @@ def build_trade_candidate(
         and score_value >= watch_minimum_score()
         and score_value < minimum
     )
-    if score_value < minimum and not watch_band:
+    if not score_band_approved and not watch_band:
         return {
             "allowed": False,
-            "reason": f"weighted score {score_value:.1f} does not qualify",
+            "reason": (
+                f"weighted score {score_value:.1f} is outside Vamsi entry band "
+                f"{minimum:.1f}-{maximum:.1f}"
+            ),
             "transaction_type": transaction_type,
             "instrument": instrument,
             "technicals": technicals,
@@ -4738,11 +4784,11 @@ def build_trade_candidate(
         technicals,
         score_value,
         enabled=configured_bool("LIVE_REGIME_STRUCTURE_GATE_ENABLED", True),
-        range_minimum_score=configured_non_negative_float(
-            "RANGE_REGIME_MIN_SCORE", 85.0
+        range_minimum_score=vamsi_score_only_minimum(
+            "RANGE_REGIME_MIN_SCORE", 85.0, symbol
         ),
-        continuation_minimum_score=configured_non_negative_float(
-            "CONTINUATION_ENTRY_MIN_SCORE", 85.0
+        continuation_minimum_score=vamsi_score_only_minimum(
+            "CONTINUATION_ENTRY_MIN_SCORE", 85.0, symbol
         ),
     )
     technicals["live_entry_gate"] = live_gate
@@ -4759,15 +4805,18 @@ def build_trade_candidate(
         }, None
     expiry_days = (parse_expiry(atm["expiry"]) - now_ist().date()).days
     technicals["market_regime"]["days_to_expiry"] = expiry_days
+    expiry_minimum = vamsi_score_only_minimum(
+        "EXPIRY_REGIME_MIN_SCORE", 85.0, symbol
+    )
     if (
         expiry_days <= int(configured_non_negative_float("EXPIRY_REGIME_MAX_DAYS", 2))
-        and score_value < configured_non_negative_float("EXPIRY_REGIME_MIN_SCORE", 85.0)
+        and score_value < expiry_minimum
     ):
         return {
             "allowed": False,
             "reason": (
                 f"near-expiry regime requires score >= "
-                f"{configured_non_negative_float('EXPIRY_REGIME_MIN_SCORE', 85.0):.1f}"
+                f"{expiry_minimum:.1f}"
             ),
             "transaction_type": transaction_type,
             "instrument": instrument,
@@ -4879,7 +4928,8 @@ def build_trade_candidate(
     return {
         "allowed": True,
         "reason": (
-            f"score cutoff approved at {score_value:.1f}/{minimum:.1f}; "
+            f"Vamsi weighted-score band approved at {score_value:.1f} "
+            f"within {minimum:.1f}-{maximum:.1f}; "
             f"{exit_settings['profile'].lower()} target/stop "
             f"{levels['target_points']:.0f}/{levels['stop_points']:.0f} points"
         ),
