@@ -1,5 +1,6 @@
 import unittest
 import os
+from contextlib import nullcontext
 from datetime import datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -153,6 +154,81 @@ class GaneshGapReversalTests(unittest.TestCase):
             side_effect=lambda slot: 1 if slot == "GANESH_GAP_NIFTY" else 0,
         ):
             self.assertEqual(trade_bot.ganesh_gap_trade_count_today(), 1)
+
+    def test_completed_ganesh_entry_overrides_transitional_metadata(self):
+        state_slot = trade_bot.GANESH_GAP_STATE_BY_SYMBOL["BANKNIFTY"]
+        initial = {
+            "status": "BUY_PLACED_NOT_COMPLETE",
+            "phase": "ENTRY_PENDING",
+            "symbol": "BANKNIFTY",
+            "underlying_symbol": "BANKNIFTY",
+            "direction": BEARISH,
+            "underlying_target_distance": 100.0,
+        }
+        pending = {
+            **initial,
+            "entry_order_id": "ENTRY-1",
+            "instrument_key": "NSE_FO|BANK_OPTION",
+        }
+        instrument = {
+            "instrument_key": "NSE_FO|BANK_OPTION",
+            "trading_symbol": "BANKNIFTY ATM PE",
+            "lot_size": 30,
+        }
+        with (
+            patch.object(trade_bot, "save_open_position_state") as save,
+            patch.object(trade_bot, "read_state", return_value=pending),
+            patch.object(trade_bot, "write_state") as write,
+        ):
+            state = trade_bot.finalize_ganesh_gap_position(
+                initial,
+                fill=300.0,
+                quantity=30,
+                instrument=instrument,
+                order_id="ENTRY-1",
+                state_slot=state_slot,
+            )
+
+        save.assert_called_once()
+        self.assertEqual(state["status"], "POSITION_OPEN")
+        self.assertEqual(state["phase"], "POSITION_OPEN")
+        written = write.call_args.args[1]
+        self.assertEqual(written["status"], "POSITION_OPEN")
+        self.assertEqual(written["phase"], "POSITION_OPEN")
+
+    def test_pending_ganesh_entry_with_existing_stop_is_repaired_without_rearming(self):
+        state_slot = trade_bot.GANESH_GAP_STATE_BY_SYMBOL["BANKNIFTY"]
+        stale = {
+            "status": "BUY_PLACED_NOT_COMPLETE",
+            "phase": "ENTRY_PENDING",
+            "symbol": "BANKNIFTY",
+            "entry_order_id": "ENTRY-1",
+            "protective_stop_order_id": "STOP-1",
+        }
+        with (
+            patch.object(
+                trade_bot, "position_finalization_lock", return_value=nullcontext()
+            ),
+            patch.object(trade_bot, "read_state", return_value=stale),
+            patch.object(trade_bot, "write_state") as write,
+            patch.object(trade_bot, "ensure_protective_stop") as ensure_stop,
+            patch.object(trade_bot, "finalize_ganesh_gap_position") as finalize,
+        ):
+            state = trade_bot.finalize_and_protect_ganesh_gap_position(
+                stale,
+                fill=300.0,
+                quantity=30,
+                instrument={"instrument_key": "NSE_FO|BANK_OPTION"},
+                order_id="ENTRY-1",
+                state_slot=state_slot,
+            )
+
+        self.assertEqual(state["status"], "POSITION_OPEN")
+        self.assertEqual(state["phase"], "POSITION_OPEN")
+        self.assertEqual(state["protective_stop_order_id"], "STOP-1")
+        write.assert_called_once_with(state_slot, state)
+        ensure_stop.assert_not_called()
+        finalize.assert_not_called()
 
     def test_banknifty_contract_selection_uses_banknifty_chain(self):
         chain = pd.DataFrame(

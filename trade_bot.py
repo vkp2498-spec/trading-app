@@ -125,10 +125,6 @@ def send_apple_trade_entered_alert(position_state):
     with file_lock(ENTRY_NOTIFICATION_RECEIPTS_LOCK_FILE):
         receipts = read_json(ENTRY_NOTIFICATION_RECEIPTS_FILE, {})
         if receipt_key in receipts:
-            verbose_log(
-                "Apple trade-entry notification suppressed as duplicate: "
-                f"order_id={order_id}"
-            )
             return {"sent": 0, "failed": 0, "duplicate": True}
         try:
             result = send_trade_entered_notification(position_state)
@@ -5527,6 +5523,10 @@ def finalize_ganesh_gap_position(
     state = read_state(state_slot)
     state.update(
         {
+            # Initial order metadata contains transitional values. Final fill
+            # state must win after that metadata has been merged.
+            "status": "POSITION_OPEN",
+            "phase": "POSITION_OPEN",
             "target_price": levels["target_price"],
             "planned_target_price": levels["target_price"],
             "stop_loss_price": levels["stop_loss_price"],
@@ -5549,7 +5549,12 @@ def finalize_and_protect_ganesh_gap_position(
             return fresh
         if fresh.get("status") == "EXIT_PENDING":
             return fresh
-        if fresh.get("status") == "POSITION_OPEN" and fresh.get("protective_stop_order_id"):
+        if fresh.get("protective_stop_order_id"):
+            # Repair legacy/stale transitional state after the broker stop has
+            # already been armed. This is idempotent and places no new order.
+            if fresh.get("status") != "POSITION_OPEN" or fresh.get("phase") != "POSITION_OPEN":
+                fresh.update({"status": "POSITION_OPEN", "phase": "POSITION_OPEN"})
+                write_state(state_slot, fresh)
             return fresh
         state = (
             fresh
