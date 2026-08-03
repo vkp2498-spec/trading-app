@@ -155,6 +155,55 @@ class GaneshGapReversalTests(unittest.TestCase):
         ):
             self.assertEqual(trade_bot.ganesh_gap_trade_count_today(), 1)
 
+    def test_trade_cap_does_not_create_partial_symbol_state(self):
+        current = datetime(2026, 8, 3, 12, 35, tzinfo=IST)
+        with (
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(trade_bot, "state_is_active", return_value=False),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(trade_bot, "ganesh_gap_max_trades_per_day", return_value=1),
+            patch.object(trade_bot, "ganesh_gap_trade_count_today", return_value=1),
+            patch.object(trade_bot, "write_state") as write,
+        ):
+            trade_bot.run_ganesh_gap_symbol_signal_check("BANKNIFTY", now=current)
+
+        write.assert_not_called()
+
+    def test_same_day_partial_state_is_reinitialized_from_market_snapshot(self):
+        current = datetime(2026, 8, 3, 12, 40, tzinfo=IST)
+        state_slot = trade_bot.GANESH_GAP_STATE_BY_SYMBOL["BANKNIFTY"]
+        partial = {
+            "date": "2026-08-03",
+            "phase": "DISABLED_FOR_DAY",
+            "symbol": "BANKNIFTY",
+        }
+        snapshot = {
+            "symbol": "BANKNIFTY",
+            "gap": {"direction": NO_GAP, "points": 0.0, "percent": 0.0},
+            "previous_high": 58000.0,
+            "previous_low": 57000.0,
+            "previous_close": 57500.0,
+            "today_open": 57500.0,
+            "pivots": {"P": 57500.0},
+        }
+        with (
+            patch.object(trade_bot, "read_state", return_value=partial),
+            patch.object(trade_bot, "state_is_active", return_value=False),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(trade_bot, "ganesh_gap_max_trades_per_day", return_value=2),
+            patch.object(trade_bot, "ganesh_gap_trade_count_today", return_value=1),
+            patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
+            patch.object(trade_bot, "ganesh_gap_market_snapshot", return_value=snapshot),
+            patch.object(trade_bot, "record_ganesh_gap_scan"),
+            patch.object(trade_bot, "write_state") as write,
+        ):
+            trade_bot.run_ganesh_gap_symbol_signal_check("BANKNIFTY", now=current)
+
+        repaired = write.call_args.args[1]
+        self.assertEqual(repaired["state_slot"], state_slot)
+        self.assertEqual(repaired["gap_direction"], NO_GAP)
+        self.assertEqual(repaired["previous_close"], 57500.0)
+
     def test_completed_ganesh_entry_overrides_transitional_metadata(self):
         state_slot = trade_bot.GANESH_GAP_STATE_BY_SYMBOL["BANKNIFTY"]
         initial = {

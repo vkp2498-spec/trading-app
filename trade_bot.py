@@ -5733,8 +5733,6 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
         log(f"GANESH GAP {symbol} no trade: another bot-managed position is active.")
         return
     if ganesh_gap_max_trades_per_day() <= ganesh_gap_trade_count_today():
-        state.update({"date": now.strftime("%Y-%m-%d"), "phase": "DISABLED_FOR_DAY"})
-        write_state(state_slot, state)
         log(f"GANESH GAP {symbol} maximum combined daily trade count reached.")
         return
     circuit = portfolio_day_circuit()
@@ -5747,7 +5745,16 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
     except Exception as error:
         log(f"GANESH GAP {symbol} market snapshot unavailable: {error}")
         return
-    if state.get("date") != now.strftime("%Y-%m-%d"):
+    required_gap_fields = (
+        "gap_direction",
+        "pivots",
+        "previous_close",
+        "today_open",
+    )
+    if (
+        state.get("date") != now.strftime("%Y-%m-%d")
+        or any(state.get(field) is None for field in required_gap_fields)
+    ):
         state = {
             "date": now.strftime("%Y-%m-%d"),
             "symbol": symbol,
