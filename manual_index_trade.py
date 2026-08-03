@@ -150,7 +150,7 @@ def main(argv=None):
     if not trade_bot.configured_bool("ENABLE_MANUAL_INDEX_TRADING", False):
         raise RuntimeError("ENABLE_MANUAL_INDEX_TRADING is not true in .env")
     if not trade_bot.market_window_ok():
-        raise RuntimeError("Manual index entries are allowed only from 09:20 to 15:15 IST")
+        raise RuntimeError("Manual index entries are allowed only from 09:20 to 15:25 IST")
 
     symbol, requested_side, target_points, stop_points = parse_request(args.parts)
     existing = active_index_position()

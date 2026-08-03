@@ -211,5 +211,5 @@ def target_reached(direction, spot_price, target_level):
     return float(spot_price) <= float(target_level)
 
 
-def within_entry_window(timestamp, start=time(9, 30), end=time(15, 15)):
+def within_entry_window(timestamp, start=time(9, 30), end=time(15, 25)):
     return start <= timestamp.time() <= end

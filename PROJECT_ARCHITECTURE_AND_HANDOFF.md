@@ -183,7 +183,7 @@ The Vamsi engine is the evolved multi-signal intraday long-option engine. Its pr
 
 The chain is evidence, not infallible truth. A strongly opposite chain can veto a trade. A neutral/low-confidence chain contributes little or no evidence and may be overridden only by an unusually strong aligned technical setup using the configured neutral-chain threshold.
 
-The live Vamsi weighted-score entry floor is 55 (`VAMSI_MIN_WEIGHTED_SCORE`). Every score at or above 55 may proceed, but only if regime direction, completed-candle structure, breadth conflicts, option quality, 15-minute reward/risk, entry extension, broker reconciliation, monitor health, account caps, and portfolio/day-risk controls all pass. Five-minute data remains an entry-timing and confirmation input; it does not limit technical reward headroom.
+The live Vamsi weighted-score rule requires a score strictly above 20 (`VAMSI_MIN_WEIGHTED_SCORE=20`). There is no upper score cutoff. A qualifying score proceeds only if regime direction, completed-candle structure, breadth conflicts, option quality, 15-minute reward/risk, entry extension, broker reconciliation, monitor health, account caps, and portfolio/day-risk controls all pass. Five-minute data remains an entry-timing and confirmation input; it does not limit technical reward headroom.
 
 ### 7.3 Contract selection
 
@@ -291,7 +291,7 @@ ENABLE_LIVE_TRADING=true
 - Lock the nearest valid technical target beyond the configured minimum distance, default 15 NIFTY points.
 - Convert the spot target to an option-premium target with the configured delta approximation.
 - Use a default 20% option-premium stop and a broker-side protective order.
-- Exit on target, confirmed opposite active-candle color, option stop, daily risk circuit, stale data, or universal 15:25 square-off.
+- Exit on target, confirmed opposite active-candle color, option stop, daily risk circuit, stale data, or universal 15:29 square-off.
 
 ### 8.4 Faithful versus enhanced mode
 
@@ -411,7 +411,8 @@ The established schedule is:
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
 - Entry checks: every 5 minutes beginning at 09:20 IST. The bot's internal market window prevents late entries.
 - Position monitor: launch at/around 09:20 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
-- Forced square-off: 15:25 IST, `55 9 * * 1-5` in UTC cron.
+- Last Vamsi and Ganesh entry scan: 15:25 IST.
+- Forced square-off: 15:29 IST, `59 9 * * 1-5` in UTC cron.
 - Mobile profile default reset: around 15:30 IST when configured.
 - Post-market audits: around 18:00 IST on weekdays when configured.
 
@@ -426,8 +427,8 @@ An example cron layout is:
 50-59 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_monitor_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --monitor >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 * 4-9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_monitor_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --monitor >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 
-# Square off at 15:25 IST.
-55 9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_squareoff.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --squareoff >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
+# Square off at 15:29 IST.
+59 9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_squareoff.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --squareoff >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 
 # Request Upstox token approval at 07:30 IST.
 0 2 * * 1-5 cd /home/ubuntu/trading-app && /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/request_upstox_token.py >> /home/ubuntu/trading-app/logs/token_request.log 2>&1

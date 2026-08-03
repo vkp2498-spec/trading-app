@@ -21,7 +21,7 @@ DATA_DIR = BASE_DIR / "data"
 ANALYSIS_FILE = DATA_DIR / "analysis_history.csv"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
-MARKET_REVIEW_END = time(15, 15)
+MARKET_REVIEW_END = time(15, 29)
 
 
 def safe_float(value, default=None):

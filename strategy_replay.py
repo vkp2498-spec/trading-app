@@ -22,8 +22,8 @@ INDEXES = {
     "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
 }
 MARKET_START = time(9, 20)
-LAST_ENTRY = time(15, 15)
-SQUARE_OFF = time(15, 25)
+LAST_ENTRY = time(15, 25)
+SQUARE_OFF = time(15, 29)
 
 
 def _float(value, default=0.0):

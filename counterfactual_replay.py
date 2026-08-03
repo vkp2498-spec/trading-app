@@ -35,7 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 LOG_FILE = BASE_DIR / "logs" / "trade_bot.log"
 IST = "Asia/Kolkata"
-MARKET_EXIT = time(15, 15)
+MARKET_EXIT = time(15, 29)
 SIGNAL_PATTERN = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2}) (?P<clock>\d{2}:\d{2}:\d{2}) \| "
     r"(?P<symbol>NIFTY|BANKNIFTY) signal: "

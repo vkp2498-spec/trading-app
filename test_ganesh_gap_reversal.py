@@ -25,6 +25,7 @@ from ganesh_gap_reversal import (
     nearest_target,
     opening_gap,
     target_reached,
+    within_entry_window,
 )
 
 
@@ -32,6 +33,14 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 class GaneshGapReversalTests(unittest.TestCase):
+    def test_entry_window_includes_1525_only(self):
+        self.assertTrue(
+            within_entry_window(datetime(2026, 8, 3, 15, 25, 0, tzinfo=IST))
+        )
+        self.assertFalse(
+            within_entry_window(datetime(2026, 8, 3, 15, 25, 1, tzinfo=IST))
+        )
+
     def test_opening_gap_threshold_is_fixed_from_open_and_previous_close(self):
         self.assertEqual(opening_gap(24000, 23940, 0.20)["direction"], GAP_DOWN)
         self.assertEqual(opening_gap(24000, 24060, 0.20)["direction"], GAP_UP)

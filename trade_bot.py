@@ -198,7 +198,7 @@ DEFAULT_INDEX_EXIT_POINTS = {
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 0.8
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
-DEFAULT_VAMSI_MIN_WEIGHTED_SCORE = 55.0
+DEFAULT_VAMSI_MIN_WEIGHTED_SCORE = 20.0
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = "MAX"
@@ -912,7 +912,7 @@ def watch_minimum_score():
 
 
 def direct_entry_minimum_score(symbol):
-    """Return Vamsi's minimum weighted score before deterministic gates."""
+    """Return the strict lower threshold for a Vamsi direct entry."""
     minimum = configured_non_negative_float(
         "VAMSI_MIN_WEIGHTED_SCORE",
         DEFAULT_VAMSI_MIN_WEIGHTED_SCORE,
@@ -923,8 +923,7 @@ def direct_entry_minimum_score(symbol):
 
 
 def vamsi_weighted_score_qualifies(score, symbol):
-    value = to_float(score)
-    return value >= direct_entry_minimum_score(symbol)
+    return to_float(score) > direct_entry_minimum_score(symbol)
 
 
 def vamsi_score_only_minimum(env_key, default, symbol):
@@ -1044,7 +1043,7 @@ def process_watch(symbol, candidate):
     if not vamsi_weighted_score_qualifies(score, symbol):
         expire_watch(
             symbol,
-            f"score {score:.1f} is below Vamsi minimum "
+            f"score {score:.1f} does not exceed Vamsi entry threshold "
             f"{direct_entry_minimum_score(symbol):.1f}",
         )
         return None
@@ -2786,7 +2785,10 @@ def ganesh_gap_option_levels(entry_price, quantity, target_distance):
 
 def market_window_ok():
     now = now_ist().time()
-    return time(9, 20) <= now <= time(15, 15)
+    return time(9, 20) <= now <= configured_clock(
+        "VAMSI_LAST_ENTRY_TIME",
+        "15:25",
+    )
 
 
 def save_open_position_state(
@@ -4455,11 +4457,10 @@ def build_trade_candidate(
 
     score_value = float(weighted.get("score") or 0)
     minimum = direct_entry_minimum_score(symbol)
-    score_band_approved = vamsi_weighted_score_qualifies(score_value, symbol)
-    cutoff_approved = bool(
-        score_cutoff_mode_enabled()
-        and score_band_approved
-    )
+    score_approved = vamsi_weighted_score_qualifies(score_value, symbol)
+    # Once the strict >20 rule passes, later portfolio checks must not silently
+    # impose a higher weighted-score threshold. Non-score gates still apply.
+    cutoff_approved = score_approved
     if option_summary.get("neutral_chain_override") and not score_cutoff_mode_enabled():
         neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
         minimum = max(
@@ -4473,12 +4474,12 @@ def build_trade_candidate(
         and score_value >= watch_minimum_score()
         and score_value < minimum
     )
-    if not score_band_approved and not watch_band:
+    if not score_approved and not watch_band:
         return {
             "allowed": False,
             "reason": (
-                f"weighted score {score_value:.1f} is below Vamsi minimum "
-                f"{minimum:.1f}"
+                f"weighted score {score_value:.1f} must be above Vamsi entry "
+                f"threshold {minimum:.1f}"
             ),
             "transaction_type": transaction_type,
             "instrument": instrument,
@@ -4648,8 +4649,8 @@ def build_trade_candidate(
     return {
         "allowed": True,
         "reason": (
-            f"Vamsi weighted-score band approved at {score_value:.1f} "
-            f"within {minimum:.1f}-{maximum:.1f}; "
+            f"Vamsi weighted score approved at {score_value:.1f} "
+            f"above {minimum:.1f}; "
             f"{exit_settings['profile'].lower()} target/stop "
             f"{levels['target_points']:.0f}/{levels['stop_points']:.0f} points"
         ),
@@ -5907,7 +5908,7 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
 def run_ganesh_gap_signal_check():
     now = now_ist()
     start = configured_clock("GANESH_STRATEGY_START_TIME", "09:30")
-    end = configured_clock("GANESH_LAST_ENTRY_TIME", "15:15")
+    end = configured_clock("GANESH_LAST_ENTRY_TIME", "15:25")
     if not start <= now.time() <= end:
         log("GANESH GAP outside entry window. No action.")
         return

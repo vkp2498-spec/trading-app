@@ -57,30 +57,56 @@ from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
-    def test_vamsi_direct_entry_score_floor_accepts_every_score_at_or_above_55(self):
+    def test_vamsi_score_must_be_strictly_above_twenty_without_upper_cutoff(self):
         with patch.dict(
             os.environ,
             {
-                "VAMSI_MIN_WEIGHTED_SCORE": "55",
+                "VAMSI_MIN_WEIGHTED_SCORE": "20",
                 "INDEX_DIRECT_ENTRY_MIN_SCORE": "75",
                 "RANGE_REGIME_MIN_SCORE": "85",
             },
             clear=False,
         ):
-            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 55)
-            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(54.9, "NIFTY"))
-            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(55, "NIFTY"))
+            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 20)
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(20, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(20.1, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))
-            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(60, "NIFTY"))
-            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(60.1, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(75, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(100, "NIFTY"))
             self.assertEqual(
                 trade_bot.vamsi_score_only_minimum(
                     "RANGE_REGIME_MIN_SCORE", 85, "NIFTY"
                 ),
-                55,
+                20,
             )
+
+    def test_vamsi_score_threshold_cannot_exceed_one_hundred(self):
+        with patch.dict(
+            os.environ,
+            {"VAMSI_MIN_WEIGHTED_SCORE": "101"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "at most 100"):
+                trade_bot.direct_entry_minimum_score("BANKNIFTY")
+
+    def test_vamsi_entry_window_includes_1525_only(self):
+        with patch.dict(
+            os.environ,
+            {"VAMSI_LAST_ENTRY_TIME": "15:25"},
+            clear=False,
+        ):
+            with patch.object(
+                trade_bot,
+                "now_ist",
+                return_value=datetime(2026, 8, 3, 15, 25, 0),
+            ):
+                self.assertTrue(trade_bot.market_window_ok())
+            with patch.object(
+                trade_bot,
+                "now_ist",
+                return_value=datetime(2026, 8, 3, 15, 25, 1),
+            ):
+                self.assertFalse(trade_bot.market_window_ok())
 
     def test_nifty_analysis_uses_nearest_expiry(self):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
@@ -464,6 +490,7 @@ class TradeControlTests(unittest.TestCase):
                     {
                         "INDEX_WATCH_MODE_ENABLED": "true",
                         "INDEX_WATCH_MODE_SHADOW_ONLY": "false",
+                        "VAMSI_MIN_WEIGHTED_SCORE": "20",
                     },
                     clear=False,
                 ),
@@ -473,7 +500,7 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertTrue(confirmed["allowed"])
         self.assertTrue(confirmed["watch_confirmed"])
-        self.assertEqual(confirmed["entry_minimum_score"], 55)
+        self.assertEqual(confirmed["entry_minimum_score"], 20)
         self.assertTrue(confirmed["score_cutoff_approved"])
 
     def test_timing_watch_confirms_on_next_completed_five_minute_candle(self):
@@ -1387,9 +1414,7 @@ class TradeControlTests(unittest.TestCase):
     def test_score_58_does_not_bypass_reward_risk_rejection(self):
         with patch.dict(
             os.environ,
-            {
-                "VAMSI_MIN_WEIGHTED_SCORE": "55",
-            },
+            {"VAMSI_MIN_WEIGHTED_SCORE": "20"},
             clear=False,
         ):
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))
@@ -2063,13 +2088,13 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertEqual(quantity, 910)
 
-    def test_vamsi_score_band_approval_is_not_raised_by_trade_sequence(self):
+    def test_vamsi_score_approval_is_not_raised_by_trade_sequence(self):
         chosen = {
             "symbol": "NIFTY",
             "direction": "BULLISH",
             "transaction_type": "BUY",
-            "weighted": {"score": 55},
-            "entry_minimum_score": 55,
+            "weighted": {"score": 21},
+            "entry_minimum_score": 20,
             "score_cutoff_approved": True,
         }
         with (
@@ -2100,7 +2125,7 @@ class TradeControlTests(unittest.TestCase):
             decision = trade_bot.pre_order_portfolio_decision(chosen, 65, 200, 170)
 
         self.assertTrue(decision["allowed"])
-        self.assertEqual(decision["required_score"], 55)
+        self.assertEqual(decision["required_score"], 20)
 
     def test_score_cutoff_post_fill_override_preserves_rr_rejection(self):
         post_fill = {
