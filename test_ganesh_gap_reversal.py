@@ -190,6 +190,7 @@ class GaneshGapReversalTests(unittest.TestCase):
             ) as find,
             patch.object(trade_bot, "read_market_cache", return_value={}),
             patch.object(trade_bot, "option_contract_quality", return_value=quality),
+            patch.object(trade_bot, "write_stream_instruments"),
         ):
             candidate = trade_bot.ganesh_gap_option_candidate(
                 {"symbol": "BANKNIFTY", "spot": 55525.0},

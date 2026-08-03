@@ -169,10 +169,9 @@ DEFAULT_INDEX_EXIT_POINTS = {
     "BANKNIFTY": {"target": 40.0, "stop": 40.0},
 }
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
-DEFAULT_MIN_TECHNICAL_REWARD_RISK = 1.0
+DEFAULT_MIN_TECHNICAL_REWARD_RISK = 0.8
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
 DEFAULT_VAMSI_MIN_WEIGHTED_SCORE = 55.0
-DEFAULT_VAMSI_MAX_WEIGHTED_SCORE = 60.0
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = "MAX"
@@ -481,13 +480,16 @@ def evaluate_trade_feasibility(
             )
             return result
 
+    # The 5M chart controls entry timing and confirmation elsewhere in the
+    # live-structure gate. Reward headroom must come from the more stable 15M
+    # structure so a nearby 5M pivot/band does not veto an otherwise viable
+    # intraday setup.
+    analysis = technicals.get("fifteen_min", {}) or {}
+    technical_target = to_float(analysis.get("option_target_price"), 0)
+    target_is_valid = technical_target < entry if is_short else technical_target > entry
     target_candidates = []
-    for timeframe_key, label in (("five_min", "5M"), ("fifteen_min", "15M")):
-        analysis = technicals.get(timeframe_key, {}) or {}
-        technical_target = to_float(analysis.get("option_target_price"), 0)
-        target_is_valid = technical_target < entry if is_short else technical_target > entry
-        if analysis.get("bias") == direction and target_is_valid:
-            target_candidates.append((technical_target, label))
+    if analysis.get("bias") == direction and target_is_valid:
+        target_candidates.append((technical_target, "15M"))
 
     result["technical_target_candidates"] = [
         {"timeframe": label, "target_price": round(value, 2)}
@@ -495,7 +497,7 @@ def evaluate_trade_feasibility(
     ]
     if not target_candidates:
         result["reasons"].append(
-            "No aligned 5M or 15M option-premium target is available"
+            "No aligned 15M option-premium target is available"
         )
         return result
 
@@ -883,7 +885,7 @@ def watch_minimum_score():
 
 
 def direct_entry_minimum_score(symbol):
-    """Return the lower boundary of Vamsi's direct-entry score band."""
+    """Return Vamsi's minimum weighted score before deterministic gates."""
     minimum = configured_non_negative_float(
         "VAMSI_MIN_WEIGHTED_SCORE",
         DEFAULT_VAMSI_MIN_WEIGHTED_SCORE,
@@ -893,29 +895,9 @@ def direct_entry_minimum_score(symbol):
     return minimum
 
 
-def direct_entry_maximum_score(symbol):
-    maximum = configured_non_negative_float(
-        "VAMSI_MAX_WEIGHTED_SCORE",
-        DEFAULT_VAMSI_MAX_WEIGHTED_SCORE,
-    )
-    if maximum > 100:
-        raise RuntimeError("VAMSI_MAX_WEIGHTED_SCORE must be at most 100")
-    minimum = direct_entry_minimum_score(symbol)
-    if maximum < minimum:
-        raise RuntimeError(
-            "VAMSI_MAX_WEIGHTED_SCORE must be greater than or equal to "
-            "VAMSI_MIN_WEIGHTED_SCORE"
-        )
-    return maximum
-
-
 def vamsi_weighted_score_qualifies(score, symbol):
     value = to_float(score)
-    return (
-        direct_entry_minimum_score(symbol)
-        <= value
-        <= direct_entry_maximum_score(symbol)
-    )
+    return value >= direct_entry_minimum_score(symbol)
 
 
 def vamsi_score_only_minimum(env_key, default, symbol):
@@ -1033,9 +1015,8 @@ def process_watch(symbol, candidate):
     if not vamsi_weighted_score_qualifies(score, symbol):
         expire_watch(
             symbol,
-            f"score {score:.1f} is outside Vamsi entry band "
-            f"{direct_entry_minimum_score(symbol):.1f}-"
-            f"{direct_entry_maximum_score(symbol):.1f}",
+            f"score {score:.1f} is below Vamsi minimum "
+            f"{direct_entry_minimum_score(symbol):.1f}",
         )
         return None
 
@@ -4435,7 +4416,6 @@ def build_trade_candidate(
 
     score_value = float(weighted.get("score") or 0)
     minimum = direct_entry_minimum_score(symbol)
-    maximum = direct_entry_maximum_score(symbol)
     score_band_approved = vamsi_weighted_score_qualifies(score_value, symbol)
     cutoff_approved = bool(
         score_cutoff_mode_enabled()
@@ -4458,8 +4438,8 @@ def build_trade_candidate(
         return {
             "allowed": False,
             "reason": (
-                f"weighted score {score_value:.1f} is outside Vamsi entry band "
-                f"{minimum:.1f}-{maximum:.1f}"
+                f"weighted score {score_value:.1f} is below Vamsi minimum "
+                f"{minimum:.1f}"
             ),
             "transaction_type": transaction_type,
             "instrument": instrument,
