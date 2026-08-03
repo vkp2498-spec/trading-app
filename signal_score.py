@@ -26,14 +26,18 @@ def banknifty_neutral_chain_direction(technicals):
     two = technicals.get("two_hour", {}) or {}
     breadth = technicals.get("banknifty_breadth", {}) or {}
 
-    direction = five.get("bias")
+    direction = fifteen.get("bias")
     blockers = []
-    if direction not in {"BULLISH", "BEARISH"} or fifteen.get("bias") != direction:
-        blockers.append("5M and 15M price structures are not directionally aligned")
-    if five.get("confidence") not in {"MEDIUM", "HIGH"}:
-        blockers.append("5M confidence is below MEDIUM")
+    if direction not in {"BULLISH", "BEARISH"}:
+        blockers.append("15M direction is unavailable")
     if fifteen.get("confidence") not in {"MEDIUM", "HIGH"}:
         blockers.append("15M confidence is below MEDIUM")
+    five_bias = five.get("bias")
+    if five_bias not in {direction, "NEUTRAL", None}:
+        blockers.append(
+            f"5M direction materially opposes {direction}: "
+            f"bias={five_bias}, confidence={five.get('confidence', 'LOW')}"
+        )
     if two.get("bias") not in {direction, "NEUTRAL"} and two.get("confidence") in {"MEDIUM", "HIGH"}:
         blockers.append("2H structure materially opposes the proposed direction")
     if breadth.get("bias") != direction or breadth.get("confidence") not in {"MEDIUM", "HIGH"}:
@@ -54,14 +58,18 @@ def nifty_neutral_chain_direction(technicals):
     two = technicals.get("two_hour", {}) or {}
     breadth = technicals.get("nifty_breadth", {}) or {}
 
-    direction = five.get("bias")
+    direction = fifteen.get("bias")
     blockers = []
-    if direction not in {"BULLISH", "BEARISH"} or fifteen.get("bias") != direction:
-        blockers.append("5M and 15M price structures are not directionally aligned")
-    if five.get("confidence") not in {"MEDIUM", "HIGH"}:
-        blockers.append("5M confidence is below MEDIUM")
+    if direction not in {"BULLISH", "BEARISH"}:
+        blockers.append("15M direction is unavailable")
     if fifteen.get("confidence") not in {"MEDIUM", "HIGH"}:
         blockers.append("15M confidence is below MEDIUM")
+    five_bias = five.get("bias")
+    if five_bias not in {direction, "NEUTRAL", None}:
+        blockers.append(
+            f"5M direction materially opposes {direction}: "
+            f"bias={five_bias}, confidence={five.get('confidence', 'LOW')}"
+        )
     if two.get("bias") not in {direction, "NEUTRAL"} and two.get("confidence") in {
         "MEDIUM",
         "HIGH",

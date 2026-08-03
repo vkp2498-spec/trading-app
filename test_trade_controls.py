@@ -476,6 +476,70 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(confirmed["entry_minimum_score"], 55)
         self.assertTrue(confirmed["score_cutoff_approved"])
 
+    def test_timing_watch_confirms_on_next_completed_five_minute_candle(self):
+        candidate = {
+            "allowed": True,
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "weighted": {"score": 58},
+            "option_summary": {
+                "chain_bias": "BULLISH",
+                "chain_confidence": "HIGH",
+            },
+            "technicals": {
+                "five_min": {
+                    "bias": "BULLISH",
+                    "candle_time": "2026-07-20T10:05:00+05:30",
+                    "open": 100,
+                    "high": 112,
+                    "low": 99,
+                    "close": 111,
+                },
+                "fifteen_min": {"bias": "BULLISH"},
+                "atm_option_flow": {
+                    "close": 110,
+                    "vwap": 100,
+                    "volume_ratio": 1.5,
+                },
+            },
+        }
+        watch = {
+            "symbol": "NIFTY",
+            "direction": "BULLISH",
+            "base_score": 58,
+            "started_at": "2026-07-20T10:00:05+05:30",
+            "confirmation_timeframe": "5M",
+            "base_candle": {
+                "candle_time": "2026-07-20T10:00:00+05:30",
+                "open": 104,
+                "high": 105,
+                "low": 99,
+                "close": 100,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(trade_bot, "WATCH_STATE_DIR", Path(temp_dir)),
+                patch.object(
+                    trade_bot,
+                    "now_ist",
+                    return_value=datetime.fromisoformat("2026-07-20T10:10:10+05:30"),
+                ),
+                patch.dict(
+                    os.environ,
+                    {
+                        "INDEX_WATCH_MODE_ENABLED": "true",
+                        "INDEX_WATCH_MODE_SHADOW_ONLY": "false",
+                    },
+                    clear=False,
+                ),
+            ):
+                trade_bot.write_watch_state("NIFTY", watch)
+                confirmed = trade_bot.process_watch("NIFTY", candidate)
+
+        self.assertTrue(confirmed["allowed"])
+        self.assertTrue(confirmed["watch_confirmed"])
+
     def test_live_daily_first_outcome_guard_is_independent_by_index(self):
         today = datetime(2026, 7, 20, 10, 0)
         history = "\n".join([

@@ -47,6 +47,84 @@ class LiveTradeFilterTests(unittest.TestCase):
         self.assertEqual(structure["type"], "RETEST_HOLD")
         self.assertTrue(decision["allowed"])
 
+    def test_neutral_five_minute_can_confirm_timing_without_vetoing_fifteen_minute(self):
+        technicals = self.bullish_technicals()
+        technicals["five_min"].update(
+            bias="NEUTRAL",
+            confidence="LOW",
+            momentum_score=3,
+        )
+        regime = classify_market_regime(technicals, extreme_atr_percent=2.0)
+        structure = entry_structure_for_direction(technicals, "BULLISH")
+        technicals.update(market_regime=regime, entry_structure=structure)
+
+        decision = live_entry_gate(
+            "BULLISH",
+            technicals,
+            82,
+            range_minimum_score=80,
+        )
+
+        self.assertEqual(structure["type"], "RETEST_HOLD")
+        self.assertTrue(structure["five_minute_timing_confirmed"])
+        self.assertTrue(structure["qualified"])
+        self.assertTrue(decision["allowed"])
+        self.assertTrue(any("5M is neutral" in reason for reason in structure["reasons"]))
+
+    def test_low_confidence_opposite_five_minute_is_watch_eligible(self):
+        technicals = self.bullish_technicals()
+        technicals["five_min"].update(
+            bias="BEARISH",
+            confidence="LOW",
+            momentum_score=-1,
+        )
+        technicals["market_regime"] = classify_market_regime(
+            technicals, extreme_atr_percent=2.0
+        )
+        technicals["entry_structure"] = entry_structure_for_direction(
+            technicals, "BULLISH"
+        )
+
+        decision = live_entry_gate("BULLISH", technicals, 82)
+
+        self.assertFalse(decision["allowed"])
+        self.assertTrue(decision["watch_eligible"])
+        self.assertIn("5M opposes BULLISH", decision["reason"])
+
+    def test_medium_confidence_opposite_five_minute_is_hard_rejection(self):
+        technicals = self.bullish_technicals()
+        technicals["five_min"].update(
+            bias="BEARISH",
+            confidence="MEDIUM",
+            momentum_score=-2,
+        )
+        technicals["market_regime"] = classify_market_regime(
+            technicals, extreme_atr_percent=2.0
+        )
+        technicals["entry_structure"] = entry_structure_for_direction(
+            technicals, "BULLISH"
+        )
+
+        decision = live_entry_gate("BULLISH", technicals, 90)
+
+        self.assertFalse(decision["allowed"])
+        self.assertFalse(decision["watch_eligible"])
+
+    def test_fifteen_minute_direction_remains_mandatory(self):
+        technicals = self.bullish_technicals()
+        technicals["fifteen_min"] = {"bias": "NEUTRAL", "confidence": "LOW"}
+        technicals["market_regime"] = classify_market_regime(
+            technicals, extreme_atr_percent=2.0
+        )
+        technicals["entry_structure"] = entry_structure_for_direction(
+            technicals, "BULLISH"
+        )
+
+        decision = live_entry_gate("BULLISH", technicals, 90)
+
+        self.assertFalse(decision["allowed"])
+        self.assertIn("15M direction is not aligned", decision["reason"])
+
     def test_conflicting_breadth_rejects_entry(self):
         technicals = self.bullish_technicals()
         technicals["nifty_breadth"] = {"bias": "BEARISH", "confidence": "HIGH"}

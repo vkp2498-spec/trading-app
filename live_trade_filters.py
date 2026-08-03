@@ -214,7 +214,13 @@ def entry_structure_for_direction(technicals, direction, *, retest_buffer_atr=0.
     buffer_value = atr * max(_number(retest_buffer_atr), 0.0)
     momentum = _number(five.get("momentum_score"))
     signed_momentum = momentum if direction == "BULLISH" else -momentum
-    aligned = five.get("bias") == direction and fifteen.get("bias") == direction
+    five_bias = five.get("bias")
+    five_confidence = five.get("confidence", "LOW")
+    fifteen_bias = fifteen.get("bias")
+    fifteen_aligned = fifteen_bias == direction
+    five_aligned = five_bias == direction
+    five_neutral = five_bias in {None, "NEUTRAL"}
+    five_opposite = five_bias == opposite_direction(direction)
     reference = None
     structure = "NONE"
     reasons = []
@@ -226,7 +232,7 @@ def entry_structure_for_direction(technicals, direction, *, retest_buffer_atr=0.
             structure, reference = "RETEST_HOLD", pivot
         elif middle > 0 and low <= middle + buffer_value and close > middle and signed_momentum >= 2:
             structure, reference = "PULLBACK_HOLD", middle
-        elif aligned and vwap > 0 and close > vwap and signed_momentum >= 3:
+        elif five_aligned and fifteen_aligned and vwap > 0 and close > vwap and signed_momentum >= 3:
             structure, reference = "TREND_CONTINUATION", vwap
     elif direction == "BEARISH":
         if pivot > 0 and previous_close >= pivot > close:
@@ -235,21 +241,60 @@ def entry_structure_for_direction(technicals, direction, *, retest_buffer_atr=0.
             structure, reference = "RETEST_HOLD", pivot
         elif middle > 0 and high >= middle - buffer_value and close < middle and signed_momentum >= 2:
             structure, reference = "PULLBACK_HOLD", middle
-        elif aligned and vwap > 0 and close < vwap and signed_momentum >= 3:
+        elif five_aligned and fifteen_aligned and vwap > 0 and close < vwap and signed_momentum >= 3:
             structure, reference = "TREND_CONTINUATION", vwap
 
+    neutral_timing_confirmed = bool(
+        five_neutral and structure != "NONE" and signed_momentum >= 2
+    )
+    timing_confirmed = bool(five_aligned or neutral_timing_confirmed)
+    qualified = bool(
+        structure != "NONE"
+        and fifteen_aligned
+        and timing_confirmed
+    )
+    watch_eligible = bool(
+        fifteen_aligned
+        and (
+            (five_neutral and not neutral_timing_confirmed)
+            or (five_opposite and five_confidence == "LOW")
+        )
+    )
     if structure == "NONE":
         reasons.append("No completed-candle breakout, retest, pullback hold, or strong continuation")
     else:
         reasons.append(f"{structure} around {reference:.2f}")
-    if not aligned:
-        reasons.append("5M and 15M are not both directionally aligned")
+    if not fifteen_aligned:
+        reasons.append(
+            f"15M direction is not aligned: bias={fifteen_bias or 'UNAVAILABLE'}; "
+            f"required={direction}"
+        )
+    elif five_neutral and neutral_timing_confirmed:
+        reasons.append(
+            f"5M is neutral but timing is confirmed by {structure} with "
+            f"signed momentum={signed_momentum:.1f}"
+        )
+    elif five_neutral:
+        reasons.append(
+            f"5M is neutral and timing is unconfirmed: structure={structure}; "
+            f"signed momentum={signed_momentum:.1f}"
+        )
+    elif five_opposite:
+        reasons.append(
+            f"5M opposes {direction}: bias={five_bias}; "
+            f"confidence={five_confidence}; signed momentum={signed_momentum:.1f}"
+        )
     return {
         "type": structure,
-        "qualified": structure != "NONE" and aligned,
+        "qualified": qualified,
+        "watch_eligible": watch_eligible,
         "direction": direction,
         "reference": round(reference, 2) if reference else None,
         "signed_momentum": round(signed_momentum, 2),
+        "fifteen_minute_aligned": fifteen_aligned,
+        "five_minute_bias": five_bias or "UNAVAILABLE",
+        "five_minute_confidence": five_confidence,
+        "five_minute_timing_confirmed": timing_confirmed,
         "reasons": reasons,
     }
 
@@ -288,7 +333,15 @@ def live_entry_gate(
     ):
         return {"allowed": False, "reason": "constituent breadth materially conflicts with trade direction", "regime": regime, "structure": structure}
     if not structure.get("qualified"):
-        return {"allowed": False, "reason": "; ".join(structure.get("reasons") or ["entry structure is not qualified"]), "regime": regime, "structure": structure}
+        return {
+            "allowed": False,
+            "watch_eligible": bool(structure.get("watch_eligible")),
+            "reason": "; ".join(
+                structure.get("reasons") or ["entry structure is not qualified"]
+            ),
+            "regime": regime,
+            "structure": structure,
+        }
     if regime_name == "RANGE" and score < _number(range_minimum_score, 85.0):
         return {"allowed": False, "reason": f"range regime requires score >= {_number(range_minimum_score, 85.0):.1f}", "regime": regime, "structure": structure}
     if regime_name == "RANGE" and breadth.get("bias") != direction:

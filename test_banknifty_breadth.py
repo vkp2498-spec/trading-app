@@ -75,6 +75,19 @@ class BankNiftyBreadthTests(unittest.TestCase):
         self.assertIsNone(direction)
         self.assertTrue(any("breadth" in blocker for blocker in blockers))
 
+    def test_neutral_five_minute_does_not_override_strong_fifteen_minute_direction(self):
+        technicals = self.bullish_technicals()
+        technicals["five_min"].update(
+            bias="NEUTRAL",
+            confidence="LOW",
+            momentum_score=3,
+        )
+
+        direction, blockers = banknifty_neutral_chain_direction(technicals)
+
+        self.assertEqual(direction, "BULLISH")
+        self.assertEqual(blockers, [])
+
     def test_neutral_chain_can_reach_strict_threshold_only_with_strong_confirmation(self):
         score = weighted_alignment_score(
             {

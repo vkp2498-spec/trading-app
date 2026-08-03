@@ -936,18 +936,11 @@ def vamsi_score_only_minimum(env_key, default, symbol):
 
 
 def score_direction_from_technicals(technicals):
-    """Choose a provisional direction so a neutral chain can still be scored."""
-    five = technicals.get("five_min", {}) or {}
+    """Use the completed 15M direction when a neutral chain needs a candidate."""
     fifteen = technicals.get("fifteen_min", {}) or {}
-    two = technicals.get("two_hour", {}) or {}
-    five_bias = five.get("bias")
     fifteen_bias = fifteen.get("bias")
-    if five_bias in {"BULLISH", "BEARISH"}:
-        return five_bias
     if fifteen_bias in {"BULLISH", "BEARISH"}:
         return fifteen_bias
-    if two.get("bias") in {"BULLISH", "BEARISH"}:
-        return two.get("bias")
     return None
 
 
@@ -977,9 +970,13 @@ def start_watch(symbol, candidate):
     now = now_ist()
     if now.time() >= configured_clock("INDEX_WATCH_START_CUTOFF", "14:45"):
         return False
-    fifteen = ((candidate.get("technicals") or {}).get("fifteen_min") or {})
+    confirmation_timeframe = "5M" if candidate.get("timing_watch") else "15M"
+    analysis_key = "five_min" if confirmation_timeframe == "5M" else "fifteen_min"
+    confirmation_candle = (
+        (candidate.get("technicals") or {}).get(analysis_key) or {}
+    )
     required = ("candle_time", "open", "high", "low", "close")
-    if any(fifteen.get(key) is None for key in required):
+    if any(confirmation_candle.get(key) is None for key in required):
         return False
     direction = str(candidate.get("direction") or "").upper()
     if direction not in {"BULLISH", "BEARISH"}:
@@ -988,7 +985,9 @@ def start_watch(symbol, candidate):
     existing = read_watch_state(symbol)
     if (
         existing.get("direction") == direction
-        and existing.get("base_candle", {}).get("candle_time") == fifteen.get("candle_time")
+        and existing.get("confirmation_timeframe") == confirmation_timeframe
+        and existing.get("base_candle", {}).get("candle_time")
+        == confirmation_candle.get("candle_time")
     ):
         return True
 
@@ -997,8 +996,9 @@ def start_watch(symbol, candidate):
         "direction": direction,
         "base_score": round(candidate_weighted_score(candidate), 2),
         "started_at": now.isoformat(),
+        "confirmation_timeframe": confirmation_timeframe,
         "base_candle": {
-            key: fifteen.get(key)
+            key: confirmation_candle.get(key)
             for key in ("candle_time", "open", "high", "low", "close")
         },
         "chain_bias": (candidate.get("option_summary") or {}).get("chain_bias"),
@@ -1008,7 +1008,9 @@ def start_watch(symbol, candidate):
     write_watch_state(symbol, state)
     log(
         f"{symbol} WATCH_STARTED direction={direction} score={state['base_score']:.1f} "
-        f"base_candle={fifteen.get('candle_time')} shadow={state['shadow_only']}"
+        f"timeframe={confirmation_timeframe} "
+        f"base_candle={confirmation_candle.get('candle_time')} "
+        f"shadow={state['shadow_only']}"
     )
     return True
 
@@ -1020,7 +1022,7 @@ def expire_watch(symbol, reason):
 
 
 def process_watch(symbol, candidate):
-    """Return a fully revalidated candidate only after one completed 15M candle."""
+    """Return a revalidated candidate after its configured confirmation candle."""
     state = read_watch_state(symbol)
     if not state:
         return None
@@ -1030,7 +1032,7 @@ def process_watch(symbol, candidate):
     if not candidate:
         expire_watch(symbol, "signal no longer qualifies for watch band")
         return None
-    if not candidate.get("watch_eligible"):
+    if not candidate.get("watch_eligible") and not candidate.get("allowed"):
         expire_watch(symbol, f"live safety gate failed: {candidate.get('reason')}")
         return None
 
@@ -1047,17 +1049,21 @@ def process_watch(symbol, candidate):
         )
         return None
 
-    fifteen = ((candidate.get("technicals") or {}).get("fifteen_min") or {})
-    current_time_text = fifteen.get("candle_time")
+    technicals = candidate.get("technicals") or {}
+    confirmation_timeframe = state.get("confirmation_timeframe", "15M")
+    analysis_key = "five_min" if confirmation_timeframe == "5M" else "fifteen_min"
+    interval_minutes = 5 if confirmation_timeframe == "5M" else 15
+    confirmation_candle = technicals.get(analysis_key) or {}
+    current_time_text = confirmation_candle.get("candle_time")
     base_time_text = (state.get("base_candle") or {}).get("candle_time")
     if not current_time_text or not base_time_text:
-        expire_watch(symbol, "completed 15M candle unavailable")
+        expire_watch(symbol, f"completed {confirmation_timeframe} candle unavailable")
         return None
     current_time = datetime.fromisoformat(current_time_text)
     base_time = datetime.fromisoformat(base_time_text)
     if current_time <= base_time:
         return None
-    if current_time > base_time + timedelta(minutes=15, seconds=30):
+    if current_time > base_time + timedelta(minutes=interval_minutes, seconds=30):
         expire_watch(symbol, "one-candle confirmation window elapsed")
         return None
 
@@ -1072,15 +1078,20 @@ def process_watch(symbol, candidate):
         expire_watch(symbol, "strong option-chain direction is opposite")
         return None
 
-    technicals = candidate.get("technicals") or {}
     five = technicals.get("five_min") or {}
+    fifteen = technicals.get("fifteen_min") or {}
     if five.get("bias") != direction or fifteen.get("bias") != direction:
-        expire_watch(symbol, "5M and 15M are not both aligned")
+        expire_watch(
+            symbol,
+            "timing confirmation failed: "
+            f"15M={fifteen.get('bias') or 'UNAVAILABLE'}; "
+            f"5M={five.get('bias') or 'UNAVAILABLE'}; required={direction}",
+        )
         return None
 
     candle_result = candle_confirmation(
         state.get("base_candle"),
-        fifteen,
+        confirmation_candle,
         direction,
         min_body_ratio=configured_non_negative_float(
             "INDEX_WATCH_MIN_BODY_RATIO", 0.55
@@ -1105,6 +1116,7 @@ def process_watch(symbol, candidate):
 
     log(
         f"{symbol} WATCH_CONFIRMED direction={direction} score={score:.1f} "
+        f"timeframe={confirmation_timeframe} "
         f"body_ratio={candle_result.get('body_ratio')} "
         f"volume_ratio={flow_result.get('volume_ratio'):.2f} "
         f"patterns={candle_result.get('patterns')} shadow={watch_mode_shadow_only()}"
@@ -4489,7 +4501,12 @@ def build_trade_candidate(
     )
     technicals["live_entry_gate"] = live_gate
     option_summary["live_entry_gate"] = live_gate
-    if not live_gate.get("allowed"):
+    timing_watch = bool(
+        not live_gate.get("allowed")
+        and live_gate.get("watch_eligible")
+        and watch_mode_enabled()
+    )
+    if not live_gate.get("allowed") and not timing_watch:
         return {
             "allowed": False,
             "reason": "live regime/structure rejected: " + str(live_gate.get("reason")),
@@ -4592,13 +4609,20 @@ def build_trade_candidate(
     )
     technicals["structural_invalidation"] = structural
 
-    if watch_band:
+    if watch_band or timing_watch:
+        if timing_watch:
+            watch_reason = "5M timing requires confirmation: " + str(
+                live_gate.get("reason")
+            )
+        else:
+            watch_reason = (
+                f"watch band score {score_value:.1f}; direct entry requires {minimum:.1f}"
+            )
         return {
             "allowed": False,
             "watch_eligible": True,
-            "reason": (
-                f"watch band score {score_value:.1f}; direct entry requires {minimum:.1f}"
-            ),
+            "timing_watch": timing_watch,
+            "reason": watch_reason,
             "transaction_type": transaction_type,
             "instrument": instrument,
             "entry_price": entry_price,
@@ -6147,6 +6171,17 @@ def run_signal_check():
                 ),
                 excluded_instrument_keys=occupied_contracts,
             )
+            had_watch = bool(read_watch_state(symbol))
+            if (
+                had_watch
+                and not active_selective_index
+                and not daily_block
+                and watch_mode_enabled()
+            ):
+                watched = process_watch(symbol, candidate)
+                if watched:
+                    qualified.append(watched)
+                continue
             if (
                 not active_selective_index
                 and not daily_block
@@ -6157,17 +6192,7 @@ def run_signal_check():
                 qualified.append(candidate)
                 continue
             if not active_selective_index and not daily_block and watch_mode_enabled():
-                had_watch = bool(read_watch_state(symbol))
-                watched = process_watch(symbol, candidate)
-                if watched:
-                    qualified.append(watched)
-                    continue
-                if (
-                    not had_watch
-                    and candidate
-                    and candidate.get("watch_eligible")
-                    and not read_watch_state(symbol)
-                ):
+                if candidate and candidate.get("watch_eligible"):
                     start_watch(symbol, candidate)
             elif read_watch_state(symbol):
                 expire_watch(symbol, "watch mode disabled or selective lane occupied")
