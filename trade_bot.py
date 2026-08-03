@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - Windows development fallback
     fcntl = None
 
 from analysis_journal import record_analysis
+from adaptive_score_calibration import read_effective_score_rule
 from scan_journal import record_scan_decision
 from banknifty_breadth import get_banknifty_breadth
 from nifty_breadth import get_nifty_breadth
@@ -911,8 +912,7 @@ def watch_minimum_score():
     return configured_non_negative_float("INDEX_WATCH_MIN_SCORE", 65.0)
 
 
-def direct_entry_minimum_score(symbol):
-    """Return the strict lower threshold for a Vamsi direct entry."""
+def static_vamsi_minimum_score():
     minimum = configured_non_negative_float(
         "VAMSI_MIN_WEIGHTED_SCORE",
         DEFAULT_VAMSI_MIN_WEIGHTED_SCORE,
@@ -922,8 +922,49 @@ def direct_entry_minimum_score(symbol):
     return minimum
 
 
+def vamsi_score_rule(symbol):
+    """Return today's adaptive rule or the configured static fallback."""
+    fallback = static_vamsi_minimum_score()
+    if configured_bool("VAMSI_ADAPTIVE_SCORE_ENABLED", True):
+        adaptive = read_effective_score_rule(symbol, now_ist().date())
+        if adaptive:
+            return {
+                "source": "ADAPTIVE",
+                "mode": adaptive["mode"],
+                "min_score": float(adaptive["min_score"]),
+                "max_score": adaptive.get("max_score"),
+            }
+    return {
+        "source": "STATIC_FALLBACK",
+        "mode": "MIN",
+        "min_score": fallback,
+        "max_score": None,
+    }
+
+
+def direct_entry_minimum_score(symbol):
+    return float(vamsi_score_rule(symbol)["min_score"])
+
+
+def format_vamsi_score_rule(rule):
+    if rule.get("mode") == "RANGE":
+        return (
+            f"adaptive range {float(rule['min_score']):.1f}-"
+            f"{float(rule['max_score']):.1f}"
+        )
+    label = "adaptive minimum" if rule.get("source") == "ADAPTIVE" else "minimum"
+    return f"{label} {float(rule['min_score']):.1f}"
+
+
 def vamsi_weighted_score_qualifies(score, symbol):
-    return to_float(score) > direct_entry_minimum_score(symbol)
+    value = to_float(score)
+    rule = vamsi_score_rule(symbol)
+    if rule.get("source") == "ADAPTIVE":
+        if value < float(rule["min_score"]):
+            return False
+        maximum = rule.get("max_score")
+        return maximum is None or value <= float(maximum)
+    return value > float(rule["min_score"])
 
 
 def vamsi_score_only_minimum(env_key, default, symbol):
@@ -1041,10 +1082,11 @@ def process_watch(symbol, candidate):
         return None
     score = candidate_weighted_score(candidate)
     if not vamsi_weighted_score_qualifies(score, symbol):
+        score_rule = vamsi_score_rule(symbol)
         expire_watch(
             symbol,
-            f"score {score:.1f} does not exceed Vamsi entry threshold "
-            f"{direct_entry_minimum_score(symbol):.1f}",
+            f"score {score:.1f} does not satisfy Vamsi "
+            f"{format_vamsi_score_rule(score_rule)}",
         )
         return None
 
@@ -1138,9 +1180,12 @@ def process_watch(symbol, candidate):
         return None
 
     confirmed = deepcopy(candidate)
+    score_rule = vamsi_score_rule(symbol)
     confirmed["allowed"] = True
     confirmed["watch_confirmed"] = True
-    confirmed["entry_minimum_score"] = direct_entry_minimum_score(symbol)
+    confirmed["entry_minimum_score"] = score_rule["min_score"]
+    confirmed["entry_maximum_score"] = score_rule.get("max_score")
+    confirmed["score_rule_source"] = score_rule.get("source")
     confirmed["score_cutoff_approved"] = True
     confirmed["reason"] = "watch-mode completed candle confirmation passed"
     return confirmed
@@ -1685,6 +1730,16 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         chosen.get("entry_minimum_score"),
         MIN_SCORE_BY_SYMBOL.get(symbol, 65),
     )
+    maximum_score = chosen.get("entry_maximum_score")
+    if maximum_score is not None and score > to_float(maximum_score, 100.0):
+        return {
+            "allowed": False,
+            "reason": (
+                f"entry score {score:.1f} is above today's adaptive maximum "
+                f"{to_float(maximum_score):.1f}"
+            ),
+            "circuit": circuit,
+        }
     required_score = base_minimum
     # A Vamsi score-band-approved setup has already passed the configured
     # weighted-score rule. Keep hard day/risk/correlation gates below, but do
@@ -4456,11 +4511,10 @@ def build_trade_candidate(
             }, None
 
     score_value = float(weighted.get("score") or 0)
-    minimum = direct_entry_minimum_score(symbol)
+    score_rule = vamsi_score_rule(symbol)
+    minimum = float(score_rule["min_score"])
+    maximum = score_rule.get("max_score")
     score_approved = vamsi_weighted_score_qualifies(score_value, symbol)
-    # Once the strict >20 rule passes, later portfolio checks must not silently
-    # impose a higher weighted-score threshold. Non-score gates still apply.
-    cutoff_approved = score_approved
     if option_summary.get("neutral_chain_override") and not score_cutoff_mode_enabled():
         neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
         minimum = max(
@@ -4469,6 +4523,17 @@ def build_trade_candidate(
                 f"{symbol}_NEUTRAL_CHAIN_MIN_SCORE", neutral_default
             ),
         )
+        score_approved = score_value > minimum
+        maximum = None
+        score_rule = {
+            "source": "STATIC_FALLBACK",
+            "mode": "MIN",
+            "min_score": minimum,
+            "max_score": None,
+        }
+    # Once the day's score rule passes, later portfolio checks must not silently
+    # impose a different weighted-score threshold. Non-score gates still apply.
+    cutoff_approved = score_approved
     watch_band = (
         watch_mode_enabled()
         and score_value >= watch_minimum_score()
@@ -4478,8 +4543,8 @@ def build_trade_candidate(
         return {
             "allowed": False,
             "reason": (
-                f"weighted score {score_value:.1f} must be above Vamsi entry "
-                f"threshold {minimum:.1f}"
+                f"weighted score {score_value:.1f} does not satisfy Vamsi "
+                f"{format_vamsi_score_rule(score_rule)}"
             ),
             "transaction_type": transaction_type,
             "instrument": instrument,
@@ -4640,6 +4705,8 @@ def build_trade_candidate(
             "option_summary": option_summary,
             "weighted": weighted,
             "entry_minimum_score": minimum,
+            "entry_maximum_score": maximum,
+            "score_rule_source": score_rule.get("source"),
             "score_cutoff_approved": False,
             "target_profile": exit_settings["profile"],
             "contract_selection_rank": option_quality.get("selection_rank", 0.0),
@@ -4649,8 +4716,8 @@ def build_trade_candidate(
     return {
         "allowed": True,
         "reason": (
-            f"Vamsi weighted score approved at {score_value:.1f} "
-            f"above {minimum:.1f}; "
+            f"Vamsi weighted score approved at {score_value:.1f} using "
+            f"{format_vamsi_score_rule(score_rule)}; "
             f"{exit_settings['profile'].lower()} target/stop "
             f"{levels['target_points']:.0f}/{levels['stop_points']:.0f} points"
         ),
@@ -4670,6 +4737,8 @@ def build_trade_candidate(
         "option_summary": option_summary,
         "weighted": weighted,
         "entry_minimum_score": minimum,
+        "entry_maximum_score": maximum,
+        "score_rule_source": score_rule.get("source"),
         "score_cutoff_approved": cutoff_approved,
         "target_profile": exit_settings["profile"],
         "contract_selection_rank": option_quality.get("selection_rank", 0.0),
@@ -5118,6 +5187,8 @@ def execute_selected_candidate(chosen):
         "planned_risk": round(planned_risk, 2),
         "score_cutoff_approved": bool(chosen.get("score_cutoff_approved")),
         "entry_minimum_score": to_float(chosen.get("entry_minimum_score")),
+        "entry_maximum_score": chosen.get("entry_maximum_score"),
+        "score_rule_source": chosen.get("score_rule_source"),
         "manual_override": bool(chosen.get("manual_override")),
         "manual_command": chosen.get("manual_command", ""),
         "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(symbol),

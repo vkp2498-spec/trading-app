@@ -89,6 +89,53 @@ class TradeControlTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "at most 100"):
                 trade_bot.direct_entry_minimum_score("BANKNIFTY")
 
+    def test_vamsi_adaptive_range_is_inclusive_and_has_an_upper_cutoff(self):
+        adaptive = {
+            "status": "ADAPTIVE",
+            "mode": "RANGE",
+            "min_score": 40.0,
+            "max_score": 64.0,
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
+                    "VAMSI_MIN_WEIGHTED_SCORE": "20",
+                },
+                clear=False,
+            ),
+            patch.object(
+                trade_bot,
+                "read_effective_score_rule",
+                return_value=adaptive,
+            ),
+        ):
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(39.9, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(40, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(64, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(64.1, "NIFTY"))
+            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 40)
+
+    def test_vamsi_uses_static_threshold_when_daily_calibration_is_missing(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
+                    "VAMSI_MIN_WEIGHTED_SCORE": "20",
+                },
+                clear=False,
+            ),
+            patch.object(
+                trade_bot,
+                "read_effective_score_rule",
+                return_value=None,
+            ),
+        ):
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(20, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(20.1, "NIFTY"))
+
     def test_vamsi_entry_window_includes_1525_only(self):
         with patch.dict(
             os.environ,

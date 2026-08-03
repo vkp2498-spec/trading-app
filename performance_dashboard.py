@@ -15,6 +15,7 @@ import streamlit as st
 from datetime import time
 
 from banknifty_post_market import run_banknifty_veto_audit
+from adaptive_score_calibration import ADAPTIVE_CONFIG_FILE
 from post_market_review import (
     ask_llm_for_insights,
     build_decision_funnel,
@@ -735,6 +736,40 @@ def render_score_followthrough_review():
         "from the scan minute through the following 15 minutes; it is research evidence, "
         "not an automatic reason to loosen live gates."
     )
+
+    adaptive_config = read_backtest_json(ADAPTIVE_CONFIG_FILE, {})
+    if adaptive_config:
+        st.markdown("#### Today's Vamsi Adaptive Score Rule")
+        effective_date = str(adaptive_config.get("effective_date") or "")
+        rule_columns = st.columns(2)
+        for column, symbol in zip(rule_columns, SYMBOLS):
+            rule = (adaptive_config.get("symbols") or {}).get(symbol, {})
+            if rule.get("status") == "ADAPTIVE":
+                if rule.get("mode") == "RANGE":
+                    score_text = (
+                        f"{float(rule.get('min_score')):.1f}–"
+                        f"{float(rule.get('max_score')):.1f}"
+                    )
+                else:
+                    score_text = f"{float(rule.get('min_score')):.0f}+"
+                detail = (
+                    f"Adaptive | {int(rule.get('samples') or 0)} samples | "
+                    f"success {float(rule.get('success_rate') or 0) * 100:.1f}%"
+                )
+            else:
+                score_text = f"{float(rule.get('min_score') or 20):.0f}+"
+                detail = "Static fallback | " + str(rule.get("reason") or "insufficient history")
+            column.metric(f"{symbol} score", score_text, detail)
+        st.caption(
+            f"Effective date: {effective_date or 'unknown'} | Generated: "
+            f"{str(adaptive_config.get('generated_at') or '')[:19]}. "
+            "Every deterministic, execution, and safety gate still applies."
+        )
+        if effective_date != now_ist().date().isoformat():
+            st.warning(
+                "The saved adaptive score rule is not for today. The live engine will ignore "
+                "it and use VAMSI_MIN_WEIGHTED_SCORE until today's calibration runs."
+            )
 
     audit = read_score_audit()
     status = read_backtest_json(SCORE_AUDIT_STATUS_FILE, {})

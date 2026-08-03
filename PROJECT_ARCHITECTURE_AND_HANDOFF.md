@@ -125,6 +125,7 @@ flowchart TD
 
 - `post_market_review.py`: Post-market review and loss analysis.
 - `post_market_score_audit.py`: Score-bucket follow-through audit.
+- `adaptive_score_calibration.py`: Pre-market Vamsi score-rule calibration from stored follow-through evidence.
 - `banknifty_post_market.py`: BANKNIFTY veto/technical follow-through study.
 - `trade_forensics.py`: Executed and rejected signal excursion analysis.
 - `session_insights.py`: Session-level observations.
@@ -183,7 +184,7 @@ The Vamsi engine is the evolved multi-signal intraday long-option engine. Its pr
 
 The chain is evidence, not infallible truth. A strongly opposite chain can veto a trade. A neutral/low-confidence chain contributes little or no evidence and may be overridden only by an unusually strong aligned technical setup using the configured neutral-chain threshold.
 
-The live Vamsi weighted-score rule requires a score strictly above 20 (`VAMSI_MIN_WEIGHTED_SCORE=20`). There is no upper score cutoff. A qualifying score proceeds only if regime direction, completed-candle structure, breadth conflicts, option quality, 15-minute reward/risk, entry extension, broker reconciliation, monitor health, account caps, and portfolio/day-risk controls all pass. Five-minute data remains an entry-timing and confirmation input; it does not limit technical reward headroom.
+Vamsi uses a daily adaptive weighted-score rule when `VAMSI_ADAPTIVE_SCORE_ENABLED=true`. At 09:00 IST, `adaptive_score_calibration.py` analyzes prior (never same-day) rows in `data/score_followthrough_audit.csv` separately for NIFTY and BANKNIFTY. It compares minimum-and-above rules with contiguous bounded ranges, requires minimum sample/day evidence, and saves the effective rule in `data/vamsi_adaptive_score_config.json`. A range is selected only when it materially outperforms the best minimum-only rule. If today's file is missing, stale, invalid, or lacks enough evidence, the engine safely returns to the strict static rule `score > VAMSI_MIN_WEIGHTED_SCORE` (currently 20). Adaptive boundaries are inclusive. A qualifying score still proceeds only if regime direction, completed-candle structure, breadth conflicts, option quality, 15-minute reward/risk, entry extension, broker reconciliation, monitor health, account caps, and portfolio/day-risk controls all pass. Five-minute data remains an entry-timing and confirmation input; it does not limit technical reward headroom.
 
 ### 7.3 Contract selection
 
@@ -346,6 +347,7 @@ Typical persistent files include:
 - `data/trade_history.csv`: Closed-trade journal used by dashboard and mobile analytics.
 - `data/analysis_history.csv`: Detailed signal snapshots.
 - `data/scan_decisions.csv`: Compact scan results.
+- `data/vamsi_adaptive_score_config.json`: Today's pre-market Vamsi minimum/range decision and its evidence summary.
 - `data/ganesh_gap_scans.csv`: Ganesh gap-state evidence.
 - `data/ganesh_gap_banknifty_scans.csv`: Ganesh BANKNIFTY gap-state evidence.
 - `data/day_risk_state.json`: Day-level risk/circuit state.
@@ -409,6 +411,7 @@ Lightsail servers use UTC. IST is UTC+05:30.
 The established schedule is:
 
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
+- Vamsi adaptive score calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
 - Entry checks: every 5 minutes beginning at 09:20 IST. The bot's internal market window prevents late entries.
 - Position monitor: launch at/around 09:20 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
 - Last Vamsi and Ganesh entry scan: 15:25 IST.
@@ -432,6 +435,9 @@ An example cron layout is:
 
 # Request Upstox token approval at 07:30 IST.
 0 2 * * 1-5 cd /home/ubuntu/trading-app && /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/request_upstox_token.py >> /home/ubuntu/trading-app/logs/token_request.log 2>&1
+
+# Calibrate today's Vamsi score rule at 09:00 IST (03:30 UTC).
+30 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_score_calibration.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/adaptive_score_calibration.py >> /home/ubuntu/trading-app/logs/adaptive_score_calibration.log 2>&1
 ```
 
 The repeated cron launch of `--monitor` is a recovery mechanism: while the long-running process holds the lock, later launches exit. If it dies, a later cron invocation restarts it. Never write `- 4-9`; the minute field must be `*`.
