@@ -387,6 +387,151 @@ class TradeControlTests(unittest.TestCase):
             98,
         )
 
+    def test_ganesh_skips_manually_held_atm_and_selects_nearest_itm(self):
+        execution_expiry = "2026-08-11"
+        recommendation = {
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "score": 4,
+            "reasons": ["nearest chain bullish"],
+            "analysis_expiry": "2026-08-04",
+            "analysis_atm": {"strike": 24300, "expiry": "2026-08-04"},
+            "execution_chain": [
+                {
+                    "strike": strike,
+                    "expiry": execution_expiry,
+                    "CE_ltp": 150,
+                    "CE_bid_price": 149,
+                    "CE_ask_price": 151,
+                }
+                for strike in (24250, 24300, 24350)
+            ],
+        }
+
+        def instrument(_symbol, expiry, strike, option_type):
+            return {
+                "instrument_key": f"NSE_FO|{expiry}|{int(strike)}|{option_type}",
+                "trading_symbol": f"NIFTY {int(strike)} {option_type} {expiry}",
+                "lot_size": 65,
+            }
+
+        occupied_key = f"NSE_FO|{execution_expiry}|24300|CE"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ENABLE_LIVE_TRADING": "true",
+                    "GANESH_GAP_LIVE_TRADING": "true",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "get_index_recommendation", return_value=recommendation),
+            patch.object(trade_bot, "find_index_option_instrument", side_effect=instrument),
+            patch.object(
+                trade_bot,
+                "get_open_positions",
+                return_value=[{"instrument_token": occupied_key, "quantity": 65}],
+            ),
+            patch.object(trade_bot, "read_market_cache", return_value={}),
+            patch.object(
+                trade_bot,
+                "option_contract_quality",
+                return_value={
+                    "ltp": 150,
+                    "bid_price": 149,
+                    "ask_price": 151,
+                    "spread_percent": 1.33,
+                },
+            ),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                return_value={"close": 100, "vwap": 98, "volume_ratio": 1.4},
+            ),
+            patch.object(trade_bot, "write_stream_instruments"),
+        ):
+            candidate = trade_bot.ganesh_gap_option_candidate(
+                {"symbol": "NIFTY", "spot": 24310},
+                {"option_type": "CE"},
+            )
+
+        self.assertTrue(candidate["allowed"])
+        self.assertEqual(candidate["strike"], 24250)
+        self.assertTrue(candidate["contract_fallback_used"])
+        self.assertIn("already held", candidate["contract_selection_attempts"][0])
+
+    def test_ganesh_skips_manually_held_put_atm_and_selects_higher_itm(self):
+        execution_expiry = "2026-08-11"
+        recommendation = {
+            "direction": "BEARISH",
+            "confidence": "HIGH",
+            "score": -4,
+            "reasons": ["nearest chain bearish"],
+            "analysis_expiry": "2026-08-04",
+            "analysis_atm": {"strike": 24300, "expiry": "2026-08-04"},
+            "execution_chain": [
+                {
+                    "strike": strike,
+                    "expiry": execution_expiry,
+                    "PE_ltp": 150,
+                    "PE_bid_price": 149,
+                    "PE_ask_price": 151,
+                }
+                for strike in (24250, 24300, 24350)
+            ],
+        }
+
+        def instrument(_symbol, expiry, strike, option_type):
+            return {
+                "instrument_key": f"NSE_FO|{expiry}|{int(strike)}|{option_type}",
+                "trading_symbol": f"NIFTY {int(strike)} {option_type} {expiry}",
+                "lot_size": 65,
+            }
+
+        occupied_key = f"NSE_FO|{execution_expiry}|24300|PE"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ENABLE_LIVE_TRADING": "true",
+                    "GANESH_GAP_LIVE_TRADING": "true",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "get_index_recommendation", return_value=recommendation),
+            patch.object(trade_bot, "find_index_option_instrument", side_effect=instrument),
+            patch.object(
+                trade_bot,
+                "get_open_positions",
+                return_value=[{"instrument_token": occupied_key, "quantity": 65}],
+            ),
+            patch.object(trade_bot, "read_market_cache", return_value={}),
+            patch.object(
+                trade_bot,
+                "option_contract_quality",
+                return_value={
+                    "ltp": 150,
+                    "bid_price": 149,
+                    "ask_price": 151,
+                    "spread_percent": 1.33,
+                },
+            ),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                return_value={"close": 100, "vwap": 98, "volume_ratio": 1.4},
+            ),
+            patch.object(trade_bot, "write_stream_instruments"),
+        ):
+            candidate = trade_bot.ganesh_gap_option_candidate(
+                {"symbol": "NIFTY", "spot": 24310},
+                {"option_type": "PE"},
+            )
+
+        self.assertTrue(candidate["allowed"])
+        self.assertEqual(candidate["strike"], 24350)
+        self.assertTrue(candidate["contract_fallback_used"])
+
     def test_replay_uses_next_nifty_expiry_on_every_weekday(self):
         session_date = datetime(2026, 7, 29).date()
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]

@@ -2846,6 +2846,55 @@ def index_contract_rows(recommendation, direction):
     return rows
 
 
+def ganesh_gap_occupied_contract_keys(force=False):
+    """Return broker-held derivative contracts that Ganesh must not add to."""
+    if not ganesh_gap_live_enabled():
+        return set()
+
+    occupied = set()
+    for position in get_open_positions(force=force):
+        if position_quantity(position) == 0:
+            continue
+        instrument_key = str(
+            position.get("instrument_token")
+            or position.get("instrument_key")
+            or ""
+        ).strip()
+        segment = str(
+            position.get("segment") or position.get("exchange") or ""
+        ).upper()
+        if instrument_key.startswith("NSE_FO|") or segment in {"NSE_FO", "NFO"}:
+            occupied.add(instrument_key)
+    return occupied
+
+
+def ganesh_gap_execution_rows(chain, requested_strike, option_type):
+    """Order next-expiry execution rows as ATM, then progressively ITM."""
+    rows = chain.copy()
+    rows["_strike"] = pd.to_numeric(rows["strike"], errors="coerce")
+    rows = rows.dropna(subset=["_strike"])
+    if rows.empty:
+        return []
+
+    atm_index = (rows["_strike"] - float(requested_strike)).abs().idxmin()
+    atm_row = rows.loc[atm_index]
+    atm_strike_value = float(atm_row["_strike"])
+    expiry = str(atm_row.get("expiry") or "")
+    same_expiry = rows[rows["expiry"].astype(str) == expiry]
+    if option_type == "CE":
+        itm = same_expiry[same_expiry["_strike"] < atm_strike_value].sort_values(
+            "_strike", ascending=False
+        )
+    else:
+        itm = same_expiry[same_expiry["_strike"] > atm_strike_value].sort_values(
+            "_strike", ascending=True
+        )
+    ordered = [atm_row.to_dict(), *itm.to_dict("records")]
+    for row in ordered:
+        row.pop("_strike", None)
+    return ordered
+
+
 def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
     """Analyze the front expiry and select a liquid next-expiry ATM option."""
     symbol = str(symbol or snapshot.get("symbol") or "NIFTY").strip().upper()
@@ -2855,43 +2904,92 @@ def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
         raise RuntimeError(f"Next-expiry {symbol} execution chain is unavailable")
     interval_name = f"GANESH_{symbol}_STRIKE_INTERVAL"
     default_interval = 50 if symbol == "NIFTY" else 100
-    strike = atm_strike(
+    requested_strike = atm_strike(
         snapshot["spot"],
         interval=max(to_int(os.getenv(interval_name), default_interval), 1),
     )
-    exact = chain[chain["strike"] == float(strike)]
-    if exact.empty:
-        row = chain.loc[(chain["strike"] - float(strike)).abs().idxmin()]
-        strike = int(float(row["strike"]))
-    else:
-        row = exact.iloc[0]
     option_type = transition["option_type"]
     prefix = "CE" if option_type == "CE" else "PE"
-    expiry = row.get("expiry")
-    instrument = find_index_option_instrument(
-        symbol,
-        expiry,
-        strike,
-        option_type,
-    )
-    stream = read_market_cache(instrument.get("instrument_key")) or {}
-    quality = option_contract_quality(row.to_dict(), option_type, stream)
-    ltp = to_float(quality.get("ltp"), to_float(row.get(f"{prefix}_ltp")))
-    bid = to_float(quality.get("bid_price"), to_float(row.get(f"{prefix}_bid_price")))
-    ask = to_float(quality.get("ask_price"), to_float(row.get(f"{prefix}_ask_price")))
-    spread_percent = quality.get("spread_percent")
     maximum_spread = configured_positive_float("GANESH_MAX_OPTION_SPREAD_PERCENT", 2.5)
-    blockers = []
-    if ltp <= 0:
-        blockers.append("option LTP is unavailable")
-    if bid <= 0 or ask <= 0:
-        blockers.append("option bid/ask is unavailable")
-    if spread_percent is None:
-        blockers.append("option spread cannot be calculated")
-    elif float(spread_percent) > maximum_spread:
-        blockers.append(
-            f"option spread {float(spread_percent):.2f}% exceeds {maximum_spread:.2f}%"
+    occupied_keys = ganesh_gap_occupied_contract_keys()
+    attempts = []
+    selected = None
+    for row in ganesh_gap_execution_rows(chain, requested_strike, option_type):
+        strike = int(float(row["strike"]))
+        expiry = row.get("expiry")
+        instrument = find_index_option_instrument(
+            symbol,
+            expiry,
+            strike,
+            option_type,
         )
+        instrument_key = str(instrument.get("instrument_key") or "")
+        if instrument_key in occupied_keys:
+            attempts.append(f"{strike} {option_type} is already held at the broker")
+            verbose_log(
+                f"GANESH GAP {symbol} contract skipped: "
+                f"{instrument.get('trading_symbol')} is already held manually or "
+                "by another strategy"
+            )
+            continue
+
+        stream = read_market_cache(instrument_key) or {}
+        quality = option_contract_quality(row, option_type, stream)
+        ltp = to_float(quality.get("ltp"), to_float(row.get(f"{prefix}_ltp")))
+        bid = to_float(
+            quality.get("bid_price"), to_float(row.get(f"{prefix}_bid_price"))
+        )
+        ask = to_float(
+            quality.get("ask_price"), to_float(row.get(f"{prefix}_ask_price"))
+        )
+        spread_percent = quality.get("spread_percent")
+        blockers = []
+        if ltp <= 0:
+            blockers.append("option LTP is unavailable")
+        if bid <= 0 or ask <= 0:
+            blockers.append("option bid/ask is unavailable")
+        if spread_percent is None:
+            blockers.append("option spread cannot be calculated")
+        elif float(spread_percent) > maximum_spread:
+            blockers.append(
+                f"option spread {float(spread_percent):.2f}% exceeds "
+                f"{maximum_spread:.2f}%"
+            )
+        if blockers:
+            attempts.append(f"{strike} {option_type}: {'; '.join(blockers)}")
+            continue
+        selected = {
+            "row": row,
+            "strike": strike,
+            "expiry": expiry,
+            "instrument": instrument,
+            "quality": quality,
+            "ltp": ltp,
+            "bid": bid,
+            "ask": ask,
+            "spread_percent": spread_percent,
+        }
+        break
+
+    if not selected:
+        return {
+            "allowed": False,
+            "reason": "no unoccupied tradeable ATM/ITM contract: "
+            + "; ".join(attempts),
+            "option_type": option_type,
+            "near_expiry_analysis": {},
+        }
+
+    row = selected["row"]
+    strike = selected["strike"]
+    expiry = selected["expiry"]
+    instrument = selected["instrument"]
+    quality = selected["quality"]
+    ltp = selected["ltp"]
+    bid = selected["bid"]
+    ask = selected["ask"]
+    spread_percent = selected["spread_percent"]
+    blockers = []
     near_expiry_analysis = {}
     stream_instruments = [
         UNDERLYING_INDEX_KEYS["NIFTY"],
@@ -2934,7 +3032,7 @@ def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
     )
     return {
         "allowed": not blockers,
-        "reason": "; ".join(blockers) if blockers else "ATM option is tradeable",
+        "reason": "; ".join(blockers) if blockers else "option contract is tradeable",
         "strike": strike,
         "expiry": str(expiry),
         "option_type": option_type,
@@ -2944,6 +3042,8 @@ def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
         "spread_percent": round(float(spread_percent), 3) if spread_percent is not None else None,
         "instrument": instrument,
         "quality": quality,
+        "contract_fallback_used": strike != int(float(requested_strike)),
+        "contract_selection_attempts": attempts,
         "near_expiry_analysis": near_expiry_analysis,
         "recommendation": recommendation,
     }
@@ -5906,6 +6006,16 @@ def execute_ganesh_gap_entry(state, snapshot, option, target, symbol=None):
     }
     live = ganesh_gap_live_enabled()
     with portfolio_entry_lock():
+        if live:
+            try:
+                occupied_keys = ganesh_gap_occupied_contract_keys(force=True)
+            except Exception as error:
+                return False, f"broker position collision check failed: {error}"
+            if instrument.get("instrument_key") in occupied_keys:
+                return False, (
+                    "selected contract became occupied at the broker before order placement; "
+                    "entry cancelled"
+                )
         decision = pre_order_portfolio_decision(
             candidate,
             quantity,
