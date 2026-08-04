@@ -89,6 +89,7 @@ from strategy_core import (
 from strategy_core import option_contract_quality
 from trade_journal import record_closed_trade
 from trading_config import active_value
+from unified_entry_score import unified_entry_score
 from safe_storage import atomic_write_json, file_lock, locked_append_csv
 from upstox_streams import (
     read_market_cache,
@@ -199,7 +200,6 @@ DEFAULT_INDEX_EXIT_POINTS = {
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 0.8
 DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
-DEFAULT_VAMSI_MIN_WEIGHTED_SCORE = 20.0
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = "MAX"
@@ -294,10 +294,16 @@ def format_score(value):
         return str(value)
 
 
-def log_scan_decision(symbol, score, action):
-    log(f"{symbol} score {format_score(score)} {action}")
+def log_scan_decision(symbol, score, action, score_version=None):
+    version_text = f" version={score_version}" if score_version else ""
+    log(f"{symbol} score {format_score(score)} {action}{version_text}")
     try:
-        record_scan_decision(symbol, score, action)
+        record_scan_decision(
+            symbol,
+            score,
+            action,
+            score_version=score_version,
+        )
     except Exception as error:
         verbose_log(f"{symbol} scan journal write failed: {error}")
 
@@ -401,9 +407,20 @@ def index_point_exit_settings(symbol):
             "OPTION_DELTA_APPROXIMATION",
             DEFAULT_OPTION_DELTA_APPROXIMATION,
         ),
+        "source": "STATIC_ENV",
     }
     if settings["delta"] > 1:
         raise RuntimeError("OPTION_DELTA_APPROXIMATION must be greater than 0 and at most 1")
+    if configured_bool("VAMSI_ADAPTIVE_SCORE_ENABLED", True):
+        adaptive = read_effective_score_rule(symbol, now_ist().date())
+        exit_levels = (adaptive or {}).get("exit_levels") or {}
+        if exit_levels.get("source") == "ADAPTIVE_HISTORY_AVERAGE":
+            target_points = to_float(exit_levels.get("target_points"))
+            stop_points = to_float(exit_levels.get("stop_points"))
+            if target_points > 0 and stop_points > 0:
+                settings["target_points"] = target_points
+                settings["stop_points"] = stop_points
+                settings["source"] = "ADAPTIVE_HISTORY_AVERAGE"
     return settings
 
 
@@ -412,7 +429,13 @@ def score_based_exit_settings(symbol, weighted_score):
     settings = dict(index_point_exit_settings(symbol))
     threshold = configured_non_negative_float("EXTREME_SETUP_MIN_SCORE", 90.0)
     score = to_float(weighted_score)
-    settings["profile"] = "STANDARD"
+    settings["profile"] = (
+        "ADAPTIVE_HISTORY"
+        if settings.get("source") == "ADAPTIVE_HISTORY_AVERAGE"
+        else "STANDARD"
+    )
+    if settings["profile"] == "ADAPTIVE_HISTORY":
+        return settings
     if score < threshold:
         return settings
 
@@ -914,11 +937,11 @@ def watch_minimum_score():
 
 def static_vamsi_minimum_score():
     minimum = configured_non_negative_float(
-        "VAMSI_MIN_WEIGHTED_SCORE",
-        DEFAULT_VAMSI_MIN_WEIGHTED_SCORE,
+        "VAMSI_UNIFIED_SCORE_FALLBACK",
+        55.0,
     )
     if minimum > 100:
-        raise RuntimeError("VAMSI_MIN_WEIGHTED_SCORE must be at most 100")
+        raise RuntimeError("VAMSI_UNIFIED_SCORE_FALLBACK must be at most 100")
     return minimum
 
 
@@ -956,7 +979,7 @@ def format_vamsi_score_rule(rule):
     return f"{label} {float(rule['min_score']):.1f}"
 
 
-def vamsi_weighted_score_qualifies(score, symbol):
+def vamsi_entry_score_qualifies(score, symbol):
     value = to_float(score)
     rule = vamsi_score_rule(symbol)
     if rule.get("source") == "ADAPTIVE":
@@ -967,12 +990,9 @@ def vamsi_weighted_score_qualifies(score, symbol):
     return value > float(rule["min_score"])
 
 
-def vamsi_score_only_minimum(env_key, default, symbol):
-    """Cap secondary score-only gates at the Vamsi direct-entry floor."""
-    return min(
-        configured_non_negative_float(env_key, default),
-        direct_entry_minimum_score(symbol),
-    )
+def vamsi_weighted_score_qualifies(score, symbol):
+    """Backward-compatible name for callers outside the live entry path."""
+    return vamsi_entry_score_qualifies(score, symbol)
 
 
 def score_direction_from_technicals(technicals):
@@ -1081,7 +1101,7 @@ def process_watch(symbol, candidate):
         expire_watch(symbol, f"direction changed to {direction or 'NEUTRAL'}")
         return None
     score = candidate_weighted_score(candidate)
-    if not vamsi_weighted_score_qualifies(score, symbol):
+    if not vamsi_entry_score_qualifies(score, symbol):
         score_rule = vamsi_score_rule(symbol)
         expire_watch(
             symbol,
@@ -1689,11 +1709,23 @@ def portfolio_day_circuit():
     return result
 
 
-def candidate_weighted_score(chosen):
+def candidate_entry_score(chosen):
     return to_float(
-        (chosen.get("weighted") or {}).get("score"),
-        to_float(chosen.get("weighted_score"), to_float(chosen.get("signal_score"))),
+        (chosen.get("entry_score") or {}).get("score"),
+        to_float(
+            (chosen.get("weighted") or {}).get("score"),
+            to_float(chosen.get("weighted_score"), to_float(chosen.get("signal_score"))),
+        ),
     )
+
+
+def candidate_weighted_score(chosen):
+    """Backward-compatible accessor; unified entry score is preferred."""
+    return candidate_entry_score(chosen)
+
+
+def candidate_score_version(chosen):
+    return (chosen.get("entry_score") or {}).get("score_version")
 
 
 def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price):
@@ -1742,7 +1774,7 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
         }
     required_score = base_minimum
     # A Vamsi score-band-approved setup has already passed the configured
-    # weighted-score rule. Keep hard day/risk/correlation gates below, but do
+    # unified entry-score rule. Keep hard day/risk/correlation gates below, but do
     # not silently raise the approved lower boundary again at order time.
     if not chosen.get("score_cutoff_approved"):
         required_score += to_float(circuit.get("score_penalty"))
@@ -4510,99 +4542,18 @@ def build_trade_candidate(
                 "weighted": weighted,
             }, None
 
-    score_value = float(weighted.get("score") or 0)
-    score_rule = vamsi_score_rule(symbol)
-    minimum = float(score_rule["min_score"])
-    maximum = score_rule.get("max_score")
-    score_approved = vamsi_weighted_score_qualifies(score_value, symbol)
-    if option_summary.get("neutral_chain_override") and not score_cutoff_mode_enabled():
-        neutral_default = 75.0 if symbol == "BANKNIFTY" else 80.0
-        minimum = max(
-            minimum,
-            configured_non_negative_float(
-                f"{symbol}_NEUTRAL_CHAIN_MIN_SCORE", neutral_default
-            ),
-        )
-        score_approved = score_value > minimum
-        maximum = None
-        score_rule = {
-            "source": "STATIC_FALLBACK",
-            "mode": "MIN",
-            "min_score": minimum,
-            "max_score": None,
-        }
-    # Once the day's score rule passes, later portfolio checks must not silently
-    # impose a different weighted-score threshold. Non-score gates still apply.
-    cutoff_approved = score_approved
-    watch_band = (
-        watch_mode_enabled()
-        and score_value >= watch_minimum_score()
-        and score_value < minimum
-    )
-    if not score_approved and not watch_band:
-        return {
-            "allowed": False,
-            "reason": (
-                f"weighted score {score_value:.1f} does not satisfy Vamsi "
-                f"{format_vamsi_score_rule(score_rule)}"
-            ),
-            "transaction_type": transaction_type,
-            "instrument": instrument,
-            "technicals": technicals,
-            "option_summary": option_summary,
-            "weighted": weighted,
-        }, None
-
     live_gate = live_entry_gate(
         direction,
         technicals,
-        score_value,
-        enabled=configured_bool("LIVE_REGIME_STRUCTURE_GATE_ENABLED", True),
-        range_minimum_score=vamsi_score_only_minimum(
-            "RANGE_REGIME_MIN_SCORE", 85.0, symbol
-        ),
-        continuation_minimum_score=vamsi_score_only_minimum(
-            "CONTINUATION_ENTRY_MIN_SCORE", 85.0, symbol
-        ),
+        float(weighted.get("score") or 0),
+        enabled=True,
+        range_minimum_score=85.0,
+        continuation_minimum_score=85.0,
     )
     technicals["live_entry_gate"] = live_gate
     option_summary["live_entry_gate"] = live_gate
-    timing_watch = bool(
-        not live_gate.get("allowed")
-        and live_gate.get("watch_eligible")
-        and watch_mode_enabled()
-    )
-    if not live_gate.get("allowed") and not timing_watch:
-        return {
-            "allowed": False,
-            "reason": "live regime/structure rejected: " + str(live_gate.get("reason")),
-            "transaction_type": transaction_type,
-            "instrument": instrument,
-            "technicals": technicals,
-            "option_summary": option_summary,
-            "weighted": weighted,
-        }, None
     expiry_days = (parse_expiry(atm["expiry"]) - now_ist().date()).days
     technicals["market_regime"]["days_to_expiry"] = expiry_days
-    expiry_minimum = vamsi_score_only_minimum(
-        "EXPIRY_REGIME_MIN_SCORE", 85.0, symbol
-    )
-    if (
-        expiry_days <= int(configured_non_negative_float("EXPIRY_REGIME_MAX_DAYS", 2))
-        and score_value < expiry_minimum
-    ):
-        return {
-            "allowed": False,
-            "reason": (
-                f"near-expiry regime requires score >= "
-                f"{expiry_minimum:.1f}"
-            ),
-            "transaction_type": transaction_type,
-            "instrument": instrument,
-            "technicals": technicals,
-            "option_summary": option_summary,
-            "weighted": weighted,
-        }, None
 
     cautious = weighted.get("grade") == "CAUTIOUS_TRADE"
     if option_summary.get("strategy") == "BOLLINGER_REVERSAL":
@@ -4626,7 +4577,10 @@ def build_trade_candidate(
             "profile": "BOLLINGER_REVERSAL",
         }
     else:
-        exit_settings = score_based_exit_settings(symbol, score_value)
+        exit_settings = score_based_exit_settings(
+            symbol,
+            float(weighted.get("score") or 0),
+        )
     levels = option_levels_from_index_points(
         symbol,
         entry_price,
@@ -4658,15 +4612,49 @@ def build_trade_candidate(
     )
     technicals["trade_feasibility"] = feasibility
     option_summary["trade_feasibility"] = feasibility
-    if not feasibility.get("allowed"):
+
+    entry_score = unified_entry_score(
+        weighted,
+        technicals,
+        institutional,
+        direction,
+        feasibility=feasibility,
+        days_to_expiry=expiry_days,
+        live_gate=live_gate,
+    )
+    option_summary["unified_entry_score"] = entry_score
+    technicals["unified_entry_score"] = entry_score
+    verbose_log(
+        f"{symbol} unified entry score: score={entry_score.get('score')} "
+        f"version={entry_score.get('score_version')} "
+        f"components={entry_score.get('components')}"
+    )
+    score_value = float(entry_score.get("score") or 0)
+    score_rule = vamsi_score_rule(symbol)
+    minimum = float(score_rule["min_score"])
+    maximum = score_rule.get("max_score")
+    score_approved = vamsi_entry_score_qualifies(score_value, symbol)
+    cutoff_approved = score_approved
+    watch_band = bool(
+        not score_approved
+        and watch_mode_enabled()
+        and score_value >= watch_minimum_score()
+        and score_value < minimum
+        and (live_gate.get("watch_eligible") or technicals["entry_structure"].get("watch_eligible"))
+    )
+    if not score_approved and not watch_band:
         return {
             "allowed": False,
-            "reason": "entry feasibility rejected: " + "; ".join(feasibility.get("reasons", [])),
+            "reason": (
+                f"unified entry score {score_value:.1f} does not satisfy Vamsi "
+                f"{format_vamsi_score_rule(score_rule)}"
+            ),
             "transaction_type": transaction_type,
             "instrument": instrument,
             "technicals": technicals,
             "option_summary": option_summary,
             "weighted": weighted,
+            "entry_score": entry_score,
         }, None
     structural = structural_invalidation(
         technicals,
@@ -4675,19 +4663,15 @@ def build_trade_candidate(
     )
     technicals["structural_invalidation"] = structural
 
-    if watch_band or timing_watch:
-        if timing_watch:
-            watch_reason = "5M timing requires confirmation: " + str(
-                live_gate.get("reason")
-            )
-        else:
-            watch_reason = (
-                f"watch band score {score_value:.1f}; direct entry requires {minimum:.1f}"
-            )
+    if watch_band:
+        watch_reason = (
+            f"watch band unified score {score_value:.1f}; direct entry requires "
+            f"{format_vamsi_score_rule(score_rule)}"
+        )
         return {
             "allowed": False,
             "watch_eligible": True,
-            "timing_watch": timing_watch,
+            "timing_watch": True,
             "reason": watch_reason,
             "transaction_type": transaction_type,
             "instrument": instrument,
@@ -4704,6 +4688,7 @@ def build_trade_candidate(
             "technicals": technicals,
             "option_summary": option_summary,
             "weighted": weighted,
+            "entry_score": entry_score,
             "entry_minimum_score": minimum,
             "entry_maximum_score": maximum,
             "score_rule_source": score_rule.get("source"),
@@ -4716,7 +4701,7 @@ def build_trade_candidate(
     return {
         "allowed": True,
         "reason": (
-            f"Vamsi weighted score approved at {score_value:.1f} using "
+            f"Vamsi unified entry score approved at {score_value:.1f} using "
             f"{format_vamsi_score_rule(score_rule)}; "
             f"{exit_settings['profile'].lower()} target/stop "
             f"{levels['target_points']:.0f}/{levels['stop_points']:.0f} points"
@@ -4736,6 +4721,7 @@ def build_trade_candidate(
         "technicals": technicals,
         "option_summary": option_summary,
         "weighted": weighted,
+        "entry_score": entry_score,
         "entry_minimum_score": minimum,
         "entry_maximum_score": maximum,
         "score_rule_source": score_rule.get("source"),
@@ -4757,7 +4743,7 @@ def select_trade_candidate(candidates, allow_sell=True):
     return max(
         qualified,
         key=lambda item: (
-            float(item.get("weighted", {}).get("score") or 0),
+            candidate_weighted_score(item),
             float(item.get("contract_selection_rank") or 0),
         ),
         default=None,
@@ -4978,13 +4964,16 @@ def evaluate_symbol_buy_or_sell(
                         "symbol": symbol,
                         "direction": direction,
                         "confidence": confidence,
-                        "signal_score": score,
+                        "signal_score": candidate_weighted_score(candidate),
+                        "chain_signal_score": score,
                     }
                 )
                 candidates.append(candidate)
                 verbose_log(
                     f"{symbol} BUY candidate: allowed={candidate.get('allowed')} "
-                    f"score={candidate.get('weighted', {}).get('score')} reason={candidate.get('reason')} "
+                    f"score={candidate_weighted_score(candidate)} "
+                    f"version={candidate_score_version(candidate) or 'LEGACY'} "
+                    f"reason={candidate.get('reason')} "
                     f"contract={candidate.get('instrument', {}).get('trading_symbol')} "
                     f"contract_rank={candidate.get('contract_selection_rank', 0)}"
                 )
@@ -5043,7 +5032,8 @@ def evaluate_symbol_buy_or_sell(
                                 "symbol": symbol,
                                 "direction": reversal_direction,
                                 "confidence": "MEDIUM",
-                                "signal_score": score,
+                                "signal_score": candidate_weighted_score(candidate),
+                                "chain_signal_score": score,
                             }
                         )
                         candidates.append(candidate)
@@ -5051,7 +5041,8 @@ def evaluate_symbol_buy_or_sell(
                             f"{symbol} BOLLINGER_REVERSAL candidate: "
                             f"allowed={candidate.get('allowed')} "
                             f"direction={reversal_direction} "
-                            f"score={candidate.get('weighted', {}).get('score')} "
+                            f"score={candidate_weighted_score(candidate)} "
+                            f"version={candidate_score_version(candidate) or 'LEGACY'} "
                             f"reason={candidate.get('reason')} "
                             f"contract={candidate.get('instrument', {}).get('trading_symbol')}"
                         )
@@ -5067,7 +5058,7 @@ def evaluate_symbol_buy_or_sell(
             item for item in candidates
             if allow_option_sell or item.get("transaction_type") != "SELL"
         ]
-        best = max(eligible, key=lambda item: float(item.get("weighted", {}).get("score") or 0), default=None)
+        best = max(eligible, key=candidate_weighted_score, default=None)
         if best:
             decision = {
                 "execute_trade": False,
@@ -5079,8 +5070,13 @@ def evaluate_symbol_buy_or_sell(
             }
             record_analysis(symbol, best["option_summary"], best["technicals"], decision)
         reject_score = candidate_weighted_score(best) if best else score
-        log_scan_decision(symbol, reject_score, "reject")
-        verbose_log(f"{symbol} no trade: BUY structure did not pass deterministic gates.")
+        log_scan_decision(
+            symbol,
+            reject_score,
+            "reject",
+            score_version=candidate_score_version(best) if best else None,
+        )
+        verbose_log(f"{symbol} no trade: unified entry score did not qualify.")
         if include_rejected and best:
             return best
         return False
@@ -5119,14 +5115,14 @@ def evaluate_symbol_buy_or_sell(
             "decision": chosen_direction,
             "confidence": (
                 "HIGH"
-                if chosen.get("weighted", {}).get("grade") == "TRADE"
+                if chosen.get("entry_score", {}).get("grade") == "TRADE"
                 else "MEDIUM"
             ),
             "target_price": chosen["target_price"],
             "stop_loss_price": chosen["stop_loss_price"],
             "reason": (
-                "Approved by deterministic option-chain, technical, market-quality, "
-                "and entry-feasibility rules."
+                "Approved by the unified signal-and-gate entry score; hard execution "
+                "safeguards remain satisfied."
             ),
         }
         record_analysis(symbol, option_summary, technicals, decision)
@@ -5136,14 +5132,20 @@ def evaluate_symbol_buy_or_sell(
                 "symbol": symbol,
                 "direction": chosen_direction,
                 "confidence": confidence,
-                "signal_score": score,
+                "signal_score": candidate_weighted_score(chosen),
+                "chain_signal_score": score,
                 "decision": decision,
             }
         )
         return chosen
 
-    log_scan_decision(symbol, score, "reject")
-    verbose_log(f"{symbol} no trade: BUY structure did not pass deterministic rules.")
+    log_scan_decision(
+        symbol,
+        candidate_weighted_score(preferred),
+        "reject",
+        score_version=candidate_score_version(preferred),
+    )
+    verbose_log(f"{symbol} no trade: qualified score could not fund an executable order.")
     return False
 
 
@@ -5182,6 +5184,7 @@ def execute_selected_candidate(chosen):
     )
     trade_context = planned_trade_context(symbol)
     structural = chosen.get("structural_invalidation") or {}
+    entry_score = chosen.get("entry_score") or {}
     trade_metadata = {
         **trade_context,
         "planned_risk": round(planned_risk, 2),
@@ -5189,6 +5192,9 @@ def execute_selected_candidate(chosen):
         "entry_minimum_score": to_float(chosen.get("entry_minimum_score")),
         "entry_maximum_score": chosen.get("entry_maximum_score"),
         "score_rule_source": chosen.get("score_rule_source"),
+        "entry_score_version": entry_score.get("score_version"),
+        "entry_score_components": entry_score.get("components", {}),
+        "base_alignment_score": (chosen.get("weighted") or {}).get("score"),
         "manual_override": bool(chosen.get("manual_override")),
         "manual_command": chosen.get("manual_command", ""),
         "underlying_instrument_key": UNDERLYING_INDEX_KEYS.get(symbol),
@@ -5227,7 +5233,12 @@ def execute_selected_candidate(chosen):
             stop,
         )
         if not portfolio_decision.get("allowed"):
-            log_scan_decision(symbol, candidate_weighted_score(chosen), "reject")
+            log_scan_decision(
+                symbol,
+                candidate_weighted_score(chosen),
+                "reject",
+                score_version=candidate_score_version(chosen),
+            )
             verbose_log(
                 f"{symbol} portfolio gate rejected entry: "
                 f"{portfolio_decision.get('reason')}"
@@ -5278,7 +5289,12 @@ def execute_selected_candidate(chosen):
     details = wait_for_order_complete(order_id)
     if order_is_rejected(details):
         clear_state(symbol)
-        log_scan_decision(symbol, candidate_weighted_score(chosen), "reject")
+        log_scan_decision(
+            symbol,
+            candidate_weighted_score(chosen),
+            "reject",
+            score_version=candidate_score_version(chosen),
+        )
         verbose_log(f"{symbol} MARKET {transaction_type} rejected: order_id={order_id} details={details}")
         return False
     if not order_is_complete(details):
@@ -6283,7 +6299,12 @@ def run_signal_check():
             reverse=True,
         )
         chosen = ordered[0]
-        log_scan_decision(chosen["symbol"], candidate_weighted_score(chosen), "buy")
+        log_scan_decision(
+            chosen["symbol"],
+            candidate_weighted_score(chosen),
+            "buy",
+            score_version=candidate_score_version(chosen),
+        )
         try:
             execute_selected_candidate(chosen)
         except Exception as error:

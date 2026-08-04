@@ -330,7 +330,73 @@ def analysis_indicator(label: str, maximum: float, contribution: float, detail: 
 
 
 def weighted_components(option_summary: dict, technicals: dict) -> list[dict]:
-    """Return the same five transparent components used by signal_score.py."""
+    """Return unified score components, with legacy weighted-score fallback."""
+    unified = option_summary.get("unified_entry_score", {}) or {}
+    if unified:
+        components = unified.get("components", {}) or {}
+        weights = unified.get("weights", {}) or {}
+        details = unified.get("details", {}) or {}
+        direction = details.get("direction_and_structure", {}) or {}
+        regime = details.get("market_regime", {}) or {}
+        feasibility = details.get("trade_feasibility", {}) or {}
+        breadth = (
+            technicals.get("banknifty_breadth", {})
+            or technicals.get("nifty_breadth", {})
+            or {}
+        )
+        institutional = technicals.get("institutional_flow", {}) or {}
+        return [
+            analysis_indicator(
+                "Core alignment",
+                safe_float(weights.get("core_alignment"), 25),
+                safe_float(components.get("core_alignment")),
+                f"Base score {safe_float(details.get('base_alignment_score')):.1f}/100",
+            ),
+            analysis_indicator(
+                "Direction & structure",
+                safe_float(weights.get("direction_and_structure"), 25),
+                safe_float(components.get("direction_and_structure")),
+                (
+                    f"15M {direction.get('fifteen_minute', 0)}/8 • "
+                    f"5M {direction.get('five_minute', 0)}/5 • "
+                    f"{direction.get('structure_type') or 'no structure'}"
+                ),
+            ),
+            analysis_indicator(
+                "Breadth",
+                safe_float(weights.get("breadth"), 20),
+                safe_float(components.get("breadth")),
+                f"{breadth.get('bias') or 'NEUTRAL'} • raw {breadth.get('score', '—')}",
+            ),
+            analysis_indicator(
+                "Institutional context",
+                safe_float(weights.get("institutional"), 10),
+                safe_float(components.get("institutional")),
+                (
+                    f"{institutional.get('bias') or 'NEUTRAL'} • "
+                    f"{institutional.get('confidence') or 'LOW'}"
+                ),
+            ),
+            analysis_indicator(
+                "Market regime",
+                safe_float(weights.get("market_regime"), 10),
+                safe_float(components.get("market_regime")),
+                (
+                    f"{regime.get('regime') or 'UNKNOWN'} • "
+                    f"{regime.get('regime_direction') or 'NEUTRAL'}"
+                ),
+            ),
+            analysis_indicator(
+                "Trade feasibility",
+                safe_float(weights.get("trade_feasibility"), 10),
+                safe_float(components.get("trade_feasibility")),
+                (
+                    f"R:R {safe_float(feasibility.get('observed_reward_risk')):.2f} • "
+                    f"target {feasibility.get('technical_target', 0)}/2"
+                ),
+            ),
+        ]
+
     weighted = option_summary.get("weighted_alignment", {}) or {}
     component_values = {}
     labels = {
@@ -383,7 +449,11 @@ def normalize_analysis(row: dict) -> dict:
     option_summary = raw.get("option_summary", {}) or {}
     technicals = raw.get("technicals", {}) or {}
     llm = raw.get("llm_decision", {}) or {}
-    weighted = option_summary.get("weighted_alignment", {}) or {}
+    entry_score = (
+        option_summary.get("unified_entry_score")
+        or option_summary.get("weighted_alignment")
+        or {}
+    )
     entry = safe_float(option_summary.get("entry_price"), None)
     target = safe_float(option_summary.get("target_price") or llm.get("target_price"), None)
     stop = safe_float(option_summary.get("stop_loss_price") or llm.get("stop_loss_price"), None)
@@ -398,8 +468,9 @@ def normalize_analysis(row: dict) -> dict:
         "llmDecision": llm.get("decision") or ("TRADE" if traded else "NO_TRADE"),
         "llmConfidence": llm.get("confidence"),
         "reason": llm.get("reason") or row.get("llm_reason") or "",
-        "overallScore": safe_float(weighted.get("score"), None),
-        "grade": weighted.get("grade"),
+        "overallScore": safe_float(entry_score.get("score"), None),
+        "scoreVersion": entry_score.get("score_version") or "LEGACY_WEIGHTED_SCORE",
+        "grade": entry_score.get("grade"),
         "indicators": weighted_components(option_summary, technicals),
         "strike": safe_float(option_summary.get("strike"), None),
         "instrument": option_summary.get("trading_symbol") or "",
@@ -455,6 +526,7 @@ def short_scan_reason(reason: str, fallback: str) -> str:
         ("configured option capital/risk budget", "Risk budget insufficient"),
         ("daily first-outcome", "Daily trade limit reached"),
         ("active index position", "Another index position is active"),
+        ("unified entry score", "Unified score below today's threshold"),
         ("weighted score", "Score below entry threshold"),
         ("volume confirmation", "Volume confirmation below threshold"),
         ("did not pass deterministic", "Entry rules not met"),

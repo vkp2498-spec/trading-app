@@ -83,6 +83,7 @@ flowchart TD
 - `strategy_core.py`: Upstox option-chain access, expiry selection, option recommendations, and directional signal construction.
 - `market_technicals.py`: 5-minute, 15-minute, and 2-hour technical analysis, pivots, Bollinger Bands, moving averages, momentum, and option-premium level conversion.
 - `signal_score.py`: Weighted signal alignment.
+- `unified_entry_score.py`: Versioned 100-point Vamsi entry score combining signal evidence with the former market-strategy gates.
 - `live_trade_filters.py`: Market regime, entry structure, reward/risk, extension, and invalidation filters.
 - `portfolio_risk.py`: Aggregate risk, day-level circuit breakers, and correlation checks.
 - `institutional_flow.py`: Futures/OI, nearby option flow, VIX, FII/DII, PCR, max pain, and persistence context.
@@ -182,9 +183,13 @@ The Vamsi engine is the evolved multi-signal intraday long-option engine. Its pr
 - Reachable technical reward/risk and entry extension.
 - Portfolio risk, daily risk, position correlation, broker state, and monitor health.
 
-The chain is evidence, not infallible truth. A strongly opposite chain can veto a trade. A neutral/low-confidence chain contributes little or no evidence and may be overridden only by an unusually strong aligned technical setup using the configured neutral-chain threshold.
+The live Vamsi entry decision uses one versioned score, `VAMSI_UNIFIED_ENTRY_V1`. Its weights total 100: core option/technical alignment 25, multi-timeframe direction and entry structure 25, breadth 20, institutional context 10, market regime/expiry 10, and trade feasibility (15-minute target, reward/risk, and entry extension) 10. These market-strategy conditions no longer veto a setup separately; alignment earns points and conflict or weak evidence earns fewer points. The score is an evidence ranking, not a calibrated probability.
 
-Vamsi uses a daily adaptive weighted-score rule when `VAMSI_ADAPTIVE_SCORE_ENABLED=true`. At 09:00 IST, `adaptive_score_calibration.py` analyzes prior (never same-day) rows in `data/score_followthrough_audit.csv` separately for NIFTY and BANKNIFTY. It compares minimum-and-above rules with contiguous bounded ranges, requires minimum sample/day evidence, and saves the effective rule in `data/vamsi_adaptive_score_config.json`. A range is selected only when it materially outperforms the best minimum-only rule. If today's file is missing, stale, invalid, or lacks enough evidence, the engine safely returns to the strict static rule `score > VAMSI_MIN_WEIGHTED_SCORE` (currently 20). Adaptive boundaries are inclusive. A qualifying score still proceeds only if regime direction, completed-candle structure, breadth conflicts, option quality, 15-minute reward/risk, entry extension, broker reconciliation, monitor health, account caps, and portfolio/day-risk controls all pass. Five-minute data remains an entry-timing and confirmation input; it does not limit technical reward headroom.
+Liquidity/contract validity, broker reconciliation, monitor health, market hours, duplicate-position controls, capital/lot ceilings, post-fill validation, broker protection, and portfolio risk remain hard execution safeguards. They are not allowed to be overridden by a high strategy score.
+
+When `VAMSI_ADAPTIVE_SCORE_ENABLED=true`, the 09:00 IST job analyzes only prior rows tagged with the current unified score version, separately for NIFTY and BANKNIFTY. It compares minimum-and-above rules with contiguous bounded ranges and saves the effective rule in `data/vamsi_adaptive_score_config.json`. Legacy weighted-score observations remain stored but are excluded because their scale is not comparable. Until at least 20 current-version observations exist across five trading days, or whenever today's calibration is missing/stale/invalid, the strict fallback is `score > VAMSI_UNIFIED_SCORE_FALLBACK` (default 55). Adaptive boundaries are inclusive.
+
+The same selected historical score window supplies adaptive exit points: average favorable movement becomes the target and average adverse movement becomes the stop. Each is bounded to 0.5x-2.0x the account's configured default to prevent a single unusual sample from producing an extreme plan. Until the unified-history requirement is met, `NIFTY_TARGET_POINTS`, `NIFTY_STOP_POINTS`, `BANKNIFTY_TARGET_POINTS`, and `BANKNIFTY_STOP_POINTS` continue unchanged. Post-fill feasibility and broker protection remain hard safeguards.
 
 ### 7.3 Contract selection
 
@@ -195,7 +200,7 @@ Vamsi uses a daily adaptive weighted-score rule when `VAMSI_ADAPTIVE_SCORE_ENABL
   evidence is recorded as context without silently adding a new entry veto.
 - BANKNIFTY continues to analyze and execute the configured nearest contract.
 - Non-NIFTY contract comparison can include suitable ATM and nearby one-strike-ITM contracts when enabled.
-- Both candidates must pass spread, Greek, structure, and feasibility checks.
+- Both candidates must pass hard spread/Greek/depth validity checks. Structure and feasibility contribute to the unified score.
 - Capital allocation is converted into whole lots and rounded down.
 - `ACCOUNT_MAX_OPTION_CAPITAL` and `ACCOUNT_MAX_LOTS_PER_ENTRY` remain hard account ceilings.
 - NIFTY expiry selection has evolved toward next-week contracts to avoid expiry-day distortion. Confirm the exact current selection in `strategy_core.py` before changing it.

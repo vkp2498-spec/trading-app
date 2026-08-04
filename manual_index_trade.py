@@ -121,6 +121,7 @@ def build_manual_candidate(candidate, target_points, stop_points, command_text):
         "technicals": candidate.get("technicals") or {},
         "option_summary": option_summary,
         "weighted": candidate.get("weighted") or {"score": score, "grade": "MANUAL"},
+        "entry_score": candidate.get("entry_score"),
         "entry_minimum_score": trade_bot.configured_non_negative_float(
             "MANUAL_INDEX_MIN_SCORE", 60.0
         ),

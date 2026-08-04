@@ -14,6 +14,7 @@ from post_market_score_audit import (
     score_bucket,
     upsert_audit,
 )
+from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
 class PostMarketScoreAuditTests(unittest.TestCase):
@@ -57,8 +58,8 @@ class PostMarketScoreAuditTests(unittest.TestCase):
                     [
                         "2026-07-30 10:05:02 | NIFTY signal: NEUTRAL, confidence=LOW, score=0, strike=24300.0, expiry=2026-08-04",
                         "2026-07-30 10:05:04 | NIFTY neutral-chain override candidate: direction=BULLISH; the complete 100-point score will decide",
-                        "2026-07-30 10:05:06 | NIFTY BUY candidate: allowed=False score=43.7 reason=weighted score 43.7 does not qualify contract=NIFTY 24300 CE 04 AUG 26 contract_rank=0",
-                        "2026-07-30 10:05:08 | NIFTY score 43.7 reject",
+                        f"2026-07-30 10:05:06 | NIFTY BUY candidate: allowed=False score=43.7 version={UNIFIED_SCORE_VERSION} reason=unified entry score 43.7 does not qualify contract=NIFTY 24300 CE 04 AUG 26 contract_rank=0",
+                        f"2026-07-30 10:05:08 | NIFTY score 43.7 reject version={UNIFIED_SCORE_VERSION}",
                         "2026-07-30 10:05:08 | NIFTY no trade: BUY structure did not pass deterministic gates.",
                     ]
                 )
@@ -69,7 +70,8 @@ class PostMarketScoreAuditTests(unittest.TestCase):
         row = parsed.iloc[0]
         self.assertEqual(row["direction"], "BULLISH")
         self.assertEqual(row["score"], 43.7)
-        self.assertIn("weighted score", row["reason"])
+        self.assertEqual(row["score_version"], UNIFIED_SCORE_VERSION)
+        self.assertIn("unified entry score", row["reason"])
 
     def test_overlapping_scans_are_not_double_counted(self):
         scans = pd.DataFrame(

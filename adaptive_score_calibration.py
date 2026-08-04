@@ -14,6 +14,7 @@ import pandas as pd
 
 from post_market_score_audit import AUDIT_FILE, read_audit
 from safe_storage import atomic_write_json
+from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +24,10 @@ ADAPTIVE_CONFIG_FILE = DATA_DIR / "vamsi_adaptive_score_config.json"
 IST = ZoneInfo("Asia/Kolkata")
 SYMBOLS = ("NIFTY", "BANKNIFTY")
 DEFAULT_FAVORABLE_POINTS = {"NIFTY": 10.0, "BANKNIFTY": 20.0}
+DEFAULT_EXIT_POINTS = {
+    "NIFTY": {"target": 20.0, "stop": 20.0},
+    "BANKNIFTY": {"target": 40.0, "stop": 40.0},
+}
 
 
 def _to_float(value, default):
@@ -37,6 +42,10 @@ def _to_int(value, default):
         return int(float(value))
     except (TypeError, ValueError):
         return int(default)
+
+
+def _clamp(value, minimum, maximum):
+    return max(float(minimum), min(float(maximum), float(value)))
 
 
 def load_env_file(path=ENV_FILE):
@@ -74,6 +83,10 @@ def prepare_history(frame, symbol, effective_date, lookback_days, favorable_poin
         working.get("trading_date"), errors="coerce"
     )
     working["score"] = pd.to_numeric(working.get("score"), errors="coerce")
+    score_versions = working.get(
+        "score_version",
+        pd.Series(index=working.index, dtype=object),
+    ).astype(str)
     working["favorable_points"] = pd.to_numeric(
         working.get("favorable_points"), errors="coerce"
     )
@@ -93,6 +106,7 @@ def prepare_history(frame, symbol, effective_date, lookback_days, favorable_poin
         & dates.ge(start_date)
         & dates.lt(effective_date)
         & working["score"].between(0, 100, inclusive="both")
+        & score_versions.eq(UNIFIED_SCORE_VERSION)
         & working["favorable_points"].notna()
         & working["adverse_points"].notna()
         & direction_correct.notna()
@@ -124,6 +138,8 @@ def evaluate_candidate(frame, mode, minimum, maximum, total_samples):
     average_net = (
         float(selected["normalized_net_excursion"].mean()) if samples else 0.0
     )
+    average_favorable = float(selected["favorable_points"].mean()) if samples else 0.0
+    average_adverse = float(selected["adverse_points"].mean()) if samples else 0.0
     coverage = samples / total_samples if total_samples else 0.0
     confidence_floor = wilson_lower_bound(successes, samples)
     quality = (
@@ -142,6 +158,8 @@ def evaluate_candidate(frame, mode, minimum, maximum, total_samples):
         "success_rate": round(success_rate, 4),
         "direction_accuracy": round(direction_accuracy, 4),
         "average_normalized_net_excursion": round(average_net, 4),
+        "average_favorable_points": round(average_favorable, 2),
+        "average_adverse_points": round(average_adverse, 2),
         "coverage": round(coverage, 4),
         "confidence_floor": round(confidence_floor, 4),
         "quality_score": round(quality, 6),
@@ -153,13 +171,15 @@ def calibrate_symbol(
     symbol,
     effective_date,
     *,
-    fallback_minimum=20.0,
+    fallback_minimum=55.0,
     lookback_days=90,
     minimum_samples=20,
     minimum_trading_days=5,
     minimum_success_rate=0.50,
     range_advantage=0.03,
     favorable_points=None,
+    default_target_points=None,
+    default_stop_points=None,
 ):
     symbol = str(symbol).upper()
     if symbol not in SYMBOLS:
@@ -169,6 +189,9 @@ def calibrate_symbol(
         if favorable_points is not None
         else DEFAULT_FAVORABLE_POINTS[symbol]
     )
+    defaults = DEFAULT_EXIT_POINTS[symbol]
+    default_target_points = float(default_target_points or defaults["target"])
+    default_stop_points = float(default_stop_points or defaults["stop"])
     if not 0 <= float(fallback_minimum) <= 100:
         raise ValueError("fallback_minimum must be between 0 and 100")
     if int(lookback_days) < 1:
@@ -181,6 +204,8 @@ def calibrate_symbol(
         raise ValueError("range_advantage must be non-negative")
     if favorable_points <= 0:
         raise ValueError("favorable_points must be greater than 0")
+    if default_target_points <= 0 or default_stop_points <= 0:
+        raise ValueError("default target and stop points must be greater than 0")
     history = prepare_history(
         frame,
         symbol,
@@ -200,9 +225,16 @@ def calibrate_symbol(
         "success_rate": None,
         "direction_accuracy": None,
         "average_normalized_net_excursion": None,
+        "average_favorable_points": None,
+        "average_adverse_points": None,
         "confidence_floor": None,
         "quality_score": None,
         "favorable_points_required": favorable_points,
+        "exit_levels": {
+            "source": "STATIC_FALLBACK",
+            "target_points": default_target_points,
+            "stop_points": default_stop_points,
+        },
         "reason": (
             f"Need at least {int(minimum_samples)} observations across "
             f"{int(minimum_trading_days)} trading days"
@@ -226,7 +258,7 @@ def calibrate_symbol(
             evaluate_candidate(history, "MIN", minimum, None, len(history))
         )
         for upper_bucket in boundaries:
-            # Live weighted scores are rounded to one decimal; include the
+            # Live unified scores are rounded to one decimal; include the
             # complete five-point audit bucket (for example, 60.0 through 64.9).
             upper = 100 if upper_bucket == 95 else upper_bucket + 4.9
             if upper - minimum < 14:
@@ -273,10 +305,34 @@ def calibrate_symbol(
         chosen = best_minimum or best_range
         reason = "A minimum-only rule was as reliable as the best bounded score window"
 
+    raw_target = float(chosen.get("average_favorable_points") or 0)
+    raw_stop = float(chosen.get("average_adverse_points") or 0)
+    if raw_target > 0 and raw_stop > 0:
+        target_points = round(
+            _clamp(raw_target, default_target_points * 0.5, default_target_points * 2.0),
+            1,
+        )
+        stop_points = round(
+            _clamp(raw_stop, default_stop_points * 0.5, default_stop_points * 2.0),
+            1,
+        )
+        exit_levels = {
+            "source": "ADAPTIVE_HISTORY_AVERAGE",
+            "target_points": target_points,
+            "stop_points": stop_points,
+            "raw_average_favorable_points": round(raw_target, 2),
+            "raw_average_adverse_points": round(raw_stop, 2),
+            "minimum_multiplier": 0.5,
+            "maximum_multiplier": 2.0,
+        }
+    else:
+        exit_levels = fallback["exit_levels"]
+
     return {
         "status": "ADAPTIVE",
         **chosen,
         "favorable_points_required": favorable_points,
+        "exit_levels": exit_levels,
         "reason": reason,
     }
 
@@ -285,16 +341,18 @@ def build_daily_config(
     frame,
     effective_date,
     *,
-    fallback_minimum=20.0,
+    fallback_minimum=55.0,
     lookback_days=90,
     minimum_samples=20,
     minimum_trading_days=5,
     minimum_success_rate=0.50,
     range_advantage=0.03,
     favorable_points_by_symbol=None,
+    default_exit_points_by_symbol=None,
     generated_at=None,
 ):
     favorable_points_by_symbol = favorable_points_by_symbol or DEFAULT_FAVORABLE_POINTS
+    default_exit_points_by_symbol = default_exit_points_by_symbol or DEFAULT_EXIT_POINTS
     generated_at = generated_at or datetime.now(IST)
     rules = {
         symbol: calibrate_symbol(
@@ -308,12 +366,15 @@ def build_daily_config(
             minimum_success_rate=minimum_success_rate,
             range_advantage=range_advantage,
             favorable_points=favorable_points_by_symbol[symbol],
+            default_target_points=default_exit_points_by_symbol[symbol]["target"],
+            default_stop_points=default_exit_points_by_symbol[symbol]["stop"],
         )
         for symbol in SYMBOLS
     }
     adaptive_count = sum(rule["status"] == "ADAPTIVE" for rule in rules.values())
     return {
-        "version": 1,
+        "version": 2,
+        "score_version": UNIFIED_SCORE_VERSION,
         "status": "COMPLETE" if adaptive_count == len(SYMBOLS) else "PARTIAL_FALLBACK",
         "generated_at": generated_at.isoformat(),
         "effective_date": effective_date.isoformat(),
@@ -338,6 +399,8 @@ def read_effective_score_rule(symbol, effective_date, path=ADAPTIVE_CONFIG_FILE)
     date_text = effective_date.isoformat() if hasattr(effective_date, "isoformat") else str(effective_date)
     if payload.get("effective_date") != date_text:
         return None
+    if payload.get("score_version") != UNIFIED_SCORE_VERSION:
+        return None
     rule = (payload.get("symbols") or {}).get(str(symbol).upper()) or {}
     if rule.get("status") != "ADAPTIVE":
         return None
@@ -352,12 +415,21 @@ def read_effective_score_rule(symbol, effective_date, path=ADAPTIVE_CONFIG_FILE)
     mode = str(rule.get("mode") or "MIN").upper()
     if mode not in {"MIN", "RANGE"} or (mode == "RANGE" and maximum is None):
         return None
+    exit_levels = rule.get("exit_levels") or {}
+    if exit_levels.get("source") == "ADAPTIVE_HISTORY_AVERAGE":
+        try:
+            target_points = float(exit_levels["target_points"])
+            stop_points = float(exit_levels["stop_points"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not 0 < target_points <= 1000 or not 0 < stop_points <= 1000:
+            return None
     return {**rule, "mode": mode, "min_score": minimum, "max_score": maximum}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Calibrate today's Vamsi weighted-score rule from post-market history"
+        description="Calibrate today's Vamsi unified-score rule from post-market history"
     )
     parser.add_argument("--date", help="Effective trading date in YYYY-MM-DD format")
     parser.add_argument("--audit-file", default=str(AUDIT_FILE))
@@ -366,7 +438,7 @@ def main():
     load_env_file()
     effective_date = date.fromisoformat(args.date) if args.date else datetime.now(IST).date()
     frame = read_audit(args.audit_file)
-    fallback_minimum = _to_float(os.getenv("VAMSI_MIN_WEIGHTED_SCORE"), 20.0)
+    fallback_minimum = _to_float(os.getenv("VAMSI_UNIFIED_SCORE_FALLBACK"), 55.0)
     config = build_daily_config(
         frame,
         effective_date,
@@ -387,6 +459,16 @@ def main():
             "BANKNIFTY": _to_float(
                 os.getenv("VAMSI_ADAPTIVE_BANKNIFTY_FAVORABLE_POINTS"), 20.0
             ),
+        },
+        default_exit_points_by_symbol={
+            "NIFTY": {
+                "target": _to_float(os.getenv("NIFTY_TARGET_POINTS"), 30.0),
+                "stop": _to_float(os.getenv("NIFTY_STOP_POINTS"), 30.0),
+            },
+            "BANKNIFTY": {
+                "target": _to_float(os.getenv("BANKNIFTY_TARGET_POINTS"), 90.0),
+                "stop": _to_float(os.getenv("BANKNIFTY_STOP_POINTS"), 90.0),
+            },
         },
     )
     atomic_write_json(args.output, config, sort_keys=True)

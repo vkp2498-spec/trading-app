@@ -54,10 +54,12 @@ OVERRIDE_RE = re.compile(
 )
 CANDIDATE_RE = re.compile(
     r"^(NIFTY|BANKNIFTY) (?:BUY|BOLLINGER_REVERSAL) candidate: .*?"
-    r"score=([-+]?\d+(?:\.\d+)?) reason=(.*?) contract="
+    r"score=([-+]?\d+(?:\.\d+)?) "
+    r"(?:version=([A-Z0-9_-]+) )?reason=(.*?) contract="
 )
 DECISION_RE = re.compile(
-    r"^(NIFTY|BANKNIFTY) score ([-+]?\d+(?:\.\d+)?) (buy|reject)$"
+    r"^(NIFTY|BANKNIFTY) score ([-+]?\d+(?:\.\d+)?) (buy|reject)"
+    r"(?: version=([A-Z0-9_-]+))?$"
 )
 NO_TRADE_RE = re.compile(r"^(NIFTY|BANKNIFTY) no trade: (.+)$")
 
@@ -67,6 +69,7 @@ AUDIT_COLUMNS = [
     "signal_time",
     "symbol",
     "score",
+    "score_version",
     "score_bucket",
     "action",
     "direction",
@@ -151,7 +154,10 @@ def reason_category(reason):
     text = str(reason or "").lower()
     rules = [
         ("REWARD_RISK", ("reward/risk", "reachable reward", "technical target")),
-        ("WEIGHTED_SCORE", ("weighted score", "does not qualify", "score is below")),
+        (
+            "UNIFIED_SCORE",
+            ("unified entry score", "weighted score", "does not qualify", "score is below"),
+        ),
         ("REGIME_STRUCTURE", ("regime", "structure", "retest", "extension")),
         ("OPTION_QUALITY", ("spread", "delta", "depth", "greeks", "tradeability")),
         ("OPTION_FLOW", ("vwap", "volume", "option premium", "atm flow")),
@@ -199,6 +205,7 @@ def parse_log_scans(log_file, date_text):
                 "chain_confidence": confidence,
                 "chain_score": float(chain_score),
                 "candidate_score": None,
+                "score_version": "",
                 "reason": "",
             }
             continue
@@ -211,23 +218,25 @@ def parse_log_scans(log_file, date_text):
 
         candidate = CANDIDATE_RE.match(message)
         if candidate:
-            symbol, candidate_score, candidate_reason = candidate.groups()
+            symbol, candidate_score, score_version, candidate_reason = candidate.groups()
             numeric = float(candidate_score)
             current = state[symbol].get("candidate_score")
             if current is None or numeric >= current:
                 state[symbol]["candidate_score"] = numeric
+                state[symbol]["score_version"] = score_version or ""
                 state[symbol]["reason"] = candidate_reason.strip()
             continue
 
         decision = DECISION_RE.match(message)
         if decision:
-            symbol, final_score, action = decision.groups()
+            symbol, final_score, action, score_version = decision.groups()
             current = state[symbol]
             events.append(
                 {
                     "timestamp": timestamp,
                     "symbol": symbol,
                     "score": float(final_score),
+                    "score_version": score_version or current.get("score_version", ""),
                     "action": action,
                     "direction": current.get("direction", ""),
                     "chain_direction": current.get("chain_direction", ""),
@@ -263,6 +272,8 @@ def read_structured_scans(scan_file, date_text):
     frame["timestamp"] = frame["timestamp"].dt.tz_convert(IST)
     frame = frame[frame["timestamp"].dt.date.astype(str) == date_text].copy()
     frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
+    if "score_version" not in frame.columns:
+        frame["score_version"] = ""
     frame = frame.dropna(subset=["timestamp", "score"])
     frame["source"] = "scan_journal"
     return frame
@@ -286,12 +297,14 @@ def _analysis_evidence(row):
         raw = {}
     option = raw.get("option_summary") or {}
     decision = raw.get("llm_decision") or {}
+    entry_score = option.get("unified_entry_score") or {}
     weighted = option.get("weighted_alignment") or {}
     direction = option.get("bias") or decision.get("decision") or ""
     if direction not in {"BULLISH", "BEARISH"}:
         direction = ""
     return {
-        "score": weighted.get("score"),
+        "score": entry_score.get("score", weighted.get("score")),
+        "score_version": entry_score.get("score_version", weighted.get("score_version", "")),
         "direction": direction,
         "chain_direction": option.get("chain_bias") or option.get("bias") or "",
         "chain_confidence": option.get("chain_confidence") or option.get("confidence") or "",
@@ -417,6 +430,7 @@ def evaluate_followthrough(scan, candles, horizon_minutes=15):
         "signal_time": signal_iso,
         "symbol": symbol,
         "score": round(float(scan["score"]), 2),
+        "score_version": scan.get("score_version", ""),
         "score_bucket": score_bucket(scan["score"]),
         "action": scan.get("action", ""),
         "direction": direction,

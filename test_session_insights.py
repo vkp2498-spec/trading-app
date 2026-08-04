@@ -4,6 +4,7 @@ from session_insights import blocker_category, build_session_insights, parse_log
 
 
 def test_blocker_categories_are_stable():
+    assert blocker_category("unified entry score 48 does not qualify") == "UNIFIED_SCORE_LOW"
     assert blocker_category("weighted score too low before LLM") == "WEIGHTED_SCORE_LOW"
     assert blocker_category("Technical reward/risk 0.37 is below required 1.00") == "TECHNICAL_RR_LOW"
     assert blocker_category("same-direction re-entry blocked after STOP_LOSS") == "LOSS_REENTRY_GUARD"

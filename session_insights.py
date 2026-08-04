@@ -67,6 +67,7 @@ def blocker_category(reason):
     rules = [
         ("DAILY_OUTCOME_GUARD", ("daily first-outcome guard", "stop after first")),
         ("LOSS_REENTRY_GUARD", ("same-direction re-entry", "re-entry cooldown", "signal reset")),
+        ("UNIFIED_SCORE_LOW", ("unified entry score", "unified score")),
         ("WEIGHTED_SCORE_LOW", ("weighted score", "score below symbol minimum", "score too low")),
         ("TECHNICAL_RR_LOW", ("reward/risk", "technical rr")),
         ("SIGNAL_NOT_HIGH", ("not directional high", "signal is not directional")),

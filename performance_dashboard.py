@@ -49,6 +49,7 @@ from trade_forensics import (
     read_rejected_signals as read_forensic_rejected_signals,
     read_trades as read_forensic_trades,
 )
+from unified_entry_score import COMPONENT_WEIGHTS, UNIFIED_SCORE_VERSION
 from session_insights import build_session_insights, read_analysis_rows, read_log_lines
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -733,17 +734,37 @@ def render_score_followthrough_review():
     st.markdown("### Score Follow-Through")
     st.caption(
         "One non-overlapping observation per index every 15 minutes. Movement is measured "
-        "from the scan minute through the following 15 minutes; it is research evidence, "
-        "not an automatic reason to loosen live gates."
+        "from the scan minute through the following 15 minutes. Only the versioned unified "
+        "signal-and-gate entry score is used for new research and calibration."
+    )
+    st.caption(
+        "Unified weights: "
+        + " | ".join(
+            f"{name.replace('_', ' ').title()} {weight:.0f}%"
+            for name, weight in COMPONENT_WEIGHTS.items()
+        )
     )
 
     adaptive_config = read_backtest_json(ADAPTIVE_CONFIG_FILE, {})
+    if adaptive_config and adaptive_config.get("score_version") != UNIFIED_SCORE_VERSION:
+        st.warning(
+            "The saved adaptive rule belongs to the retired score model. The live engine "
+            "will ignore it and use the unified-score fallback until new evidence builds."
+        )
+        adaptive_config = {}
     if adaptive_config:
         st.markdown("#### Today's Vamsi Adaptive Score Rule")
         effective_date = str(adaptive_config.get("effective_date") or "")
         rule_columns = st.columns(2)
         for column, symbol in zip(rule_columns, SYMBOLS):
             rule = (adaptive_config.get("symbols") or {}).get(symbol, {})
+            exit_levels = rule.get("exit_levels") or {}
+            exit_text = (
+                f"target/stop {float(exit_levels.get('target_points')):.1f}/"
+                f"{float(exit_levels.get('stop_points')):.1f} pts"
+                if exit_levels.get("target_points") and exit_levels.get("stop_points")
+                else "target/stop from .env"
+            )
             if rule.get("status") == "ADAPTIVE":
                 if rule.get("mode") == "RANGE":
                     score_text = (
@@ -754,11 +775,15 @@ def render_score_followthrough_review():
                     score_text = f"{float(rule.get('min_score')):.0f}+"
                 detail = (
                     f"Adaptive | {int(rule.get('samples') or 0)} samples | "
-                    f"success {float(rule.get('success_rate') or 0) * 100:.1f}%"
+                    f"success {float(rule.get('success_rate') or 0) * 100:.1f}% | "
+                    f"{exit_text}"
                 )
             else:
-                score_text = f"{float(rule.get('min_score') or 20):.0f}+"
-                detail = "Static fallback | " + str(rule.get("reason") or "insufficient history")
+                score_text = f"{float(rule.get('min_score') or 55):.0f}+"
+                detail = (
+                    f"Static fallback | {exit_text} | "
+                    + str(rule.get("reason") or "insufficient history")
+                )
             column.metric(f"{symbol} score", score_text, detail)
         st.caption(
             f"Effective date: {effective_date or 'unknown'} | Generated: "
@@ -768,15 +793,20 @@ def render_score_followthrough_review():
         if effective_date != now_ist().date().isoformat():
             st.warning(
                 "The saved adaptive score rule is not for today. The live engine will ignore "
-                "it and use VAMSI_MIN_WEIGHTED_SCORE until today's calibration runs."
+                "it and use VAMSI_UNIFIED_SCORE_FALLBACK until today's calibration runs."
             )
 
     audit = read_score_audit()
     status = read_backtest_json(SCORE_AUDIT_STATUS_FILE, {})
+    if not audit.empty:
+        if "score_version" not in audit.columns:
+            audit = audit.iloc[0:0]
+        else:
+            audit = audit[audit["score_version"] == UNIFIED_SCORE_VERSION].copy()
     if audit.empty:
         st.info(
-            "No evening score audit is available yet. The first completed trading-day run "
-            "will create it automatically."
+            "No unified-score evening audit is available yet. Legacy score rows are kept "
+            "for history but are excluded from the new pre-market calibration."
         )
         if status:
             st.caption(f"Last audit: {status.get('status', 'UNKNOWN')} | {status.get('message', '')}")
@@ -893,6 +923,7 @@ def render_score_followthrough_review():
             "signal_time",
             "symbol",
             "score",
+            "score_version",
             "score_bucket",
             "action",
             "direction",

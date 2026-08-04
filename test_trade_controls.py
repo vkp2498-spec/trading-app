@@ -57,33 +57,26 @@ from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
-    def test_vamsi_score_must_be_strictly_above_twenty_without_upper_cutoff(self):
+    def test_vamsi_unified_fallback_is_strictly_above_fifty_five(self):
         with patch.dict(
             os.environ,
             {
-                "VAMSI_MIN_WEIGHTED_SCORE": "20",
+                "VAMSI_UNIFIED_SCORE_FALLBACK": "55",
                 "INDEX_DIRECT_ENTRY_MIN_SCORE": "75",
-                "RANGE_REGIME_MIN_SCORE": "85",
             },
             clear=False,
         ):
-            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 20)
-            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(20, "NIFTY"))
-            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(20.1, "NIFTY"))
+            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 55)
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(55, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(55.1, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(75, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(100, "NIFTY"))
-            self.assertEqual(
-                trade_bot.vamsi_score_only_minimum(
-                    "RANGE_REGIME_MIN_SCORE", 85, "NIFTY"
-                ),
-                20,
-            )
 
     def test_vamsi_score_threshold_cannot_exceed_one_hundred(self):
         with patch.dict(
             os.environ,
-            {"VAMSI_MIN_WEIGHTED_SCORE": "101"},
+            {"VAMSI_UNIFIED_SCORE_FALLBACK": "101"},
             clear=False,
         ):
             with self.assertRaisesRegex(RuntimeError, "at most 100"):
@@ -101,7 +94,7 @@ class TradeControlTests(unittest.TestCase):
                 os.environ,
                 {
                     "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
-                    "VAMSI_MIN_WEIGHTED_SCORE": "20",
+                    "VAMSI_UNIFIED_SCORE_FALLBACK": "55",
                 },
                 clear=False,
             ),
@@ -123,7 +116,7 @@ class TradeControlTests(unittest.TestCase):
                 os.environ,
                 {
                     "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
-                    "VAMSI_MIN_WEIGHTED_SCORE": "20",
+                    "VAMSI_UNIFIED_SCORE_FALLBACK": "55",
                 },
                 clear=False,
             ),
@@ -133,8 +126,8 @@ class TradeControlTests(unittest.TestCase):
                 return_value=None,
             ),
         ):
-            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(20, "NIFTY"))
-            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(20.1, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_weighted_score_qualifies(55, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(55.1, "NIFTY"))
 
     def test_vamsi_entry_window_includes_1525_only(self):
         with patch.dict(
@@ -552,7 +545,7 @@ class TradeControlTests(unittest.TestCase):
                     {
                         "INDEX_WATCH_MODE_ENABLED": "true",
                         "INDEX_WATCH_MODE_SHADOW_ONLY": "false",
-                        "VAMSI_MIN_WEIGHTED_SCORE": "20",
+                        "VAMSI_UNIFIED_SCORE_FALLBACK": "55",
                     },
                     clear=False,
                 ),
@@ -562,7 +555,7 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertTrue(confirmed["allowed"])
         self.assertTrue(confirmed["watch_confirmed"])
-        self.assertEqual(confirmed["entry_minimum_score"], 20)
+        self.assertEqual(confirmed["entry_minimum_score"], 55)
         self.assertTrue(confirmed["score_cutoff_approved"])
 
     def test_timing_watch_confirms_on_next_completed_five_minute_candle(self):
@@ -1338,6 +1331,36 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(levels["target_points"], 30)
         self.assertEqual(levels["stop_points"], 30)
 
+    def test_adaptive_history_sets_target_and_stop_when_rule_is_current(self):
+        rule = {
+            "status": "ADAPTIVE",
+            "mode": "MIN",
+            "min_score": 55,
+            "max_score": None,
+            "exit_levels": {
+                "source": "ADAPTIVE_HISTORY_AVERAGE",
+                "target_points": 24.5,
+                "stop_points": 18.0,
+            },
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
+                    "NIFTY_TARGET_POINTS": "30",
+                    "NIFTY_STOP_POINTS": "30",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "read_effective_score_rule", return_value=rule),
+        ):
+            settings = trade_bot.score_based_exit_settings("NIFTY", 95)
+
+        self.assertEqual(settings["target_points"], 24.5)
+        self.assertEqual(settings["stop_points"], 18.0)
+        self.assertEqual(settings["profile"], "ADAPTIVE_HISTORY")
+
     def test_active_selective_position_blocks_new_index_scan(self):
         def state_for(symbol):
             if symbol == "NIFTY":
@@ -1476,7 +1499,7 @@ class TradeControlTests(unittest.TestCase):
     def test_score_58_does_not_bypass_reward_risk_rejection(self):
         with patch.dict(
             os.environ,
-            {"VAMSI_MIN_WEIGHTED_SCORE": "20"},
+            {"VAMSI_UNIFIED_SCORE_FALLBACK": "55"},
             clear=False,
         ):
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))

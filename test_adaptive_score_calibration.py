@@ -12,6 +12,7 @@ from adaptive_score_calibration import (
     calibrate_symbol,
     read_effective_score_rule,
 )
+from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -28,6 +29,7 @@ def history_rows(symbol, score_outcomes, days=10, start=date(2026, 7, 1)):
                     "trading_date": trading_date.isoformat(),
                     "symbol": symbol,
                     "score": score,
+                    "score_version": UNIFIED_SCORE_VERSION,
                     "direction_correct": success,
                     "favorable_points": 30 if success else 4,
                     "adverse_points": 5 if success else 25,
@@ -56,6 +58,9 @@ class AdaptiveScoreCalibrationTests(unittest.TestCase):
         self.assertEqual(rule["mode"], "MIN")
         self.assertEqual(rule["min_score"], 35)
         self.assertIsNone(rule["max_score"])
+        self.assertEqual(rule["exit_levels"]["source"], "ADAPTIVE_HISTORY_AVERAGE")
+        self.assertEqual(rule["exit_levels"]["target_points"], 30)
+        self.assertEqual(rule["exit_levels"]["stop_points"], 10)
 
     def test_selects_range_when_high_scores_perform_materially_worse(self):
         frame = pd.DataFrame(
@@ -91,6 +96,23 @@ class AdaptiveScoreCalibrationTests(unittest.TestCase):
         self.assertEqual(rule["status"], "FALLBACK_INSUFFICIENT_HISTORY")
         self.assertEqual(rule["min_score"], 20)
 
+    def test_legacy_score_history_is_not_mixed_into_unified_calibration(self):
+        rows = history_rows("NIFTY", [(35, True), (45, True)], days=10)
+        for row in rows:
+            row["score_version"] = "2026-07-safety-1"
+        rule = calibrate_symbol(
+            pd.DataFrame(rows),
+            "NIFTY",
+            date(2026, 8, 1),
+            fallback_minimum=55,
+            minimum_samples=10,
+            minimum_trading_days=5,
+        )
+
+        self.assertEqual(rule["status"], "FALLBACK_INSUFFICIENT_HISTORY")
+        self.assertEqual(rule["samples"], 0)
+        self.assertEqual(rule["min_score"], 55)
+
     def test_current_day_is_not_used_for_calibration(self):
         effective_date = date(2026, 8, 1)
         rows = history_rows("NIFTY", [(35, True)], days=5)
@@ -100,6 +122,7 @@ class AdaptiveScoreCalibrationTests(unittest.TestCase):
                 "trading_date": effective_date.isoformat(),
                 "symbol": "NIFTY",
                 "score": 35,
+                "score_version": UNIFIED_SCORE_VERSION,
                 "direction_correct": False,
                 "favorable_points": 0,
                 "adverse_points": 30,
@@ -137,6 +160,26 @@ class AdaptiveScoreCalibrationTests(unittest.TestCase):
 
         self.assertEqual(current["status"], "ADAPTIVE")
         self.assertIsNone(stale)
+
+    def test_runtime_ignores_legacy_score_version(self):
+        frame = pd.DataFrame(
+            history_rows("NIFTY", [(35, True), (45, True)], days=10)
+            + history_rows("BANKNIFTY", [(40, True), (55, True)], days=10)
+        )
+        config = build_daily_config(
+            frame,
+            date(2026, 8, 3),
+            minimum_samples=10,
+            minimum_trading_days=5,
+            generated_at=datetime(2026, 8, 3, 9, 0, tzinfo=IST),
+        )
+        config["score_version"] = "LEGACY_WEIGHTED_SCORE"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "adaptive.json"
+            path.write_text(json.dumps(config))
+            current = read_effective_score_rule("NIFTY", date(2026, 8, 3), path)
+
+        self.assertIsNone(current)
 
 
 if __name__ == "__main__":

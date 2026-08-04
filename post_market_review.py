@@ -129,8 +129,8 @@ def suggest_loss_improvement(trade, analysis, loss_info):
         suggestions.append("Avoid entry when ATM option flow is weak or below VWAP.")
 
     score = float(analysis.get("weighted_score") or 0)
-    if score < 70 and trade.get("symbol") == "NIFTY":
-        suggestions.append("For NIFTY, require weighted score >= 70.")
+    if score < 55 and trade.get("symbol") == "NIFTY":
+        suggestions.append("The unified entry score was below the current 55 fallback.")
 
     exit_reason = str(trade.get("exit_reason", ""))
     if exit_reason == "STOP_LOSS":
@@ -313,7 +313,11 @@ def classify_blocker(raw):
     technicals = raw.get("technicals", {}) or {}
     llm_decision = raw.get("llm_decision", {}) or {}
 
-    weighted = option_summary.get("weighted_alignment", {}) or {}
+    weighted = (
+        option_summary.get("unified_entry_score")
+        or option_summary.get("weighted_alignment")
+        or {}
+    )
     atm_flow = technicals.get("atm_option_flow", {}) or {}
     two = technicals.get("two_hour", {}) or technicals.get("four_hour", {}) or {}
     fifteen = technicals.get("fifteen_min", {}) or {}
@@ -325,7 +329,11 @@ def classify_blocker(raw):
     blockers = []
 
     if weighted.get("grade") == "SKIP":
-        blockers.append("WEIGHTED_SCORE_LOW")
+        blockers.append(
+            "UNIFIED_SCORE_LOW"
+            if option_summary.get("unified_entry_score")
+            else "WEIGHTED_SCORE_LOW"
+        )
 
     if two.get("bias") in {"BULLISH", "BEARISH"} and direction in {"BULLISH", "BEARISH"}:
         if two.get("bias") != direction:
@@ -382,7 +390,11 @@ def build_review(date_text):
         entry_price = option_summary.get("entry_price")
         target_price = option_summary.get("target_price")
         stop_loss_price = option_summary.get("stop_loss_price")
-        weighted = option_summary.get("weighted_alignment", {}) or {}
+        weighted = (
+            option_summary.get("unified_entry_score")
+            or option_summary.get("weighted_alignment")
+            or {}
+        )
         atm_flow = technicals.get("atm_option_flow", {}) or {}
         institutional = technicals.get("institutional_flow", {}) or {}
 
@@ -438,6 +450,7 @@ def build_review(date_text):
                 "stop_loss_price": stop_loss_price,
                 "weighted_score": weighted.get("score"),
                 "weighted_grade": weighted.get("grade"),
+                "score_version": weighted.get("score_version") or "LEGACY_WEIGHTED_SCORE",
                 "two_hour_bias": row.get("two_hour_bias") or row.get("four_hour_bias"),
                 "two_hour_confidence": row.get("two_hour_confidence") or row.get("four_hour_confidence"),
                 "fifteen_min_bias": row.get("fifteen_min_bias"),
@@ -483,8 +496,8 @@ def replay_reason_category(reason, decision=None):
         return "DAILY_LIMIT"
     if decision_text == "ERROR":
         return "DATA_ERROR"
-    if "weighted score rejected" in reason_text or "below nifty minimum" in reason_text or "below banknifty minimum" in reason_text:
-        return "WEIGHTED_SCORE_LOW"
+    if "unified entry score" in reason_text or "weighted score rejected" in reason_text or "below nifty minimum" in reason_text or "below banknifty minimum" in reason_text:
+        return "UNIFIED_SCORE_LOW"
     if "minimum reward/risk" in reason_text or "reward/risk" in reason_text:
         return "TECHNICAL_RR_TOO_LOW"
     if (
@@ -610,7 +623,7 @@ def build_decision_funnel(review_df, decisions_df):
         passed_feasibility = 0
         simulated_trades = 0
     else:
-        initial_blocks = {"NOT_DIRECTIONAL", "OPTION_SIGNAL_WEAK", "WEIGHTED_SCORE_LOW"}
+        initial_blocks = {"NOT_DIRECTIONAL", "OPTION_SIGNAL_WEAK", "UNIFIED_SCORE_LOW", "WEIGHTED_SCORE_LOW"}
         feasibility_blocks = {
             "TECHNICAL_RR_TOO_LOW",
             "ENTRY_TOO_EXTENDED",
@@ -628,8 +641,8 @@ def build_decision_funnel(review_df, decisions_df):
         [
             {"stage": "Analysis checks", "count": total_checks},
             {"stage": "Strong directional signals", "count": strong_signals},
-            {"stage": "Passed weighted score", "count": passed_weighted},
-            {"stage": "Passed entry feasibility", "count": passed_feasibility},
+            {"stage": "Passed unified score", "count": passed_weighted},
+            {"stage": "Passed hard execution checks", "count": passed_feasibility},
             {"stage": "Revised replay trades", "count": simulated_trades},
         ]
     )
