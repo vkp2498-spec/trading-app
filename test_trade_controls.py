@@ -139,9 +139,24 @@ class TradeControlTests(unittest.TestCase):
     def test_vamsi_entry_window_includes_1525_only(self):
         with patch.dict(
             os.environ,
-            {"VAMSI_LAST_ENTRY_TIME": "15:25"},
+            {
+                "VAMSI_FIRST_ENTRY_TIME": "09:15",
+                "VAMSI_LAST_ENTRY_TIME": "15:25",
+            },
             clear=False,
         ):
+            with patch.object(
+                trade_bot,
+                "now_ist",
+                return_value=datetime(2026, 8, 3, 9, 14, 59),
+            ):
+                self.assertFalse(trade_bot.market_window_ok())
+            with patch.object(
+                trade_bot,
+                "now_ist",
+                return_value=datetime(2026, 8, 3, 9, 15, 0),
+            ):
+                self.assertTrue(trade_bot.market_window_ok())
             with patch.object(
                 trade_bot,
                 "now_ist",

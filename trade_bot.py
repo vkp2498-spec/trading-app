@@ -2840,7 +2840,7 @@ def ganesh_gap_option_levels(entry_price, quantity, target_distance):
 
 def market_window_ok():
     now = now_ist().time()
-    return time(9, 20) <= now <= configured_clock(
+    return configured_clock("VAMSI_FIRST_ENTRY_TIME", "09:15") <= now <= configured_clock(
         "VAMSI_LAST_ENTRY_TIME",
         "15:25",
     )

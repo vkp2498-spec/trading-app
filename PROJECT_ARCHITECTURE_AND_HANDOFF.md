@@ -412,8 +412,8 @@ The established schedule is:
 
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
 - Vamsi adaptive score calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
-- Entry checks: every 5 minutes beginning at 09:20 IST. The bot's internal market window prevents late entries.
-- Position monitor: launch at/around 09:20 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
+- Vamsi entry checks: every 5 minutes beginning at 09:15 IST. Ganesh retains its internal 09:30 strategy start. The bot's internal market window prevents late entries.
+- Position monitor: launch just before 09:15 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
 - Last Vamsi and Ganesh entry scan: 15:25 IST.
 - Forced square-off: 15:29 IST, `59 9 * * 1-5` in UTC cron.
 - Mobile profile default reset: around 15:30 IST when configured.
@@ -422,12 +422,12 @@ The established schedule is:
 An example cron layout is:
 
 ```cron
-# Entry checks: 09:20 IST onward, every five minutes.
-50,55 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_entry_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
+# Vamsi entry checks: 09:15 IST onward, every five minutes.
+45,50,55 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_entry_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 */5 4-9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_entry_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 
-# Start/preserve the long-running position monitor. flock prevents duplicates.
-50-59 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_monitor_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --monitor >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
+# Start the monitor at 09:14 IST so it is healthy before the 09:15 entry scan.
+44-59 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_monitor_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --monitor >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 * 4-9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_monitor_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --monitor >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 
 # Square off at 15:29 IST.
