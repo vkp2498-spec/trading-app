@@ -48,8 +48,11 @@ from ganesh_gap_reversal import (
     bollinger_bands,
     candle_colour,
     classic_pivots,
+    continuation_for_gap,
     nearest_target,
+    nearest_continuation_target,
     opening_gap,
+    score_gap_continuation,
     target_reached,
     transition_for_gap,
 )
@@ -700,6 +703,78 @@ def ganesh_gap_live_enabled():
     )
 
 
+def is_ganesh_gap_strategy(value):
+    strategy = value.get("strategy") if isinstance(value, dict) else value
+    return str(strategy or "").strip().upper() in {
+        "GANESH_GAP_REVERSAL",
+        "GANESH_GAP_CONTINUATION",
+    }
+
+
+def ganesh_gap_continuation_enabled():
+    return configured_bool("GANESH_CONTINUATION_ENABLED", True)
+
+
+def ganesh_gap_breadth(symbol):
+    try:
+        ensure_instruments_file()
+        if symbol == "BANKNIFTY":
+            return get_banknifty_breadth(INSTRUMENT_CACHE, upstox_request)
+        return get_nifty_breadth(INSTRUMENT_CACHE, upstox_request)
+    except Exception as error:
+        return {
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "score": 0.0,
+            "reasons": [f"{symbol} breadth unavailable: {error}"],
+        }
+
+
+def ganesh_gap_continuation_evidence(snapshot, option):
+    symbol = str(snapshot.get("symbol") or "NIFTY").upper()
+    analysis = option.get("near_expiry_analysis") or {}
+    recommendation = option.get("recommendation") or {}
+    flow = analysis.get("option_flow") or {}
+    breadth = ganesh_gap_breadth(symbol)
+    try:
+        institutional = get_institutional_footprint(symbol, recommendation, flow)
+    except Exception as error:
+        institutional = neutral_institutional_footprint(
+            f"institutional footprint unavailable: {error}"
+        )
+    chain = {
+        "direction": analysis.get("chain_bias") or recommendation.get("direction"),
+        "confidence": analysis.get("chain_confidence") or recommendation.get("confidence"),
+        "score": analysis.get("chain_score", recommendation.get("score")),
+    }
+    evaluation = score_gap_continuation(
+        snapshot,
+        breadth,
+        chain,
+        flow,
+        institutional,
+        minimum_score=configured_positive_float("GANESH_CONTINUATION_MIN_SCORE", 75.0),
+        minimum_volume_ratio=configured_positive_float(
+            "GANESH_CONTINUATION_MIN_OPTION_VOLUME_RATIO", 1.20
+        ),
+        maximum_extension_range=configured_non_negative_float(
+            "GANESH_CONTINUATION_MAX_EXTENSION_RANGE", 0.75
+        ),
+        retest_tolerance_range=configured_non_negative_float(
+            "GANESH_CONTINUATION_RETEST_TOLERANCE_RANGE", 0.10
+        ),
+    )
+    evaluation.update(
+        {
+            "breadth": breadth,
+            "institutional": institutional,
+            "chain": chain,
+            "option_flow": flow,
+        }
+    )
+    return evaluation
+
+
 def _frame_in_ist(frame):
     if frame is None or frame.empty:
         return pd.DataFrame()
@@ -727,6 +802,21 @@ def _ganesh_candle_age_seconds(candle_start, current_time, interval_minutes=1):
     """Measure candle freshness from interval end; Upstox stamps interval start."""
     candle_end = pd.Timestamp(candle_start) + pd.Timedelta(minutes=interval_minutes)
     return max((pd.Timestamp(current_time) - candle_end).total_seconds(), 0.0)
+
+
+def _ganesh_ohlc_summary(frame, start, end):
+    rows = frame[(frame.index >= start) & (frame.index < end)]
+    if rows.empty:
+        return {"complete": False}
+    return {
+        "complete": True,
+        "start": pd.Timestamp(start).isoformat(),
+        "end": pd.Timestamp(end).isoformat(),
+        "open": round(float(rows.iloc[0]["open"]), 2),
+        "high": round(float(rows["high"].max()), 2),
+        "low": round(float(rows["low"].min()), 2),
+        "close": round(float(rows.iloc[-1]["close"]), 2),
+    }
 
 
 def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
@@ -817,6 +907,21 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
         spot,
         configured_non_negative_float("GANESH_COLOUR_NEUTRAL_BUFFER_POINTS", 0.0),
     )
+    session_open = pd.Timestamp(current_time.replace(hour=9, minute=15, second=0, microsecond=0))
+    opening_minutes = max(to_int(os.getenv("GANESH_OPENING_RANGE_MINUTES"), 15), 5)
+    opening_end = session_open + pd.Timedelta(minutes=opening_minutes)
+    opening_range = (
+        _ganesh_ohlc_summary(today_rows, session_open, opening_end)
+        if pd.Timestamp(current_time) >= opening_end
+        else {"complete": False}
+    )
+    completed_five_end = pd.Timestamp(current_time).floor("5min")
+    completed_five_start = completed_five_end - pd.Timedelta(minutes=5)
+    latest_completed_five = (
+        _ganesh_ohlc_summary(today_rows, completed_five_start, completed_five_end)
+        if completed_five_end > session_open
+        else {"complete": False}
+    )
     return {
         "symbol": symbol,
         "underlying_instrument_key": instrument_key,
@@ -840,6 +945,8 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
         "volume_average_20": round(average_volume, 2),
         "volume_ratio": round(volume_ratio, 3),
         "volume_confirmed": average_volume > 0 and active_volume > average_volume,
+        "opening_range": opening_range,
+        "latest_completed_5m": latest_completed_five,
     }
 
 
@@ -2740,16 +2847,12 @@ def index_contract_rows(recommendation, direction):
 
 
 def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
-    """Select a liquid ATM option with NIFTY's split-expiry evidence model."""
+    """Analyze the front expiry and select a liquid next-expiry ATM option."""
     symbol = str(symbol or snapshot.get("symbol") or "NIFTY").strip().upper()
-    recommendation = {}
-    if symbol == "NIFTY":
-        recommendation = get_index_recommendation(symbol)
-        chain = pd.DataFrame(recommendation.get("execution_chain") or [])
-        if chain.empty:
-            raise RuntimeError("Next-expiry NIFTY execution chain is unavailable")
-    else:
-        _, _, chain = fetch_upstox_option_chain(symbol, nearby=5)
+    recommendation = get_index_recommendation(symbol)
+    chain = pd.DataFrame(recommendation.get("execution_chain") or [])
+    if chain.empty:
+        raise RuntimeError(f"Next-expiry {symbol} execution chain is unavailable")
     interval_name = f"GANESH_{symbol}_STRIKE_INTERVAL"
     default_interval = 50 if symbol == "NIFTY" else 100
     strike = atm_strike(
@@ -2795,31 +2898,37 @@ def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
         UNDERLYING_INDEX_KEYS["BANKNIFTY"],
         instrument.get("instrument_key"),
     ]
-    if symbol == "NIFTY":
-        analysis_row = dict(recommendation.get("analysis_atm") or {})
-        analysis_instrument = find_index_option_instrument(
-            symbol,
-            analysis_row.get("expiry"),
-            analysis_row.get("strike"),
-            option_type,
-        )
+    analysis_row = dict(recommendation.get("analysis_atm") or {})
+    analysis_instrument = find_index_option_instrument(
+        symbol,
+        analysis_row.get("expiry"),
+        analysis_row.get("strike"),
+        option_type,
+    )
+    try:
         analysis_flow = get_option_volume_vwap_analysis(
             analysis_instrument["instrument_key"],
             side_label=analysis_instrument["trading_symbol"],
         )
-        stream_instruments.append(analysis_instrument.get("instrument_key"))
-        near_expiry_analysis = {
-            "expiry": recommendation.get("analysis_expiry"),
-            "strike": analysis_row.get("strike"),
-            "option_type": option_type,
-            "instrument_key": analysis_instrument.get("instrument_key"),
-            "trading_symbol": analysis_instrument.get("trading_symbol"),
-            "chain_bias": recommendation.get("direction"),
-            "chain_confidence": recommendation.get("confidence"),
-            "chain_score": recommendation.get("score"),
-            "chain_reasons": recommendation.get("reasons", []),
-            "option_flow": analysis_flow,
+    except Exception as error:
+        analysis_flow = {
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "reasons": [f"near-expiry ATM option flow unavailable: {error}"],
         }
+    stream_instruments.append(analysis_instrument.get("instrument_key"))
+    near_expiry_analysis = {
+        "expiry": recommendation.get("analysis_expiry"),
+        "strike": analysis_row.get("strike"),
+        "option_type": option_type,
+        "instrument_key": analysis_instrument.get("instrument_key"),
+        "trading_symbol": analysis_instrument.get("trading_symbol"),
+        "chain_bias": recommendation.get("direction"),
+        "chain_confidence": recommendation.get("confidence"),
+        "chain_score": recommendation.get("score"),
+        "chain_reasons": recommendation.get("reasons", []),
+        "option_flow": analysis_flow,
+    }
     write_stream_instruments(
         stream_instruments
     )
@@ -2836,6 +2945,7 @@ def ganesh_gap_option_candidate(snapshot, transition, symbol=None):
         "instrument": instrument,
         "quality": quality,
         "near_expiry_analysis": near_expiry_analysis,
+        "recommendation": recommendation,
     }
 
 
@@ -2938,8 +3048,7 @@ def save_open_position_state(
             precision = (
                 2
                 if instrument_class == "STOCK_FUTURE"
-                or str((trade_metadata or {}).get("strategy") or "").upper()
-                == "GANESH_GAP_REVERSAL"
+                or is_ganesh_gap_strategy((trade_metadata or {}).get("strategy"))
                 else 0
             )
             target_price = round(float(target_price), precision)
@@ -3402,6 +3511,48 @@ def submit_ganesh_gap_exit(state, option_ltp, exit_reason, quantity, state_slot=
     return True
 
 
+def ganesh_continuation_structure_exit(state, current_time):
+    if str(state.get("strategy_lane") or "").upper() != "CONTINUATION":
+        return None
+    completed_bucket = pd.Timestamp(current_time).floor("5min")
+    bucket_key = completed_bucket.isoformat()
+    if state.get("continuation_last_structure_bucket") == bucket_key:
+        return None
+    underlying_key = state.get("underlying_instrument_key")
+    try:
+        frame = _frame_in_ist(fetch_v3_intraday_minutes(underlying_key, minutes=5))
+        rows = frame[
+            (frame.index.date == current_time.date())
+            & (frame.index < completed_bucket)
+        ]
+        if rows.empty:
+            return None
+        candle_start = pd.Timestamp(rows.index[-1])
+        state["continuation_last_structure_bucket"] = bucket_key
+        state["continuation_last_completed_5m_start"] = candle_start.isoformat()
+        state["continuation_last_completed_5m_close"] = round(
+            float(rows.iloc[-1]["close"]), 2
+        )
+        entry_start = state.get("continuation_entry_5m_start")
+        if entry_start and candle_start <= pd.Timestamp(entry_start):
+            return None
+        close = float(rows.iloc[-1]["close"])
+        buffer_points = configured_non_negative_float(
+            "GANESH_CONTINUATION_INVALIDATION_BUFFER_POINTS", 0.0
+        )
+        direction = str(state.get("direction") or "").upper()
+        if direction == GANESH_BULLISH:
+            boundary = to_float(state.get("continuation_opening_range_high"), 0)
+            invalidated = boundary > 0 and close < boundary - buffer_points
+        else:
+            boundary = to_float(state.get("continuation_opening_range_low"), 0)
+            invalidated = boundary > 0 and close > boundary + buffer_points
+        return "CONTINUATION_5M_INVALIDATION" if invalidated else None
+    except Exception as error:
+        log(f"GANESH GAP continuation 5M check unavailable: {error}")
+        return None
+
+
 def handle_ganesh_gap_position(state, verbose=True, state_slot=None):
     state_slot = state_slot or ganesh_gap_state_slot(state)
     symbol = str(state.get("underlying_symbol") or state.get("symbol") or "NIFTY").upper()
@@ -3513,7 +3664,9 @@ def handle_ganesh_gap_position(state, verbose=True, state_slot=None):
             state.get("direction"), spot, ganesh_gap_state_target(state, "level")
         ):
             exit_reason = "UNDERLYING_TARGET"
-        elif opposite_confirmed:
+        elif is_ganesh_gap_strategy(state):
+            exit_reason = ganesh_continuation_structure_exit(state, current_time)
+        if not exit_reason and opposite_confirmed:
             exit_reason = "CONFIRMED_OPPOSITE_2H_COLOUR"
 
     write_state(state_slot, state)
@@ -3541,7 +3694,7 @@ def handle_ganesh_gap_position(state, verbose=True, state_slot=None):
 
 
 def handle_existing_state(symbol, state, verbose=True):
-    if str(state.get("strategy") or "").upper() == "GANESH_GAP_REVERSAL":
+    if is_ganesh_gap_strategy(state):
         return handle_ganesh_gap_position(state, verbose=verbose, state_slot=symbol)
     instrument_key = state.get("instrument_key")
     if not instrument_key:
@@ -4224,7 +4377,7 @@ def run_squareoff():
         if state.get("paper_trade"):
             quote = read_market_cache(state["instrument_key"]) or {}
             ltp = to_float(quote.get("ltp"), to_float(state.get("entry_price")))
-            if str(state.get("strategy") or "").upper() == "GANESH_GAP_REVERSAL":
+            if is_ganesh_gap_strategy(state):
                 close_ganesh_gap_paper_position(
                     state, ltp, "SQUAREOFF", state_slot=symbol
                 )
@@ -5607,7 +5760,7 @@ def finalize_ganesh_gap_position(
         "symbol": symbol,
         "underlying_symbol": symbol,
         "state_slot": state_slot,
-        "strategy": "GANESH_GAP_REVERSAL",
+        "strategy": initial_state.get("strategy") or "GANESH_GAP_REVERSAL",
         "underlying_instrument_key": UNDERLYING_INDEX_KEYS[symbol],
         "profit_protection_enabled_for_trade": False,
     }
@@ -5721,15 +5874,35 @@ def execute_ganesh_gap_entry(state, snapshot, option, target, symbol=None):
     if quantity <= 0:
         return False, "configured lots or available funds cannot buy one complete lot"
     levels = ganesh_gap_option_levels(expected_entry, quantity, target["distance"])
+    lane = str(state.get("strategy_lane") or "REVERSAL").upper()
+    transition = (
+        continuation_for_gap(state["gap_direction"])
+        if lane == "CONTINUATION"
+        else transition_for_gap(state["gap_direction"])
+    )
+    if not transition:
+        return False, "gap direction has no executable transition"
+    strategy_name = (
+        "GANESH_GAP_CONTINUATION" if lane == "CONTINUATION" else "GANESH_GAP_REVERSAL"
+    )
+    entry_score = (
+        to_float(state.get("continuation_score"), 75.0)
+        if lane == "CONTINUATION"
+        else 100.0
+    )
     candidate = {
         "symbol": symbol,
         "underlying_symbol": symbol,
-        "direction": transition_for_gap(state["gap_direction"])["direction"],
+        "direction": transition["direction"],
         "transaction_type": "BUY",
         "instrument": instrument,
-        "entry_minimum_score": 0,
+        "entry_minimum_score": (
+            configured_positive_float("GANESH_CONTINUATION_MIN_SCORE", 75.0)
+            if lane == "CONTINUATION"
+            else 0
+        ),
         "score_cutoff_approved": True,
-        "weighted": {"score": 100},
+        "weighted": {"score": entry_score},
     }
     live = ganesh_gap_live_enabled()
     with portfolio_entry_lock():
@@ -5747,7 +5920,8 @@ def execute_ganesh_gap_entry(state, snapshot, option, target, symbol=None):
             "symbol": symbol,
             "underlying_symbol": symbol,
             "state_slot": state_slot,
-            "strategy": "GANESH_GAP_REVERSAL",
+            "strategy": strategy_name,
+            "strategy_lane": lane,
             "underlying_instrument_key": UNDERLYING_INDEX_KEYS[symbol],
             "direction": candidate["direction"],
             "option_type": option["option_type"],
@@ -5768,7 +5942,24 @@ def execute_ganesh_gap_entry(state, snapshot, option, target, symbol=None):
             "entry_candle_start": snapshot["candle_start"],
             "entry_candle_open": snapshot["candle_open"],
             "entry_transition": (
-                "RED_TO_GREEN" if candidate["direction"] == GANESH_BULLISH else "GREEN_TO_RED"
+                f"{state.get('gap_direction')}_ACCEPTANCE"
+                if lane == "CONTINUATION"
+                else (
+                    "RED_TO_GREEN"
+                    if candidate["direction"] == GANESH_BULLISH
+                    else "GREEN_TO_RED"
+                )
+            ),
+            "continuation_score": state.get("continuation_score"),
+            "continuation_reasons": state.get("continuation_reasons", []),
+            "continuation_opening_range_high": (
+                (snapshot.get("opening_range") or {}).get("high")
+            ),
+            "continuation_opening_range_low": (
+                (snapshot.get("opening_range") or {}).get("low")
+            ),
+            "continuation_entry_5m_start": (
+                (snapshot.get("latest_completed_5m") or {}).get("start")
             ),
             "entry_volume_confirmed": snapshot.get("volume_confirmed"),
             "entry_volume_ratio": snapshot.get("volume_ratio"),
@@ -5776,8 +5967,8 @@ def execute_ganesh_gap_entry(state, snapshot, option, target, symbol=None):
             "target_price": levels["target_price"],
             "stop_loss_price": levels["stop_loss_price"],
             "entry_price": expected_entry,
-            "score": 100,
-            "weighted_score": 100,
+            "score": entry_score,
+            "weighted_score": entry_score,
             "status": "POSITION_OPEN" if not live else "BUY_PLACED_NOT_COMPLETE",
             "phase": "POSITION_OPEN" if not live else "ENTRY_PENDING",
             "created_at": now_ist().isoformat(),
@@ -5812,7 +6003,14 @@ def execute_ganesh_gap_entry(state, snapshot, option, target, symbol=None):
 
     details = wait_for_order_complete(order_id)
     if order_is_rejected(details):
-        state.update({"phase": "WAITING_FOR_REVERSAL", "reversal_triggered": False})
+        state.update(
+            {
+                "phase": (
+                    "CONTINUATION_READY" if lane == "CONTINUATION" else "WAITING_FOR_REVERSAL"
+                ),
+                "reversal_triggered": False,
+            }
+        )
         write_state(state_slot, state)
         return False, f"broker rejected BUY: {details.get('status_message') or details.get('status')}"
     increment_trade_count(state_slot)
@@ -5890,18 +6088,25 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
         log(f"GANESH GAP {symbol} no trade: {reason}")
         return
 
-    transition = transition_for_gap(state["gap_direction"])
-    reversal_distance = abs(snapshot["spot"] - snapshot["candle_open"])
-    minimum_reversal = configured_non_negative_float("GANESH_MIN_REVERSAL_POINTS", 0.0)
-    buffer_confirmed = minimum_reversal > 0 and reversal_distance >= minimum_reversal
-    state, transition_confirmed = advance_entry_confirmation(
-        state,
-        active_two_hour_start(now),
-        snapshot["candle_colour"],
-        state["gap_direction"],
-        required_scans=max(to_int(os.getenv("GANESH_ENTRY_CONFIRMATION_SCANS"), 2), 1),
-        buffer_confirmed=buffer_confirmed,
-    )
+    reversal_transition = transition_for_gap(state["gap_direction"])
+    continuation_transition = continuation_for_gap(state["gap_direction"])
+    lane = str(state.get("strategy_lane") or "").upper()
+    transition_confirmed = False
+    if lane != "CONTINUATION":
+        reversal_distance = abs(snapshot["spot"] - snapshot["candle_open"])
+        minimum_reversal = configured_non_negative_float("GANESH_MIN_REVERSAL_POINTS", 0.0)
+        buffer_confirmed = minimum_reversal > 0 and reversal_distance >= minimum_reversal
+        state, transition_confirmed = advance_entry_confirmation(
+            state,
+            active_two_hour_start(now),
+            snapshot["candle_colour"],
+            state["gap_direction"],
+            required_scans=max(to_int(os.getenv("GANESH_ENTRY_CONFIRMATION_SCANS"), 2), 1),
+            buffer_confirmed=buffer_confirmed,
+        )
+        if transition_confirmed and not lane:
+            lane = "REVERSAL"
+            state["strategy_lane"] = lane
     state.update(
         {
             "last_scan_at": now.isoformat(),
@@ -5910,23 +6115,111 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
             "bollinger": snapshot["bollinger"],
         }
     )
-    target = nearest_target(
-        transition["direction"],
-        snapshot["spot"],
-        snapshot["bollinger"]["middle"],
-        state["pivots"],
-        minimum_distance=configured_non_negative_float(
-            f"GANESH_{symbol}_MIN_TARGET_POINTS",
-            configured_non_negative_float("GANESH_MIN_TARGET_POINTS", 15.0),
-        ),
+    minimum_target_distance = configured_non_negative_float(
+        f"GANESH_{symbol}_MIN_TARGET_POINTS",
+        configured_non_negative_float("GANESH_MIN_TARGET_POINTS", 15.0),
     )
+    transition = reversal_transition
+    target = None
     option = {}
     reason = "waiting for confirmed colour reversal"
-    eligible = bool(transition_confirmed and target)
-    if transition_confirmed and not target:
-        reason = "no valid technical target beyond the minimum distance"
+    eligible = False
 
-    if eligible:
+    if lane == "REVERSAL":
+        transition = reversal_transition
+        target = nearest_target(
+            transition["direction"],
+            snapshot["spot"],
+            snapshot["bollinger"]["middle"],
+            state["pivots"],
+            minimum_distance=minimum_target_distance,
+        )
+        eligible = bool(transition_confirmed and target)
+        if transition_confirmed and not target:
+            reason = "no valid reversal target beyond the minimum distance"
+
+    continuation_start = configured_clock("GANESH_CONTINUATION_START_TIME", "09:35")
+    continuation_end = configured_clock("GANESH_CONTINUATION_LAST_ENTRY_TIME", "11:30")
+    continuation_window = continuation_start <= now.time() <= continuation_end
+    if (
+        lane in {"", "CONTINUATION"}
+        and ganesh_gap_continuation_enabled()
+        and continuation_window
+    ):
+        opening = snapshot.get("opening_range") or {}
+        latest_five = snapshot.get("latest_completed_5m") or {}
+        bullish_continuation = continuation_transition["direction"] == GANESH_BULLISH
+        opening_accepted = bool(
+            opening.get("complete")
+            and (
+                to_float(opening.get("close")) > snapshot["today_open"]
+                and to_float(opening.get("close")) > snapshot["previous_close"]
+                if bullish_continuation
+                else to_float(opening.get("close")) < snapshot["today_open"]
+                and to_float(opening.get("close")) < snapshot["previous_close"]
+            )
+        )
+        range_broken = bool(
+            latest_five.get("complete")
+            and (
+                to_float(latest_five.get("close")) > to_float(opening.get("high"))
+                if bullish_continuation
+                else to_float(latest_five.get("close")) < to_float(opening.get("low"))
+            )
+        )
+        if opening_accepted and range_broken:
+            transition = continuation_transition
+            target = nearest_continuation_target(
+                transition["direction"],
+                snapshot["spot"],
+                snapshot["bollinger"],
+                state["pivots"],
+                minimum_distance=minimum_target_distance,
+            )
+            if not target:
+                reason = "no valid continuation target beyond the minimum distance"
+            else:
+                try:
+                    option = ganesh_gap_option_candidate(snapshot, transition, symbol=symbol)
+                except Exception as error:
+                    option = {"allowed": False, "reason": str(error)}
+                if not option.get("allowed"):
+                    reason = option.get("reason") or "ATM option is unavailable"
+                else:
+                    state["phase"] = "CONTINUATION_EVALUATION"
+                    evidence = ganesh_gap_continuation_evidence(snapshot, option)
+                    state.update(
+                        {
+                            "continuation_score": evidence.get("score"),
+                            "continuation_reasons": evidence.get("reasons", []),
+                            "continuation_blockers": evidence.get("blockers", []),
+                            "continuation_retest_confirmed": evidence.get(
+                                "retest_confirmed", False
+                            ),
+                        }
+                    )
+                    verbose_log(
+                        f"GANESH GAP {symbol} continuation score={evidence.get('score')} "
+                        f"allowed={evidence.get('allowed')} "
+                        f"reasons={evidence.get('reasons')} "
+                        f"blockers={evidence.get('blockers')}"
+                    )
+                    eligible = bool(evidence.get("allowed"))
+                    if eligible:
+                        lane = "CONTINUATION"
+                        state.update(
+                            {
+                                "strategy_lane": lane,
+                                "phase": "CONTINUATION_READY",
+                            }
+                        )
+                        reason = (
+                            f"gap continuation accepted with score {evidence.get('score'):.1f}"
+                        )
+                    else:
+                        reason = "; ".join(evidence.get("blockers", []))
+
+    if lane == "REVERSAL" and eligible and not option:
         try:
             option = ganesh_gap_option_candidate(snapshot, transition, symbol=symbol)
         except Exception as error:
@@ -5938,7 +6231,7 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
             analysis = option.get("near_expiry_analysis") or {}
             flow = analysis.get("option_flow") or {}
             verbose_log(
-                "GANESH GAP NIFTY expiry split: "
+                f"GANESH GAP {symbol} expiry split: "
                 f"analysis={analysis.get('expiry')} {analysis.get('trading_symbol')} "
                 f"chain={analysis.get('chain_bias')}/{analysis.get('chain_confidence')} "
                 f"vwap={flow.get('vwap')} volume_ratio={flow.get('volume_ratio')}; "
@@ -5949,7 +6242,7 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
     mode = str(os.getenv("GANESH_GAP_MODE", "FAITHFUL")).strip().upper()
     if mode not in {"FAITHFUL", "ENHANCED"}:
         raise RuntimeError("GANESH_GAP_MODE must be FAITHFUL or ENHANCED")
-    if eligible and mode == "ENHANCED":
+    if eligible and lane == "REVERSAL" and mode == "ENHANCED":
         if configured_bool("GANESH_REQUIRE_VOLUME_CONFIRMATION", False) and not snapshot.get("volume_confirmed"):
             eligible = False
             reason = "enhanced volume confirmation failed"
@@ -5970,7 +6263,7 @@ def run_ganesh_gap_symbol_signal_check(symbol, now=None):
                 eligible = False
                 reason = f"expected reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
 
-    if eligible:
+    if eligible and lane == "REVERSAL":
         reason = "confirmed opening-gap reversal with a valid locked target"
 
     write_state(state_slot, state)

@@ -105,6 +105,22 @@ def transition_for_gap(gap_direction):
     return None
 
 
+def continuation_for_gap(gap_direction):
+    if gap_direction == GAP_UP:
+        return {
+            "direction": BULLISH,
+            "option_type": "CE",
+            "acceptance_colour": "GREEN",
+        }
+    if gap_direction == GAP_DOWN:
+        return {
+            "direction": BEARISH,
+            "option_type": "PE",
+            "acceptance_colour": "RED",
+        }
+    return None
+
+
 def advance_entry_confirmation(
     state,
     candle_start,
@@ -196,6 +212,201 @@ def nearest_target(direction, current_price, bollinger_middle, pivots, minimum_d
     label, level = ordered[0]
     distance = abs(level - current)
     return {"type": label, "level": round(level, 2), "distance": round(distance, 2)}
+
+
+def nearest_continuation_target(
+    direction,
+    current_price,
+    bollinger_bands_value,
+    pivots,
+    minimum_distance=0.0,
+):
+    """Return the nearest continuation objective beyond the accepted breakout."""
+    current = float(current_price)
+    bands = bollinger_bands_value or {}
+    candidates = []
+    band_name = "upper" if direction == BULLISH else "lower"
+    if bands.get(band_name) is not None:
+        candidates.append((f"BB_{band_name.upper()}", float(bands[band_name])))
+    labels = ("P", "R1", "R2", "R3") if direction == BULLISH else ("P", "S1", "S2", "S3")
+    candidates.extend((label, float(pivots[label])) for label in labels if pivots.get(label) is not None)
+    minimum = max(float(minimum_distance), 0.0)
+    if direction == BULLISH:
+        valid = [
+            (label, level)
+            for label, level in candidates
+            if level > current and level - current >= minimum
+        ]
+        ordered = sorted(valid, key=lambda item: item[1])
+    else:
+        valid = [
+            (label, level)
+            for label, level in candidates
+            if level < current and current - level >= minimum
+        ]
+        ordered = sorted(valid, key=lambda item: item[1], reverse=True)
+    if not ordered:
+        return None
+    label, level = ordered[0]
+    return {
+        "type": label,
+        "level": round(level, 2),
+        "distance": round(abs(level - current), 2),
+    }
+
+
+def score_gap_continuation(
+    snapshot,
+    breadth,
+    option_chain,
+    option_flow,
+    institutional,
+    minimum_score=75.0,
+    minimum_volume_ratio=1.20,
+    maximum_extension_range=0.75,
+    retest_tolerance_range=0.10,
+):
+    """Score a completed-candle gap-acceptance setup on a 100-point scale."""
+    gap_direction = ((snapshot or {}).get("gap") or {}).get("direction")
+    transition = continuation_for_gap(gap_direction)
+    result = {
+        "allowed": False,
+        "score": 0.0,
+        "direction": transition.get("direction") if transition else NEUTRAL,
+        "option_type": transition.get("option_type") if transition else None,
+        "reasons": [],
+        "blockers": [],
+        "retest_confirmed": False,
+    }
+    if not transition:
+        result["blockers"].append("opening gap is not directional")
+        return result
+
+    opening = (snapshot or {}).get("opening_range") or {}
+    latest_five = (snapshot or {}).get("latest_completed_5m") or {}
+    required = ("open", "high", "low", "close")
+    if not opening.get("complete") or any(opening.get(key) is None for key in required):
+        result["blockers"].append("first 15-minute opening range is incomplete")
+        return result
+    if not latest_five.get("complete") or any(latest_five.get(key) is None for key in required):
+        result["blockers"].append("completed 5-minute confirmation candle is unavailable")
+        return result
+
+    direction = transition["direction"]
+    bullish = direction == BULLISH
+    previous_close = float((snapshot or {}).get("previous_close") or 0)
+    today_open = float((snapshot or {}).get("today_open") or 0)
+    opening_close = float(opening["close"])
+    boundary = float(opening["high"] if bullish else opening["low"])
+    five_close = float(latest_five["close"])
+    opening_range = max(float(opening["high"]) - float(opening["low"]), 0.01)
+
+    accepted = (
+        opening_close > today_open and opening_close > previous_close
+        if bullish
+        else opening_close < today_open and opening_close < previous_close
+    )
+    if not accepted:
+        result["blockers"].append("first 15-minute candle did not accept the opening gap")
+    else:
+        result["score"] += 25.0
+        result["reasons"].append("15M gap acceptance=25/25")
+
+    breakout = five_close > boundary if bullish else five_close < boundary
+    if not breakout:
+        result["blockers"].append("completed 5-minute candle has not broken the opening range")
+    else:
+        result["score"] += 15.0
+        tolerance = opening_range * max(float(retest_tolerance_range), 0.0)
+        retest = (
+            float(latest_five["low"]) <= boundary + tolerance
+            if bullish
+            else float(latest_five["high"]) >= boundary - tolerance
+        )
+        result["retest_confirmed"] = bool(retest)
+        if retest:
+            result["score"] += 10.0
+            result["reasons"].append("5M opening-range breakout/retest=25/25")
+        else:
+            result["reasons"].append("5M opening-range breakout without retest=15/25")
+
+    extension = max(five_close - boundary, 0.0) if bullish else max(boundary - five_close, 0.0)
+    extension_ratio = extension / opening_range
+    result["extension_range_multiple"] = round(extension_ratio, 3)
+    if extension_ratio > max(float(maximum_extension_range), 0.0):
+        result["blockers"].append(
+            f"entry is extended {extension_ratio:.2f} opening ranges beyond the breakout"
+        )
+
+    desired = direction
+    breadth = breadth or {}
+    breadth_bias = str(breadth.get("bias") or NEUTRAL).upper()
+    breadth_confidence = str(breadth.get("confidence") or "LOW").upper()
+    if breadth_bias == desired:
+        breadth_points = {"HIGH": 20.0, "MEDIUM": 16.0, "LOW": 8.0}.get(
+            breadth_confidence, 8.0
+        )
+    elif breadth_bias == NEUTRAL:
+        breadth_points = 5.0
+    else:
+        breadth_points = 0.0
+        if breadth_confidence in {"MEDIUM", "HIGH"}:
+            result["blockers"].append("constituent breadth strongly opposes the gap direction")
+    result["score"] += breadth_points
+    result["reasons"].append(f"constituent breadth={breadth_points:.1f}/20")
+
+    flow = option_flow or {}
+    flow_close = float(flow.get("close") or 0)
+    flow_vwap = float(flow.get("vwap") or 0)
+    flow_slope = float(flow.get("vwap_slope") or 0)
+    volume_ratio = float(flow.get("volume_ratio") or 0)
+    flow_aligned = flow_close > 0 and flow_vwap > 0 and flow_close >= flow_vwap and flow_slope >= 0
+    volume_aligned = bool(flow.get("volume_confirmed")) and volume_ratio >= float(minimum_volume_ratio)
+    if not flow_aligned:
+        result["blockers"].append("near-expiry ATM option is not above a flat/rising VWAP")
+    if not volume_aligned:
+        result["blockers"].append(
+            f"near-expiry ATM option volume ratio {volume_ratio:.2f} is below {float(minimum_volume_ratio):.2f}"
+        )
+    if flow_aligned and volume_aligned:
+        result["score"] += 15.0
+        result["reasons"].append("ATM option VWAP/volume=15/15")
+
+    chain = option_chain or {}
+    chain_bias = str(chain.get("direction") or chain.get("bias") or NEUTRAL).upper()
+    chain_confidence = str(chain.get("confidence") or "LOW").upper()
+    if chain_bias == desired:
+        chain_points = 10.0
+    elif chain_bias == NEUTRAL:
+        chain_points = 5.0
+    else:
+        chain_points = 0.0
+        if chain_confidence == "HIGH":
+            result["blockers"].append("HIGH-confidence option chain opposes continuation")
+    result["score"] += chain_points
+    result["reasons"].append(f"option chain={chain_points:.1f}/10")
+
+    institutional = institutional or {}
+    institutional_bias = str(institutional.get("bias") or NEUTRAL).upper()
+    institutional_confidence = str(institutional.get("confidence") or "LOW").upper()
+    if institutional_bias == desired:
+        institutional_points = 5.0
+    elif institutional_bias == NEUTRAL:
+        institutional_points = 2.5
+    else:
+        institutional_points = 0.0
+        if institutional_confidence in {"MEDIUM", "HIGH"}:
+            result["blockers"].append("institutional footprint strongly opposes continuation")
+    result["score"] += institutional_points
+    result["reasons"].append(f"institutional context={institutional_points:.1f}/5")
+
+    result["score"] = round(min(result["score"], 100.0), 1)
+    if result["score"] < float(minimum_score):
+        result["blockers"].append(
+            f"continuation score {result['score']:.1f} is below {float(minimum_score):.1f}"
+        )
+    result["allowed"] = not result["blockers"]
+    return result
 
 
 def atm_strike(spot_price, interval=50):

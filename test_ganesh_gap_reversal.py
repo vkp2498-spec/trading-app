@@ -22,8 +22,11 @@ from ganesh_gap_reversal import (
     bollinger_bands,
     candle_colour,
     classic_pivots,
+    continuation_for_gap,
+    nearest_continuation_target,
     nearest_target,
     opening_gap,
+    score_gap_continuation,
     target_reached,
     within_entry_window,
 )
@@ -129,6 +132,79 @@ class GaneshGapReversalTests(unittest.TestCase):
         self.assertTrue(target_reached(BULLISH, 24250, 24240))
         self.assertTrue(target_reached(BEARISH, 24190, 24200))
 
+    def test_continuation_direction_follows_the_opening_gap(self):
+        self.assertEqual(continuation_for_gap(GAP_UP)["direction"], BULLISH)
+        self.assertEqual(continuation_for_gap(GAP_UP)["option_type"], "CE")
+        self.assertEqual(continuation_for_gap(GAP_DOWN)["direction"], BEARISH)
+        self.assertEqual(continuation_for_gap(GAP_DOWN)["option_type"], "PE")
+
+    def test_continuation_target_uses_outer_band_or_directional_pivot(self):
+        bands = {"middle": 101, "upper": 106, "lower": 94}
+        pivots = {"P": 100, "R1": 104, "R2": 108, "R3": 112, "S1": 96, "S2": 92, "S3": 88}
+        bullish = nearest_continuation_target(BULLISH, 102, bands, pivots)
+        bearish = nearest_continuation_target(BEARISH, 98, bands, pivots)
+        self.assertEqual(bullish["type"], "R1")
+        self.assertEqual(bullish["level"], 104.0)
+        self.assertEqual(bearish["type"], "S1")
+        self.assertEqual(bearish["level"], 96.0)
+
+    def continuation_snapshot(self):
+        return {
+            "gap": {"direction": GAP_UP},
+            "previous_close": 100.0,
+            "today_open": 102.0,
+            "spot": 104.5,
+            "opening_range": {
+                "complete": True,
+                "open": 102.0,
+                "high": 104.0,
+                "low": 101.8,
+                "close": 103.5,
+            },
+            "latest_completed_5m": {
+                "complete": True,
+                "open": 103.5,
+                "high": 105.0,
+                "low": 103.8,
+                "close": 104.5,
+            },
+        }
+
+    def test_gap_continuation_accepts_completed_candles_and_aligned_evidence(self):
+        result = score_gap_continuation(
+            self.continuation_snapshot(),
+            {"bias": BULLISH, "confidence": "HIGH"},
+            {"direction": BULLISH, "confidence": "HIGH"},
+            {
+                "close": 110.0,
+                "vwap": 100.0,
+                "vwap_slope": 0.5,
+                "volume_ratio": 1.5,
+                "volume_confirmed": True,
+            },
+            {"bias": "NEUTRAL", "confidence": "LOW"},
+        )
+        self.assertTrue(result["allowed"])
+        self.assertGreaterEqual(result["score"], 75.0)
+        self.assertTrue(result["retest_confirmed"])
+
+    def test_gap_continuation_rejects_high_confidence_opposite_chain(self):
+        result = score_gap_continuation(
+            self.continuation_snapshot(),
+            {"bias": BULLISH, "confidence": "HIGH"},
+            {"direction": BEARISH, "confidence": "HIGH"},
+            {
+                "close": 110.0,
+                "vwap": 100.0,
+                "vwap_slope": 0.5,
+                "volume_ratio": 1.5,
+                "volume_confirmed": True,
+            },
+            {"bias": "NEUTRAL", "confidence": "LOW"},
+        )
+        self.assertFalse(result["allowed"])
+        self.assertIn("HIGH-confidence option chain opposes continuation", result["blockers"])
+
     def test_candle_freshness_is_measured_from_interval_end(self):
         current = datetime(2026, 8, 3, 10, 2, 30, tzinfo=IST)
         candle_start = datetime(2026, 8, 3, 10, 1, tzinfo=IST)
@@ -177,6 +253,106 @@ class GaneshGapReversalTests(unittest.TestCase):
             trade_bot.run_ganesh_gap_symbol_signal_check("BANKNIFTY", now=current)
 
         write.assert_not_called()
+
+    def test_completed_gap_acceptance_selects_continuation_lane(self):
+        current = datetime(2026, 8, 3, 9, 35, tzinfo=IST)
+        state_slot = trade_bot.GANESH_GAP_STATE_BY_SYMBOL["NIFTY"]
+        snapshot = {
+            "symbol": "NIFTY",
+            "timestamp": current.isoformat(),
+            "spot": 104.5,
+            "previous_high": 103.0,
+            "previous_low": 98.0,
+            "previous_close": 100.0,
+            "today_open": 102.0,
+            "gap": {"direction": GAP_UP, "points": 2.0, "percent": 2.0},
+            "pivots": {
+                "P": 100.3,
+                "R1": 102.7,
+                "R2": 105.3,
+                "R3": 107.7,
+                "S1": 97.7,
+                "S2": 95.3,
+                "S3": 92.7,
+            },
+            "bollinger": {"middle": 101.0, "upper": 106.0, "lower": 96.0},
+            "candle_start": current.replace(hour=9, minute=15).isoformat(),
+            "candle_open": 102.0,
+            "candle_colour": "GREEN",
+            "volume_confirmed": False,
+            "volume_ratio": 0.0,
+            "opening_range": {
+                "complete": True,
+                "open": 102.0,
+                "high": 104.0,
+                "low": 101.8,
+                "close": 103.5,
+            },
+            "latest_completed_5m": {
+                "complete": True,
+                "start": current.replace(minute=30).isoformat(),
+                "open": 103.5,
+                "high": 105.0,
+                "low": 103.8,
+                "close": 104.5,
+            },
+        }
+        option = {
+            "allowed": True,
+            "option_type": "CE",
+            "strike": 100,
+            "expiry": "2026-08-11",
+        }
+        evidence = {
+            "allowed": True,
+            "score": 92.5,
+            "reasons": ["aligned"],
+            "blockers": [],
+            "retest_confirmed": True,
+        }
+        with (
+            patch.dict(os.environ, {"GANESH_MIN_TARGET_POINTS": "1"}, clear=False),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(trade_bot, "state_is_active", return_value=False),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(trade_bot, "ganesh_gap_max_trades_per_day", return_value=2),
+            patch.object(trade_bot, "ganesh_gap_trade_count_today", return_value=0),
+            patch.object(trade_bot, "portfolio_day_circuit", return_value={"allowed": True}),
+            patch.object(trade_bot, "ganesh_gap_market_snapshot", return_value=snapshot),
+            patch.object(trade_bot, "ganesh_gap_option_candidate", return_value=option),
+            patch.object(trade_bot, "ganesh_gap_continuation_evidence", return_value=evidence),
+            patch.object(trade_bot, "record_ganesh_gap_scan"),
+            patch.object(trade_bot, "write_state"),
+            patch.object(trade_bot, "execute_ganesh_gap_entry", return_value=(True, "opened")) as execute,
+        ):
+            trade_bot.run_ganesh_gap_symbol_signal_check("NIFTY", now=current)
+
+        selected_state = execute.call_args.args[0]
+        self.assertEqual(selected_state["strategy_lane"], "CONTINUATION")
+        self.assertEqual(selected_state["continuation_score"], 92.5)
+        self.assertEqual(execute.call_args.kwargs["symbol"], "NIFTY")
+
+    def test_continuation_exits_after_later_completed_5m_closes_back_inside_range(self):
+        current = datetime(2026, 8, 3, 10, 0, tzinfo=IST)
+        frame = pd.DataFrame(
+            [{"open": 104.2, "high": 104.4, "low": 103.2, "close": 103.5}],
+            index=pd.DatetimeIndex([datetime(2026, 8, 3, 9, 55, tzinfo=IST)]),
+        )
+        state = {
+            "strategy": "GANESH_GAP_CONTINUATION",
+            "strategy_lane": "CONTINUATION",
+            "direction": BULLISH,
+            "underlying_instrument_key": "NSE_INDEX|Nifty 50",
+            "continuation_opening_range_high": 104.0,
+            "continuation_entry_5m_start": datetime(
+                2026, 8, 3, 9, 30, tzinfo=IST
+            ).isoformat(),
+        }
+        with patch.object(
+            trade_bot, "fetch_v3_intraday_minutes", return_value=frame
+        ):
+            reason = trade_bot.ganesh_continuation_structure_exit(state, current)
+        self.assertEqual(reason, "CONTINUATION_5M_INVALIDATION")
 
     def test_same_day_partial_state_is_reinitialized_from_market_snapshot(self):
         current = datetime(2026, 8, 3, 12, 40, tzinfo=IST)
@@ -311,12 +487,22 @@ class GaneshGapReversalTests(unittest.TestCase):
             "ask_price": 321.0,
             "spread_percent": 0.625,
         }
+        recommendation = {
+            "symbol": "BANKNIFTY",
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "score": 4,
+            "reasons": [],
+            "analysis_expiry": "2026-08-18",
+            "analysis_atm": {"strike": 55500.0, "expiry": "2026-08-18"},
+            "execution_chain": chain.to_dict("records"),
+        }
         with (
             patch.object(
                 trade_bot,
-                "fetch_upstox_option_chain",
-                return_value=(None, None, chain),
-            ) as fetch,
+                "get_index_recommendation",
+                return_value=recommendation,
+            ) as recommend,
             patch.object(
                 trade_bot,
                 "find_index_option_instrument",
@@ -324,6 +510,11 @@ class GaneshGapReversalTests(unittest.TestCase):
             ) as find,
             patch.object(trade_bot, "read_market_cache", return_value={}),
             patch.object(trade_bot, "option_contract_quality", return_value=quality),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                return_value={"bias": "BULLISH"},
+            ),
             patch.object(trade_bot, "write_stream_instruments"),
         ):
             candidate = trade_bot.ganesh_gap_option_candidate(
@@ -332,7 +523,7 @@ class GaneshGapReversalTests(unittest.TestCase):
             )
 
         self.assertTrue(candidate["allowed"])
-        fetch.assert_called_once_with("BANKNIFTY", nearby=5)
+        recommend.assert_called_once_with("BANKNIFTY")
         self.assertEqual(find.call_args.args[0], "BANKNIFTY")
         self.assertEqual(candidate["strike"], 55500)
 

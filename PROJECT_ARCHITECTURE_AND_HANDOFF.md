@@ -260,7 +260,7 @@ The experimental T20 fallback lane has been removed from runtime code, configura
 
 ### 8.1 Intent
 
-The Ganesh engine is a focused NIFTY/BANKNIFTY opening-gap reversal strategy. It is deliberately simpler than the Vamsi engine. It evaluates both indices independently but permits at most one combined Ganesh trade per day.
+The Ganesh engine is a focused NIFTY/BANKNIFTY opening-gap strategy. It supports mutually exclusive reversal and continuation lanes. It evaluates both indices independently but uses one combined Ganesh daily trade cap.
 
 Current Ganesh AWS selection:
 
@@ -286,6 +286,10 @@ ENABLE_LIVE_TRADING=true
 - For a gap down, first observe a red active candle, then a confirmed red-to-green reversal, and buy an ATM CE.
 - For a gap up, first observe a green active candle, then a confirmed green-to-red reversal, and buy an ATM PE.
 - Require two confirmation scans by default, unless a configured reversal-distance buffer confirms earlier.
+- A gap may instead enter the continuation lane after the first completed 15-minute candle accepts the gap and a completed 5-minute candle breaks the opening range.
+- The continuation score assigns 25 points to 15-minute gap acceptance, 25 to opening-range breakout/retest, 20 to constituent breadth, 15 to near-expiry ATM option VWAP/volume, 10 to option-chain direction and 5 to institutional context.
+- Continuation requires a default score of 75, option volume ratio of at least 1.20, no HIGH-confidence opposing chain, no MEDIUM/HIGH opposing breadth or institutional footprint, and no excessive opening-range extension.
+- Once reversal or continuation is selected for a symbol/day, the other lane cannot compete with it.
 - Use a next-week NIFTY option or the nearest supported BANKNIFTY expiry, and one lot by default.
 - Allow at most one combined Ganesh trade per day across NIFTY and BANKNIFTY.
 - Do not re-enter after the daily trade is completed.
@@ -298,6 +302,7 @@ ENABLE_LIVE_TRADING=true
 - Convert the spot target to an option-premium target with the configured delta approximation.
 - Use a default 20% option-premium stop and a broker-side protective order.
 - Exit on target, confirmed opposite active-candle color, option stop, daily risk circuit, stale data, or universal 15:29 square-off.
+- A continuation position also exits when a later completed 5-minute candle closes back through the accepted opening-range boundary.
 
 ### 8.4 Faithful versus enhanced mode
 
