@@ -1074,7 +1074,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-20T09:35:00+05:30",
-                "score": 6.4,
+                "score": 76.4,
                 "grossPnL": 1000,
             },
             {
@@ -1082,7 +1082,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T09:45:00+05:30",
-                "score": -6.8,
+                "score": 78.8,
                 "grossPnL": 3000,
             },
             {
@@ -1090,7 +1090,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T10:30:00+05:30",
-                "score": 5.4,
+                "score": 65.4,
                 "grossPnL": -1000,
             },
             {
@@ -1106,7 +1106,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T12:00:00+05:30",
-                "score": 0,
+                "score": 42,
                 "grossPnL": -200,
             },
             {
@@ -1114,7 +1114,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T13:30:00+05:30",
-                "score": -2,
+                "score": 58,
                 "grossPnL": 400,
             },
             {
@@ -1122,7 +1122,7 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "",
-                "score": -4,
+                "score": 84,
                 "grossPnL": 800,
             },
         ]
@@ -1132,13 +1132,13 @@ class TradeControlTests(unittest.TestCase):
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "opening"
-            and cell["scoreBand"] == "5+"
+            and cell["scoreBand"] == "70-79"
         )
         unknown_time = next(
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "unknown"
-            and cell["scoreBand"] == "3-4"
+            and cell["scoreBand"] == "80-89"
         )
         unscored = next(
             cell
@@ -1149,13 +1149,33 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertEqual(analytics["totalTrades"], 7)
         self.assertEqual(analytics["symbolTrades"], {"NIFTY": 4, "BANKNIFTY": 3})
-        self.assertEqual(analytics["scoreBands"], ["0", "1-2", "3-4", "5+", "Unscored"])
+        self.assertEqual(
+            analytics["scoreBands"],
+            ["<50", "50-59", "60-69", "70-79", "80-89", "90-100", "Unscored"],
+        )
         self.assertEqual(opening_high["expectancy"], 2000)
         self.assertEqual(opening_high["trades"], 2)
         self.assertEqual(unknown_time["trades"], 1)
         self.assertEqual(unscored["trades"], 1)
         self.assertEqual(analytics["bestZone"]["timeBucket"], "opening")
-        self.assertEqual(analytics["bestZone"]["scoreBand"], "5+")
+        self.assertEqual(analytics["bestZone"]["scoreBand"], "70-79")
+
+    def test_edge_score_bands_cover_the_zero_to_one_hundred_scale(self):
+        cases = {
+            0: "<50",
+            49.9: "<50",
+            50: "50-59",
+            60: "60-69",
+            70: "70-79",
+            80: "80-89",
+            90: "90-100",
+            100: "90-100",
+            -1: "Unscored",
+            101: "Unscored",
+        }
+        for score, expected in cases.items():
+            with self.subTest(score=score):
+                self.assertEqual(dashboard_data.edge_score_band(score), expected)
 
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):
         trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}
