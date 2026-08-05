@@ -1,6 +1,7 @@
 from collections import deque
 from pathlib import Path
 import ast
+import calendar as calendar_module
 import html
 import json
 import os
@@ -137,6 +138,47 @@ st.markdown(
         font-size: 26px;
         font-weight: 850;
         margin-top: 8px;
+    }
+    .analytics-calendar-wrap {
+        overflow-x: auto;
+        padding-bottom: 6px;
+    }
+    .analytics-calendar {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(94px, 1fr));
+        gap: 6px;
+        min-width: 720px;
+    }
+    .analytics-weekday {
+        color: #64748b;
+        font-size: 11px;
+        font-weight: 800;
+        padding: 4px 6px;
+        text-align: center;
+    }
+    .analytics-day {
+        background: #f1f5f9;
+        border: 1px solid #d8e0ea;
+        border-radius: 7px;
+        color: #061a35;
+        min-height: 74px;
+        padding: 8px;
+    }
+    .analytics-day.profit { background: #dcfce7; border-color: #86efac; }
+    .analytics-day.loss { background: #fee2e2; border-color: #fca5a5; }
+    .analytics-day.week { background: #dbeafe; border-color: #93c5fd; }
+    .analytics-day.empty { background: transparent; border-color: transparent; }
+    .analytics-day-head { display: flex; justify-content: space-between; font-size: 10px; font-weight: 800; }
+    .analytics-day-pnl { font-size: 14px; font-weight: 850; margin-top: 12px; }
+    .analytics-day-trades { color: #64748b; font-size: 9px; font-weight: 750; margin-top: 3px; }
+    .analytics-insight {
+        background: #061a35;
+        border-radius: 8px;
+        color: #ffffff;
+        font-size: 15px;
+        font-weight: 700;
+        margin-top: 14px;
+        padding: 16px;
     }
     .mini-chart-grid {
         display: grid;
@@ -2266,13 +2308,249 @@ def sequence_table(rows):
     return frame
 
 
+def render_analytics_calendar(days):
+    parsed_days = []
+    for item in days or []:
+        timestamp = pd.to_datetime(item.get("date"), errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        parsed_days.append(
+            {
+                "date": timestamp.date(),
+                "pnl": float(item.get("netPnL", item.get("grossPnL", 0)) or 0),
+                "trades": int(item.get("trades", 0) or 0),
+            }
+        )
+    if not parsed_days:
+        st.info("Completed NIFTY and BANKNIFTY trades will populate the P&L calendar.")
+        return
+
+    available_months = sorted({(item["date"].year, item["date"].month) for item in parsed_days})
+    labels = {
+        f"{year:04d}-{month:02d}": pd.Timestamp(year=year, month=month, day=1).strftime("%B %Y")
+        for year, month in available_months
+    }
+    month_keys = list(labels)
+    selected_key = st.selectbox(
+        "Calendar month",
+        month_keys,
+        index=len(month_keys) - 1,
+        format_func=lambda key: labels[key],
+        key="analytics_calendar_month",
+    )
+    selected_year, selected_month = (int(value) for value in selected_key.split("-"))
+    by_date = {item["date"]: item for item in parsed_days}
+    month_rows = [
+        item
+        for item in parsed_days
+        if item["date"].year == selected_year and item["date"].month == selected_month
+    ]
+    month_pnl = sum(item["pnl"] for item in month_rows)
+    st.metric(f"{labels[selected_key]} P&L", money(month_pnl))
+
+    cells = []
+    for weekday in ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"):
+        cells.append(f'<div class="analytics-weekday">{weekday}</div>')
+    month_calendar = calendar_module.Calendar(firstweekday=0)
+    for week in month_calendar.monthdatescalendar(selected_year, selected_month):
+        weekly_rows = [by_date.get(day) for day in week[:5]]
+        weekly_rows = [item for item in weekly_rows if item is not None]
+        weekly_pnl = sum(item["pnl"] for item in weekly_rows)
+        weekly_trades = sum(item["trades"] for item in weekly_rows)
+        for position, day in enumerate(week):
+            if day.month != selected_month:
+                cells.append('<div class="analytics-day empty"></div>')
+                continue
+            is_saturday = position == 5
+            if is_saturday:
+                pnl = weekly_pnl
+                trades = weekly_trades
+                scope = "WEEK"
+            else:
+                item = by_date.get(day)
+                pnl = item["pnl"] if item else None
+                trades = item["trades"] if item else None
+                scope = ""
+            state_class = (
+                "week"
+                if is_saturday
+                else "profit"
+                if pnl is not None and pnl > 0
+                else "loss"
+                if pnl is not None and pnl < 0
+                else ""
+            )
+            pnl_text = money(pnl) if pnl is not None else "—"
+            trades_text = f"{trades}T" if trades is not None else "NO TRADE"
+            cells.append(
+                f'<div class="analytics-day {state_class}">'
+                f'<div class="analytics-day-head"><span>{day.day}</span><span>{scope}</span></div>'
+                f'<div class="analytics-day-pnl">{html.escape(pnl_text)}</div>'
+                f'<div class="analytics-day-trades">{html.escape(trades_text)}</div>'
+                "</div>"
+            )
+    st.markdown(
+        '<div class="analytics-calendar-wrap"><div class="analytics-calendar">'
+        + "".join(cells)
+        + "</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Green = profit | Red = loss | Blue Saturday cell = Monday–Friday week P&L")
+
+
+def edge_heatmap_style(value, trades):
+    if trades <= 0:
+        return "background-color:#f1f5f9;color:#64748b;font-weight:700"
+    if value < -500:
+        return "background-color:#dc2626;color:white;font-weight:800"
+    if value < 0:
+        return "background-color:#fb923c;color:#061a35;font-weight:800"
+    if value <= 500:
+        return "background-color:#fde047;color:#061a35;font-weight:800"
+    if value <= 1000:
+        return "background-color:#a3e635;color:#061a35;font-weight:800"
+    return "background-color:#16a34a;color:white;font-weight:800"
+
+
+def render_edge_matrix(edge):
+    st.markdown("### Edge Matrix")
+    st.caption("Expectancy per trade by 0–100 unified entry score and entry time.")
+    total_trades = int(edge.get("totalTrades", 0) or 0)
+    profit_factor = edge.get("profitFactor")
+    symbol_trades = edge.get("symbolTrades") or {}
+    metrics = st.columns(4)
+    metrics[0].metric("Expectancy", money(edge.get("overallExpectancy", 0)), "per trade")
+    metrics[1].metric(
+        "Win Rate",
+        f"{float(edge.get('winRate', 0) or 0):.1f}%",
+        f"{int(edge.get('wins', 0) or 0)} / {total_trades}",
+    )
+    metrics[2].metric(
+        "Profit Factor",
+        f"{float(profit_factor):.2f}" if profit_factor is not None else "—",
+    )
+    metrics[3].metric(
+        "Total Trades",
+        total_trades,
+        f"N {int(symbol_trades.get('NIFTY', 0) or 0)} • BN {int(symbol_trades.get('BANKNIFTY', 0) or 0)}",
+    )
+    if total_trades == 0:
+        st.info("Waiting for scored NIFTY and BANKNIFTY trades.")
+
+    score_bands = edge.get("scoreBands") or []
+    time_buckets = edge.get("timeBuckets") or []
+    matrix_rows = edge.get("matrix") or []
+    cells = {
+        (str(item.get("timeBucket")), str(item.get("scoreBand"))): item
+        for item in matrix_rows
+    }
+    if score_bands and time_buckets:
+        display = pd.DataFrame(index=[item.get("label") for item in time_buckets], columns=score_bands)
+        styles = pd.DataFrame(index=display.index, columns=display.columns)
+        for bucket in time_buckets:
+            label = bucket.get("label")
+            for score_band in score_bands:
+                cell = cells.get((str(bucket.get("id")), str(score_band)), {})
+                trades = int(cell.get("trades", 0) or 0)
+                expectancy = float(cell.get("expectancy", 0) or 0)
+                display.loc[label, score_band] = (
+                    f"{money(expectancy)} • {trades}T" if trades else "—"
+                )
+                styles.loc[label, score_band] = edge_heatmap_style(expectancy, trades)
+        styled = display.style.apply(lambda _frame: styles, axis=None)
+        st.markdown("#### Expectancy Heat Map")
+        st.dataframe(styled, use_container_width=True)
+        st.caption(
+            "Red < -₹500 | Orange -₹500 to ₹0 | Yellow ₹0 to ₹500 | "
+            "Light green ₹500 to ₹1,000 | Green > ₹1,000"
+        )
+
+    best_zone = edge.get("bestZone") or {}
+    time_performance = pd.DataFrame(edge.get("timePerformance") or [])
+    best_column, time_column = st.columns(2)
+    with best_column:
+        st.markdown("#### Best Edge Zone")
+        if best_zone:
+            st.metric("Entry Time", best_zone.get("timeLabel", "—"))
+            st.metric("Unified Score", best_zone.get("scoreBand", "—"))
+            st.metric("Expectancy", money(best_zone.get("expectancy", 0)))
+            st.caption(
+                f"Win rate {float(best_zone.get('winRate', 0) or 0):.1f}% | "
+                f"{int(best_zone.get('trades', 0) or 0)} trades"
+            )
+        else:
+            st.info("More scored trades are needed to identify a best zone.")
+    with time_column:
+        st.markdown("#### Expectancy by Entry Time")
+        if time_performance.empty:
+            st.info("No entry-time performance is available yet.")
+        else:
+            time_performance["expectancy"] = pd.to_numeric(
+                time_performance["expectancy"], errors="coerce"
+            ).fillna(0)
+            st.bar_chart(
+                time_performance.set_index("label")[["expectancy"]],
+                use_container_width=True,
+            )
+    insight = str(edge.get("keyInsight") or "")
+    if insight:
+        st.markdown(
+            f'<div class="analytics-insight">★ {html.escape(insight)}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_analytics_tab(performance_payload):
+    st.markdown('<div class="dash-title">Analytics</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">The same calendar, weekday, cumulative P&L, and edge analytics shown in the iOS app</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("### P&L Calendar")
+    st.caption("Daily recorded bot results.")
+    render_analytics_calendar(performance_payload.get("pnlCalendar") or [])
+
+    st.markdown("### P&L by Weekday")
+    st.caption("NIFTY and BANKNIFTY results by trading day.")
+    weekday = pd.DataFrame(
+        (performance_payload.get("cumulative") or {}).get("dayOfWeekPerformance") or []
+    )
+    if weekday.empty:
+        st.info("The chart will appear when completed weekday results are available.")
+    else:
+        weekday["netPnL"] = pd.to_numeric(weekday["netPnL"], errors="coerce").fillna(0)
+        weekday_chart = weekday.pivot(index="day", columns="symbol", values="netPnL")
+        weekday_chart = weekday_chart.reindex(
+            ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        ).fillna(0)
+        st.bar_chart(weekday_chart, use_container_width=True)
+
+    st.markdown("### Cumulative P&L")
+    st.caption("Progression across completed trading days.")
+    equity = pd.DataFrame(performance_payload.get("equityCurve") or [])
+    if equity.empty:
+        st.info("The cumulative line will appear when completed daily results are available.")
+    else:
+        equity["date"] = pd.to_datetime(equity["date"], errors="coerce")
+        equity["cumulativePnL"] = pd.to_numeric(
+            equity["cumulativePnL"], errors="coerce"
+        ).fillna(0)
+        equity = equity.dropna(subset=["date"]).set_index("date")
+        st.line_chart(equity[["cumulativePnL"]], use_container_width=True)
+
+    render_edge_matrix(performance_payload.get("edgeAnalytics") or {})
+
+
 st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="dash-subtitle">NIFTY and BANKNIFTY performance and score follow-through research</div>',
     unsafe_allow_html=True,
 )
 
-performance_tab, score_review_tab = st.tabs(["Performance", "Post Market Review"])
+performance_tab, analytics_tab, score_review_tab = st.tabs(
+    ["Performance", "Analytics", "Post Market Review"]
+)
 
 with performance_tab:
     today = performance.get("today", {})
@@ -2320,6 +2598,9 @@ with performance_tab:
     if not second_context.empty:
         st.markdown("**Second Trade Context**")
         st.dataframe(second_context, use_container_width=True, hide_index=True)
+
+with analytics_tab:
+    render_analytics_tab(performance)
 
 with score_review_tab:
     render_score_followthrough_review()
