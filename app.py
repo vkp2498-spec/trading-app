@@ -358,8 +358,11 @@ def clean_num(x):
     return float(m.group(0)) if m else None
 
 
-def should_use_next_week_expiry(symbol):
-    return str(symbol or "").upper() == "NIFTY"
+def should_use_next_week_expiry(symbol, trading_date=None):
+    trading_date = trading_date or now_ist().date()
+    if isinstance(trading_date, datetime):
+        trading_date = trading_date.date()
+    return str(symbol or "").upper() == "NIFTY" and trading_date.weekday() != 2
 
 
 def parse_oi_with_change(text):

@@ -194,8 +194,10 @@ The same selected historical score window supplies adaptive exit points: average
 ### 7.3 Contract selection
 
 - NIFTY deliberately separates evidence from execution: nearest-expiry ATM
-  option-chain, OI/PCR, VWAP, volume, and trend data drive the analysis, while
-  Vamsi selective/Test orders buy the next-expiry ATM contract.
+  option-chain, OI/PCR, VWAP, volume, and trend data drive the analysis. On
+  Wednesday, the day after the normal Tuesday expiry, execution uses that new
+  front/same-week ATM contract. From Thursday through Tuesday, execution uses
+  the following NIFTY expiry.
 - Ganesh uses the same NIFTY expiry split. In FAITHFUL mode the nearest-expiry
   evidence is recorded as context without silently adding a new entry veto.
 - BANKNIFTY continues to analyze and execute the configured nearest contract.
@@ -203,7 +205,9 @@ The same selected historical score window supplies adaptive exit points: average
 - Both candidates must pass hard spread/Greek/depth validity checks. Structure and feasibility contribute to the unified score.
 - Capital allocation is converted into whole lots and rounded down.
 - `ACCOUNT_MAX_OPTION_CAPITAL` and `ACCOUNT_MAX_LOTS_PER_ENTRY` remain hard account ceilings.
-- NIFTY expiry selection has evolved toward next-week contracts to avoid expiry-day distortion. Confirm the exact current selection in `strategy_core.py` before changing it.
+- NIFTY uses the front expiry only on Wednesday; every other session uses the
+  following expiry to reduce near-expiry distortion. Confirm the exact current
+  selection in `strategy_core.py` before changing it.
 
 ### 7.4 Default risk/exit shape in `.env.example`
 
@@ -290,7 +294,8 @@ ENABLE_LIVE_TRADING=true
 - The continuation score assigns 25 points to 15-minute gap acceptance, 25 to opening-range breakout/retest, 20 to constituent breadth, 15 to near-expiry ATM option VWAP/volume, 10 to option-chain direction and 5 to institutional context.
 - Continuation requires a default score of 75, option volume ratio of at least 1.20, no HIGH-confidence opposing chain, no MEDIUM/HIGH opposing breadth or institutional footprint, and no excessive opening-range extension.
 - Once reversal or continuation is selected for a symbol/day, the other lane cannot compete with it.
-- Use a next-week NIFTY option or the nearest supported BANKNIFTY expiry, and one lot by default.
+- Use Wednesday's front NIFTY expiry or the following NIFTY expiry on every
+  other weekday; BANKNIFTY uses its nearest supported expiry. Use one lot by default.
 - Allow at most one combined Ganesh trade per day across NIFTY and BANKNIFTY.
 - Do not re-enter after the daily trade is completed.
 

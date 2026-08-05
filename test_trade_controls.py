@@ -167,13 +167,29 @@ class TradeControlTests(unittest.TestCase):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
         self.assertEqual(choose_analysis_expiry("NIFTY", expiries), "2026-08-04")
 
-    def test_nifty_always_uses_second_available_expiry(self):
+    def test_nifty_uses_following_expiry_outside_wednesday(self):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
-        self.assertEqual(choose_expiry("NIFTY", expiries), "2026-08-11")
+        trading_date = datetime(2026, 8, 4).date()
+        self.assertEqual(
+            choose_expiry("NIFTY", expiries, trading_date),
+            "2026-08-11",
+        )
+
+    def test_nifty_uses_front_expiry_only_on_wednesday(self):
+        expiries = ["2026-08-11", "2026-08-18", "2026-08-25"]
+        trading_date = datetime(2026, 8, 5).date()
+        self.assertEqual(
+            choose_expiry("NIFTY", expiries, trading_date),
+            "2026-08-11",
+        )
 
     def test_nifty_does_not_fall_back_when_next_expiry_is_missing(self):
         with self.assertRaisesRegex(RuntimeError, "No next-week expiry"):
-            choose_expiry("NIFTY", ["2026-08-04"])
+            choose_expiry(
+                "NIFTY",
+                ["2026-08-04"],
+                datetime(2026, 8, 4).date(),
+            )
 
     def test_banknifty_keeps_nearest_expiry(self):
         expiries = ["2026-08-25", "2026-09-29"]
@@ -210,6 +226,11 @@ class TradeControlTests(unittest.TestCase):
                 strategy_core,
                 "get_expiries_from_upstox",
                 return_value=["2026-08-04", "2026-08-11", "2026-08-18"],
+            ),
+            patch.object(
+                strategy_core,
+                "now_ist",
+                return_value=datetime(2026, 8, 3, 10, 0),
             ),
             patch.object(strategy_core, "fetch_upstox_option_chain", side_effect=fetch),
         ):
@@ -532,8 +553,16 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(candidate["strike"], 24350)
         self.assertTrue(candidate["contract_fallback_used"])
 
-    def test_replay_uses_next_nifty_expiry_on_every_weekday(self):
+    def test_replay_uses_front_nifty_expiry_on_wednesday(self):
         session_date = datetime(2026, 7, 29).date()
+        expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
+        self.assertEqual(
+            _choose_expiry("NIFTY", expiries, session_date),
+            datetime(2026, 8, 4).date(),
+        )
+
+    def test_replay_uses_following_nifty_expiry_outside_wednesday(self):
+        session_date = datetime(2026, 7, 30).date()
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
         self.assertEqual(
             _choose_expiry("NIFTY", expiries, session_date),

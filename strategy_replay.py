@@ -177,6 +177,8 @@ def _choose_expiry(symbol, expiries, session_date):
     if not valid:
         return None
     if symbol == "NIFTY":
+        if session_date.weekday() == 2:
+            return valid[0]
         return valid[1] if len(valid) >= 2 else None
     return valid[0]
 

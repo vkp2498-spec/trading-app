@@ -529,7 +529,10 @@ class GaneshGapReversalTests(unittest.TestCase):
 
     def test_nifty_contract_selection_uses_expiry_after_nearest(self):
         expiries = ["2026-08-04", "2026-08-11", "2026-08-18"]
-        self.assertEqual(choose_expiry("NIFTY", expiries), "2026-08-11")
+        self.assertEqual(
+            choose_expiry("NIFTY", expiries, datetime(2026, 8, 4).date()),
+            "2026-08-11",
+        )
 
     def test_ganesh_engine_dispatches_only_ganesh_entry_logic(self):
         with (

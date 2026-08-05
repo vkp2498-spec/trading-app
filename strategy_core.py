@@ -1,6 +1,6 @@
 import os
 import socket
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -55,18 +55,37 @@ def now_ist():
     return datetime.now(IST)
 
 
-def should_use_next_week_expiry(symbol):
-    return int(INDEX_CONFIG[symbol].get("execution_expiry_offset", 0)) == 1
+def _trading_date(value=None):
+    value = value or now_ist().date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
 
 
-def choose_expiry(symbol, expiries):
+def execution_expiry_offset(symbol, trading_date=None):
+    """Return the active execution-expiry offset for the trading session."""
+    configured_offset = int(INDEX_CONFIG[symbol].get("execution_expiry_offset", 0))
+    if symbol == "NIFTY" and _trading_date(trading_date).weekday() == 2:
+        # Tuesday is the normal NIFTY expiry. On Wednesday only, use the new
+        # same-week/front contract; all other sessions keep the next expiry.
+        return 0
+    return configured_offset
+
+
+def should_use_next_week_expiry(symbol, trading_date=None):
+    return execution_expiry_offset(symbol, trading_date) == 1
+
+
+def choose_expiry(symbol, expiries, trading_date=None):
     """Choose the contract that may actually be traded."""
     expiries = sorted([e for e in expiries if e])
 
     if not expiries:
         raise RuntimeError(f"No expiries available for {symbol}")
 
-    expiry_offset = int(INDEX_CONFIG[symbol].get("execution_expiry_offset", 0))
+    expiry_offset = execution_expiry_offset(symbol, trading_date)
     if len(expiries) <= expiry_offset:
         label = "next-week" if expiry_offset == 1 else "nearest"
         raise RuntimeError(
@@ -505,8 +524,9 @@ def get_index_recommendation(symbol):
         "confidence": confidence,
         "score": score,
         "reasons": reasons,
-        # The traditional keys remain execution-facing so every downstream
-        # order path buys the next NIFTY expiry without needing special cases.
+        # The traditional keys remain execution-facing so downstream order
+        # paths automatically receive Wednesday's front NIFTY expiry or the
+        # next expiry used on every other NIFTY trading day.
         "atm": execution_atm.to_dict(),
         "nearby_contracts": execution_nearby_df.to_dict("records"),
         "execution_chain": execution_chain_df.to_dict("records"),
