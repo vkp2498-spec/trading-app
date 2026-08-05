@@ -38,6 +38,8 @@ from strategy_core import now_ist
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
 from dashboard_data import dashboard_index_trades
+from dashboard_data import edge_time_bucket
+from dashboard_data import entry_minutes
 from dashboard_data import normalized_underlying
 from dashboard_data import option_type
 from dashboard_data import read_trade_history
@@ -993,164 +995,112 @@ def render_score_followthrough_review():
         )
 
 
-def render_todays_trades_analysis():
-    def clean_text(value, default=""):
-        if value is None or pd.isna(value):
-            return default
-        text = str(value).strip()
-        return text or default
+def score_band_for_matrix(score, score_bands):
+    if score is None or pd.isna(score):
+        return "Unscored" if "Unscored" in score_bands else None
+    value = float(score)
+    for label in score_bands:
+        normalized = str(label).replace("–", "-").strip()
+        if normalized.lower() == "unscored":
+            continue
+        less_than = re.fullmatch(r"<\s*(\d+(?:\.\d+)?)", normalized)
+        if less_than and value < float(less_than.group(1)):
+            return label
+        score_range = re.fullmatch(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", normalized)
+        if score_range:
+            lower = float(score_range.group(1))
+            upper = float(score_range.group(2))
+            if lower <= value < upper + 1:
+                return label
+        minimum = re.fullmatch(r"(\d+(?:\.\d+)?)\+", normalized)
+        if minimum and value >= float(minimum.group(1)):
+            return label
+    return "Unscored" if "Unscored" in score_bands else None
 
-    st.markdown('<div class="dash-title">Today’s Trades Analysis</div>', unsafe_allow_html=True)
+
+def daily_pnl_matrix_style(value, trades):
+    if trades <= 0:
+        return "background-color:#f1f5f9;color:#64748b;font-weight:700"
+    if value > 0:
+        return "background-color:#16a34a;color:white;font-weight:850"
+    if value < 0:
+        return "background-color:#dc2626;color:white;font-weight:850"
+    return "background-color:#fde047;color:#061a35;font-weight:850"
+
+
+def render_daily_trade_pnl_matrix(performance_payload):
+    st.markdown('<div class="dash-title">Time × Score Net P&L</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="dash-subtitle">Executed trades only: what happened after exit, and whether a losing trade could have recovered with a modestly wider stop</div>',
+        '<div class="dash-subtitle">Executed trades grouped by entry time and entry score for one trading day</div>',
         unsafe_allow_html=True,
     )
-    st.caption(
-        "Uses one-minute option-premium candles from the first complete minute after exit "
-        "through 3:30 PM IST. The stop comparison uses the recorded original stop when available."
+
+    trades = dashboard_index_trades(read_trade_history())
+    today_text = now_ist().date().isoformat()
+    available_dates = sorted(
+        {
+            str(trade.get("tradeDate") or "").strip()
+            for trade in trades
+            if str(trade.get("tradeDate") or "").strip()
+        }
+        | {today_text},
+        reverse=True,
     )
+    selected_date = st.selectbox(
+        "Trading day",
+        available_dates,
+        index=available_dates.index(today_text),
+        key="daily_trade_pnl_matrix_date",
+    )
+    daily_trades = [trade for trade in trades if trade.get("tradeDate") == selected_date]
 
-    today = now_ist().date()
-    date_text = today.isoformat()
-    executed_file = DATA_DIR / f"executed_trade_forensics_{date_text}.csv"
-    is_market_active = now_ist().time() < POST_MARKET_REVIEW_TIME
-    if is_market_active:
-        st.info(
-            "Today’s path is still developing. A provisional report can be built now, but "
-            "run it again after 3:30 PM IST for the complete session."
-        )
+    edge = performance_payload.get("edgeAnalytics") or {}
+    score_bands = edge.get("scoreBands") or [
+        "<50", "50-59", "60-69", "70-79", "80-89", "90-100", "Unscored"
+    ]
+    time_buckets = edge.get("timeBuckets") or [
+        {"id": "opening", "label": "09:15–10:00"},
+        {"id": "morning", "label": "10:00–11:00"},
+        {"id": "late_morning", "label": "11:00–13:00"},
+        {"id": "early_afternoon", "label": "13:00–14:00"},
+        {"id": "late_afternoon", "label": "14:00–15:30"},
+        {"id": "unknown", "label": "Unknown time"},
+    ]
+    labels_by_id = {
+        str(bucket.get("id")): str(bucket.get("label") or bucket.get("id"))
+        for bucket in time_buckets
+    }
+    pnl_by_cell = {
+        (bucket_id, score_band): 0.0
+        for bucket_id in labels_by_id
+        for score_band in score_bands
+    }
+    trades_by_cell = {key: 0 for key in pnl_by_cell}
+    for trade in daily_trades:
+        bucket_id = edge_time_bucket(entry_minutes(trade))
+        score_band = score_band_for_matrix(trade.get("score"), score_bands)
+        key = (bucket_id, score_band)
+        if key not in pnl_by_cell:
+            continue
+        pnl_by_cell[key] += float(trade.get("grossPnL") or 0)
+        trades_by_cell[key] += 1
 
-    if st.button(
-        "Analyze Today’s Trades",
-        type="primary",
+    display = pd.DataFrame(index=list(labels_by_id.values()), columns=score_bands)
+    styles = pd.DataFrame(index=display.index, columns=display.columns)
+    for bucket_id, label in labels_by_id.items():
+        for score_band in score_bands:
+            key = (bucket_id, score_band)
+            pnl = round(pnl_by_cell[key], 2)
+            count = trades_by_cell[key]
+            display.loc[label, score_band] = money(pnl) if count else "—"
+            styles.loc[label, score_band] = daily_pnl_matrix_style(pnl, count)
+
+    st.dataframe(
+        display.style.apply(lambda _frame: styles, axis=None),
         use_container_width=True,
-        key="analyze_todays_executed_trades",
-    ):
-        with st.spinner("Following every executed trade through the remaining one-minute candles..."):
-            try:
-                instruments = load_forensic_instruments()
-                by_symbol, by_key = forensic_instrument_lookup(instruments)
-                executed = run_executed_trade_forensics(
-                    read_forensic_trades(date_text),
-                    by_symbol,
-                    by_key,
-                    {},
-                    1,
-                )
-                DATA_DIR.mkdir(exist_ok=True)
-                executed.to_csv(executed_file, index=False)
-                st.session_state["todays_trade_analysis_date"] = date_text
-                st.session_state["todays_trade_analysis"] = executed
-            except Exception as error:
-                st.error(f"Today’s trade analysis could not be generated: {error}")
-
-    if st.session_state.get("todays_trade_analysis_date") == date_text:
-        executed = st.session_state.get("todays_trade_analysis", pd.DataFrame())
-    elif executed_file.exists():
-        executed = read_csv_if_present(executed_file)
-    else:
-        st.info("Build the report after the market closes to analyze today’s executed trades.")
-        return
-
-    required_column = "post_exit_max_move_points_before_stop"
-    if not executed.empty and required_column not in executed.columns:
-        st.info("The saved report uses the earlier format. Click Analyze Today’s Trades to rebuild it.")
-        return
-    if executed.empty:
-        st.info("No closed trades were recorded today.")
-        return
-
-    errors = executed.get(
-        "analysis_error",
-        pd.Series(index=executed.index, dtype="object"),
-    ).fillna("").astype(str).str.strip()
-    valid = executed[errors.eq("")].copy()
-    realized = pd.to_numeric(valid.get("realized_pnl"), errors="coerce").fillna(0)
-    classifications = valid.get(
-        "loss_path_classification",
-        pd.Series(index=valid.index, dtype="object"),
-    ).fillna("DATA_UNAVAILABLE")
-    metrics = st.columns(4)
-    metrics[0].metric("Trades Analyzed", f"{len(valid)}/{len(executed)}")
-    metrics[1].metric("Losing Trades", int(realized.lt(0).sum()))
-    metrics[2].metric(
-        "Target After Wider Stop",
-        int(classifications.eq("TARGET_AFTER_RELAXING_STOP").sum()),
     )
-    metrics[3].metric("Hard Losses", int(classifications.eq("HARD_LOSS").sum()))
-
-    for _, row in executed.sort_values("entry_time").iterrows():
-        symbol = clean_text(row.get("symbol"))
-        trading_symbol = clean_text(row.get("trading_symbol"))
-        pnl_value = row.get("realized_pnl")
-        pnl = float(pnl_value) if pd.notna(pnl_value) else 0.0
-        analysis_error = clean_text(row.get("analysis_error"))
-        original_stop = row.get("original_stop_loss_price")
-        display_stop = (
-            original_stop
-            if pd.notna(original_stop) and float(original_stop or 0) > 0
-            else row.get("stop_loss_price")
-        )
-        with st.container(border=True):
-            st.markdown(f"#### {symbol} | {trading_symbol}")
-            columns = st.columns(5)
-            columns[0].metric("Recorded P&L", money(pnl))
-            columns[1].metric(
-                "Entry / Exit",
-                f"{number(row.get('entry_price'))} / {number(row.get('exit_price'))}",
-            )
-            columns[2].metric(
-                "Target / Stop",
-                f"{number(row.get('target_price'))} / "
-                f"{number(display_stop)}",
-            )
-            columns[3].metric(
-                "Best Move After Exit",
-                f"{number(row.get('post_exit_max_move_points_before_stop'))} pts",
-                "before planned stop touch",
-            )
-            extra_stop = row.get("extra_stop_points_to_target")
-            columns[4].metric(
-                "Extra Stop To Target",
-                f"{number(extra_stop)} pts" if pd.notna(extra_stop) else "N/A",
-            )
-
-            if analysis_error:
-                st.warning(f"Candle analysis unavailable: {analysis_error}")
-                continue
-
-            classification = clean_text(
-                row.get("loss_path_classification"),
-                "DATA_UNAVAILABLE",
-            )
-            note = clean_text(row.get("loss_path_note"))
-            if classification == "HARD_LOSS":
-                st.error(note)
-            elif classification in {"TARGET_AFTER_RELAXING_STOP", "AMBIGUOUS_SAME_CANDLE"}:
-                st.warning(note)
-            elif classification == "TARGET_WITHOUT_RELAXATION":
-                st.success(note)
-            else:
-                st.info(note)
-
-            best_price = row.get("post_exit_best_price_before_stop")
-            stop_time = clean_text(row.get("post_exit_stop_touch_time"))
-            target_time = clean_text(row.get("post_exit_target_touch_time"))
-            details = f"Best post-exit price before stop: {number(best_price)}"
-            if stop_time:
-                details += f" | Stop touched: {stop_time[11:16]}"
-            if target_time:
-                details += f" | Target touched: {target_time[11:16]}"
-            st.caption(details)
-
-    if errors.ne("").any():
-        st.warning(
-            f"{int(errors.ne('').sum())} trade(s) could not be fully analyzed. "
-            "The card shows the saved instrument or market-data error."
-        )
     st.caption(
-        "This is hindsight diagnostics, not a recommendation to widen live stops. One-minute "
-        "OHLC candles cannot establish tick order when target and stop fall inside the same candle."
+        "Green cells were profitable, red cells were loss-making, yellow cells were flat, and — means no trade."
     )
 
 
@@ -2605,4 +2555,4 @@ with analytics_tab:
 with score_review_tab:
     render_score_followthrough_review()
     st.divider()
-    render_todays_trades_analysis()
+    render_daily_trade_pnl_matrix(performance)
