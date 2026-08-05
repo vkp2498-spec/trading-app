@@ -1056,9 +1056,36 @@ def static_vamsi_minimum_score():
     return minimum
 
 
+def static_vamsi_score_rule():
+    minimum = static_vamsi_minimum_score()
+    raw_maximum = str(os.getenv("VAMSI_UNIFIED_SCORE_MAXIMUM") or "").strip()
+    if not raw_maximum:
+        return {
+            "source": "STATIC_FALLBACK",
+            "mode": "MIN",
+            "min_score": minimum,
+            "max_score": None,
+        }
+    try:
+        maximum = float(raw_maximum)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("VAMSI_UNIFIED_SCORE_MAXIMUM must be a number") from error
+    if maximum < minimum or maximum > 100:
+        raise RuntimeError(
+            "VAMSI_UNIFIED_SCORE_MAXIMUM must be between "
+            "VAMSI_UNIFIED_SCORE_FALLBACK and 100"
+        )
+    return {
+        "source": "STATIC_FALLBACK",
+        "mode": "RANGE",
+        "min_score": minimum,
+        "max_score": maximum,
+    }
+
+
 def vamsi_score_rule(symbol):
     """Return today's adaptive rule or the configured static fallback."""
-    fallback = static_vamsi_minimum_score()
+    fallback = static_vamsi_score_rule()
     if configured_bool("VAMSI_ADAPTIVE_SCORE_ENABLED", True):
         adaptive = read_effective_score_rule(symbol, now_ist().date())
         if adaptive:
@@ -1068,12 +1095,7 @@ def vamsi_score_rule(symbol):
                 "min_score": float(adaptive["min_score"]),
                 "max_score": adaptive.get("max_score"),
             }
-    return {
-        "source": "STATIC_FALLBACK",
-        "mode": "MIN",
-        "min_score": fallback,
-        "max_score": None,
-    }
+    return fallback
 
 
 def direct_entry_minimum_score(symbol):
@@ -1082,8 +1104,9 @@ def direct_entry_minimum_score(symbol):
 
 def format_vamsi_score_rule(rule):
     if rule.get("mode") == "RANGE":
+        label = "adaptive range" if rule.get("source") == "ADAPTIVE" else "configured range"
         return (
-            f"adaptive range {float(rule['min_score']):.1f}-"
+            f"{label} {float(rule['min_score']):.1f}-"
             f"{float(rule['max_score']):.1f}"
         )
     label = "adaptive minimum" if rule.get("source") == "ADAPTIVE" else "minimum"
@@ -1093,6 +1116,11 @@ def format_vamsi_score_rule(rule):
 def vamsi_entry_score_qualifies(score, symbol):
     value = to_float(score)
     rule = vamsi_score_rule(symbol)
+    if rule.get("mode") == "RANGE":
+        return (
+            value >= float(rule["min_score"])
+            and value <= float(rule["max_score"])
+        )
     if rule.get("source") == "ADAPTIVE":
         if value < float(rule["min_score"]):
             return False

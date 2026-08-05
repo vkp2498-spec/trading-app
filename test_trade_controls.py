@@ -63,6 +63,7 @@ class TradeControlTests(unittest.TestCase):
             os.environ,
             {
                 "VAMSI_UNIFIED_SCORE_FALLBACK": "55",
+                "VAMSI_UNIFIED_SCORE_MAXIMUM": "",
                 "INDEX_DIRECT_ENTRY_MIN_SCORE": "75",
             },
             clear=False,
@@ -73,6 +74,25 @@ class TradeControlTests(unittest.TestCase):
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(58, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(75, "NIFTY"))
             self.assertTrue(trade_bot.vamsi_weighted_score_qualifies(100, "NIFTY"))
+
+    def test_vamsi_static_score_range_is_inclusive(self):
+        with patch.dict(
+            os.environ,
+            {
+                "VAMSI_ADAPTIVE_SCORE_ENABLED": "false",
+                "VAMSI_UNIFIED_SCORE_FALLBACK": "50",
+                "VAMSI_UNIFIED_SCORE_MAXIMUM": "59",
+            },
+            clear=False,
+        ):
+            rule = trade_bot.vamsi_score_rule("NIFTY")
+            self.assertEqual(rule["mode"], "RANGE")
+            self.assertEqual(rule["min_score"], 50)
+            self.assertEqual(rule["max_score"], 59)
+            self.assertFalse(trade_bot.vamsi_entry_score_qualifies(49.9, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_entry_score_qualifies(50, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_entry_score_qualifies(59, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_entry_score_qualifies(59.1, "NIFTY"))
 
     def test_vamsi_score_threshold_cannot_exceed_one_hundred(self):
         with patch.dict(

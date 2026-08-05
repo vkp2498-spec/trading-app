@@ -189,6 +189,8 @@ Liquidity/contract validity, broker reconciliation, monitor health, market hours
 
 When `VAMSI_ADAPTIVE_SCORE_ENABLED=true`, the 09:00 IST job analyzes only prior rows tagged with the current unified score version, separately for NIFTY and BANKNIFTY. It compares minimum-and-above rules with contiguous bounded ranges and saves the effective rule in `data/vamsi_adaptive_score_config.json`. Legacy weighted-score observations remain stored but are excluded because their scale is not comparable. Until at least 20 current-version observations exist across five trading days, or whenever today's calibration is missing/stale/invalid, the strict fallback is `score > VAMSI_UNIFIED_SCORE_FALLBACK` (default 55). Adaptive boundaries are inclusive.
 
+For a manually selected static score range, set `VAMSI_ADAPTIVE_SCORE_ENABLED=false`, use `VAMSI_UNIFIED_SCORE_FALLBACK` as the inclusive lower boundary, and set the optional `VAMSI_UNIFIED_SCORE_MAXIMUM` as the inclusive upper boundary. If the maximum is omitted, the legacy strict minimum-only rule remains in effect.
+
 The same selected historical score window supplies adaptive exit points: average favorable movement becomes the target and average adverse movement becomes the stop. Each is bounded to 0.5x-2.0x the account's configured default to prevent a single unusual sample from producing an extreme plan. Until the unified-history requirement is met, `NIFTY_TARGET_POINTS`, `NIFTY_STOP_POINTS`, `BANKNIFTY_TARGET_POINTS`, and `BANKNIFTY_STOP_POINTS` continue unchanged. Post-fill technical feasibility remains diagnostic, while broker protection remains a hard safeguard.
 
 ### 7.3 Contract selection
