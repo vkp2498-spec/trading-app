@@ -2406,7 +2406,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertTrue(decision["allowed"])
         self.assertEqual(decision["required_score"], 20)
 
-    def test_score_cutoff_post_fill_override_preserves_rr_rejection(self):
+    def test_post_fill_reward_risk_rejection_is_diagnostic_only(self):
         post_fill = {
             "allowed": False,
             "feasibility": {
@@ -2416,12 +2416,13 @@ class TradeControlTests(unittest.TestCase):
                 ],
             },
         }
-        result = trade_bot.apply_score_cutoff_post_fill_override(post_fill, True)
-        self.assertFalse(result["allowed"])
-        self.assertFalse(result["feasibility"]["score_cutoff_override"])
-        self.assertTrue(result["feasibility"]["hard_execution_gate"])
+        result = trade_bot.make_post_fill_diagnostic_only(post_fill)
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["feasibility"]["post_fill_diagnostic_only"])
+        self.assertTrue(result["feasibility"]["post_fill_diagnostic_rejected"])
+        self.assertFalse(result["feasibility"]["hard_execution_gate"])
 
-    def test_score_cutoff_post_fill_override_preserves_hard_extension_exit(self):
+    def test_post_fill_extension_rejection_is_diagnostic_only(self):
         post_fill = {
             "allowed": False,
             "feasibility": {
@@ -2431,9 +2432,10 @@ class TradeControlTests(unittest.TestCase):
                 ],
             },
         }
-        result = trade_bot.apply_score_cutoff_post_fill_override(post_fill, True)
-        self.assertFalse(result["allowed"])
-        self.assertTrue(result["feasibility"]["hard_execution_gate"])
+        result = trade_bot.make_post_fill_diagnostic_only(post_fill)
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["feasibility"]["post_fill_diagnostic_rejected"])
+        self.assertFalse(result["feasibility"]["hard_execution_gate"])
 
 
 if __name__ == "__main__":

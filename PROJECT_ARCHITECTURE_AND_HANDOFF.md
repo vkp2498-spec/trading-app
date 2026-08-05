@@ -185,11 +185,11 @@ The Vamsi engine is the evolved multi-signal intraday long-option engine. Its pr
 
 The live Vamsi entry decision uses one versioned score, `VAMSI_UNIFIED_ENTRY_V1`. Its weights total 100: core option/technical alignment 25, multi-timeframe direction and entry structure 25, breadth 20, institutional context 10, market regime/expiry 10, and trade feasibility (15-minute target, reward/risk, and entry extension) 10. These market-strategy conditions no longer veto a setup separately; alignment earns points and conflict or weak evidence earns fewer points. The score is an evidence ranking, not a calibrated probability.
 
-Liquidity/contract validity, broker reconciliation, monitor health, market hours, duplicate-position controls, capital/lot ceilings, post-fill validation, broker protection, and portfolio risk remain hard execution safeguards. They are not allowed to be overridden by a high strategy score.
+Liquidity/contract validity, broker reconciliation, monitor health, market hours, duplicate-position controls, capital/lot ceilings, broker protection, and portfolio risk remain hard execution safeguards. Post-fill technical validation is observation-only: it records revised reward/risk and target context but cannot flatten a filled position.
 
 When `VAMSI_ADAPTIVE_SCORE_ENABLED=true`, the 09:00 IST job analyzes only prior rows tagged with the current unified score version, separately for NIFTY and BANKNIFTY. It compares minimum-and-above rules with contiguous bounded ranges and saves the effective rule in `data/vamsi_adaptive_score_config.json`. Legacy weighted-score observations remain stored but are excluded because their scale is not comparable. Until at least 20 current-version observations exist across five trading days, or whenever today's calibration is missing/stale/invalid, the strict fallback is `score > VAMSI_UNIFIED_SCORE_FALLBACK` (default 55). Adaptive boundaries are inclusive.
 
-The same selected historical score window supplies adaptive exit points: average favorable movement becomes the target and average adverse movement becomes the stop. Each is bounded to 0.5x-2.0x the account's configured default to prevent a single unusual sample from producing an extreme plan. Until the unified-history requirement is met, `NIFTY_TARGET_POINTS`, `NIFTY_STOP_POINTS`, `BANKNIFTY_TARGET_POINTS`, and `BANKNIFTY_STOP_POINTS` continue unchanged. Post-fill feasibility and broker protection remain hard safeguards.
+The same selected historical score window supplies adaptive exit points: average favorable movement becomes the target and average adverse movement becomes the stop. Each is bounded to 0.5x-2.0x the account's configured default to prevent a single unusual sample from producing an extreme plan. Until the unified-history requirement is met, `NIFTY_TARGET_POINTS`, `NIFTY_STOP_POINTS`, `BANKNIFTY_TARGET_POINTS`, and `BANKNIFTY_STOP_POINTS` continue unchanged. Post-fill technical feasibility remains diagnostic, while broker protection remains a hard safeguard.
 
 ### 7.3 Contract selection
 
@@ -606,7 +606,7 @@ Upstox rejected a protective option stop from the retired T20 experiment as if i
 
 ### Post-fill guardrail
 
-A filled order was immediately flattened because the post-fill technical reward/risk no longer passed. Post-fill checks are useful, but must not unexpectedly reinterpret a score-qualified trade without clear logging and tests.
+A filled order was previously flattened when post-fill technical reward/risk no longer passed. Post-fill technical checks are now diagnostic-only, so they remain available for audit without reinterpreting or closing a score-qualified filled trade.
 
 ### Monitor failures
 

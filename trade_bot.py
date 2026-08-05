@@ -652,13 +652,15 @@ def revalidate_option_after_fill(
     }
 
 
-def apply_score_cutoff_post_fill_override(post_fill, score_cutoff_approved):
-    """A score may approve a setup, but it never overrides execution safety."""
-    if not post_fill.get("allowed") and score_cutoff_approved:
-        feasibility = post_fill.get("feasibility", {}) or {}
-        feasibility["score_cutoff_override"] = False
-        feasibility["hard_execution_gate"] = True
-        post_fill["feasibility"] = feasibility
+def make_post_fill_diagnostic_only(post_fill):
+    """Retain post-fill analytics without using them to flatten a position."""
+    feasibility = post_fill.get("feasibility", {}) or {}
+    diagnostic_rejected = not bool(post_fill.get("allowed"))
+    feasibility["post_fill_diagnostic_only"] = True
+    feasibility["post_fill_diagnostic_rejected"] = diagnostic_rejected
+    feasibility["hard_execution_gate"] = False
+    post_fill["feasibility"] = feasibility
+    post_fill["allowed"] = True
     return post_fill
 
 
@@ -4076,14 +4078,11 @@ def handle_existing_state(symbol, state, verbose=True):
                 state.get("option_delta_used"),
                 technical_context,
             )
-            post_fill = apply_score_cutoff_post_fill_override(
-                post_fill,
-                bool(state.get("score_cutoff_approved")),
-            )
-            if post_fill.get("feasibility", {}).get("score_cutoff_override"):
+            post_fill = make_post_fill_diagnostic_only(post_fill)
+            if post_fill.get("feasibility", {}).get("post_fill_diagnostic_rejected"):
                 log(
-                    f"{symbol} delayed-fill score cutoff retained position; "
-                    "soft technical headroom veto ignored"
+                    f"{symbol} delayed-fill post-fill diagnostic did not pass; "
+                    "position retained because post-fill checks are observation-only"
                 )
             state["post_fill_feasibility"] = post_fill["feasibility"]
             if not post_fill["allowed"]:
@@ -5635,14 +5634,11 @@ def execute_selected_candidate(chosen):
             chosen["option_delta_used"],
             chosen.get("technicals", {}),
         )
-        post_fill = apply_score_cutoff_post_fill_override(
-            post_fill,
-            bool(chosen.get("score_cutoff_approved")),
-        )
-        if post_fill.get("feasibility", {}).get("score_cutoff_override"):
+        post_fill = make_post_fill_diagnostic_only(post_fill)
+        if post_fill.get("feasibility", {}).get("post_fill_diagnostic_rejected"):
             log(
-                f"{symbol} post-fill score cutoff retained position; "
-                "soft technical headroom veto ignored"
+                f"{symbol} post-fill diagnostic did not pass; position retained because "
+                "post-fill checks are observation-only"
             )
     state = read_state(symbol)
     state["weighted_score"] = candidate_weighted_score(chosen)
