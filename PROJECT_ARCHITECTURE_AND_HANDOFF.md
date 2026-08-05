@@ -323,7 +323,7 @@ Both engines use the same safety-critical infrastructure.
 
 - Validate live-trading switches.
 - Reconcile local state with broker positions and orders.
-- Require a healthy position monitor when configured.
+- Require a healthy position monitor running the same runtime version as the entry process when configured.
 - Validate market-data freshness.
 - Apply account capital and lot ceilings.
 - Compute actual planned stop risk using final quantity.
@@ -706,9 +706,9 @@ Then:
 
 - Review `.env` rather than replacing it.
 - Run focused tests or syntax checks.
-- Restart only services affected by the change.
+- Restart every affected long-running service before allowing the next entry. A runtime-version mismatch between the entry process and position monitor blocks live entries.
 - Do not restart/kill the monitor during an open position unless the risk of leaving the old code is greater and broker protection is verified.
-- Cron-launched entry checks use fresh Python processes, so most entry-code changes apply on the next run after pull.
+- Cron-launched entry checks use fresh Python processes. They will refuse a new live entry until the long-running monitor has also loaded the matching code version.
 - Long-running monitor, stream, dashboard, webhook, and mobile services require restart to load new code.
 
 Typical restart commands:

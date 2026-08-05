@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import call, patch
@@ -2436,6 +2437,118 @@ class TradeControlTests(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertTrue(result["feasibility"]["post_fill_diagnostic_rejected"])
         self.assertFalse(result["feasibility"]["hard_execution_gate"])
+
+    def test_live_entry_rejects_monitor_running_different_code(self):
+        health = {
+            "healthy": True,
+            "updated_epoch": trade_bot.time_module.time(),
+            "runtime_version": "older-runtime",
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ENABLE_LIVE_TRADING": "true",
+                    "REQUIRE_HEALTHY_POSITION_MONITOR": "true",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "read_json", return_value=health),
+        ):
+            result = trade_bot.monitor_health_gate()
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("restart the monitor", result["reason"])
+
+    def test_existing_state_refreshes_inside_finalization_lock(self):
+        fresh = {"instrument_key": "NSE_FO|123", "status": "POSITION_OPEN"}
+        with (
+            patch.object(trade_bot, "read_state", return_value=fresh),
+            patch.object(
+                trade_bot,
+                "position_finalization_lock",
+                return_value=nullcontext(),
+            ) as lock,
+            patch.object(
+                trade_bot,
+                "_handle_existing_state_locked",
+                return_value=True,
+            ) as locked_handler,
+        ):
+            result = trade_bot.handle_existing_state(
+                "NIFTY",
+                {"instrument_key": "stale"},
+                verbose=False,
+            )
+
+        self.assertTrue(result)
+        lock.assert_called_once_with("NIFTY")
+        locked_handler.assert_called_once_with("NIFTY", fresh, verbose=False)
+
+    def test_selective_entry_uses_same_finalization_lock_as_monitor(self):
+        chosen = {"symbol": "NIFTY"}
+        with (
+            patch.object(
+                trade_bot,
+                "position_finalization_lock",
+                return_value=nullcontext(),
+            ) as lock,
+            patch.object(
+                trade_bot,
+                "_execute_selected_candidate_locked",
+                return_value=True,
+            ) as locked_execution,
+        ):
+            result = trade_bot.execute_selected_candidate(chosen)
+
+        self.assertTrue(result)
+        lock.assert_called_once_with("NIFTY")
+        locked_execution.assert_called_once_with(chosen)
+
+    def test_protection_failure_does_not_claim_second_pending_exit(self):
+        state = {"status": "EXIT_PENDING", "entry_order_id": "entry-1"}
+        with (
+            patch.object(trade_bot, "read_state", return_value=state),
+            patch.object(trade_bot, "find_matching_position_for_side") as position,
+            patch.object(trade_bot, "write_state") as write,
+        ):
+            result = trade_bot.prepare_protection_failure_exit(
+                "NIFTY",
+                "NSE_FO|123",
+                "BUY",
+                520,
+            )
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["quantity"], 0)
+        position.assert_not_called()
+        write.assert_not_called()
+
+    def test_protection_failure_uses_only_remaining_broker_quantity(self):
+        state = {"status": "POSITION_OPEN", "entry_order_id": "entry-1"}
+        position = {"instrument_token": "NSE_FO|123", "quantity": 300}
+        with (
+            patch.object(trade_bot, "read_state", return_value=state),
+            patch.object(
+                trade_bot,
+                "find_matching_position_for_side",
+                return_value=position,
+            ) as find_position,
+            patch.object(trade_bot, "write_state") as write,
+        ):
+            result = trade_bot.prepare_protection_failure_exit(
+                "NIFTY",
+                "NSE_FO|123",
+                "BUY",
+                520,
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["quantity"], 300)
+        self.assertEqual(state["status"], "EXIT_PENDING")
+        self.assertTrue(state["exit_submission_in_progress"])
+        find_position.assert_called_once_with("NSE_FO|123", "BUY", force=True)
+        write.assert_called_once_with("NIFTY", state)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import gzip
+import hashlib
 import time as time_module
 import socket
 import urllib.request
@@ -162,6 +163,7 @@ TRADE_HISTORY_FILE = BASE_DIR / "data" / "trade_history.csv"
 STOCK_SCANNER_STATUS_FILE = BASE_DIR / "data" / "stock_scanner_status.json"
 DAY_RISK_STATE_FILE = BASE_DIR / "data" / "day_risk_state.json"
 MONITOR_HEALTH_FILE = BASE_DIR / "data" / "monitor_health.json"
+BOT_RUNTIME_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 ENTRY_NOTIFICATION_RECEIPTS_FILE = BASE_DIR / "data" / "entry_notification_receipts.json"
 ENTRY_NOTIFICATION_RECEIPTS_LOCK_FILE = BASE_DIR / ".entry_notification_receipts.lock"
 PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
@@ -2714,8 +2716,12 @@ def find_matching_position(instrument_key):
     return find_matching_position_for_side(instrument_key, "BUY")
 
 
-def find_matching_position_for_side(instrument_key, entry_transaction_type="BUY"):
-    for pos in get_open_positions():
+def find_matching_position_for_side(
+    instrument_key,
+    entry_transaction_type="BUY",
+    force=False,
+):
+    for pos in get_open_positions(force=force):
         pos_key = pos.get("instrument_token") or pos.get("instrument_key")
         qty = position_quantity(pos)
 
@@ -2724,6 +2730,54 @@ def find_matching_position_for_side(instrument_key, entry_transaction_type="BUY"
             return pos
 
     return None
+
+
+def prepare_protection_failure_exit(
+    symbol,
+    instrument_key,
+    entry_transaction_type,
+    requested_quantity,
+):
+    """Claim one emergency exit only when the broker still shows the position."""
+    fresh_state = read_state(symbol)
+    if fresh_state.get("status") == "EXIT_PENDING":
+        return {
+            "allowed": False,
+            "reason": "another exit is already pending",
+            "state": fresh_state,
+            "quantity": 0,
+        }
+
+    remaining_position = find_matching_position_for_side(
+        instrument_key,
+        entry_transaction_type,
+        force=True,
+    )
+    remaining_quantity = (
+        abs(position_quantity(remaining_position))
+        if remaining_position
+        else 0
+    )
+    if remaining_quantity <= 0:
+        clear_state(symbol)
+        return {
+            "allowed": False,
+            "reason": "broker no longer reports the filled position",
+            "state": fresh_state,
+            "quantity": 0,
+        }
+
+    emergency_quantity = min(int(requested_quantity), int(remaining_quantity))
+    fresh_state["status"] = "EXIT_PENDING"
+    fresh_state["exit_reason"] = "PROTECTION_FAILURE"
+    fresh_state["exit_submission_in_progress"] = True
+    write_state(symbol, fresh_state)
+    return {
+        "allowed": True,
+        "reason": "emergency exit claimed",
+        "state": fresh_state,
+        "quantity": emergency_quantity,
+    }
 
 
 def position_ltp(position):
@@ -3306,6 +3360,17 @@ def monitor_health_gate():
     if not configured_bool("REQUIRE_HEALTHY_POSITION_MONITOR", True):
         return {"allowed": True, "reason": "monitor health gate disabled"}
     health = read_json(MONITOR_HEALTH_FILE, {})
+    monitor_version = str(health.get("runtime_version") or "")
+    if monitor_version != BOT_RUNTIME_VERSION:
+        return {
+            "allowed": False,
+            "reason": (
+                "position monitor code version does not match the entry bot; "
+                "restart the monitor before allowing a new trade"
+            ),
+            "monitor_runtime_version": monitor_version or "missing",
+            "entry_runtime_version": BOT_RUNTIME_VERSION,
+        }
     maximum_age = configured_positive_float("MONITOR_HEALTH_MAX_AGE_SECONDS", 20.0)
     updated_at = to_float(health.get("updated_epoch"), 0)
     age = time_module.time() - updated_at if updated_at else 999999.0
@@ -3345,6 +3410,7 @@ def run_position_monitor(log_empty=True):
         MONITOR_HEALTH_FILE,
         {
             "healthy": failure_count < threshold,
+            "runtime_version": BOT_RUNTIME_VERSION,
             "failure_count": failure_count,
             "last_error": "; ".join(errors)[:1000] if errors else "",
             "updated_at": now_ist().isoformat(),
@@ -3796,6 +3862,20 @@ def handle_ganesh_gap_position(state, verbose=True, state_slot=None):
 
 
 def handle_existing_state(symbol, state, verbose=True):
+    """Handle one state slot while preventing concurrent selective finalization."""
+    fresh = read_state(symbol)
+    if not fresh:
+        return False
+    if is_ganesh_gap_strategy(fresh):
+        return _handle_existing_state_locked(symbol, fresh, verbose=verbose)
+    with position_finalization_lock(symbol):
+        fresh = read_state(symbol)
+        if not fresh:
+            return False
+        return _handle_existing_state_locked(symbol, fresh, verbose=verbose)
+
+
+def _handle_existing_state_locked(symbol, state, verbose=True):
     if is_ganesh_gap_strategy(state):
         return handle_ganesh_gap_position(state, verbose=verbose, state_slot=symbol)
     instrument_key = state.get("instrument_key")
@@ -4085,51 +4165,6 @@ def handle_existing_state(symbol, state, verbose=True):
                     "position retained because post-fill checks are observation-only"
                 )
             state["post_fill_feasibility"] = post_fill["feasibility"]
-            if not post_fill["allowed"]:
-                reason = "; ".join(post_fill["feasibility"].get("reasons", []))
-                state["status"] = "EXIT_PENDING"
-                state["exit_reason"] = "POST_FILL_GUARDRAIL"
-                state["post_fill_guardrail_reason"] = reason
-                state["target_price"] = post_fill["target_price"]
-                state["stop_loss_price"] = post_fill["stop_loss_price"]
-                write_state(symbol, state)
-                log(
-                    f"{symbol} delayed-fill guardrail rejected position: fill={entry_price} "
-                    f"reason={reason}; flattening immediately"
-                )
-                instrument = {
-                    "instrument_key": instrument_key,
-                    "trading_symbol": state.get("trading_symbol"),
-                }
-                exit_result, exit_payload = place_market_order(
-                    instrument, "SELL", quantity, product=order_product
-                )
-                exit_order_id = exit_result.get("data", {}).get("order_id")
-                if not exit_order_id:
-                    raise RuntimeError(
-                        f"{symbol} delayed-fill guardrail exit returned no order_id"
-                    )
-                exit_details = wait_for_order_complete(exit_order_id)
-                if order_is_complete(exit_details):
-                    complete_exit(
-                        symbol,
-                        state,
-                        exit_details,
-                        entry_price,
-                        "POST_FILL_GUARDRAIL",
-                        exit_result,
-                        exit_payload,
-                    )
-                else:
-                    state["exit_order_id"] = exit_order_id
-                    state["exit_fallback_price"] = entry_price
-                    write_state(symbol, state)
-                    log(
-                        f"{symbol} delayed-fill guardrail exit pending: "
-                        f"order_id={exit_order_id}"
-                    )
-                return True
-
             state.update(
                 {
                     "target_price": post_fill["target_price"],
@@ -5402,6 +5437,12 @@ def evaluate_symbol_buy_or_sell(
 
 
 def execute_selected_candidate(chosen):
+    """Serialize entry submission and fill finalization against the monitor."""
+    with position_finalization_lock(chosen["symbol"]):
+        return _execute_selected_candidate_locked(chosen)
+
+
+def _execute_selected_candidate_locked(chosen):
     symbol = chosen["symbol"]
     direction = chosen["direction"]
     confidence = chosen["confidence"]
@@ -5643,40 +5684,6 @@ def execute_selected_candidate(chosen):
     state = read_state(symbol)
     state["weighted_score"] = candidate_weighted_score(chosen)
     state["post_fill_feasibility"] = post_fill["feasibility"]
-    if not post_fill["allowed"]:
-        reason = "; ".join(post_fill["feasibility"].get("reasons", []))
-        state["status"] = "EXIT_PENDING"
-        state["exit_reason"] = "POST_FILL_GUARDRAIL"
-        state["post_fill_guardrail_reason"] = reason
-        state["target_price"] = post_fill["target_price"]
-        state["stop_loss_price"] = post_fill["stop_loss_price"]
-        write_state(symbol, state)
-        log(
-            f"{symbol} post-fill guardrail rejected position: fill={fill} "
-            f"reason={reason}; flattening immediately"
-        )
-        exit_result, exit_payload = place_market_order(instrument, "SELL", quantity)
-        exit_order_id = exit_result.get("data", {}).get("order_id")
-        if not exit_order_id:
-            raise RuntimeError(f"{symbol} post-fill guardrail exit returned no order_id")
-        exit_details = wait_for_order_complete(exit_order_id)
-        if order_is_complete(exit_details):
-            complete_exit(
-                symbol,
-                state,
-                exit_details,
-                fill,
-                "POST_FILL_GUARDRAIL",
-                exit_result,
-                exit_payload,
-            )
-        else:
-            state["exit_order_id"] = exit_order_id
-            state["exit_fallback_price"] = fill
-            write_state(symbol, state)
-            log(f"{symbol} post-fill guardrail exit pending: order_id={exit_order_id}")
-        return True
-
     state.update(
         {
             "target_price": post_fill["target_price"],
@@ -5698,21 +5705,49 @@ def execute_selected_candidate(chosen):
             ensure_protective_stop(symbol, read_state(symbol))
         except Exception as error:
             log(f"{symbol} CRITICAL: protective stop failed; flattening immediately: {error}")
+            emergency_claim = prepare_protection_failure_exit(
+                symbol,
+                instrument["instrument_key"],
+                transaction_type,
+                quantity,
+            )
+            if not emergency_claim["allowed"]:
+                log(
+                    f"{symbol} emergency exit not submitted: "
+                    f"{emergency_claim['reason']}"
+                )
+                return True
+            fresh_state = emergency_claim["state"]
+            emergency_quantity = emergency_claim["quantity"]
             emergency_transaction = "BUY" if transaction_type == "SELL" else "SELL"
             emergency, emergency_payload = place_market_order(
-                instrument, emergency_transaction, quantity
+                instrument, emergency_transaction, emergency_quantity
             )
             emergency_id = emergency.get("data", {}).get("order_id")
+            if not emergency_id:
+                fresh_state["status"] = "POSITION_OPEN"
+                fresh_state.pop("exit_submission_in_progress", None)
+                write_state(symbol, fresh_state)
+                raise RuntimeError(
+                    f"{symbol} emergency {emergency_transaction} returned no order_id"
+                ) from error
             emergency_details = wait_for_order_complete(emergency_id) if emergency_id else {}
-            complete_exit(
-                symbol,
-                read_state(symbol),
-                emergency_details,
-                fill,
-                "PROTECTION_FAILURE",
-                emergency,
-                emergency_payload,
-            )
+            if order_is_complete(emergency_details):
+                complete_exit(
+                    symbol,
+                    read_state(symbol),
+                    emergency_details,
+                    fill,
+                    "PROTECTION_FAILURE",
+                    emergency,
+                    emergency_payload,
+                )
+            else:
+                fresh_state = read_state(symbol)
+                fresh_state.pop("exit_submission_in_progress", None)
+                fresh_state["exit_order_id"] = emergency_id
+                fresh_state["exit_fallback_price"] = fill
+                write_state(symbol, fresh_state)
             return True
     clear_reentry_guard(symbol)
     return True
