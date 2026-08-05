@@ -1388,13 +1388,12 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(performance["cumulative"]["totalPnL"], 6200.0)
         self.assertEqual(performance["equityCurve"][-1]["dailyPnL"], 6200.0)
         self.assertIn("netPnL", performance["today"])
-        self.assertIn("otherCharges", performance["today"])
+        self.assertNotIn("otherCharges", performance["today"])
         self.assertIn("symbolStats", performance["today"])
         self.assertIn("symbolStats", performance["cumulative"])
         self.assertEqual(performance["today"]["symbolStats"]["NIFTY"]["trades"], 1)
         self.assertEqual(performance["today"]["symbolStats"]["BANKNIFTY"]["trades"], 0)
-        self.assertGreater(performance["today"]["otherCharges"], 0)
-        self.assertLess(performance["today"]["netPnL"], performance["today"]["closedPnL"])
+        self.assertEqual(performance["today"]["netPnL"], performance["today"]["closedPnL"])
 
     def test_confirmed_entry_notification_contains_trade_plan(self):
         position_state = {

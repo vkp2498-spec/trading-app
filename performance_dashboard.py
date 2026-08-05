@@ -2013,14 +2013,13 @@ load_env()
 if st.button("Refresh Dashboard", use_container_width=True):
     st.rerun()
 
-raw_performance = api_build_trade_performance()
+performance = api_build_trade_performance()
 
 
 def summary_card_html(title, summary, show_averages=False):
     net_pnl = float(summary.get("netPnL", summary.get("net_pnl", 0)) or 0)
     trades = int(summary.get("trades", 0) or 0)
     win_rate = float(summary.get("winRate", 0) or 0)
-    charges = float(summary.get("otherCharges", 0) or 0)
     average_profit = float(summary.get("averageProfit", summary.get("avg_profit", 0)) or 0)
     average_loss = float(summary.get("averageLoss", summary.get("avg_loss", 0)) or 0)
     average_rows = ""
@@ -2037,13 +2036,10 @@ Avg loss <span class="negative">{money(average_loss)}</span>
 <div class="metric-label">{html.escape(title)}</div>
 <div class="metric-value">{trades} trades</div>
 <div class="{pnl_class(net_pnl)}" style="font-size:20px;margin-top:8px;">
-Net P&amp;L {money(net_pnl)}
+P&amp;L {money(net_pnl)}
 </div>
 <div style="margin-top:8px;color:#334155;font-weight:700;">
 Win rate {win_rate:.1f}%
-</div>
-<div style="margin-top:4px;color:#334155;font-weight:700;">
-Other charges {money(charges)}
 </div>
 {average_rows}
 </div>"""
@@ -2053,14 +2049,13 @@ def section_stats(payload, total_trades_key, total_pnl_key):
     overall = payload.get("overallStats") or {
         "trades": payload.get(total_trades_key, 0),
         "netPnL": payload.get("netPnL", payload.get(total_pnl_key, 0)),
-        "otherCharges": payload.get("otherCharges", 0),
         "winRate": payload.get("winRate", 0),
         "averageProfit": payload.get("averageProfitPerWinningTrade", 0),
         "averageLoss": payload.get("averageLossPerLosingTrade", 0),
     }
     symbol_stats = payload.get("symbolStats") or {}
     return [("Overall", overall)] + [
-        (symbol, symbol_stats.get(symbol, {"trades": 0, "netPnL": 0, "otherCharges": 0, "winRate": 0}))
+        (symbol, symbol_stats.get(symbol, {"trades": 0, "netPnL": 0, "winRate": 0}))
         for symbol in SYMBOLS
     ]
 
@@ -2096,13 +2091,13 @@ def sequence_table(rows):
         "sequence": "Trade",
         "priorOutcome": "Prior Outcome",
         "trades": "Trades",
-        "netPnL": "Net P&L",
+        "netPnL": "P&L",
         "winRate": "Win %",
         "averageProfit": "Avg Win",
         "averageLoss": "Avg Loss",
     }
     frame = frame.rename(columns=rename)
-    for column in ["Net P&L", "Avg Win", "Avg Loss"]:
+    for column in ["P&L", "Avg Win", "Avg Loss"]:
         if column in frame.columns:
             frame[column] = frame[column].map(money)
     if "Win %" in frame.columns:
@@ -2119,17 +2114,6 @@ st.markdown(
 performance_tab, score_review_tab = st.tabs(["Performance", "Post Market Review"])
 
 with performance_tab:
-    scale_mode = st.radio(
-        "P&L scale",
-        ["Per ₹1L", "Raw"],
-        horizontal=True,
-        index=0,
-    )
-    performance = (
-        raw_performance.get("normalizedPerLakh", raw_performance)
-        if scale_mode == "Per ₹1L"
-        else raw_performance
-    )
     today = performance.get("today", {})
     cumulative = performance.get("cumulative", {})
 

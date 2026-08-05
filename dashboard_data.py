@@ -838,13 +838,11 @@ def symbol_pnl(trades: list[dict]) -> dict:
 
 def performance_stats(trades: list[dict]) -> dict:
     gross_pnl = round(sum(trade["grossPnL"] for trade in trades), 2)
-    other_charges = total_other_charges(trades)
     average_profit, average_loss = average_trade_results(trades)
     return {
         "trades": len(trades),
         "grossPnL": gross_pnl,
-        "otherCharges": other_charges,
-        "netPnL": round(gross_pnl - other_charges, 2),
+        "netPnL": gross_pnl,
         "winRate": calculate_win_rate(trades),
         "averageProfit": average_profit,
         "averageLoss": average_loss,
@@ -1440,14 +1438,12 @@ def build_pnl_calendar(trades: list[dict]) -> list[dict]:
             sum(safe_float(trade.get("grossPnL")) for trade in daily_trades),
             2,
         )
-        other_charges = total_other_charges(daily_trades)
         calendar.append(
             {
                 "date": trade_date,
                 "trades": len(daily_trades),
                 "grossPnL": gross_pnl,
-                "otherCharges": other_charges,
-                "netPnL": round(gross_pnl - other_charges, 2),
+                "netPnL": gross_pnl,
             }
         )
     return calendar
@@ -1573,7 +1569,6 @@ def _build_trade_performance_payload(
             "closedTrades": today_closed_trades,
             "closedPnL": today_closed_pnl,
             "netPnL": today_stats["OVERALL"]["netPnL"],
-            "otherCharges": today_stats["OVERALL"]["otherCharges"],
             "botPnL": bot_pnl,
             "closedPnLSource": today_pnl_source,
             "closedPnLError": None,
@@ -1600,7 +1595,6 @@ def _build_trade_performance_payload(
             "totalTrades": len(trades),
             "totalPnL": cumulative_total_pnl,
             "netPnL": cumulative_stats["OVERALL"]["netPnL"],
-            "otherCharges": cumulative_stats["OVERALL"]["otherCharges"],
             "winRate": calculate_win_rate(
                 trades
             ),

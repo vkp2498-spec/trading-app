@@ -9,7 +9,7 @@ import dashboard_data
 
 
 class PnLCalendarTests(unittest.TestCase):
-    def test_groups_daily_bot_trades_and_deducts_approximate_charges(self):
+    def test_groups_daily_bot_trades_without_presenting_estimated_charges(self):
         trades = [
             {
                 "tradeDate": "2026-07-29",
@@ -45,11 +45,10 @@ class PnLCalendarTests(unittest.TestCase):
         self.assertEqual([row["date"] for row in result], ["2026-07-29", "2026-07-30"])
         self.assertEqual(result[0]["trades"], 2)
         self.assertEqual(result[0]["grossPnL"], 1_500.0)
-        expected_charges = dashboard_data.total_other_charges(trades[:2])
-        self.assertEqual(result[0]["otherCharges"], expected_charges)
-        self.assertEqual(result[0]["netPnL"], round(1_500.0 - expected_charges, 2))
-        self.assertGreater(result[1]["otherCharges"], 88.5)
-        self.assertLess(result[1]["netPnL"], 800.0)
+        self.assertNotIn("otherCharges", result[0])
+        self.assertEqual(result[0]["netPnL"], 1_500.0)
+        self.assertNotIn("otherCharges", result[1])
+        self.assertEqual(result[1]["netPnL"], 800.0)
 
 
 if __name__ == "__main__":
