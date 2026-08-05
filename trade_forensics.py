@@ -131,6 +131,162 @@ def first_level_touch(candles, target_price, stop_price, transaction_type="BUY")
     return "NEITHER", None
 
 
+def post_exit_trade_diagnosis(
+    candles,
+    entry_price,
+    exit_price,
+    target_price,
+    stop_price,
+    realized_pnl,
+    transaction_type="BUY",
+):
+    """Explain the session path after an executed trade was closed.
+
+    The best post-exit move is deliberately measured only in candles completed
+    before the first candle that touches the planned stop. A stop and favorable
+    move inside the same one-minute candle have unknown tick order, so that
+    candle is not credited as a confirmed favorable move.
+    """
+    entry = safe_float(entry_price)
+    exit_value = safe_float(exit_price)
+    target = safe_float(target_price)
+    stop = safe_float(stop_price)
+    pnl = safe_float(realized_pnl, 0.0) or 0.0
+    empty_result = {
+        "post_exit_session_candles": 0,
+        "post_exit_best_price_before_stop": None,
+        "post_exit_max_move_points_before_stop": None,
+        "post_exit_stop_touched": None,
+        "post_exit_stop_touch_time": None,
+        "post_exit_target_touch_time": None,
+        "extra_stop_points_to_target": None,
+        "required_stop_price_to_target": None,
+        "loss_path_classification": "DATA_UNAVAILABLE",
+        "loss_path_note": "Post-exit one-minute candles are unavailable.",
+    }
+    if candles is None or candles.empty or not entry or not exit_value:
+        return empty_result
+
+    frame = normalize_candles(candles)
+    is_short = str(transaction_type).upper() == "SELL"
+    best_price = exit_value
+    stop_touch_time = None
+
+    for timestamp, candle in frame.iterrows():
+        high = float(candle["high"])
+        low = float(candle["low"])
+        stop_hit = bool(stop) and (high >= stop if is_short else low <= stop)
+        if stop_hit:
+            stop_touch_time = timestamp.isoformat()
+            break
+        best_price = min(best_price, low) if is_short else max(best_price, high)
+
+    max_move = (
+        max(exit_value - best_price, 0.0)
+        if is_short
+        else max(best_price - exit_value, 0.0)
+    )
+    result = {
+        **empty_result,
+        "post_exit_session_candles": int(len(frame)),
+        "post_exit_best_price_before_stop": round(best_price, 2),
+        "post_exit_max_move_points_before_stop": round(max_move, 2),
+        "post_exit_stop_touched": stop_touch_time is not None if stop else None,
+        "post_exit_stop_touch_time": stop_touch_time,
+    }
+
+    if pnl >= 0:
+        result.update(
+            {
+                "loss_path_classification": "NOT_A_LOSS",
+                "loss_path_note": "Winning or flat trade; stop-relaxation analysis is not applicable.",
+            }
+        )
+        return result
+
+    if not target or not stop:
+        result.update(
+            {
+                "loss_path_classification": "LEVELS_UNAVAILABLE",
+                "loss_path_note": "The original target or stop was not recorded.",
+            }
+        )
+        return result
+
+    adverse_price = entry
+    stop_seen_before_target = False
+    ambiguous_target_candle = False
+    target_touch_time = None
+    for timestamp, candle in frame.iterrows():
+        high = float(candle["high"])
+        low = float(candle["low"])
+        target_hit = low <= target if is_short else high >= target
+        stop_hit = high >= stop if is_short else low <= stop
+        adverse_price = max(adverse_price, high) if is_short else min(adverse_price, low)
+        if target_hit:
+            target_touch_time = timestamp.isoformat()
+            ambiguous_target_candle = stop_hit and not stop_seen_before_target
+            break
+        if stop_hit:
+            stop_seen_before_target = True
+
+    result["post_exit_target_touch_time"] = target_touch_time
+    if target_touch_time is None:
+        result.update(
+            {
+                "loss_path_classification": "HARD_LOSS",
+                "loss_path_note": (
+                    "Hard loss: the original target was not reached after exit before market close; "
+                    "the observed path does not support widening the stop."
+                ),
+            }
+        )
+        return result
+
+    required_stop = adverse_price
+    extra_stop = (
+        max(required_stop - stop, 0.0)
+        if is_short
+        else max(stop - required_stop, 0.0)
+    )
+    result.update(
+        {
+            "extra_stop_points_to_target": round(extra_stop, 2),
+            "required_stop_price_to_target": round(required_stop, 2),
+        }
+    )
+    if ambiguous_target_candle:
+        result.update(
+            {
+                "loss_path_classification": "AMBIGUOUS_SAME_CANDLE",
+                "loss_path_note": (
+                    "Target and stop were both inside the same one-minute candle; "
+                    "tick order is unknown, so the required relaxation is only an upper-bound estimate."
+                ),
+            }
+        )
+    elif stop_seen_before_target or extra_stop > 0:
+        result.update(
+            {
+                "loss_path_classification": "TARGET_AFTER_RELAXING_STOP",
+                "loss_path_note": (
+                    f"The target was reached later, but surviving the observed path required "
+                    f"approximately {extra_stop:.2f} additional stop points."
+                ),
+            }
+        )
+    else:
+        result.update(
+            {
+                "loss_path_classification": "TARGET_WITHOUT_RELAXATION",
+                "loss_path_note": (
+                    "The original target was reached after exit without the recorded stop being breached."
+                ),
+            }
+        )
+    return result
+
+
 def _read_rows_for_date(path, timestamp_column, date_text):
     if not path.exists():
         return pd.DataFrame()
@@ -311,6 +467,29 @@ def analyze_executed_trades(trades, by_symbol, by_key, candle_cache, post_exit_c
                 base["original_stop_loss_price"] or base["stop_loss_price"],
                 base["transaction_type"],
             )
+            session_close = pd.Timestamp(
+                year=exit_time.year,
+                month=exit_time.month,
+                day=exit_time.day,
+                hour=15,
+                minute=30,
+                tz=IST,
+            )
+            post_exit_session = _candle_window(
+                one_minute,
+                exit_time.ceil("1min"),
+                session_close,
+                1,
+            )
+            diagnosis = post_exit_trade_diagnosis(
+                post_exit_session,
+                base["entry_price"],
+                base["exit_price"],
+                base["target_price"],
+                base["original_stop_loss_price"] or base["stop_loss_price"],
+                base["realized_pnl"],
+                base["transaction_type"],
+            )
             realized = base["realized_pnl"] or 0.0
             peak_pnl = metrics.get("max_favorable_pnl") or 0.0
             post_peak_pnl = post_metrics.get("max_favorable_pnl")
@@ -334,6 +513,7 @@ def analyze_executed_trades(trades, by_symbol, by_key, candle_cache, post_exit_c
                     "post_exit_best_time": post_metrics.get("favorable_time"),
                     "post_exit_planned_level_outcome": post_outcome,
                     "post_exit_planned_level_time": post_outcome_time,
+                    **diagnosis,
                     "recovered_to_entry_after_exit": bool(
                         realized < 0 and post_peak_pnl is not None and post_peak_pnl >= 0
                     ),

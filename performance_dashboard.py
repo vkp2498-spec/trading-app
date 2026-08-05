@@ -951,6 +951,167 @@ def render_score_followthrough_review():
         )
 
 
+def render_todays_trades_analysis():
+    def clean_text(value, default=""):
+        if value is None or pd.isna(value):
+            return default
+        text = str(value).strip()
+        return text or default
+
+    st.markdown('<div class="dash-title">Today’s Trades Analysis</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="dash-subtitle">Executed trades only: what happened after exit, and whether a losing trade could have recovered with a modestly wider stop</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Uses one-minute option-premium candles from the first complete minute after exit "
+        "through 3:30 PM IST. The stop comparison uses the recorded original stop when available."
+    )
+
+    today = now_ist().date()
+    date_text = today.isoformat()
+    executed_file = DATA_DIR / f"executed_trade_forensics_{date_text}.csv"
+    is_market_active = now_ist().time() < POST_MARKET_REVIEW_TIME
+    if is_market_active:
+        st.info(
+            "Today’s path is still developing. A provisional report can be built now, but "
+            "run it again after 3:30 PM IST for the complete session."
+        )
+
+    if st.button(
+        "Analyze Today’s Trades",
+        type="primary",
+        use_container_width=True,
+        key="analyze_todays_executed_trades",
+    ):
+        with st.spinner("Following every executed trade through the remaining one-minute candles..."):
+            try:
+                instruments = load_forensic_instruments()
+                by_symbol, by_key = forensic_instrument_lookup(instruments)
+                executed = run_executed_trade_forensics(
+                    read_forensic_trades(date_text),
+                    by_symbol,
+                    by_key,
+                    {},
+                    1,
+                )
+                DATA_DIR.mkdir(exist_ok=True)
+                executed.to_csv(executed_file, index=False)
+                st.session_state["todays_trade_analysis_date"] = date_text
+                st.session_state["todays_trade_analysis"] = executed
+            except Exception as error:
+                st.error(f"Today’s trade analysis could not be generated: {error}")
+
+    if st.session_state.get("todays_trade_analysis_date") == date_text:
+        executed = st.session_state.get("todays_trade_analysis", pd.DataFrame())
+    elif executed_file.exists():
+        executed = read_csv_if_present(executed_file)
+    else:
+        st.info("Build the report after the market closes to analyze today’s executed trades.")
+        return
+
+    required_column = "post_exit_max_move_points_before_stop"
+    if not executed.empty and required_column not in executed.columns:
+        st.info("The saved report uses the earlier format. Click Analyze Today’s Trades to rebuild it.")
+        return
+    if executed.empty:
+        st.info("No closed trades were recorded today.")
+        return
+
+    errors = executed.get(
+        "analysis_error",
+        pd.Series(index=executed.index, dtype="object"),
+    ).fillna("").astype(str).str.strip()
+    valid = executed[errors.eq("")].copy()
+    realized = pd.to_numeric(valid.get("realized_pnl"), errors="coerce").fillna(0)
+    classifications = valid.get(
+        "loss_path_classification",
+        pd.Series(index=valid.index, dtype="object"),
+    ).fillna("DATA_UNAVAILABLE")
+    metrics = st.columns(4)
+    metrics[0].metric("Trades Analyzed", f"{len(valid)}/{len(executed)}")
+    metrics[1].metric("Losing Trades", int(realized.lt(0).sum()))
+    metrics[2].metric(
+        "Target After Wider Stop",
+        int(classifications.eq("TARGET_AFTER_RELAXING_STOP").sum()),
+    )
+    metrics[3].metric("Hard Losses", int(classifications.eq("HARD_LOSS").sum()))
+
+    for _, row in executed.sort_values("entry_time").iterrows():
+        symbol = clean_text(row.get("symbol"))
+        trading_symbol = clean_text(row.get("trading_symbol"))
+        pnl_value = row.get("realized_pnl")
+        pnl = float(pnl_value) if pd.notna(pnl_value) else 0.0
+        analysis_error = clean_text(row.get("analysis_error"))
+        original_stop = row.get("original_stop_loss_price")
+        display_stop = (
+            original_stop
+            if pd.notna(original_stop) and float(original_stop or 0) > 0
+            else row.get("stop_loss_price")
+        )
+        with st.container(border=True):
+            st.markdown(f"#### {symbol} | {trading_symbol}")
+            columns = st.columns(5)
+            columns[0].metric("Recorded P&L", money(pnl))
+            columns[1].metric(
+                "Entry / Exit",
+                f"{number(row.get('entry_price'))} / {number(row.get('exit_price'))}",
+            )
+            columns[2].metric(
+                "Target / Stop",
+                f"{number(row.get('target_price'))} / "
+                f"{number(display_stop)}",
+            )
+            columns[3].metric(
+                "Best Move After Exit",
+                f"{number(row.get('post_exit_max_move_points_before_stop'))} pts",
+                "before planned stop touch",
+            )
+            extra_stop = row.get("extra_stop_points_to_target")
+            columns[4].metric(
+                "Extra Stop To Target",
+                f"{number(extra_stop)} pts" if pd.notna(extra_stop) else "N/A",
+            )
+
+            if analysis_error:
+                st.warning(f"Candle analysis unavailable: {analysis_error}")
+                continue
+
+            classification = clean_text(
+                row.get("loss_path_classification"),
+                "DATA_UNAVAILABLE",
+            )
+            note = clean_text(row.get("loss_path_note"))
+            if classification == "HARD_LOSS":
+                st.error(note)
+            elif classification in {"TARGET_AFTER_RELAXING_STOP", "AMBIGUOUS_SAME_CANDLE"}:
+                st.warning(note)
+            elif classification == "TARGET_WITHOUT_RELAXATION":
+                st.success(note)
+            else:
+                st.info(note)
+
+            best_price = row.get("post_exit_best_price_before_stop")
+            stop_time = clean_text(row.get("post_exit_stop_touch_time"))
+            target_time = clean_text(row.get("post_exit_target_touch_time"))
+            details = f"Best post-exit price before stop: {number(best_price)}"
+            if stop_time:
+                details += f" | Stop touched: {stop_time[11:16]}"
+            if target_time:
+                details += f" | Target touched: {target_time[11:16]}"
+            st.caption(details)
+
+    if errors.ne("").any():
+        st.warning(
+            f"{int(errors.ne('').sum())} trade(s) could not be fully analyzed. "
+            "The card shows the saved instrument or market-data error."
+        )
+    st.caption(
+        "This is hindsight diagnostics, not a recommendation to widen live stops. One-minute "
+        "OHLC candles cannot establish tick order when target and stop fall inside the same candle."
+    )
+
+
 def read_backtest_json(path, default):
     try:
         return json.loads(Path(path).read_text()) if Path(path).exists() else default
@@ -2162,3 +2323,5 @@ with performance_tab:
 
 with score_review_tab:
     render_score_followthrough_review()
+    st.divider()
+    render_todays_trades_analysis()
