@@ -90,6 +90,40 @@ class PerLakhDashboardTests(unittest.TestCase):
             analytics,
         )
 
+    def test_edge_heatmap_removes_low_unscored_and_unknown_time_entries(self):
+        valid = trade(pnl=1_000.0, quantity=100, entry_price=100.0)
+        below_fifty = trade(pnl=20_000.0, quantity=100, entry_price=100.0)
+        unscored = trade(pnl=30_000.0, quantity=100, entry_price=100.0)
+        unknown_time = trade(pnl=40_000.0, quantity=100, entry_price=100.0)
+        valid.update(
+            {
+                "entryTime": "2026-07-31T10:15:00+05:30",
+                "score": 55,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
+            }
+        )
+        below_fifty.update(valid, score=49)
+        unscored.update(valid, score=None)
+        unknown_time.update(valid, entryTime="")
+
+        analytics = dashboard_data.normalized_edge_analytics_per_lakh(
+            [valid, below_fifty, unscored, unknown_time]
+        )
+
+        self.assertEqual(analytics["totalTrades"], 1)
+        self.assertEqual(analytics["excludedHiddenCategoryTrades"], 3)
+        self.assertNotIn("<50", analytics["scoreBands"])
+        self.assertNotIn("00-49", analytics["scoreBands"])
+        self.assertNotIn("Unscored", analytics["scoreBands"])
+        self.assertNotIn("unknown", {item["id"] for item in analytics["timeBuckets"]})
+        self.assertTrue(
+            all(
+                cell["scoreBand"] not in {"<50", "00-49", "Unscored"}
+                and cell["timeBucket"] != "unknown"
+                for cell in analytics["matrix"]
+            )
+        )
+
     def test_index_history_does_not_filter_retired_strategy_labels(self):
         historical = trade(pnl=2_500.0)
         historical["strategy"] = "RETIRED_EXPERIMENT"

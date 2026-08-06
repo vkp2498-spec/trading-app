@@ -1056,7 +1056,7 @@ def render_daily_trade_pnl_matrix(performance_payload):
 
     edge = performance_payload.get("edgeAnalytics") or {}
     score_bands = edge.get("scoreBands") or [
-        "<50", "50-59", "60-69", "70-79", "80-89", "90-100", "Unscored"
+        "50-59", "60-69", "70-79", "80-89", "90-100"
     ]
     time_buckets = edge.get("timeBuckets") or [
         {"id": "opening", "label": "09:15–10:00"},
@@ -1064,7 +1064,6 @@ def render_daily_trade_pnl_matrix(performance_payload):
         {"id": "late_morning", "label": "11:00–13:00"},
         {"id": "early_afternoon", "label": "13:00–14:00"},
         {"id": "late_afternoon", "label": "14:00–15:30"},
-        {"id": "unknown", "label": "Unknown time"},
     ]
     labels_by_id = {
         str(bucket.get("id")): str(bucket.get("label") or bucket.get("id"))

@@ -1270,17 +1270,58 @@ def edge_analytics(trades: list[dict]) -> dict:
 def normalized_edge_analytics_per_lakh(trades: list[dict]) -> dict:
     """Return size-independent expectancy using ₹1 lakh of entry premium per trade."""
     scalable = []
-    excluded = 0
+    excluded_unscalable = 0
+    excluded_hidden = 0
     for trade in trades:
         if trade_value_at_entry(trade) <= 0:
-            excluded += 1
+            excluded_unscalable += 1
+            continue
+        score = safe_float(trade.get("score"), None)
+        time_bucket = edge_time_bucket(entry_minutes(trade))
+        has_score_version = "scoreVersion" in trade
+        score_version = str(trade.get("scoreVersion") or "")
+        if (
+            score is None
+            or score < 50
+            or time_bucket == "unknown"
+            or (
+                has_score_version
+                and score_version != "VAMSI_UNIFIED_ENTRY_V1"
+            )
+        ):
+            excluded_hidden += 1
             continue
         scalable.append(normalize_trade_per_lakh(trade))
 
     analytics = edge_analytics(scalable)
+    hidden_score_bands = {"<50", "00-49", EDGE_UNSCORED_BAND}
+    analytics["scoreBands"] = [
+        band
+        for band in analytics.get("scoreBands", [])
+        if band not in hidden_score_bands
+    ]
+    analytics["timeBuckets"] = [
+        bucket
+        for bucket in analytics.get("timeBuckets", [])
+        if bucket.get("id") != "unknown"
+    ]
+    visible_times = {bucket["id"] for bucket in analytics["timeBuckets"]}
+    visible_scores = set(analytics["scoreBands"])
+    analytics["matrix"] = [
+        cell
+        for cell in analytics.get("matrix", [])
+        if cell.get("timeBucket") in visible_times
+        and cell.get("scoreBand") in visible_scores
+    ]
+    analytics["timePerformance"] = [
+        item
+        for item in analytics.get("timePerformance", [])
+        if item.get("id") in visible_times
+    ]
     analytics["normalizationBasis"] = "PER_LAKH_ENTRY_PREMIUM"
     analytics["normalizationLabel"] = "Per ₹1L deployed"
-    analytics["excludedUnscalableTrades"] = excluded
+    analytics["excludedUnscalableTrades"] = excluded_unscalable
+    analytics["excludedHiddenCategoryTrades"] = excluded_hidden
     best_zone = analytics.get("bestZone")
     if best_zone:
         analytics["keyInsight"] = (
