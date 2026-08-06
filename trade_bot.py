@@ -1917,6 +1917,17 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
     symbol = str(chosen.get("symbol") or "").upper()
     instrument_key = (chosen.get("instrument") or {}).get("instrument_key")
     if symbol in SYMBOLS:
+        maximum_trades = max_index_trades_per_day()
+        trades_used = index_trade_count_today()
+        if maximum_trades > 0 and trades_used >= maximum_trades:
+            return {
+                "allowed": False,
+                "reason": (
+                    f"maximum {maximum_trades} index trades already used today"
+                ),
+                "circuit": circuit,
+                "trades_used": trades_used,
+            }
         if selective_index_has_active_state(symbol):
             return {
                 "allowed": False,

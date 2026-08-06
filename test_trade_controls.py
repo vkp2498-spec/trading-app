@@ -1974,6 +1974,39 @@ class TradeControlTests(unittest.TestCase):
         self.assertFalse(decision["allowed"])
         self.assertIn("85.0", decision["reason"])
 
+    def test_final_order_gate_enforces_combined_index_trade_cap(self):
+        chosen = {
+            "symbol": "BANKNIFTY",
+            "direction": "BULLISH",
+            "transaction_type": "BUY",
+            "weighted_score": 55,
+            "instrument": {"instrument_key": "NSE_FO|BANKNIFTY_NEW"},
+        }
+        with (
+            patch.object(
+                trade_bot,
+                "monitor_health_gate",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+            patch.object(
+                trade_bot,
+                "broker_pending_order_gate",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "reason": "ok"},
+            ),
+            patch.object(trade_bot, "max_index_trades_per_day", return_value=2),
+            patch.object(trade_bot, "index_trade_count_today", return_value=2),
+        ):
+            decision = trade_bot.pre_order_portfolio_decision(chosen, 30, 200, 180)
+
+        self.assertFalse(decision["allowed"])
+        self.assertEqual(decision["trades_used"], 2)
+        self.assertIn("maximum 2 index trades", decision["reason"])
+
     def test_capital_value_one_means_one_lot(self):
         with patch.dict(
             os.environ,
