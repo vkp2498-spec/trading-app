@@ -99,7 +99,7 @@ from upstox_streams import (
     read_market_cache,
     read_portfolio_cache,
     read_recent_ticks,
-    write_stream_instruments,
+    write_stream_instruments as _write_stream_instruments,
 )
 
 from apns_push import send_trade_closed_notification, send_trade_entered_notification
@@ -691,6 +691,16 @@ def write_state(symbol, state):
 
 def clear_state(symbol):
     write_state(symbol, {})
+
+
+def write_stream_instruments(instrument_keys):
+    """Keep every active bot contract pinned in the dynamic market stream."""
+    active_instrument_keys = []
+    for state_slot in BOT_STATE_SLOTS:
+        state = read_state(state_slot)
+        if state_is_active(state) and state.get("instrument_key"):
+            active_instrument_keys.append(state["instrument_key"])
+    _write_stream_instruments([*instrument_keys, *active_instrument_keys])
 
 
 def ganesh_gap_max_trades_per_day():
@@ -2129,6 +2139,10 @@ def sentiment_exit_enabled_for_state(state):
 
 def max_index_trades_per_day():
     return max(to_int(os.getenv("MAX_INDEX_TRADES_PER_DAY"), 2), 0)
+
+
+def allow_simultaneous_index_positions():
+    return configured_bool("ALLOW_SIMULTANEOUS_INDEX_POSITIONS", False)
 
 
 def max_daily_index_risk():
@@ -6669,7 +6683,8 @@ def run_signal_check():
     active_selective_index = {
         symbol for symbol in SYMBOLS if state_is_active(read_state(symbol))
     }
-    if active_selective_index:
+    simultaneous_index_positions = allow_simultaneous_index_positions()
+    if active_selective_index and not simultaneous_index_positions:
         for symbol in SYMBOLS:
             expire_watch(symbol, "a selective index-option position is already active")
         verbose_log(
@@ -6678,6 +6693,13 @@ def run_signal_check():
             + "; no new index-option entry will be evaluated"
         )
         return
+    if active_selective_index:
+        verbose_log(
+            "Simultaneous index mode active; continuing scans for "
+            + "/".join(
+                symbol for symbol in SYMBOLS if symbol not in active_selective_index
+            )
+        )
 
     try:
         tracked_instrument_keys = {
@@ -6722,6 +6744,10 @@ def run_signal_check():
 
     qualified = []
     for symbol in SYMBOLS:
+        if symbol in active_selective_index:
+            expire_watch(symbol, f"{symbol} already has an active selective position")
+            verbose_log(f"{symbol} scan skipped: its selective position is already active")
+            continue
         occupied_contracts = active_index_instrument_keys(symbol)
         try:
             daily_block = daily_index_entry_block_reason(symbol)
@@ -6747,7 +6773,7 @@ def run_signal_check():
             had_watch = bool(read_watch_state(symbol))
             if (
                 had_watch
-                and not active_selective_index
+                and (not active_selective_index or simultaneous_index_positions)
                 and not daily_block
                 and watch_mode_enabled()
             ):
@@ -6756,7 +6782,7 @@ def run_signal_check():
                     qualified.append(watched)
                 continue
             if (
-                not active_selective_index
+                (not active_selective_index or simultaneous_index_positions)
                 and not daily_block
                 and candidate
                 and candidate.get("allowed", True)
@@ -6764,7 +6790,11 @@ def run_signal_check():
                 clear_watch_state(symbol)
                 qualified.append(candidate)
                 continue
-            if not active_selective_index and not daily_block and watch_mode_enabled():
+            if (
+                (not active_selective_index or simultaneous_index_positions)
+                and not daily_block
+                and watch_mode_enabled()
+            ):
                 if candidate and candidate.get("watch_eligible"):
                     start_watch(symbol, candidate)
             elif read_watch_state(symbol):
@@ -6783,17 +6813,18 @@ def run_signal_check():
             ),
             reverse=True,
         )
-        chosen = ordered[0]
-        log_scan_decision(
-            chosen["symbol"],
-            candidate_weighted_score(chosen),
-            "buy",
-            score_version=candidate_score_version(chosen),
-        )
-        try:
-            execute_selected_candidate(chosen)
-        except Exception as error:
-            log(f"{chosen['symbol']} order execution ERROR: {error}")
+        selected = ordered if simultaneous_index_positions else ordered[:1]
+        for chosen in selected:
+            log_scan_decision(
+                chosen["symbol"],
+                candidate_weighted_score(chosen),
+                "buy",
+                score_version=candidate_score_version(chosen),
+            )
+            try:
+                execute_selected_candidate(chosen)
+            except Exception as error:
+                log(f"{chosen['symbol']} order execution ERROR: {error}")
 
 
 

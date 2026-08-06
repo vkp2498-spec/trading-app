@@ -330,6 +330,9 @@ Both engines use the same safety-critical infrastructure.
 - Apply account capital and lot ceilings.
 - Compute actual planned stop risk using final quantity.
 - Apply open-portfolio, daily-loss, daily-profit, consecutive-loss, and correlation controls.
+- `ALLOW_SIMULTANEOUS_INDEX_POSITIONS=true` permits one active NIFTY and one active
+  BANKNIFTY selective position, including both qualifying in the same scan. Portfolio
+  risk and same-direction correlation controls continue to apply.
 - Check spread/Greeks/depth when enabled.
 - Place a market-protected entry order.
 - Confirm broker fill and calculate levels from the fill.

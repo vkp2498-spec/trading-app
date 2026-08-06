@@ -1604,6 +1604,126 @@ class TradeControlTests(unittest.TestCase):
         evaluate.assert_not_called()
         execute.assert_not_called()
 
+    def test_simultaneous_mode_scans_other_index_while_one_is_active(self):
+        def state_for(symbol):
+            if symbol == "NIFTY":
+                return {
+                    "instrument_key": "NSE_FO|NIFTY_OPEN",
+                    "status": "POSITION_OPEN",
+                }
+            return {}
+
+        bank_candidate = {
+            "symbol": "BANKNIFTY",
+            "transaction_type": "BUY",
+            "weighted_score": 55,
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {"ALLOW_SIMULTANEOUS_INDEX_POSITIONS": "true"},
+                clear=False,
+            ),
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "trading_engine", return_value="VAMSI"),
+            patch.object(trade_bot, "read_state", side_effect=state_for),
+            patch.object(trade_bot, "handle_existing_state"),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(trade_bot, "daily_index_entry_block_reason", return_value=""),
+            patch.object(trade_bot, "active_index_instrument_keys", return_value=set()),
+            patch.object(trade_bot, "read_watch_state", return_value={}),
+            patch.object(trade_bot, "watch_mode_enabled", return_value=False),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=bank_candidate,
+            ) as evaluate,
+            patch.object(trade_bot, "execute_selected_candidate", return_value=True) as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(evaluate.call_args.args[0], "BANKNIFTY")
+        execute.assert_called_once_with(bank_candidate)
+
+    def test_simultaneous_mode_can_execute_both_indices_from_same_scan(self):
+        candidates = {
+            "NIFTY": {
+                "symbol": "NIFTY",
+                "transaction_type": "BUY",
+                "weighted_score": 50,
+            },
+            "BANKNIFTY": {
+                "symbol": "BANKNIFTY",
+                "transaction_type": "BUY",
+                "weighted_score": 60,
+            },
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {"ALLOW_SIMULTANEOUS_INDEX_POSITIONS": "true"},
+                clear=False,
+            ),
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "trading_engine", return_value="VAMSI"),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(trade_bot, "daily_index_entry_block_reason", return_value=""),
+            patch.object(trade_bot, "active_index_instrument_keys", return_value=set()),
+            patch.object(trade_bot, "read_watch_state", return_value={}),
+            patch.object(trade_bot, "watch_mode_enabled", return_value=False),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                side_effect=lambda symbol, **kwargs: candidates[symbol],
+            ),
+            patch.object(trade_bot, "execute_selected_candidate", return_value=True) as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(
+            {call.args[0]["symbol"] for call in execute.call_args_list},
+            {"NIFTY", "BANKNIFTY"},
+        )
+
+    def test_stream_subscription_keeps_all_active_bot_contracts(self):
+        states = {
+            "NIFTY": {
+                "instrument_key": "NSE_FO|NIFTY_OPEN",
+                "status": "POSITION_OPEN",
+            },
+            "BANKNIFTY": {},
+        }
+        with patch.object(
+            trade_bot,
+            "BOT_STATE_SLOTS",
+            tuple(states),
+        ), patch.object(
+            trade_bot,
+            "read_state",
+            side_effect=lambda symbol: states[symbol],
+        ), patch.object(trade_bot, "_write_stream_instruments") as write:
+            trade_bot.write_stream_instruments(
+                ["NSE_INDEX|Nifty 50", "NSE_FO|BANKNIFTY_CANDIDATE"]
+            )
+
+        subscribed = write.call_args.args[0]
+        self.assertIn("NSE_FO|NIFTY_OPEN", subscribed)
+        self.assertIn("NSE_FO|BANKNIFTY_CANDIDATE", subscribed)
+
     def test_losing_setups_are_rejected_by_feasibility_gate(self):
         first = trade_bot.evaluate_trade_feasibility(
             "BULLISH",
