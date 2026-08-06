@@ -2351,25 +2351,32 @@ def render_analytics_calendar(days):
 def edge_heatmap_style(value, trades):
     if trades <= 0:
         return "background-color:#f1f5f9;color:#64748b;font-weight:700"
-    if value < -500:
+    if value < -5000:
         return "background-color:#dc2626;color:white;font-weight:800"
     if value < 0:
         return "background-color:#fb923c;color:#061a35;font-weight:800"
-    if value <= 500:
+    if value <= 2500:
         return "background-color:#fde047;color:#061a35;font-weight:800"
-    if value <= 1000:
+    if value <= 5000:
         return "background-color:#a3e635;color:#061a35;font-weight:800"
     return "background-color:#16a34a;color:white;font-weight:800"
 
 
 def render_edge_matrix(edge):
     st.markdown("### Edge Matrix")
-    st.caption("Expectancy per trade by 0–100 unified entry score and entry time.")
+    st.caption(
+        "Size-independent expectancy per trade by unified entry score and entry time, "
+        "normalized to ₹1 lakh of option premium deployed."
+    )
     total_trades = int(edge.get("totalTrades", 0) or 0)
     profit_factor = edge.get("profitFactor")
     symbol_trades = edge.get("symbolTrades") or {}
     metrics = st.columns(4)
-    metrics[0].metric("Expectancy", money(edge.get("overallExpectancy", 0)), "per trade")
+    metrics[0].metric(
+        "Expectancy",
+        money(edge.get("overallExpectancy", 0)),
+        "per trade / ₹1L deployed",
+    )
     metrics[1].metric(
         "Win Rate",
         f"{float(edge.get('winRate', 0) or 0):.1f}%",
@@ -2408,11 +2415,11 @@ def render_edge_matrix(edge):
                 )
                 styles.loc[label, score_band] = edge_heatmap_style(expectancy, trades)
         styled = display.style.apply(lambda _frame: styles, axis=None)
-        st.markdown("#### Expectancy Heat Map")
+        st.markdown("#### Expectancy Heat Map — Per ₹1L Deployed")
         st.dataframe(styled, use_container_width=True)
         st.caption(
-            "Red < -₹500 | Orange -₹500 to ₹0 | Yellow ₹0 to ₹500 | "
-            "Light green ₹500 to ₹1,000 | Green > ₹1,000"
+            "Red < -₹5,000 | Orange -₹5,000 to ₹0 | Yellow ₹0 to ₹2,500 | "
+            "Light green ₹2,500 to ₹5,000 | Green > ₹5,000"
         )
 
     best_zone = edge.get("bestZone") or {}
@@ -2425,13 +2432,14 @@ def render_edge_matrix(edge):
             st.metric("Unified Score", best_zone.get("scoreBand", "—"))
             st.metric("Expectancy", money(best_zone.get("expectancy", 0)))
             st.caption(
+                "Per trade per ₹1L deployed | "
                 f"Win rate {float(best_zone.get('winRate', 0) or 0):.1f}% | "
                 f"{int(best_zone.get('trades', 0) or 0)} trades"
             )
         else:
             st.info("More scored trades are needed to identify a best zone.")
     with time_column:
-        st.markdown("#### Expectancy by Entry Time")
+        st.markdown("#### Expectancy by Entry Time — Per ₹1L Deployed")
         if time_performance.empty:
             st.info("No entry-time performance is available yet.")
         else:

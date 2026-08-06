@@ -54,6 +54,42 @@ class PerLakhDashboardTests(unittest.TestCase):
         self.assertEqual(normalized["cumulative"]["winRate"], 100.0)
         self.assertEqual(normalized["recentTrades"][0]["grossPnL"], 5_000.0)
 
+    def test_edge_expectancy_is_always_normalized_and_excludes_unscalable_rows(self):
+        small = trade(pnl=1_000.0, quantity=100, entry_price=100.0)
+        large = trade(pnl=10_000.0, quantity=1_000, entry_price=100.0)
+        missing_size = trade(pnl=50_000.0, quantity=0, entry_price=100.0)
+        for item in (small, large, missing_size):
+            item.update(
+                {
+                    "entryTime": "2026-07-31T10:15:00+05:30",
+                    "score": 55,
+                    "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
+                }
+            )
+
+        with patch.object(
+            dashboard_data,
+            "read_trade_history",
+            return_value=[small, large, missing_size],
+        ):
+            performance = dashboard_data.build_trade_performance()
+
+        analytics = performance["edgeAnalytics"]
+        cell = next(
+            item
+            for item in analytics["matrix"]
+            if item["timeBucket"] == "morning" and item["scoreBand"] == "50-59"
+        )
+        self.assertEqual(performance["cumulative"]["totalPnL"], 61_000.0)
+        self.assertEqual(cell["expectancy"], 10_000.0)
+        self.assertEqual(cell["trades"], 2)
+        self.assertEqual(analytics["normalizationBasis"], "PER_LAKH_ENTRY_PREMIUM")
+        self.assertEqual(analytics["excludedUnscalableTrades"], 1)
+        self.assertEqual(
+            performance["normalizedPerLakh"]["edgeAnalytics"],
+            analytics,
+        )
+
     def test_index_history_does_not_filter_retired_strategy_labels(self):
         historical = trade(pnl=2_500.0)
         historical["strategy"] = "RETIRED_EXPERIMENT"

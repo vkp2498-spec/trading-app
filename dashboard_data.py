@@ -1267,6 +1267,30 @@ def edge_analytics(trades: list[dict]) -> dict:
     }
 
 
+def normalized_edge_analytics_per_lakh(trades: list[dict]) -> dict:
+    """Return size-independent expectancy using ₹1 lakh of entry premium per trade."""
+    scalable = []
+    excluded = 0
+    for trade in trades:
+        if trade_value_at_entry(trade) <= 0:
+            excluded += 1
+            continue
+        scalable.append(normalize_trade_per_lakh(trade))
+
+    analytics = edge_analytics(scalable)
+    analytics["normalizationBasis"] = "PER_LAKH_ENTRY_PREMIUM"
+    analytics["normalizationLabel"] = "Per ₹1L deployed"
+    analytics["excludedUnscalableTrades"] = excluded
+    best_zone = analytics.get("bestZone")
+    if best_zone:
+        analytics["keyInsight"] = (
+            f"{best_zone['scoreBand']} trades during {best_zone['timeLabel']} "
+            f"have the strongest normalized expectancy at "
+            f"₹{best_zone['expectancy']:,.0f} per trade per ₹1L deployed."
+        )
+    return analytics
+
+
 def today_category_pnl(
     trades: list[dict],
 ) -> dict:
@@ -1628,10 +1652,14 @@ def build_trade_performance() -> dict:
     history = read_trade_history()
     trades = selective_index_trades(history)
     raw = _build_trade_performance_payload(trades, today_text)
-    raw["normalizedPerLakh"] = _build_trade_performance_payload(
+    normalized = _build_trade_performance_payload(
         normalize_trades_per_lakh(trades),
         today_text,
     )
+    normalized_edge = normalized_edge_analytics_per_lakh(trades)
+    raw["edgeAnalytics"] = normalized_edge
+    normalized["edgeAnalytics"] = normalized_edge
+    raw["normalizedPerLakh"] = normalized
     return raw
 
 def state_file(symbol: str) -> Path:
