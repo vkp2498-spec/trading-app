@@ -61,7 +61,11 @@ def record_closed_trade(state, exit_price, exit_reason):
         "symbol": state.get("symbol", ""),
         "underlying_symbol": state.get("underlying_symbol", state.get("symbol", "")),
         "instrument_class": state.get("instrument_class", "INDEX_OPTION"),
-        "strategy": state.get("strategy", "SELECTIVE"),
+        "strategy": (
+            "MANUAL_INDEX"
+            if state.get("manual_override")
+            else state.get("strategy", "SELECTIVE")
+        ),
         "trading_symbol": state.get("trading_symbol", ""),
         "direction": state.get("direction", ""),
         "transaction_type": transaction_type,

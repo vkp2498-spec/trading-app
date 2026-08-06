@@ -208,6 +208,7 @@ DEFAULT_MAX_ENTRY_EXTENSION_PERCENT = 1.5
 DEFAULT_RISK_SLOTS_PER_DAY = 3
 DEFAULT_MIN_REENTRY_MINUTES = 0
 DEFAULT_OPTION_CAPITAL_PER_ENTRY = "MAX"
+UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 
 SYMBOL_CONFIG = {
     "NIFTY": {
@@ -1568,6 +1569,8 @@ def today_realized_pnl():
             for row in reader:
                 if str(row.get("trade_date")) != today:
                     continue
+                if not is_bot_trade_history_row(row):
+                    continue
 
                 total += to_float(row.get("gross_pnl"))
 
@@ -1610,6 +1613,8 @@ def first_index_trade_outcome_today(symbol):
                 continue
             if str(row.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
                 continue
+            if not is_bot_trade_history_row(row):
+                continue
             pnl = to_float(row.get("gross_pnl"))
             if pnl > 0 and stop_after_first_outcome_enabled("PROFIT"):
                 return {"outcome": "PROFIT", "gross_pnl": pnl, "row": row}
@@ -1637,6 +1642,7 @@ def bot_unrealized_pnl():
         state.get("instrument_key"): state
         for state in states
         if state.get("instrument_key") and state.get("status") in {"POSITION_OPEN", "EXIT_PENDING"}
+        and not state.get("manual_override")
     }
     if not tracked:
         return 0.0
@@ -1680,6 +1686,20 @@ def selective_index_has_active_state(symbol):
     return state_is_active(read_state(symbol))
 
 
+def is_bot_trade_history_row(row):
+    """Exclude manual/broker-sync rows from bot-only risk and P&L controls."""
+    exit_reason = str(row.get("exit_reason") or "").strip().upper()
+    trading_symbol = str(row.get("trading_symbol") or "").strip().upper()
+    strategy = str(row.get("strategy") or "").strip().upper()
+    manual_override = str(row.get("manual_override") or "").strip().lower()
+    return not (
+        exit_reason == UPSTOX_SYNC_EXIT_REASON
+        or trading_symbol.startswith("UPSTOX SYNC")
+        or strategy in {"MANUAL", "MANUAL_INDEX", "MOBILE_MANUAL"}
+        or manual_override in {"1", "true", "yes", "on"}
+    )
+
+
 def active_index_instrument_keys(symbol):
     """Return the selective contract already managed for one underlying."""
     state = read_state(symbol)
@@ -1699,6 +1719,7 @@ def today_closed_trade_rows():
                 for row in csv.DictReader(handle)
                 if str(row.get("trade_date")) == today
                 and str(row.get("status") or "CLOSED").upper() == "CLOSED"
+                and is_bot_trade_history_row(row)
             ]
     except Exception as error:
         log(f"Could not read today's closed trades for portfolio circuit: {error}")
@@ -1746,7 +1767,6 @@ def portfolio_day_circuit():
     ):
         try:
             broker_pnl = broker_derivatives_day_pnl()
-            pnl = broker_pnl
         except Exception as error:
             return {
                 "allowed": False,
@@ -1796,6 +1816,7 @@ def portfolio_day_circuit():
         "unrealized_pnl": unrealized,
         "combined_pnl": pnl,
         "broker_day_pnl": broker_pnl,
+        "pnl_source": "BOT_ONLY",
         "peak_pnl": state["peak_pnl"],
         "consecutive_losses": consecutive_losses_today(),
         "score_penalty": score_penalty if state.get("soft_triggered_at") else 0.0,
@@ -2149,6 +2170,8 @@ def today_index_trade_rows():
                 if str(row.get("symbol") or "").upper() not in SYMBOLS:
                     continue
                 if str(row.get("instrument_class") or "INDEX_OPTION").upper() != "INDEX_OPTION":
+                    continue
+                if not is_bot_trade_history_row(row):
                     continue
                 rows.append(row)
     except Exception as error:
