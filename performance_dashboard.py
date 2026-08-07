@@ -67,7 +67,7 @@ BACKTEST_DIR = DATA_DIR / "backtests"
 BACKTEST_STATUS_FILE = BACKTEST_DIR / "status.json"
 BACKTEST_LATEST_FILE = BACKTEST_DIR / "latest.json"
 
-SYMBOLS = ["NIFTY", "BANKNIFTY"]
+SYMBOLS = ["NIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE", "GANESH_GAP_NIFTY", "GANESH_GAP_BANKNIFTY"]
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
@@ -893,6 +893,7 @@ def render_score_followthrough_review():
     filtered = audit[
         audit["trading_date_dt"].dt.date.between(start_date, end_date)
     ].copy()
+    filtered = filtered[filtered["symbol"].astype(str).str.upper() == "NIFTY"]
     directional = filtered[filtered["direction"].isin(["BULLISH", "BEARISH"])]
     high_score = directional[pd.to_numeric(directional["score"], errors="coerce") >= 75]
 
@@ -938,7 +939,7 @@ def render_score_followthrough_review():
     for column in numeric_columns:
         wide[column] = pd.to_numeric(wide[column], errors="coerce").round(1)
 
-    st.markdown("#### NIFTY and BANKNIFTY by Score Bucket")
+    st.markdown("#### NIFTY by Score Bucket")
     st.dataframe(wide, use_container_width=True, hide_index=True)
     st.caption(
         "Scores from 0 through 49 use five-point buckets for additional resolution. "
@@ -1035,7 +1036,11 @@ def render_daily_trade_pnl_matrix(performance_payload):
         unsafe_allow_html=True,
     )
 
-    trades = dashboard_index_trades(read_trade_history())
+    trades = [
+        trade
+        for trade in dashboard_index_trades(read_trade_history())
+        if normalized_underlying(trade) == "NIFTY"
+    ]
     today_text = now_ist().date().isoformat()
     available_dates = sorted(
         {
@@ -1246,7 +1251,11 @@ def section_header(title):
 
 
 def dashboard_trades_for_summary():
-    return dashboard_index_trades(read_trade_history())
+    return [
+        trade
+        for trade in dashboard_index_trades(read_trade_history())
+        if normalized_underlying(trade) == "NIFTY"
+    ]
 
 
 def symbol_summary(trades, symbol):
@@ -2198,18 +2207,15 @@ Win rate {win_rate:.1f}%
 
 
 def section_stats(payload, total_trades_key, total_pnl_key):
-    overall = payload.get("overallStats") or {
+    symbol_stats = payload.get("symbolStats") or {}
+    nifty = symbol_stats.get("NIFTY") or payload.get("overallStats") or {
         "trades": payload.get(total_trades_key, 0),
         "netPnL": payload.get("netPnL", payload.get(total_pnl_key, 0)),
         "winRate": payload.get("winRate", 0),
         "averageProfit": payload.get("averageProfitPerWinningTrade", 0),
         "averageLoss": payload.get("averageLossPerLosingTrade", 0),
     }
-    symbol_stats = payload.get("symbolStats") or {}
-    return [("Overall", overall)] + [
-        (symbol, symbol_stats.get(symbol, {"trades": 0, "netPnL": 0, "winRate": 0}))
-        for symbol in SYMBOLS
-    ]
+    return [("NIFTY Options", nifty)]
 
 def sequence_table(rows):
     frame = pd.DataFrame(rows or [])
@@ -2271,7 +2277,7 @@ def render_analytics_calendar(days):
             }
         )
     if not parsed_days:
-        st.info("Completed NIFTY and BANKNIFTY trades will populate the P&L calendar.")
+        st.info("Completed NIFTY option trades will populate the P&L calendar.")
         return
 
     available_months = sorted({(item["date"].year, item["date"].month) for item in parsed_days})
@@ -2369,7 +2375,6 @@ def render_edge_matrix(edge):
     )
     total_trades = int(edge.get("totalTrades", 0) or 0)
     profit_factor = edge.get("profitFactor")
-    symbol_trades = edge.get("symbolTrades") or {}
     metrics = st.columns(4)
     metrics[0].metric(
         "Expectancy",
@@ -2388,10 +2393,10 @@ def render_edge_matrix(edge):
     metrics[3].metric(
         "Total Trades",
         total_trades,
-        f"N {int(symbol_trades.get('NIFTY', 0) or 0)} • BN {int(symbol_trades.get('BANKNIFTY', 0) or 0)}",
+        "NIFTY options",
     )
     if total_trades == 0:
-        st.info("Waiting for scored NIFTY and BANKNIFTY trades.")
+        st.info("Waiting for scored NIFTY option trades.")
 
     score_bands = edge.get("scoreBands") or []
     time_buckets = edge.get("timeBuckets") or []
@@ -2469,10 +2474,12 @@ def render_analytics_tab(performance_payload):
     render_analytics_calendar(performance_payload.get("pnlCalendar") or [])
 
     st.markdown("### P&L by Weekday")
-    st.caption("NIFTY and BANKNIFTY results by trading day.")
+    st.caption("NIFTY option results by trading day.")
     weekday = pd.DataFrame(
         (performance_payload.get("cumulative") or {}).get("dayOfWeekPerformance") or []
     )
+    if not weekday.empty and "symbol" in weekday.columns:
+        weekday = weekday[weekday["symbol"].astype(str).str.upper() == "NIFTY"]
     if weekday.empty:
         st.info("The chart will appear when completed weekday results are available.")
     else:
@@ -2499,9 +2506,9 @@ def render_analytics_tab(performance_payload):
     render_edge_matrix(performance_payload.get("edgeAnalytics") or {})
 
 
-st.markdown('<div class="dash-title">Trading Bot Dashboard</div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-title">Nifty Options Trading</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="dash-subtitle">NIFTY and BANKNIFTY performance and score follow-through research</div>',
+    '<div class="dash-subtitle">NIFTY option performance and score follow-through research</div>',
     unsafe_allow_html=True,
 )
 
@@ -2514,19 +2521,21 @@ with performance_tab:
     cumulative = performance.get("cumulative", {})
 
     section_header("Today")
-    today_cols = st.columns(3)
+    today_summaries = section_stats(today, "closedTrades", "closedPnL")
+    today_cols = st.columns(len(today_summaries))
     for column, (title, summary) in zip(
         today_cols,
-        section_stats(today, "closedTrades", "closedPnL"),
+        today_summaries,
     ):
         with column:
             st.markdown(summary_card_html(title, summary), unsafe_allow_html=True)
 
     section_header("Cumulative")
-    summary_cols = st.columns(3)
+    cumulative_summaries = section_stats(cumulative, "totalTrades", "totalPnL")
+    summary_cols = st.columns(len(cumulative_summaries))
     for column, (title, summary) in zip(
         summary_cols,
-        section_stats(cumulative, "totalTrades", "totalPnL"),
+        cumulative_summaries,
     ):
         with column:
             st.markdown(

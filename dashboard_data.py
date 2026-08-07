@@ -1691,7 +1691,11 @@ def _build_trade_performance_payload(
 def build_trade_performance() -> dict:
     today_text = datetime.now(IST).strftime("%Y-%m-%d")
     history = read_trade_history()
-    trades = selective_index_trades(history)
+    trades = [
+        trade
+        for trade in selective_index_trades(history)
+        if normalized_underlying(trade) == "NIFTY"
+    ]
     raw = _build_trade_performance_payload(trades, today_text)
     normalized = _build_trade_performance_payload(
         normalize_trades_per_lakh(trades),

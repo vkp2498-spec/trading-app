@@ -517,7 +517,7 @@ Do not use `source .env` as the normal application loader. Unquoted values conta
 
 ### 13.1 Dashboard
 
-The Streamlit dashboard reads journals, live state files, Upstox positions, and research outputs. It includes performance, live cockpit, post-market analysis, forensics, and research views accumulated during the project.
+The Streamlit dashboard and iOS trading presentation are branded **Nifty Options Trading**. Their performance totals, calendar, weekday charts, trade sequences, score/time heat maps, expectancy, and post-market score review use NIFTY index-option trades only. Historical BANKNIFTY journal rows are preserved for audit purposes but are excluded from these displayed analytics.
 
 Restart after code changes that affect the dashboard:
 
