@@ -1568,6 +1568,54 @@ class TradeControlTests(unittest.TestCase):
 
         execute.assert_called_once_with(candidates["BANKNIFTY"])
 
+    def test_trade_bank_nifty_false_scans_and_trades_only_nifty(self):
+        nifty_candidate = {
+            "symbol": "NIFTY",
+            "transaction_type": "BUY",
+            "weighted": {"score": 82},
+        }
+
+        with (
+            patch.dict(os.environ, {"TRADE_BANK_NIFTY": "false"}, clear=False),
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=nifty_candidate,
+            ) as evaluate,
+            patch.object(trade_bot, "execute_selected_candidate") as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        evaluate.assert_called_once()
+        self.assertEqual(evaluate.call_args.args[0], "NIFTY")
+        execute.assert_called_once_with(nifty_candidate)
+
+    def test_trade_bank_nifty_false_applies_to_ganesh_scans(self):
+        with (
+            patch.dict(os.environ, {"TRADE_BANK_NIFTY": "false"}, clear=False),
+            patch.object(
+                trade_bot,
+                "now_ist",
+                return_value=datetime(2026, 8, 7, 10, 0),
+            ),
+            patch.object(trade_bot, "active_bot_states", return_value=[]),
+            patch.object(trade_bot, "write_stream_instruments"),
+            patch.object(trade_bot, "run_ganesh_gap_symbol_signal_check") as scan,
+            patch.object(trade_bot, "read_state", return_value={}),
+        ):
+            trade_bot.run_ganesh_gap_signal_check()
+
+        scan.assert_called_once()
+        self.assertEqual(scan.call_args.args[0], "NIFTY")
+
     def test_index_point_exits_are_read_from_environment(self):
         with patch.dict(
             os.environ,

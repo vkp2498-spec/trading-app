@@ -397,6 +397,14 @@ def trading_engine():
     return engine
 
 
+def enabled_index_symbols():
+    """Return indices eligible for new bot entries; monitoring remains global."""
+    symbols = ["NIFTY"]
+    if configured_bool("TRADE_BANK_NIFTY", True):
+        symbols.append("BANKNIFTY")
+    return symbols
+
+
 def score_cutoff_mode_enabled():
     return configured_bool("SCORE_CUTOFF_MODE_ENABLED", True)
 
@@ -6581,7 +6589,7 @@ def run_ganesh_gap_signal_check():
             "NSE_INDEX|India VIX",
         ]
     )
-    for symbol in SYMBOLS:
+    for symbol in enabled_index_symbols():
         run_ganesh_gap_symbol_signal_check(symbol, now=now)
         if any(
             state_is_active(read_state(slot)) for slot in GANESH_GAP_STATE_SLOTS
@@ -6811,8 +6819,13 @@ def run_signal_check():
         log(f"Global broker-position precheck failed; no new entry for safety: {error}")
         return
 
-    qualified = []
+    enabled_symbols = enabled_index_symbols()
     for symbol in SYMBOLS:
+        if symbol not in enabled_symbols:
+            expire_watch(symbol, f"{symbol} bot entries are disabled in .env")
+
+    qualified = []
+    for symbol in enabled_symbols:
         if symbol in active_selective_index:
             expire_watch(symbol, f"{symbol} already has an active selective position")
             verbose_log(f"{symbol} scan skipped: its selective position is already active")
@@ -6872,7 +6885,8 @@ def run_signal_check():
             log(f"{symbol} ERROR: {error}")
 
     if not qualified:
-        verbose_log("No new qualified NIFTY or BANKNIFTY selective BUY structure.")
+        enabled_label = " or ".join(enabled_symbols)
+        verbose_log(f"No new qualified {enabled_label} selective BUY structure.")
     else:
         ordered = sorted(
             qualified,

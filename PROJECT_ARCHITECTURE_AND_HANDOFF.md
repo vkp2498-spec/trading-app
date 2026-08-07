@@ -335,6 +335,8 @@ Both engines use the same safety-critical infrastructure.
 - `ALLOW_SIMULTANEOUS_INDEX_POSITIONS=true` permits one active NIFTY and one active
   BANKNIFTY selective position, including both qualifying in the same scan. Portfolio
   risk and same-direction correlation controls continue to apply.
+- `TRADE_BANK_NIFTY=false` prevents both entry engines from opening new BANKNIFTY
+  trades while leaving existing BANKNIFTY position monitoring and exits active.
 - Check spread/Greeks/depth when enabled.
 - Place a market-protected entry order.
 - Confirm broker fill and calculate levels from the fill.
