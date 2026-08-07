@@ -94,6 +94,46 @@ class TradeControlTests(unittest.TestCase):
             self.assertTrue(trade_bot.vamsi_entry_score_qualifies(59, "NIFTY"))
             self.assertFalse(trade_bot.vamsi_entry_score_qualifies(59.1, "NIFTY"))
 
+    def test_vamsi_disjoint_score_ranges_are_inclusive_and_reject_the_gap(self):
+        with patch.dict(
+            os.environ,
+            {
+                "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
+                "VAMSI_UNIFIED_SCORE_RANGES": "50-59,80-89",
+                "VAMSI_UNIFIED_SCORE_FALLBACK": "10",
+                "VAMSI_UNIFIED_SCORE_MAXIMUM": "100",
+            },
+            clear=False,
+        ), patch.object(trade_bot, "read_effective_score_rule") as adaptive:
+            rule = trade_bot.vamsi_score_rule("NIFTY")
+
+            self.assertEqual(rule["mode"], "RANGES")
+            self.assertEqual(rule["source"], "STATIC_RANGES")
+            self.assertEqual(trade_bot.direct_entry_minimum_score("NIFTY"), 50)
+            self.assertFalse(trade_bot.vamsi_entry_score_qualifies(49.9, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_entry_score_qualifies(50, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_entry_score_qualifies(59, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_entry_score_qualifies(59.1, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_entry_score_qualifies(79.9, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_entry_score_qualifies(80, "NIFTY"))
+            self.assertTrue(trade_bot.vamsi_entry_score_qualifies(89, "NIFTY"))
+            self.assertFalse(trade_bot.vamsi_entry_score_qualifies(89.1, "NIFTY"))
+            self.assertEqual(
+                trade_bot.format_vamsi_score_rule(rule),
+                "configured ranges 50.0-59.0 or 80.0-89.0",
+            )
+            adaptive.assert_not_called()
+
+    def test_vamsi_disjoint_score_ranges_reject_invalid_or_overlapping_bands(self):
+        for configured in ("50-59,broken", "50-70,70-89", "80-50", "50-101"):
+            with self.subTest(configured=configured), patch.dict(
+                os.environ,
+                {"VAMSI_UNIFIED_SCORE_RANGES": configured},
+                clear=False,
+            ):
+                with self.assertRaises(RuntimeError):
+                    trade_bot.static_vamsi_score_rule()
+
     def test_vamsi_score_threshold_cannot_exceed_one_hundred(self):
         with patch.dict(
             os.environ,

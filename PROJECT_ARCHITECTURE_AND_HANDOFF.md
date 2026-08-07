@@ -191,6 +191,8 @@ When `VAMSI_ADAPTIVE_SCORE_ENABLED=true`, the 09:00 IST job analyzes only prior 
 
 For a manually selected static score range, set `VAMSI_ADAPTIVE_SCORE_ENABLED=false`, use `VAMSI_UNIFIED_SCORE_FALLBACK` as the inclusive lower boundary, and set the optional `VAMSI_UNIFIED_SCORE_MAXIMUM` as the inclusive upper boundary. If the maximum is omitted, the legacy strict minimum-only rule remains in effect.
 
+For multiple disjoint static bands, set `VAMSI_UNIFIED_SCORE_RANGES` to comma-separated inclusive ranges such as `50-59,80-89`. An explicit multi-range setting takes precedence over adaptive calibration and over the fallback/maximum pair; scores in gaps between bands are rejected.
+
 The same selected historical score window supplies adaptive exit points: average favorable movement becomes the target and average adverse movement becomes the stop. Each is bounded to 0.5x-2.0x the account's configured default to prevent a single unusual sample from producing an extreme plan. Until the unified-history requirement is met, `NIFTY_TARGET_POINTS`, `NIFTY_STOP_POINTS`, `BANKNIFTY_TARGET_POINTS`, and `BANKNIFTY_STOP_POINTS` continue unchanged. Post-fill technical feasibility remains diagnostic, while broker protection remains a hard safeguard.
 
 ### 7.3 Contract selection

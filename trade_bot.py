@@ -11,6 +11,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import csv
 import random
+import re
 import pandas as pd
 from copy import deepcopy
 from contextlib import contextmanager
@@ -1067,7 +1068,50 @@ def static_vamsi_minimum_score():
     return minimum
 
 
+def configured_vamsi_score_ranges():
+    raw = str(os.getenv("VAMSI_UNIFIED_SCORE_RANGES") or "").strip()
+    if not raw:
+        return []
+
+    ranges = []
+    for item in raw.split(","):
+        match = re.fullmatch(
+            r"\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*",
+            item,
+        )
+        if not match:
+            raise RuntimeError(
+                "VAMSI_UNIFIED_SCORE_RANGES must use comma-separated MIN-MAX "
+                "bands, for example 50-59,80-89"
+            )
+        minimum = float(match.group(1))
+        maximum = float(match.group(2))
+        if minimum < 0 or maximum > 100 or maximum < minimum:
+            raise RuntimeError(
+                "Each VAMSI_UNIFIED_SCORE_RANGES band must satisfy "
+                "0 <= MIN <= MAX <= 100"
+            )
+        ranges.append({"min_score": minimum, "max_score": maximum})
+
+    ranges.sort(key=lambda band: (band["min_score"], band["max_score"]))
+    for previous, current in zip(ranges, ranges[1:]):
+        if current["min_score"] <= previous["max_score"]:
+            raise RuntimeError(
+                "VAMSI_UNIFIED_SCORE_RANGES bands must not overlap"
+            )
+    return ranges
+
+
 def static_vamsi_score_rule():
+    ranges = configured_vamsi_score_ranges()
+    if ranges:
+        return {
+            "source": "STATIC_RANGES",
+            "mode": "RANGES",
+            "min_score": ranges[0]["min_score"],
+            "max_score": ranges[-1]["max_score"],
+            "ranges": ranges,
+        }
     minimum = static_vamsi_minimum_score()
     raw_maximum = str(os.getenv("VAMSI_UNIFIED_SCORE_MAXIMUM") or "").strip()
     if not raw_maximum:
@@ -1097,6 +1141,8 @@ def static_vamsi_score_rule():
 def vamsi_score_rule(symbol):
     """Return today's adaptive rule or the configured static fallback."""
     fallback = static_vamsi_score_rule()
+    if fallback.get("mode") == "RANGES":
+        return fallback
     if configured_bool("VAMSI_ADAPTIVE_SCORE_ENABLED", True):
         adaptive = read_effective_score_rule(symbol, now_ist().date())
         if adaptive:
@@ -1114,6 +1160,12 @@ def direct_entry_minimum_score(symbol):
 
 
 def format_vamsi_score_rule(rule):
+    if rule.get("mode") == "RANGES":
+        bands = " or ".join(
+            f"{float(item['min_score']):.1f}-{float(item['max_score']):.1f}"
+            for item in rule.get("ranges", [])
+        )
+        return f"configured ranges {bands}"
     if rule.get("mode") == "RANGE":
         label = "adaptive range" if rule.get("source") == "ADAPTIVE" else "configured range"
         return (
@@ -1127,6 +1179,12 @@ def format_vamsi_score_rule(rule):
 def vamsi_entry_score_qualifies(score, symbol):
     value = to_float(score)
     rule = vamsi_score_rule(symbol)
+    if rule.get("mode") == "RANGES":
+        return any(
+            value >= float(item["min_score"])
+            and value <= float(item["max_score"])
+            for item in rule.get("ranges", [])
+        )
     if rule.get("mode") == "RANGE":
         return (
             value >= float(rule["min_score"])
