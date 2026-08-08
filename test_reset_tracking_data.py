@@ -68,6 +68,32 @@ class ResetTrackingDataTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     reset_tracking_data.run_reset(confirm=True)
 
+    def test_new_account_reset_archives_saved_profile_devices_and_stream_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            logs = root / "logs"
+            data.mkdir()
+            logs.mkdir()
+            for name in reset_tracking_data.NEW_ACCOUNT_DATA_NAMES:
+                (data / name).write_text("{}")
+
+            with (
+                patch.object(reset_tracking_data, "BASE_DIR", root),
+                patch.object(reset_tracking_data, "DATA_DIR", data),
+                patch.object(reset_tracking_data, "LOG_DIR", logs),
+                patch.object(reset_tracking_data, "ARCHIVE_DIR", root / "archive"),
+            ):
+                archive, moved = reset_tracking_data.run_reset(
+                    confirm=True,
+                    new_account=True,
+                )
+
+            self.assertEqual(len(moved), len(reset_tracking_data.NEW_ACCOUNT_DATA_NAMES))
+            for name in reset_tracking_data.NEW_ACCOUNT_DATA_NAMES:
+                self.assertFalse((data / name).exists())
+                self.assertTrue((archive / "data" / name).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

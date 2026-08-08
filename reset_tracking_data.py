@@ -44,6 +44,14 @@ DATA_PATTERNS = (
     "banknifty_veto_summary_*",
 )
 
+NEW_ACCOUNT_DATA_NAMES = {
+    "trading_config.json",
+    "apns_devices.json",
+    "upstox_market_stream.json",
+    "upstox_portfolio_stream.json",
+    "upstox_stream_status.json",
+}
+
 
 def active_local_states() -> list[Path]:
     active = []
@@ -62,7 +70,7 @@ def active_local_states() -> list[Path]:
     return active
 
 
-def reset_candidates() -> list[Path]:
+def reset_candidates(new_account: bool = False) -> list[Path]:
     candidates = []
     candidates.extend(BASE_DIR.glob("trade_state_*.json"))
     candidates.extend(BASE_DIR.glob("reentry_guard_*.json"))
@@ -70,6 +78,8 @@ def reset_candidates() -> list[Path]:
     candidates.extend(DATA_DIR / name for name in DATA_NAMES)
     for pattern in DATA_PATTERNS:
         candidates.extend(DATA_DIR.glob(pattern))
+    if new_account:
+        candidates.extend(DATA_DIR / name for name in NEW_ACCOUNT_DATA_NAMES)
     candidates.append(DATA_DIR / "watch_states")
     candidates.append(LOG_DIR / "trade_bot.log")
     return sorted({path for path in candidates if path.exists()}, key=lambda path: str(path))
@@ -83,7 +93,11 @@ def archive_destination(root: Path, source: Path) -> Path:
     return root / relative
 
 
-def run_reset(confirm: bool = False, force: bool = False) -> tuple[Path, list[Path]]:
+def run_reset(
+    confirm: bool = False,
+    force: bool = False,
+    new_account: bool = False,
+) -> tuple[Path, list[Path]]:
     active = active_local_states()
     if active and not force:
         names = ", ".join(path.name for path in active)
@@ -95,7 +109,7 @@ def run_reset(confirm: bool = False, force: bool = False) -> tuple[Path, list[Pa
 
     stamp = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
     archive_root = ARCHIVE_DIR / f"tracking_reset_{stamp}"
-    candidates = reset_candidates()
+    candidates = reset_candidates(new_account=new_account)
     if not confirm:
         return archive_root, candidates
 
@@ -122,9 +136,21 @@ def main():
         action="store_true",
         help="Proceed despite an active local state only after broker positions are verified closed.",
     )
+    parser.add_argument(
+        "--new-account",
+        action="store_true",
+        help=(
+            "Also archive copied mobile profile, APNs devices, and account stream "
+            "caches so configuration regenerates for a newly cloned account."
+        ),
+    )
     args = parser.parse_args()
 
-    archive_root, candidates = run_reset(confirm=args.confirm, force=args.force)
+    archive_root, candidates = run_reset(
+        confirm=args.confirm,
+        force=args.force,
+        new_account=args.new_account,
+    )
     action = "Archived" if args.confirm else "Would archive"
     print(f"{action} {len(candidates)} item(s):")
     for path in candidates:

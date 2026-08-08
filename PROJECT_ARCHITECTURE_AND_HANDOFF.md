@@ -677,6 +677,19 @@ venv/bin/python reset_tracking_data.py --confirm
 sudo systemctl restart nifty-app hk-mobile-api
 ```
 
+For an AWS instance cloned for a different Upstox account, preview and run the
+broader account reset instead:
+
+```bash
+venv/bin/python reset_tracking_data.py --new-account
+venv/bin/python reset_tracking_data.py --new-account --confirm
+sudo systemctl restart nifty-app hk-mobile-api upstox-streams
+```
+
+This additionally archives the copied capital-profile selection, APNs device
+registrations, and account stream caches. The capital profile then regenerates
+from `DEFAULT_TRADING_PROFILE` in the new account's `.env`.
+
 The utility archives affected files under:
 
 ```text
