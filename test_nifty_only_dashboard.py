@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import dashboard_data
@@ -6,34 +7,35 @@ import dashboard_data
 
 class NiftyOnlyDashboardTests(unittest.TestCase):
     def test_all_dashboard_analytics_exclude_banknifty_trades(self):
+        today = datetime.now(dashboard_data.IST).date().isoformat()
         trades = [
             {
-                "tradeDate": "2026-08-07",
+                "tradeDate": today,
                 "symbol": "NIFTY",
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "tradingSymbol": "NIFTY 25000 CE",
                 "transactionType": "BUY",
                 "quantity": 65,
-                "entryTime": "2026-08-07T11:15:00+05:30",
+                "entryTime": f"{today}T11:15:00+05:30",
                 "entryPrice": 100.0,
-                "exitTime": "2026-08-07T11:30:00+05:30",
+                "exitTime": f"{today}T11:30:00+05:30",
                 "grossPnL": 650.0,
                 "score": 55.0,
                 "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "tradeSequence": 1,
             },
             {
-                "tradeDate": "2026-08-07",
+                "tradeDate": today,
                 "symbol": "BANKNIFTY",
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "tradingSymbol": "BANKNIFTY 57000 CE",
                 "transactionType": "BUY",
                 "quantity": 30,
-                "entryTime": "2026-08-07T11:20:00+05:30",
+                "entryTime": f"{today}T11:20:00+05:30",
                 "entryPrice": 200.0,
-                "exitTime": "2026-08-07T11:35:00+05:30",
+                "exitTime": f"{today}T11:35:00+05:30",
                 "grossPnL": 6000.0,
                 "score": 85.0,
                 "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",

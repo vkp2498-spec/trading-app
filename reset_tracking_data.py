@@ -21,16 +21,20 @@ DATA_NAMES = {
     "analysis_history.csv",
     "scan_decisions.csv",
     "ganesh_gap_scans.csv",
+    "ganesh_gap_banknifty_scans.csv",
     "day_risk_state.json",
     "monitor_health.json",
+    "stock_scanner_status.json",
     "score_followthrough_audit.csv",
     "score_followthrough_status.json",
+    "vamsi_adaptive_score_config.json",
 }
 
 DATA_PATTERNS = (
     "counterfactual_*",
     "post_market_review_*",
     "post_market_summary_*",
+    "post_market_llm_insights_*",
     "executed_trade_forensics_*",
     "rejected_signal_forensics_*",
     "trade_forensics_summary_*",

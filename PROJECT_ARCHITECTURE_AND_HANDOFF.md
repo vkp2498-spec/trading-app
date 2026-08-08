@@ -683,7 +683,12 @@ The utility archives affected files under:
 archive/tracking_reset_YYYYMMDD_HHMMSS/
 ```
 
-It preserves `.env`, credentials, APNs devices, mobile configuration, market stream caches, and backtest data. It refuses to proceed when active local bot state exists unless `--force` is supplied. Use `--force` only after independently verifying the broker has no bot position.
+It resets copied trade/scan analytics, post-market artifacts, adaptive score calibration,
+dashboard scanner status, risk counters, and local bot state. It preserves `.env`,
+credentials, APNs devices, mobile configuration, market stream caches, and backtest
+data. It refuses to proceed when active local bot state exists unless `--force` is
+supplied. Use `--force` only after independently verifying the broker has no bot
+position.
 
 ## 18. Safe deployment workflow
 

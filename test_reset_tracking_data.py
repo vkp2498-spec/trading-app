@@ -17,6 +17,9 @@ class ResetTrackingDataTests(unittest.TestCase):
             logs.mkdir()
             (data / "trade_history.csv").write_text("trade\n")
             (data / "analysis_history.csv").write_text("analysis\n")
+            (data / "vamsi_adaptive_score_config.json").write_text("{}")
+            (data / "stock_scanner_status.json").write_text("{}")
+            (data / "post_market_llm_insights_2026-08-07.txt").write_text("old\n")
             (data / "trading_config.json").write_text("{}")
             (data / "apns_devices.json").write_text("{}")
             (logs / "trade_bot.log").write_text("old log\n")
@@ -30,14 +33,20 @@ class ResetTrackingDataTests(unittest.TestCase):
             ):
                 archive, moved = reset_tracking_data.run_reset(confirm=True)
 
-            self.assertEqual(len(moved), 4)
+            self.assertEqual(len(moved), 7)
             self.assertFalse((data / "trade_history.csv").exists())
             self.assertFalse((data / "analysis_history.csv").exists())
+            self.assertFalse((data / "vamsi_adaptive_score_config.json").exists())
+            self.assertFalse((data / "stock_scanner_status.json").exists())
+            self.assertFalse((data / "post_market_llm_insights_2026-08-07.txt").exists())
             self.assertTrue((logs / "trade_bot.log").exists())
             self.assertEqual((logs / "trade_bot.log").read_text(), "")
             self.assertTrue((data / "trading_config.json").exists())
             self.assertTrue((data / "apns_devices.json").exists())
             self.assertTrue((archive / "data" / "trade_history.csv").exists())
+            self.assertTrue(
+                (archive / "data" / "vamsi_adaptive_score_config.json").exists()
+            )
 
     def test_reset_refuses_active_position(self):
         with tempfile.TemporaryDirectory() as directory:
