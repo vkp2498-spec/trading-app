@@ -193,7 +193,7 @@ For a manually selected static score range, set `VAMSI_ADAPTIVE_SCORE_ENABLED=fa
 
 For multiple disjoint static bands, set `VAMSI_UNIFIED_SCORE_RANGES` to comma-separated inclusive ranges such as `50-59,80-89`. An explicit multi-range setting takes precedence over adaptive calibration and over the fallback/maximum pair; scores in gaps between bands are rejected.
 
-The same selected historical score window supplies adaptive exit points: average favorable movement becomes the target and average adverse movement becomes the stop. Each is bounded to 0.5x-2.0x the account's configured default to prevent a single unusual sample from producing an extreme plan. Until the unified-history requirement is met, `NIFTY_TARGET_POINTS`, `NIFTY_STOP_POINTS`, `BANKNIFTY_TARGET_POINTS`, and `BANKNIFTY_STOP_POINTS` continue unchanged. Post-fill technical feasibility remains diagnostic, while broker protection remains a hard safeguard.
+Exit adaptation is now isolated in shadow research. The post-market audit stores up to 60 one-minute OHLC candles for each selected observation. The 09:00 job uses only prior-day, current-version, entry-qualified NIFTY observations from the configured entry window; purges overlapping 60-minute episodes; and replays a target/stop grid with conservative stop-first handling for same-candle ambiguity. Each score band needs at least 40 independent episodes across ten trading days, then must pass a chronological held-out validation set. Proposed changes are capped to 10% per day and written to `data/vamsi_adaptive_exit_shadow.json`. Neither live nor paper execution reads that file: both continue to use `NIFTY_TARGET_POINTS` and `NIFTY_STOP_POINTS` from `.env` until a separate, explicit future promotion is implemented.
 
 ### 7.3 Contract selection
 
@@ -372,6 +372,7 @@ Typical persistent files include:
 - `data/analysis_history.csv`: Detailed signal snapshots.
 - `data/scan_decisions.csv`: Compact scan results.
 - `data/vamsi_adaptive_score_config.json`: Today's pre-market Vamsi minimum/range decision and its evidence summary.
+- `data/vamsi_adaptive_exit_shadow.json`: Non-executable NIFTY score-band target/stop research, with training and held-out evidence.
 - `data/ganesh_gap_scans.csv`: Ganesh gap-state evidence.
 - `data/ganesh_gap_banknifty_scans.csv`: Ganesh BANKNIFTY gap-state evidence.
 - `data/day_risk_state.json`: Day-level risk/circuit state.
@@ -435,13 +436,13 @@ Lightsail servers use UTC. IST is UTC+05:30.
 The established schedule is:
 
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
-- Vamsi adaptive score calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
+- Vamsi score and shadow-exit calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
 - Vamsi entry checks: every 5 minutes beginning at 09:15 IST. Ganesh retains its internal 09:30 strategy start. The bot's internal market window prevents late entries.
 - Position monitor: launch just before 09:15 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
-- Last Vamsi and Ganesh entry scan: 15:25 IST.
+- Current NIFTY evidence strategy entry window: 11:00 through 13:55 IST; cron may continue scanning outside it, but the engine rejects entry outside the internal window.
 - Forced square-off: 15:29 IST, `59 9 * * 1-5` in UTC cron.
 - Mobile profile default reset: around 15:30 IST when configured.
-- Post-market audits: around 18:00 IST on weekdays when configured.
+- Post-market score audit: 15:45 IST on weekdays (`15 10 * * 1-5` in UTC cron); it stores a 15-minute summary plus the longer minute path used by shadow exit research.
 
 An example cron layout is:
 
@@ -460,8 +461,11 @@ An example cron layout is:
 # Request Upstox token approval at 07:30 IST.
 0 2 * * 1-5 cd /home/ubuntu/trading-app && /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/request_upstox_token.py >> /home/ubuntu/trading-app/logs/token_request.log 2>&1
 
-# Calibrate today's Vamsi score rule at 09:00 IST (03:30 UTC).
+# Calibrate today's Vamsi score rule and non-executable shadow exits at 09:00 IST (03:30 UTC).
 30 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_score_calibration.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/adaptive_score_calibration.py >> /home/ubuntu/trading-app/logs/adaptive_score_calibration.log 2>&1
+
+# Store score follow-through and 60-minute shadow-exit paths at 15:45 IST (10:15 UTC).
+15 10 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/post_market_score_audit.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/post_market_score_audit.py >> /home/ubuntu/trading-app/logs/post_market_score_audit.log 2>&1
 ```
 
 The repeated cron launch of `--monitor` is a recovery mechanism: while the long-running process holds the lock, later launches exit. If it dies, a later cron invocation restarts it. Never write `- 4-9`; the minute field must be `*`.
@@ -758,6 +762,14 @@ Check for an active monitor:
 ```bash
 pgrep -af "trade_bot.py --monitor"
 ```
+
+For three accounts that intentionally share the same one-lot NIFTY strategy,
+run `scripts/deploy_three_aws.sh` from the development machine with three SSH
+aliases or `ubuntu@IP` values. It pulls all three first, refuses to alter `.env`
+or restart while any instance has active bot state, preserves account-specific
+keys/tokens, removes duplicate/deprecated strategy values, writes one canonical
+core block, creates a timestamped `.env` backup, generates calibration output,
+and restarts only installed long-running services. The operation is idempotent.
 
 ## 19. Verify effective engine and configuration
 

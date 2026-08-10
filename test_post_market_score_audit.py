@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,31 @@ class PostMarketScoreAuditTests(unittest.TestCase):
         self.assertTrue(row["direction_correct"])
         self.assertTrue(row["nifty_10_point_hit"])
         self.assertFalse(row["nifty_20_point_hit"])
+
+    def test_followthrough_stores_longer_minute_path_for_shadow_exits(self):
+        index = pd.date_range(
+            "2026-07-30 10:05", periods=60, freq="min", tz="Asia/Kolkata"
+        )
+        candles = pd.DataFrame(
+            {"open": 100, "high": 102, "low": 98, "close": 101}, index=index
+        )
+        scan = {
+            "timestamp": index[0],
+            "symbol": "NIFTY",
+            "score": 66,
+            "score_version": UNIFIED_SCORE_VERSION,
+            "direction": "BULLISH",
+        }
+
+        row = evaluate_followthrough(
+            scan, candles, horizon_minutes=15, exit_path_minutes=60
+        )
+        path = json.loads(row["minute_path_json"])
+
+        self.assertEqual(row["path_horizon_minutes"], 60)
+        self.assertEqual(len(path), 60)
+        self.assertEqual(path[0]["o"], 100.0)
+        self.assertEqual(path[-1]["c"], 101.0)
 
     def test_upsert_is_idempotent(self):
         index = pd.date_range("2026-07-30 10:05", periods=15, freq="min", tz="Asia/Kolkata")

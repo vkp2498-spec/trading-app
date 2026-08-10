@@ -16,6 +16,7 @@ import streamlit as st
 from datetime import time
 
 from banknifty_post_market import run_banknifty_veto_audit
+from adaptive_exit_shadow import SHADOW_CONFIG_FILE
 from adaptive_score_calibration import ADAPTIVE_CONFIG_FILE
 from post_market_review import (
     ask_llm_for_insights,
@@ -799,8 +800,8 @@ def render_score_followthrough_review():
     if adaptive_config:
         st.markdown("#### Today's Vamsi Adaptive Score Rule")
         effective_date = str(adaptive_config.get("effective_date") or "")
-        rule_columns = st.columns(2)
-        for column, symbol in zip(rule_columns, SYMBOLS):
+        rule_columns = st.columns(1)
+        for column, symbol in zip(rule_columns, ("NIFTY",)):
             rule = (adaptive_config.get("symbols") or {}).get(symbol, {})
             exit_levels = rule.get("exit_levels") or {}
             exit_text = (
@@ -839,6 +840,70 @@ def render_score_followthrough_review():
                 "The saved adaptive score rule is not for today. The live engine will ignore "
                 "it and use VAMSI_UNIFIED_SCORE_FALLBACK until today's calibration runs."
             )
+
+    shadow_config = read_backtest_json(SHADOW_CONFIG_FILE, {})
+    st.markdown("#### Shadow Exit Calibration — Execution Unchanged")
+    st.caption(
+        "NIFTY score-band target/stop proposals are replayed from stored one-minute paths. "
+        "They are research only: real and paper trades continue to use NIFTY_TARGET_POINTS "
+        "and NIFTY_STOP_POINTS from .env."
+    )
+    if shadow_config:
+        rows = []
+        for band, result in (shadow_config.get("bands") or {}).items():
+            training = result.get("training") or {}
+            validation = result.get("validation") or {}
+            rows.append(
+                {
+                    "Score Band": band,
+                    "Status": result.get("status", "BUILDING"),
+                    "Samples": int(result.get("samples") or 0),
+                    "Days": int(result.get("trading_days") or 0),
+                    "Current T/S": (
+                        f"{float(result.get('current_target_points') or 0):.1f}/"
+                        f"{float(result.get('current_stop_points') or 0):.1f}"
+                    ),
+                    "Raw Proposed T/S": (
+                        f"{float(result.get('raw_proposed_target_points')):.1f}/"
+                        f"{float(result.get('raw_proposed_stop_points')):.1f}"
+                        if result.get("raw_proposed_target_points") is not None
+                        and result.get("raw_proposed_stop_points") is not None
+                        else "—"
+                    ),
+                    "10% Capped T/S": (
+                        f"{float(result.get('proposed_target_points')):.1f}/"
+                        f"{float(result.get('proposed_stop_points')):.1f}"
+                        if result.get("proposed_target_points") is not None
+                        and result.get("proposed_stop_points") is not None
+                        else "—"
+                    ),
+                    "Train Exp/PF": (
+                        f"{float(training.get('expectancy_points') or 0):.2f}/"
+                        f"{training.get('profit_factor') if training.get('profit_factor') is not None else '∞'}"
+                        if training
+                        else "—"
+                    ),
+                    "Held-out Exp/PF": (
+                        f"{float(validation.get('expectancy_points') or 0):.2f}/"
+                        f"{validation.get('profit_factor') if validation.get('profit_factor') is not None else '∞'}"
+                        if validation
+                        else "—"
+                    ),
+                    "Applied": "No",
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(
+            f"Generated: {str(shadow_config.get('generated_at') or '')[:19]} | "
+            f"History through: {shadow_config.get('history_through_date', 'unknown')} | "
+            f"Independent episodes: {int(shadow_config.get('independent_episodes') or 0)}. "
+            "BUILDING means no recommendation should be acted on yet."
+        )
+    else:
+        st.info(
+            "No shadow exit report exists yet. The weekday 09:00 calibration creates it "
+            "after the evening audit has stored minute paths."
+        )
 
     audit = read_score_audit()
     status = read_backtest_json(SCORE_AUDIT_STATUS_FILE, {})

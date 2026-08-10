@@ -12,6 +12,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from adaptive_exit_shadow import (
+    SHADOW_CONFIG_FILE,
+    build_shadow_config,
+    parse_grid,
+)
 from post_market_score_audit import AUDIT_FILE, read_audit
 from safe_storage import atomic_write_json
 from unified_entry_score import UNIFIED_SCORE_VERSION
@@ -25,7 +30,7 @@ IST = ZoneInfo("Asia/Kolkata")
 SYMBOLS = ("NIFTY", "BANKNIFTY")
 DEFAULT_FAVORABLE_POINTS = {"NIFTY": 10.0, "BANKNIFTY": 20.0}
 DEFAULT_EXIT_POINTS = {
-    "NIFTY": {"target": 20.0, "stop": 20.0},
+    "NIFTY": {"target": 30.0, "stop": 30.0},
     "BANKNIFTY": {"target": 40.0, "stop": 40.0},
 }
 
@@ -305,34 +310,14 @@ def calibrate_symbol(
         chosen = best_minimum or best_range
         reason = "A minimum-only rule was as reliable as the best bounded score window"
 
-    raw_target = float(chosen.get("average_favorable_points") or 0)
-    raw_stop = float(chosen.get("average_adverse_points") or 0)
-    if raw_target > 0 and raw_stop > 0:
-        target_points = round(
-            _clamp(raw_target, default_target_points * 0.5, default_target_points * 2.0),
-            1,
-        )
-        stop_points = round(
-            _clamp(raw_stop, default_stop_points * 0.5, default_stop_points * 2.0),
-            1,
-        )
-        exit_levels = {
-            "source": "ADAPTIVE_HISTORY_AVERAGE",
-            "target_points": target_points,
-            "stop_points": stop_points,
-            "raw_average_favorable_points": round(raw_target, 2),
-            "raw_average_adverse_points": round(raw_stop, 2),
-            "minimum_multiplier": 0.5,
-            "maximum_multiplier": 2.0,
-        }
-    else:
-        exit_levels = fallback["exit_levels"]
-
     return {
         "status": "ADAPTIVE",
         **chosen,
         "favorable_points_required": favorable_points,
-        "exit_levels": exit_levels,
+        # Score calibration and exit calibration are intentionally isolated.
+        # Exit research is written to a separate shadow-only file and can never
+        # alter live or paper execution settings.
+        "exit_levels": fallback["exit_levels"],
         "reason": reason,
     }
 
@@ -415,15 +400,6 @@ def read_effective_score_rule(symbol, effective_date, path=ADAPTIVE_CONFIG_FILE)
     mode = str(rule.get("mode") or "MIN").upper()
     if mode not in {"MIN", "RANGE"} or (mode == "RANGE" and maximum is None):
         return None
-    exit_levels = rule.get("exit_levels") or {}
-    if exit_levels.get("source") == "ADAPTIVE_HISTORY_AVERAGE":
-        try:
-            target_points = float(exit_levels["target_points"])
-            stop_points = float(exit_levels["stop_points"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        if not 0 < target_points <= 1000 or not 0 < stop_points <= 1000:
-            return None
     return {**rule, "mode": mode, "min_score": minimum, "max_score": maximum}
 
 
@@ -434,6 +410,7 @@ def main():
     parser.add_argument("--date", help="Effective trading date in YYYY-MM-DD format")
     parser.add_argument("--audit-file", default=str(AUDIT_FILE))
     parser.add_argument("--output", default=str(ADAPTIVE_CONFIG_FILE))
+    parser.add_argument("--shadow-output", default=str(SHADOW_CONFIG_FILE))
     args = parser.parse_args()
     load_env_file()
     effective_date = date.fromisoformat(args.date) if args.date else datetime.now(IST).date()
@@ -472,7 +449,66 @@ def main():
         },
     )
     atomic_write_json(args.output, config, sort_keys=True)
-    print(json.dumps(config, indent=2, sort_keys=True))
+
+    shadow_config = None
+    shadow_mode = str(os.getenv("VAMSI_ADAPTIVE_EXIT_MODE", "shadow")).strip().lower()
+    if shadow_mode == "shadow":
+        shadow_config = build_shadow_config(
+            frame,
+            effective_date,
+            current_target=_to_float(os.getenv("NIFTY_TARGET_POINTS"), 30.0),
+            current_stop=_to_float(os.getenv("NIFTY_STOP_POINTS"), 30.0),
+            lookback_days=_to_int(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_LOOKBACK_DAYS"), 90
+            ),
+            horizon_minutes=_to_int(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_HORIZON_MINUTES"), 60
+            ),
+            entry_start_time=os.getenv("VAMSI_FIRST_ENTRY_TIME", "11:00"),
+            entry_end_time=os.getenv("VAMSI_LAST_ENTRY_TIME", "13:55"),
+            target_grid=parse_grid(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_TARGET_GRID"),
+                (10, 15, 20, 25, 30, 35, 40, 45),
+            ),
+            stop_grid=parse_grid(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_STOP_GRID"),
+                (10, 15, 20, 25, 30, 35, 40, 45),
+            ),
+            minimum_samples=_to_int(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_MIN_SAMPLES"), 40
+            ),
+            minimum_trading_days=_to_int(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_MIN_TRADING_DAYS"), 10
+            ),
+            validation_fraction=_to_float(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_VALIDATION_FRACTION"), 0.30
+            ),
+            minimum_validation_samples=_to_int(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_MIN_VALIDATION_SAMPLES"), 10
+            ),
+            minimum_validation_profit_factor=_to_float(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_MIN_VALIDATION_PROFIT_FACTOR"),
+                1.10,
+            ),
+            minimum_reward_risk=_to_float(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_MIN_REWARD_RISK"), 0.80
+            ),
+            maximum_daily_change_percent=_to_float(
+                os.getenv("VAMSI_ADAPTIVE_EXIT_MAX_DAILY_CHANGE_PERCENT"), 10.0
+            ),
+        )
+        atomic_write_json(args.shadow_output, shadow_config, sort_keys=True)
+
+    print(
+        json.dumps(
+            {
+                "score_calibration": config,
+                "shadow_exit_calibration": shadow_config,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

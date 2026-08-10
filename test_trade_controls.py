@@ -910,6 +910,29 @@ class TradeControlTests(unittest.TestCase):
                 self.assertEqual(trade_bot.daily_index_entry_block_reason("NIFTY"), "")
                 self.assertTrue(trade_bot.paper_after_first_outcome("NIFTY"))
 
+    def test_flat_first_real_trade_also_switches_later_entries_to_paper(self):
+        today = datetime(2026, 7, 20, 10, 0)
+        history = "\n".join([
+            "trade_date,symbol,instrument_class,strategy,gross_pnl",
+            "2026-07-20,NIFTY,INDEX_OPTION,SELECTIVE,0",
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "trade_history.csv"
+            history_path.write_text(history)
+            with (
+                patch.object(trade_bot, "TRADE_HISTORY_FILE", history_path),
+                patch.object(trade_bot, "now_ist", return_value=today),
+                patch.dict(
+                    os.environ,
+                    {
+                        "STOP_AFTER_FIRST_PROFIT_OR_LOSS": "true",
+                        "AFTER_FIRST_OUTCOME_MODE": "paper",
+                    },
+                    clear=False,
+                ),
+            ):
+                self.assertTrue(trade_bot.paper_after_first_outcome("NIFTY"))
+
     def test_paper_trade_is_excluded_from_live_bot_pnl_controls(self):
         self.assertFalse(
             trade_bot.is_bot_trade_history_row(
@@ -1751,7 +1774,7 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(levels["target_points"], 30)
         self.assertEqual(levels["stop_points"], 30)
 
-    def test_adaptive_history_sets_target_and_stop_when_rule_is_current(self):
+    def test_adaptive_exit_history_cannot_override_static_execution_levels(self):
         rule = {
             "status": "ADAPTIVE",
             "mode": "MIN",
@@ -1770,16 +1793,18 @@ class TradeControlTests(unittest.TestCase):
                     "VAMSI_ADAPTIVE_SCORE_ENABLED": "true",
                     "NIFTY_TARGET_POINTS": "30",
                     "NIFTY_STOP_POINTS": "30",
+                    "EXTREME_SETUP_MIN_SCORE": "101",
                 },
                 clear=False,
             ),
             patch.object(trade_bot, "read_effective_score_rule", return_value=rule),
         ):
-            settings = trade_bot.score_based_exit_settings("NIFTY", 95)
+            settings = trade_bot.score_based_exit_settings("NIFTY", 65)
 
-        self.assertEqual(settings["target_points"], 24.5)
-        self.assertEqual(settings["stop_points"], 18.0)
-        self.assertEqual(settings["profile"], "ADAPTIVE_HISTORY")
+        self.assertEqual(settings["target_points"], 30)
+        self.assertEqual(settings["stop_points"], 30)
+        self.assertEqual(settings["profile"], "STANDARD")
+        self.assertEqual(settings["source"], "STATIC_ENV")
 
     def test_active_selective_position_blocks_new_index_scan(self):
         def state_for(symbol):

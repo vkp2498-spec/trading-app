@@ -426,16 +426,6 @@ def index_point_exit_settings(symbol):
     }
     if settings["delta"] > 1:
         raise RuntimeError("OPTION_DELTA_APPROXIMATION must be greater than 0 and at most 1")
-    if configured_bool("VAMSI_ADAPTIVE_SCORE_ENABLED", True):
-        adaptive = read_effective_score_rule(symbol, now_ist().date())
-        exit_levels = (adaptive or {}).get("exit_levels") or {}
-        if exit_levels.get("source") == "ADAPTIVE_HISTORY_AVERAGE":
-            target_points = to_float(exit_levels.get("target_points"))
-            stop_points = to_float(exit_levels.get("stop_points"))
-            if target_points > 0 and stop_points > 0:
-                settings["target_points"] = target_points
-                settings["stop_points"] = stop_points
-                settings["source"] = "ADAPTIVE_HISTORY_AVERAGE"
     return settings
 
 
@@ -444,13 +434,7 @@ def score_based_exit_settings(symbol, weighted_score):
     settings = dict(index_point_exit_settings(symbol))
     threshold = configured_non_negative_float("EXTREME_SETUP_MIN_SCORE", 90.0)
     score = to_float(weighted_score)
-    settings["profile"] = (
-        "ADAPTIVE_HISTORY"
-        if settings.get("source") == "ADAPTIVE_HISTORY_AVERAGE"
-        else "STANDARD"
-    )
-    if settings["profile"] == "ADAPTIVE_HISTORY":
-        return settings
+    settings["profile"] = "STANDARD"
     if score < threshold:
         return settings
 
@@ -1709,6 +1693,8 @@ def first_index_trade_outcome_today(symbol):
                 return {"outcome": "PROFIT", "gross_pnl": pnl, "row": row}
             if pnl < 0 and stop_after_first_outcome_enabled("LOSS"):
                 return {"outcome": "LOSS", "gross_pnl": pnl, "row": row}
+            if pnl == 0 and stop_after_first_outcome_enabled("FLAT"):
+                return {"outcome": "FLAT", "gross_pnl": pnl, "row": row}
     return None
 
 

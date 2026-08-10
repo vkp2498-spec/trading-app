@@ -58,9 +58,9 @@ class AdaptiveScoreCalibrationTests(unittest.TestCase):
         self.assertEqual(rule["mode"], "MIN")
         self.assertEqual(rule["min_score"], 35)
         self.assertIsNone(rule["max_score"])
-        self.assertEqual(rule["exit_levels"]["source"], "ADAPTIVE_HISTORY_AVERAGE")
+        self.assertEqual(rule["exit_levels"]["source"], "STATIC_FALLBACK")
         self.assertEqual(rule["exit_levels"]["target_points"], 30)
-        self.assertEqual(rule["exit_levels"]["stop_points"], 10)
+        self.assertEqual(rule["exit_levels"]["stop_points"], 30)
 
     def test_selects_range_when_high_scores_perform_materially_worse(self):
         frame = pd.DataFrame(

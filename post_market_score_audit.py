@@ -96,6 +96,8 @@ AUDIT_COLUMNS = [
     "banknifty_90_point_hit",
     "window_start",
     "window_end",
+    "path_horizon_minutes",
+    "minute_path_json",
     "source",
 ]
 
@@ -361,12 +363,21 @@ def non_overlapping_scans(scans, horizon_minutes=15):
     selected = []
     horizon = pd.Timedelta(minutes=int(horizon_minutes))
     for _, group in scans.groupby("symbol"):
-        next_allowed = None
-        for index, row in group.sort_values("timestamp").iterrows():
-            if next_allowed is not None and row["timestamp"] < next_allowed:
-                continue
-            selected.append(index)
-            next_allowed = row["timestamp"] + horizon
+        remaining = group.sort_values("timestamp")
+        while not remaining.empty:
+            first_time = remaining.iloc[0]["timestamp"]
+            window = remaining[remaining["timestamp"] < first_time + horizon]
+            buys = window[
+                window.get("action", pd.Series(index=window.index, dtype=object))
+                .astype(str)
+                .str.lower()
+                .eq("buy")
+            ]
+            chosen = buys.iloc[0] if not buys.empty else window.iloc[0]
+            selected.append(chosen.name)
+            remaining = remaining[
+                remaining["timestamp"] >= chosen["timestamp"] + horizon
+            ]
     return scans.loc[selected].sort_values(["timestamp", "symbol"]).reset_index(drop=True)
 
 
@@ -397,13 +408,35 @@ def fetch_day_candles(symbol, trading_date):
     return frame[frame.index.date == trading_date]
 
 
-def evaluate_followthrough(scan, candles, horizon_minutes=15):
+def _serialize_minute_path(candles):
+    rows = []
+    for timestamp, candle in candles.iterrows():
+        rows.append(
+            {
+                "t": _timestamp(timestamp).isoformat(),
+                "o": round(float(candle["open"]), 2),
+                "h": round(float(candle["high"]), 2),
+                "l": round(float(candle["low"]), 2),
+                "c": round(float(candle["close"]), 2),
+            }
+        )
+    return json.dumps(rows, separators=(",", ":"))
+
+
+def evaluate_followthrough(
+    scan,
+    candles,
+    horizon_minutes=15,
+    exit_path_minutes=60,
+):
     signal_time = _timestamp(scan["timestamp"])
     window_start = signal_time.floor("min")
     window_end = window_start + pd.Timedelta(minutes=int(horizon_minutes))
     window = candles[(candles.index >= window_start) & (candles.index < window_end)]
     if window.empty:
         return None
+    path_end = window_start + pd.Timedelta(minutes=max(int(exit_path_minutes), 1))
+    exit_path = candles[(candles.index >= window_start) & (candles.index < path_end)]
 
     reference = float(window.iloc[0]["open"])
     high = float(window["high"].max())
@@ -457,6 +490,8 @@ def evaluate_followthrough(scan, candles, horizon_minutes=15):
         "banknifty_90_point_hit": symbol == "BANKNIFTY" and favorable is not None and favorable >= 90,
         "window_start": window.index.min().isoformat(),
         "window_end": window.index.max().isoformat(),
+        "path_horizon_minutes": int(exit_path_minutes),
+        "minute_path_json": _serialize_minute_path(exit_path),
         "source": scan.get("source", ""),
     }
     return row
@@ -575,7 +610,12 @@ def _write_status(status, message, **extra):
     return payload
 
 
-def run_audit(trading_date=None, horizon_minutes=15, skip_holiday_check=False):
+def run_audit(
+    trading_date=None,
+    horizon_minutes=15,
+    exit_path_minutes=60,
+    skip_holiday_check=False,
+):
     trading_date = trading_date or now_ist().date()
     date_text = trading_date.isoformat()
     if not skip_holiday_check:
@@ -604,7 +644,12 @@ def run_audit(trading_date=None, horizon_minutes=15, skip_holiday_check=False):
     rows = []
     for _, scan in scans.iterrows():
         frame = candles.get(scan["symbol"], pd.DataFrame())
-        evaluated = evaluate_followthrough(scan, frame, horizon_minutes=horizon_minutes)
+        evaluated = evaluate_followthrough(
+            scan,
+            frame,
+            horizon_minutes=horizon_minutes,
+            exit_path_minutes=exit_path_minutes,
+        )
         if evaluated:
             rows.append(evaluated)
     if not rows:
@@ -630,6 +675,12 @@ def main():
     parser = argparse.ArgumentParser(description="Audit scan scores against the following 15 minutes")
     parser.add_argument("--date", help="Trading date in YYYY-MM-DD format")
     parser.add_argument("--horizon-minutes", type=int, default=15)
+    parser.add_argument(
+        "--exit-path-minutes",
+        type=int,
+        default=60,
+        help="Minute path stored for shadow target/stop replay (default: 60)",
+    )
     parser.add_argument("--skip-holiday-check", action="store_true")
     args = parser.parse_args()
     trading_date = date.fromisoformat(args.date) if args.date else now_ist().date()
@@ -637,6 +688,7 @@ def main():
         result = run_audit(
             trading_date=trading_date,
             horizon_minutes=args.horizon_minutes,
+            exit_path_minutes=args.exit_path_minutes,
             skip_holiday_check=args.skip_holiday_check,
         )
         print(json.dumps(result, indent=2, sort_keys=True))

@@ -13,6 +13,7 @@ import re
 
 import requests
 
+from adaptive_exit_shadow import SHADOW_CONFIG_FILE
 from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
@@ -2280,6 +2281,14 @@ def build_health_snapshot() -> dict:
             "closedPnLError": today.get("closedPnLError"),
         },
         "stockFuturesScanner": stock_scanner,
+        "shadowExitCalibration": read_json_file(
+            SHADOW_CONFIG_FILE,
+            {
+                "mode": "SHADOW_ONLY",
+                "execution_applied": False,
+                "status": "NO DATA",
+            },
+        ),
     }
 
 
