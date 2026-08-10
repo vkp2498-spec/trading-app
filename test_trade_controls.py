@@ -885,6 +885,98 @@ class TradeControlTests(unittest.TestCase):
         with patch.dict(os.environ, {"STOP_AFTER_FIRST_PROFIT_OR_LOSS": "false"}):
             self.assertEqual(trade_bot.daily_index_entry_block_reason("NIFTY"), "")
 
+    def test_first_outcome_paper_mode_allows_later_simulated_entries(self):
+        today = datetime(2026, 7, 20, 10, 0)
+        history = "\n".join([
+            "trade_date,symbol,instrument_class,strategy,gross_pnl",
+            "2026-07-20,NIFTY,INDEX_OPTION,SELECTIVE,1250",
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = Path(temp_dir) / "trade_history.csv"
+            history_path.write_text(history)
+            with (
+                patch.object(trade_bot, "TRADE_HISTORY_FILE", history_path),
+                patch.object(trade_bot, "now_ist", return_value=today),
+                patch.dict(
+                    os.environ,
+                    {
+                        "STOP_AFTER_FIRST_PROFIT_OR_LOSS": "true",
+                        "AFTER_FIRST_OUTCOME_MODE": "paper",
+                        "MAX_INDEX_TRADES_PER_DAY": "0",
+                    },
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(trade_bot.daily_index_entry_block_reason("NIFTY"), "")
+                self.assertTrue(trade_bot.paper_after_first_outcome("NIFTY"))
+
+    def test_paper_trade_is_excluded_from_live_bot_pnl_controls(self):
+        self.assertFalse(
+            trade_bot.is_bot_trade_history_row(
+                {
+                    "strategy": "SELECTIVE_PAPER",
+                    "trading_symbol": "NIFTY26AUG25000CE",
+                    "exit_reason": "TARGET",
+                }
+            )
+        )
+
+    def test_selective_paper_position_uses_target_exit_without_broker_order(self):
+        state = {
+            "date": "2026-07-20",
+            "symbol": "NIFTY",
+            "underlying_symbol": "NIFTY",
+            "instrument_class": "INDEX_OPTION",
+            "strategy": "SELECTIVE_PAPER",
+            "paper_trade": True,
+            "entry_order_id": "PAPER-20260720100000",
+            "entry_transaction_type": "BUY",
+            "status": "POSITION_OPEN",
+            "instrument_key": "NSE_FO|PAPER_NIFTY",
+            "trading_symbol": "NIFTY26JUL25000CE",
+            "quantity": 65,
+            "lot_size": 65,
+            "entry_price": 100.0,
+            "target_price": 110.0,
+            "planned_target_price": 110.0,
+            "profit_booking_price": 110.0,
+            "profit_booking_mode": "runner",
+            "stop_loss_price": 90.0,
+            "original_stop_loss_price": 90.0,
+            "direction": "BULLISH",
+            "created_at": "2026-07-20T10:00:00+05:30",
+            "highest_ltp": 100.0,
+            "lowest_ltp": 100.0,
+        }
+        paper_row = {
+            "entry_price": 100.0,
+            "exit_price": 110.0,
+            "gross_pnl": 650.0,
+        }
+        with (
+            patch.object(trade_bot, "read_state", return_value=state),
+            patch.object(trade_bot, "write_state"),
+            patch.object(
+                trade_bot,
+                "read_market_cache",
+                side_effect=lambda key: {"ltp": 110.0, "received_at": 1},
+            ),
+            patch.object(trade_bot, "read_recent_ticks", return_value=[]),
+            patch.object(trade_bot, "sentiment_exit_enabled_for_state", return_value=False),
+            patch.object(trade_bot, "underlying_exit_reason", return_value=None),
+            patch.object(trade_bot, "record_closed_trade", return_value=paper_row) as record,
+            patch.object(trade_bot, "clear_state") as clear,
+            patch.object(trade_bot, "place_market_order") as broker_order,
+            patch.object(trade_bot, "find_matching_position_for_side") as broker_position,
+        ):
+            handled = trade_bot.handle_existing_state("NIFTY", state)
+
+        self.assertTrue(handled)
+        record.assert_called_once_with(state, 110.0, "TARGET")
+        clear.assert_called_once_with("NIFTY")
+        broker_order.assert_not_called()
+        broker_position.assert_not_called()
+
     def test_daily_loss_guard_can_be_relaxed_without_disabling_profit_guard(self):
         today = datetime(2026, 7, 20, 10, 0)
         history = "\n".join([
@@ -1164,7 +1256,8 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-20T09:35:00+05:30",
-                "score": 76.4,
+                "score": 64.4,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": 1000,
             },
             {
@@ -1172,7 +1265,8 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T09:45:00+05:30",
-                "score": 78.8,
+                "score": 62.8,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": 3000,
             },
             {
@@ -1180,7 +1274,8 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T10:30:00+05:30",
-                "score": 65.4,
+                "score": 59.4,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": -1000,
             },
             {
@@ -1189,6 +1284,7 @@ class TradeControlTests(unittest.TestCase):
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T11:30:00+05:30",
                 "score": None,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": 500,
             },
             {
@@ -1196,7 +1292,8 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "BANKNIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T12:00:00+05:30",
-                "score": 42,
+                "score": 0,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": -200,
             },
             {
@@ -1204,7 +1301,8 @@ class TradeControlTests(unittest.TestCase):
                 "underlyingSymbol": "NIFTY",
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "2026-07-21T13:30:00+05:30",
-                "score": 58,
+                "score": 72,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": 400,
             },
             {
@@ -1213,6 +1311,7 @@ class TradeControlTests(unittest.TestCase):
                 "instrumentClass": "INDEX_OPTION",
                 "entryTime": "",
                 "score": 84,
+                "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
                 "grossPnL": 800,
             },
         ]
@@ -1222,13 +1321,13 @@ class TradeControlTests(unittest.TestCase):
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "opening"
-            and cell["scoreBand"] == "70-79"
+            and cell["scoreBand"] == "60-64"
         )
         unknown_time = next(
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "unknown"
-            and cell["scoreBand"] == "80-89"
+            and cell["scoreBand"] == "80-84"
         )
         unscored = next(
             cell
@@ -1241,23 +1340,28 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(analytics["symbolTrades"], {"NIFTY": 4, "BANKNIFTY": 3})
         self.assertEqual(
             analytics["scoreBands"],
-            ["<50", "50-59", "60-69", "70-79", "80-89", "90-100", "Unscored"],
+            [
+                "00-49", "50-59", "60-64", "65-69", "70-74",
+                "75-79", "80-84", "85-89", "90-100", "Unscored",
+            ],
         )
+        self.assertEqual(analytics["scoreVersion"], "VAMSI_UNIFIED_ENTRY_V1")
         self.assertEqual(opening_high["expectancy"], 2000)
         self.assertEqual(opening_high["trades"], 2)
         self.assertEqual(unknown_time["trades"], 1)
         self.assertEqual(unscored["trades"], 1)
         self.assertEqual(analytics["bestZone"]["timeBucket"], "opening")
-        self.assertEqual(analytics["bestZone"]["scoreBand"], "70-79")
+        self.assertEqual(analytics["bestZone"]["scoreBand"], "60-64")
 
     def test_edge_score_bands_cover_the_zero_to_one_hundred_scale(self):
         cases = {
-            0: "<50",
-            49.9: "<50",
+            0: "00-49",
+            49.9: "00-49",
             50: "50-59",
-            60: "60-69",
-            70: "70-79",
-            80: "80-89",
+            60: "60-64",
+            65: "65-69",
+            70: "70-74",
+            80: "80-84",
             90: "90-100",
             100: "90-100",
             -1: "Unscored",
@@ -1265,7 +1369,17 @@ class TradeControlTests(unittest.TestCase):
         }
         for score, expected in cases.items():
             with self.subTest(score=score):
-                self.assertEqual(dashboard_data.edge_score_band(score), expected)
+                self.assertEqual(
+                    dashboard_data.edge_score_band(
+                        score,
+                        "VAMSI_UNIFIED_ENTRY_V1",
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            dashboard_data.edge_score_band(75, "LEGACY_WEIGHTED_SCORE"),
+            "Unscored",
+        )
 
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):
         trade = {"tradingSymbol": "NIFTY 24200 PE 28 JUL 26"}

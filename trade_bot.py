@@ -1675,6 +1675,19 @@ def stop_after_first_outcome_enabled(outcome):
     return specific_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def after_first_outcome_mode(outcome=None):
+    """Return whether later qualified entries stop or continue as paper trades."""
+    specific_name = f"AFTER_FIRST_{str(outcome).upper()}_MODE" if outcome else ""
+    raw_value = os.getenv(specific_name) if specific_name else None
+    if raw_value is None:
+        raw_value = os.getenv("AFTER_FIRST_OUTCOME_MODE", "stop")
+    mode = str(raw_value).strip().lower()
+    if mode not in {"stop", "paper"}:
+        name = specific_name or "AFTER_FIRST_OUTCOME_MODE"
+        raise RuntimeError(f"{name} must be stop or paper")
+    return mode
+
+
 def first_index_trade_outcome_today(symbol):
     """Return the first closed outcome whose configured daily guard is enabled."""
     if not TRADE_HISTORY_FILE.exists():
@@ -1699,12 +1712,21 @@ def first_index_trade_outcome_today(symbol):
     return None
 
 
+def paper_after_first_outcome(symbol):
+    outcome = first_index_trade_outcome_today(symbol)
+    return bool(
+        outcome and after_first_outcome_mode(outcome.get("outcome")) == "paper"
+    )
+
+
 def daily_index_entry_block_reason(symbol):
     maximum = max_index_trades_per_day()
     if maximum > 0 and index_trade_count_today() >= maximum:
         return f"maximum {maximum} index trades already used today"
     outcome = first_index_trade_outcome_today(symbol)
     if not outcome:
+        return ""
+    if after_first_outcome_mode(outcome.get("outcome")) == "paper":
         return ""
     return (
         f"daily first-outcome guard active after {outcome['outcome']}: "
@@ -1763,7 +1785,7 @@ def selective_index_has_active_state(symbol):
 
 
 def is_bot_trade_history_row(row):
-    """Exclude manual/broker-sync rows from bot-only risk and P&L controls."""
+    """Exclude manual, broker-sync, and simulated rows from live-bot controls."""
     exit_reason = str(row.get("exit_reason") or "").strip().upper()
     trading_symbol = str(row.get("trading_symbol") or "").strip().upper()
     strategy = str(row.get("strategy") or "").strip().upper()
@@ -1771,7 +1793,13 @@ def is_bot_trade_history_row(row):
     return not (
         exit_reason == UPSTOX_SYNC_EXIT_REASON
         or trading_symbol.startswith("UPSTOX SYNC")
-        or strategy in {"MANUAL", "MANUAL_INDEX", "MOBILE_MANUAL"}
+        or strategy in {
+            "MANUAL",
+            "MANUAL_INDEX",
+            "MOBILE_MANUAL",
+            "SELECTIVE_PAPER",
+        }
+        or strategy.endswith("_PAPER")
         or manual_override in {"1", "true", "yes", "on"}
     )
 
@@ -3420,7 +3448,8 @@ def save_open_position_state(
         f"{symbol} score {format_score(score)} bought {state['entry_price']} "
         f"target {target_price} stop {stop_loss_price} qty {quantity}"
     )
-    send_apple_trade_entered_alert(state)
+    if not state.get("paper_trade"):
+        send_apple_trade_entered_alert(state)
 
 
 def order_status(order_details):
@@ -3588,6 +3617,8 @@ def run_position_monitor_loop():
 
 
 def broker_protective_stop_required(state):
+    if state.get("paper_trade"):
+        return False
     if not configured_bool("BROKER_PROTECTIVE_STOP_ENABLED", True):
         return False
     return state.get("instrument_class") in {
@@ -4058,10 +4089,20 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
         entry_order_id
         and state.get("status") in {pending_status, "BUY_PLACED_NOT_COMPLETE"}
     )
-    position = find_matching_position_for_side(instrument_key, entry_transaction)
-    if position and not is_pending_entry:
-        ltp = position_ltp(position)
-        qty = abs(position_quantity(position))
+    paper_trade = bool(state.get("paper_trade"))
+    position = (
+        None
+        if paper_trade
+        else find_matching_position_for_side(instrument_key, entry_transaction)
+    )
+    if (position or paper_trade) and not is_pending_entry:
+        if paper_trade:
+            option_quote = read_market_cache(instrument_key) or {}
+            ltp = to_float(option_quote.get("ltp"), 0) or None
+            qty = int(state.get("quantity") or 0)
+        else:
+            ltp = position_ltp(position)
+            qty = abs(position_quantity(position))
         if needs_broker_stop and not state.get("protective_stop_order_id"):
             try:
                 state = ensure_protective_stop(symbol, state)
@@ -4228,6 +4269,16 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
             state["exit_reason"] = exit_reason
             write_state(symbol, state)
 
+            if paper_trade:
+                journal_row = record_closed_trade(state, ltp, exit_reason)
+                log(
+                    f"{symbol} PAPER bought {journal_row.get('entry_price')} "
+                    f"closed {journal_row.get('exit_price')} "
+                    f"pnl {journal_row.get('gross_pnl')} reason {exit_reason}"
+                )
+                clear_state(symbol)
+                return True
+
             if needs_broker_stop and cancel_protective_stop(symbol, state):
                 return True
 
@@ -4284,6 +4335,13 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
                 option_delta_used=state.get("option_delta_used"),
                 exit_profile=state.get("exit_profile", {}),
                 profit_protection_enabled_for_trade=state.get("profit_protection_enabled_for_trade", True),
+                trade_metadata={
+                    "weighted_score": state.get("weighted_score", state.get("score")),
+                    "entry_score_version": state.get("entry_score_version"),
+                    "entry_score_components": state.get("entry_score_components", {}),
+                    "base_alignment_score": state.get("base_alignment_score"),
+                    "score_cutoff_approved": state.get("score_cutoff_approved"),
+                },
             )
             state = read_state(symbol)
             technical_context = state.get("technical_context") or {}
@@ -5642,11 +5700,16 @@ def _execute_selected_candidate_locked(chosen):
         "entry_structure": (chosen.get("technicals", {}).get("entry_structure") or {}).get("type"),
     }
 
-    live = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    paper_trade = bool(chosen.get("paper_trade")) or paper_after_first_outcome(symbol)
+    live = (
+        os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+        and not paper_trade
+    )
     verbose_log(
         f"{symbol} selected {transaction_type}: {instrument['trading_symbol']} qty={quantity} "
         f"entry={entry_price} target={target} stop={stop} "
-        f"trailing={chosen.get('profit_protection_enabled_for_trade', True)} live={live}"
+        f"trailing={chosen.get('profit_protection_enabled_for_trade', True)} "
+        f"live={live} paper={paper_trade}"
     )
     if not live:
         dry_run_note = " (dry run)"
@@ -5685,6 +5748,67 @@ def _execute_selected_candidate_locked(chosen):
             f"current_risk={risk.get('current_risk')} proposed_risk={risk.get('proposed_risk')} "
             f"projected_risk={risk.get('projected_risk')} limit={risk.get('risk_limit')}"
         )
+        if paper_trade:
+            post_fill = revalidate_option_after_fill(
+                symbol,
+                direction,
+                chosen.get("option_summary", {}).get("option_type"),
+                entry_price,
+                chosen["target_points"],
+                chosen["stop_points"],
+                chosen["option_delta_used"],
+                chosen.get("technicals", {}),
+            )
+            post_fill = make_post_fill_diagnostic_only(post_fill)
+            paper_metadata = {
+                **trade_metadata,
+                "paper_trade": True,
+                "strategy": "SELECTIVE_PAPER",
+                "execution_mode": "PAPER",
+                "weighted_score": candidate_weighted_score(chosen),
+                "technical_context": post_fill.get("technicals", {}),
+                "post_fill_feasibility": post_fill.get("feasibility", {}),
+            }
+            increment_trade_count(symbol)
+            save_open_position_state(
+                symbol,
+                f"PAPER-{now_ist().strftime('%Y%m%d%H%M%S')}",
+                instrument,
+                direction,
+                confidence,
+                candidate_entry_score(chosen),
+                entry_price,
+                quantity,
+                target,
+                stop,
+                chosen["target_percent"],
+                chosen["stop_percent"],
+                entry_transaction_type=transaction_type,
+                target_points=chosen["target_points"],
+                stop_points=chosen["stop_points"],
+                option_delta_used=chosen["option_delta_used"],
+                exit_profile=chosen.get("exit_profile", {}),
+                profit_protection_enabled_for_trade=chosen.get(
+                    "profit_protection_enabled_for_trade", True
+                ),
+                trade_metadata=paper_metadata,
+            )
+            paper_state = read_state(symbol)
+            paper_state.update(
+                {
+                    "target_price": post_fill["target_price"],
+                    "stop_loss_price": post_fill["stop_loss_price"],
+                    "original_stop_loss_price": post_fill["stop_loss_price"],
+                    "technical_context": post_fill.get("technicals", {}),
+                    "post_fill_feasibility": post_fill.get("feasibility", {}),
+                }
+            )
+            write_state(symbol, paper_state)
+            log(
+                f"{symbol} PAPER position opened after first live outcome; "
+                f"score={candidate_weighted_score(chosen):.1f} qty={quantity}"
+            )
+            return True
         if not live:
             log(f"{symbol} DRY RUN ONLY: would {transaction_type} configured quantity.")
             return True
@@ -5714,7 +5838,7 @@ def _execute_selected_candidate_locked(chosen):
             "profit_protection_enabled_for_trade": chosen.get("profit_protection_enabled_for_trade", True),
             "direction": direction,
             "confidence": confidence,
-            "score": score,
+            "score": candidate_entry_score(chosen),
             "weighted_score": candidate_weighted_score(chosen),
             **trade_metadata,
             "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
@@ -5760,7 +5884,7 @@ def _execute_selected_candidate_locked(chosen):
             "technical_context": chosen.get("technicals", {}),
             "direction": direction,
             "confidence": confidence,
-            "score": score,
+            "score": candidate_entry_score(chosen),
             "weighted_score": candidate_weighted_score(chosen),
             **trade_metadata,
             "status": f"{transaction_type}_PLACED_NOT_COMPLETE",
@@ -5773,7 +5897,8 @@ def _execute_selected_candidate_locked(chosen):
     fill = fill or to_float(details.get("average_price")) or entry_price
     increment_trade_count(symbol)
     save_open_position_state(
-        symbol, order_id, instrument, direction, confidence, score, fill, quantity,
+        symbol, order_id, instrument, direction, confidence,
+        candidate_entry_score(chosen), fill, quantity,
         target, stop, chosen["target_percent"], chosen["stop_percent"],
         entry_transaction_type=transaction_type,
         target_points=chosen["target_points"],

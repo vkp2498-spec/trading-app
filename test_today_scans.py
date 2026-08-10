@@ -26,7 +26,11 @@ class TodayScansTests(unittest.TestCase):
             log_file = root / "trade_bot.log"
             raw = {
                 "option_summary": {
-                    "weighted_alignment": {"score": -4, "grade": "REJECT"}
+                    "unified_entry_score": {
+                        "score": 53.7,
+                        "score_version": "VAMSI_UNIFIED_ENTRY_V1",
+                        "grade": "SKIP",
+                    }
                 },
                 "llm_decision": {
                     "execute_trade": False,
@@ -51,9 +55,9 @@ class TodayScansTests(unittest.TestCase):
             log_file.write_text(
                 "\n".join(
                     [
-                        "2026-07-29 09:21:05 | NIFTY score -4 reject",
+                        "2026-07-29 09:21:05 | NIFTY score 53.7 reject version=VAMSI_UNIFIED_ENTRY_V1",
                         "2026-07-29 09:21:06 | NIFTY no trade: Volume confirmation is below threshold.",
-                        "2026-07-29 09:22:05 | BANKNIFTY score 0 buy",
+                        "2026-07-29 09:22:05 | BANKNIFTY score 68 buy version=VAMSI_UNIFIED_ENTRY_V1",
                         "2026-07-29 09:26:05 | NIFTY score used reject",
                     ]
                 )
@@ -72,10 +76,12 @@ class TodayScansTests(unittest.TestCase):
             self.assertEqual(scans[0]["nifty"]["reason"], "Daily trade limit reached")
             self.assertIsNone(scans[0]["bankNifty"])
             self.assertEqual(scans[1]["nifty"]["decision"], "REJECTED")
-            self.assertEqual(scans[1]["nifty"]["score"], -4)
+            self.assertEqual(scans[1]["nifty"]["score"], 53.7)
+            self.assertEqual(scans[1]["nifty"]["scoreVersion"], "VAMSI_UNIFIED_ENTRY_V1")
             self.assertEqual(scans[1]["nifty"]["reason"], "Volume confirmation below threshold")
             self.assertEqual(scans[1]["bankNifty"]["decision"], "ENTERED")
-            self.assertEqual(scans[1]["bankNifty"]["score"], 0)
+            self.assertEqual(scans[1]["bankNifty"]["score"], 68)
+            self.assertEqual(scans[1]["bankNifty"]["scoreVersion"], "VAMSI_UNIFIED_ENTRY_V1")
 
 
 if __name__ == "__main__":

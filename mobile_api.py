@@ -166,12 +166,16 @@ def health():
 )
 def dashboard(
     scale: str = Query(default="per_lakh", pattern="^(per_lakh|raw)$"),
+    analytics_mode: str = Query(default="real", pattern="^(real|mixed)$"),
 ):
     """
     Authenticated, read-only dashboard snapshot.
     """
     try:
         snapshot = build_health_snapshot()
+        snapshot["performance"] = build_trade_performance(
+            analytics_mode=analytics_mode
+        )
 
         if scale == "per_lakh":
             performance = snapshot.get("performance", {})

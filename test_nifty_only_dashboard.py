@@ -6,6 +6,45 @@ import dashboard_data
 
 
 class NiftyOnlyDashboardTests(unittest.TestCase):
+    def test_analytics_scope_can_show_real_only_or_real_and_paper(self):
+        today = datetime.now(dashboard_data.IST).date().isoformat()
+        base = {
+            "tradeDate": today,
+            "symbol": "NIFTY",
+            "underlyingSymbol": "NIFTY",
+            "instrumentClass": "INDEX_OPTION",
+            "tradingSymbol": "NIFTY 25000 CE",
+            "transactionType": "BUY",
+            "quantity": 65,
+            "entryTime": f"{today}T11:15:00+05:30",
+            "entryPrice": 100.0,
+            "exitTime": f"{today}T11:30:00+05:30",
+            "score": 55.0,
+            "scoreVersion": "VAMSI_UNIFIED_ENTRY_V1",
+            "tradeSequence": 1,
+        }
+        trades = [
+            {**base, "strategy": "SELECTIVE", "grossPnL": 650.0},
+            {
+                **base,
+                "strategy": "SELECTIVE_PAPER",
+                "grossPnL": -325.0,
+                "entryTime": f"{today}T12:15:00+05:30",
+                "exitTime": f"{today}T12:30:00+05:30",
+            },
+        ]
+
+        with patch.object(dashboard_data, "read_trade_history", return_value=trades):
+            real = dashboard_data.build_trade_performance("real")
+            mixed = dashboard_data.build_trade_performance("mixed")
+
+        self.assertEqual(real["cumulative"]["totalTrades"], 1)
+        self.assertEqual(real["cumulative"]["totalPnL"], 650.0)
+        self.assertEqual(real["analyticsMode"], "REAL")
+        self.assertEqual(mixed["cumulative"]["totalTrades"], 2)
+        self.assertEqual(mixed["cumulative"]["totalPnL"], 325.0)
+        self.assertEqual(mixed["analyticsMode"], "MIXED")
+
     def test_all_dashboard_analytics_exclude_banknifty_trades(self):
         today = datetime.now(dashboard_data.IST).date().isoformat()
         trades = [

@@ -13,6 +13,8 @@ import re
 
 import requests
 
+from unified_entry_score import UNIFIED_SCORE_VERSION
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -28,11 +30,14 @@ SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE", "GANESH_GAP_NIFTY", "GANESH_GAP_BANKNIFTY"]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 EDGE_SCORE_BANDS = (
-    ("<50", 0.0, 50.0),
+    ("00-49", 0.0, 50.0),
     ("50-59", 50.0, 60.0),
-    ("60-69", 60.0, 70.0),
-    ("70-79", 70.0, 80.0),
-    ("80-89", 80.0, 90.0),
+    ("60-64", 60.0, 65.0),
+    ("65-69", 65.0, 70.0),
+    ("70-74", 70.0, 75.0),
+    ("75-79", 75.0, 80.0),
+    ("80-84", 80.0, 85.0),
+    ("85-89", 85.0, 90.0),
     ("90-100", 90.0, 101.0),
 )
 EDGE_UNSCORED_BAND = "Unscored"
@@ -138,6 +143,10 @@ def empty_symbol_status(symbol: str) -> dict:
         "signal": None,
         "confidence": None,
         "optionScore": None,
+        "entryScore": None,
+        "scoreVersion": None,
+        "entryGrade": None,
+        "baseAlignmentScore": None,
         "weightedScore": None,
         "weightedGrade": None,
         "atmOptionFlow": None,
@@ -472,6 +481,10 @@ def normalize_analysis(row: dict) -> dict:
         "reason": llm.get("reason") or row.get("llm_reason") or "",
         "overallScore": safe_float(entry_score.get("score"), None),
         "scoreVersion": entry_score.get("score_version") or "LEGACY_WEIGHTED_SCORE",
+        "baseAlignmentScore": safe_float(
+            (entry_score.get("details") or {}).get("base_alignment_score"),
+            safe_float((option_summary.get("weighted_alignment") or {}).get("score"), None),
+        ),
         "grade": entry_score.get("grade"),
         "indicators": weighted_components(option_summary, technicals),
         "strike": safe_float(option_summary.get("strike"), None),
@@ -498,6 +511,23 @@ def latest_symbol_analyses() -> list[dict]:
         except (OSError, csv.Error):
             pass
     return [latest.get(symbol, {"symbol": symbol, "decision": "NO DATA", "indicators": []}) for symbol in SYMBOLS]
+
+
+def apply_latest_entry_scores(bot_status: dict, analyses: list[dict]) -> dict:
+    """Project the authoritative unified entry score onto the mobile bot cards."""
+    by_symbol = {
+        str(analysis.get("symbol") or "").upper(): analysis
+        for analysis in analyses
+    }
+    for item in bot_status.get("symbols", []):
+        analysis = by_symbol.get(str(item.get("symbol") or "").upper())
+        if not analysis:
+            continue
+        item["entryScore"] = analysis.get("overallScore")
+        item["scoreVersion"] = analysis.get("scoreVersion")
+        item["entryGrade"] = analysis.get("grade")
+        item["baseAlignmentScore"] = analysis.get("baseAlignmentScore")
+    return bot_status
 
 
 def parse_history_timestamp(value: str) -> datetime | None:
@@ -565,6 +595,7 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                 "decision": "REJECTED",
                 "reason": "Entry rules not met",
                 "score": None,
+                "scoreVersion": None,
             }
         return row[key]
 
@@ -587,6 +618,7 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                                 "Entry signal accepted" if entered else "Entry rules not met",
                             ),
                             "score": analysis.get("overallScore"),
+                            "scoreVersion": analysis.get("scoreVersion"),
                         }
                     )
         except (OSError, csv.Error):
@@ -595,7 +627,8 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
     latest_events: dict[str, tuple[datetime, dict]] = {}
     decision_pattern = re.compile(
         r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| "
-        r"(NIFTY|BANKNIFTY) score ([^ ]+) (reject|buy)$",
+        r"(NIFTY|BANKNIFTY) score ([^ ]+) (reject|buy)"
+        r"(?: version=([A-Z0-9_-]+))?$",
         re.IGNORECASE,
     )
     reason_patterns = (
@@ -614,6 +647,7 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
             symbol = match.group(2).upper()
             score_text = match.group(3)
             action = match.group(4).lower()
+            score_version = match.group(5)
             result = result_for(scan_bucket(timestamp), symbol)
             score = safe_float(score_text, None)
             result.update(
@@ -624,6 +658,7 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                         "Entry signal accepted" if action == "buy" else "Entry rules not met",
                     ),
                     "score": score if score is not None else result.get("score"),
+                    "scoreVersion": score_version or result.get("scoreVersion"),
                 }
             )
             if score_text.lower() == "used":
@@ -1111,6 +1146,11 @@ def selective_index_trades(trades: list[dict]) -> list[dict]:
     return dashboard_index_trades(trades)
 
 
+def is_paper_trade(trade: dict) -> bool:
+    strategy = str(trade.get("strategy") or "").strip().upper()
+    return strategy == "SELECTIVE_PAPER" or strategy.endswith("_PAPER")
+
+
 def is_stock_option_trade(trade: dict) -> bool:
     instrument_class = str(
         trade.get("instrumentClass") or ""
@@ -1134,8 +1174,8 @@ def entry_minutes(trade: dict) -> int | None:
     return hour * 60 + minute
 
 
-def edge_score_band(score: float | None) -> str:
-    if score is None:
+def edge_score_band(score: float | None, score_version: str | None = None) -> str:
+    if score is None or score_version != UNIFIED_SCORE_VERSION:
         return EDGE_UNSCORED_BAND
     for label, lower, upper in EDGE_SCORE_BANDS:
         if score >= lower and score < upper:
@@ -1164,7 +1204,8 @@ def edge_analytics(trades: list[dict]) -> dict:
         if str(trade.get("instrumentClass") or "INDEX_OPTION").upper() != "INDEX_OPTION":
             continue
         score = safe_float(trade.get("score"), None)
-        score_band = edge_score_band(score)
+        score_version = trade.get("scoreVersion")
+        score_band = edge_score_band(score, score_version)
         time_bucket = edge_time_bucket(entry_minutes(trade))
         enriched = dict(trade)
         enriched["edgeScoreBand"] = score_band
@@ -1239,6 +1280,7 @@ def edge_analytics(trades: list[dict]) -> dict:
         key_insight = "More scored index-option trades are needed to identify a reliable edge zone."
 
     return {
+        "scoreVersion": UNIFIED_SCORE_VERSION,
         "overallExpectancy": round(total_pnl / len(eligible), 2) if eligible else 0.0,
         "winRate": calculate_win_rate(eligible),
         "wins": len(wins),
@@ -1404,6 +1446,7 @@ def normalize_trade(row: dict) -> dict:
             row.get("gross_pnl")
         ),
         "score": safe_float(row.get("score"), None),
+        "scoreVersion": row.get("score_version", ""),
         "tradeSequence": safe_int(row.get("trade_sequence")),
         "priorTradeSymbol": row.get("prior_trade_symbol", ""),
         "priorTradeOutcome": row.get("prior_trade_outcome", ""),
@@ -1688,13 +1731,17 @@ def _build_trade_performance_payload(
     }
 
 
-def build_trade_performance() -> dict:
+def build_trade_performance(analytics_mode: str = "real") -> dict:
+    analytics_mode = str(analytics_mode or "real").strip().lower()
+    if analytics_mode not in {"real", "mixed"}:
+        raise ValueError("analytics_mode must be real or mixed")
     today_text = datetime.now(IST).strftime("%Y-%m-%d")
     history = read_trade_history()
     trades = [
         trade
         for trade in selective_index_trades(history)
         if normalized_underlying(trade) == "NIFTY"
+        and (analytics_mode == "mixed" or not is_paper_trade(trade))
     ]
     raw = _build_trade_performance_payload(trades, today_text)
     normalized = _build_trade_performance_payload(
@@ -1705,6 +1752,8 @@ def build_trade_performance() -> dict:
     raw["edgeAnalytics"] = normalized_edge
     normalized["edgeAnalytics"] = normalized_edge
     raw["normalizedPerLakh"] = normalized
+    raw["analyticsMode"] = analytics_mode.upper()
+    normalized["analyticsMode"] = analytics_mode.upper()
     return raw
 
 def state_file(symbol: str) -> Path:
@@ -2155,7 +2204,11 @@ def normalize_live_positions_per_lakh(live: dict) -> dict:
 def build_health_snapshot() -> dict:
     load_env()
 
-    bot_status = parse_latest_bot_status()
+    latest_analyses = latest_symbol_analyses()
+    bot_status = apply_latest_entry_scores(
+        parse_latest_bot_status(),
+        latest_analyses,
+    )
 
     trade_performance = build_trade_performance()
     live_positions = build_live_positions()
@@ -2214,7 +2267,7 @@ def build_health_snapshot() -> dict:
             )
         },
         "bot": bot_status,
-        "lastRuns": latest_symbol_analyses(),
+        "lastRuns": latest_analyses,
         "todayScans": build_today_scans(),
         "performance": trade_performance,
         "live": live_positions,

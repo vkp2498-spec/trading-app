@@ -2174,7 +2174,8 @@ load_env()
 if st.button("Refresh Dashboard", use_container_width=True):
     st.rerun()
 
-performance = api_build_trade_performance()
+performance = api_build_trade_performance(analytics_mode="real")
+mixed_performance = api_build_trade_performance(analytics_mode="mixed")
 
 
 def summary_card_html(title, summary, show_averages=False):
@@ -2566,7 +2567,20 @@ with performance_tab:
         st.dataframe(second_context, use_container_width=True, hide_index=True)
 
 with analytics_tab:
-    render_analytics_tab(performance)
+    analytics_scope = st.segmented_control(
+        "Analytics data",
+        options=["Real only", "Real + Paper"],
+        default="Real only",
+        key="analytics_trade_scope",
+    )
+    analytics_performance = (
+        mixed_performance if analytics_scope == "Real + Paper" else performance
+    )
+    st.caption(
+        "Real + Paper includes simulated trades taken after the first real "
+        "profit or loss. Live account P&L remains real-only."
+    )
+    render_analytics_tab(analytics_performance)
 
 with score_review_tab:
     render_score_followthrough_review()

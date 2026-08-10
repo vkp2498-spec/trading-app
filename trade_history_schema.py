@@ -21,6 +21,7 @@ COLUMNS = [
     "exit_reason",
     "gross_pnl",
     "score",
+    "score_version",
     "trade_sequence",
     "prior_trade_symbol",
     "prior_trade_outcome",

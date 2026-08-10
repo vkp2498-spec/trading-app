@@ -541,6 +541,14 @@ The mobile allocation window is intended for approximately 09:00-09:15 IST. Mult
 
 The account-level caps in `.env` cannot be bypassed by mobile selection. For Ganesh, `GANESH_LOTS_PER_ENTRY=1` controls the gap strategy independently.
 
+For the Vamsi selective engine, `STOP_AFTER_FIRST_PROFIT_OR_LOSS=true` can be
+combined with `AFTER_FIRST_OUTCOME_MODE=paper`. The first closed real NIFTY
+trade remains the final broker trade of the day. Later score-qualified entries
+are simulated using the same position state, target, stop-loss, trailing-profit
+protection, and exit checks. They are journaled as `SELECTIVE_PAPER`, excluded
+from live P&L/risk circuits, and available through the dashboard/mobile
+analytics selector as either **Real only** or **Real + Paper**.
+
 ### 13.4 App build notes
 
 The iOS release workflow used was Clean Build Folder, select Any iOS Device, Product > Archive, then distribute to TestFlight.
