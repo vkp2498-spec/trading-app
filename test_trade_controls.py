@@ -1378,7 +1378,11 @@ class TradeControlTests(unittest.TestCase):
                 )
         self.assertEqual(
             dashboard_data.edge_score_band(75, "LEGACY_WEIGHTED_SCORE"),
-            "Unscored",
+            "75-79",
+        )
+        self.assertEqual(
+            dashboard_data.edge_score_band(55, ""),
+            "50-59",
         )
 
     def test_option_type_recognizes_put_token_inside_trading_symbol(self):

@@ -6,6 +6,38 @@ import dashboard_data
 
 
 class NiftyOnlyDashboardTests(unittest.TestCase):
+    def test_historical_numeric_score_without_version_populates_heatmap(self):
+        today = datetime.now(dashboard_data.IST).date().isoformat()
+        trade = {
+            "tradeDate": today,
+            "symbol": "NIFTY",
+            "underlyingSymbol": "NIFTY",
+            "instrumentClass": "INDEX_OPTION",
+            "strategy": "SELECTIVE",
+            "tradingSymbol": "NIFTY 25000 CE",
+            "transactionType": "BUY",
+            "quantity": 65,
+            "entryTime": f"{today}T11:15:00+05:30",
+            "entryPrice": 100.0,
+            "exitTime": f"{today}T11:30:00+05:30",
+            "grossPnL": 650.0,
+            "score": 55.0,
+            "scoreVersion": "",
+            "tradeSequence": 1,
+        }
+
+        with patch.object(dashboard_data, "read_trade_history", return_value=[trade]):
+            performance = dashboard_data.build_trade_performance("real")
+
+        populated = [
+            cell
+            for cell in performance["edgeAnalytics"]["matrix"]
+            if cell["trades"] > 0
+        ]
+        self.assertEqual(len(populated), 1)
+        self.assertEqual(populated[0]["scoreBand"], "50-59")
+        self.assertEqual(populated[0]["expectancy"], 10_000.0)
+
     def test_analytics_scope_can_show_real_only_or_real_and_paper(self):
         today = datetime.now(dashboard_data.IST).date().isoformat()
         base = {

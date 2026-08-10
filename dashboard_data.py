@@ -1175,7 +1175,11 @@ def entry_minutes(trade: dict) -> int | None:
 
 
 def edge_score_band(score: float | None, score_version: str | None = None) -> str:
-    if score is None or score_version != UNIFIED_SCORE_VERSION:
+    # Historical journal rows predate the score_version column but still carry
+    # the numeric entry score that was shown in the dashboard at trade time.
+    # Keep those rows usable; otherwise schema migration turns the entire
+    # historical heat map into the hidden Unscored category.
+    if score is None:
         return EDGE_UNSCORED_BAND
     for label, lower, upper in EDGE_SCORE_BANDS:
         if score >= lower and score < upper:
@@ -1320,16 +1324,10 @@ def normalized_edge_analytics_per_lakh(trades: list[dict]) -> dict:
             continue
         score = safe_float(trade.get("score"), None)
         time_bucket = edge_time_bucket(entry_minutes(trade))
-        has_score_version = "scoreVersion" in trade
-        score_version = str(trade.get("scoreVersion") or "")
         if (
             score is None
             or score < 50
             or time_bucket == "unknown"
-            or (
-                has_score_version
-                and score_version != "VAMSI_UNIFIED_ENTRY_V1"
-            )
         ):
             excluded_hidden += 1
             continue
