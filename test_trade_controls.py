@@ -933,6 +933,48 @@ class TradeControlTests(unittest.TestCase):
             ):
                 self.assertTrue(trade_bot.paper_after_first_outcome("NIFTY"))
 
+    def test_adaptive_policy_controls_how_many_outcomes_remain_live(self):
+        policy = {"global_status": "LIVE_ENABLED", "maximum_live_trades": 2}
+        outcome = {"outcome": "PROFIT", "gross_pnl": 1000}
+        with (
+            patch.object(trade_bot, "adaptive_live_policy_today", return_value=policy),
+            patch.object(trade_bot, "first_index_trade_outcome_today", return_value=outcome),
+            patch.object(trade_bot, "today_index_trade_rows", return_value=[{"id": 1}]),
+        ):
+            self.assertFalse(trade_bot.paper_after_first_outcome("NIFTY"))
+        with (
+            patch.object(trade_bot, "adaptive_live_policy_today", return_value=policy),
+            patch.object(trade_bot, "first_index_trade_outcome_today", return_value=outcome),
+            patch.object(
+                trade_bot,
+                "today_index_trade_rows",
+                return_value=[{"id": 1}, {"id": 2}],
+            ),
+        ):
+            self.assertTrue(trade_bot.paper_after_first_outcome("NIFTY"))
+
+    def test_adaptive_live_entry_decision_uses_effective_policy_cell(self):
+        policy = {
+            "global_status": "LIVE_ENABLED",
+            "cells": {
+                "11:00-12:59|65-69": {
+                    "status": "LIVE_ENABLED",
+                    "cell_id": "11:00-12:59|65-69",
+                    "score_band": "65-69",
+                    "proposed_target_points": 27,
+                    "proposed_stop_points": 33,
+                }
+            },
+        }
+        with patch.object(trade_bot, "adaptive_live_policy_today", return_value=policy):
+            decision = trade_bot.adaptive_live_entry_decision(
+                66,
+                datetime.fromisoformat("2026-07-20T11:15:00+05:30"),
+            )
+
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["cell"]["proposed_target_points"], 27)
+
     def test_paper_trade_is_excluded_from_live_bot_pnl_controls(self):
         self.assertFalse(
             trade_bot.is_bot_trade_history_row(

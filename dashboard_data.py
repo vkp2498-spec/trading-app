@@ -14,6 +14,7 @@ import re
 import requests
 
 from adaptive_exit_shadow import SHADOW_CONFIG_FILE
+from adaptive_live_policy import LIVE_POLICY_FILE
 from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
@@ -2287,6 +2288,14 @@ def build_health_snapshot() -> dict:
                 "mode": "SHADOW_ONLY",
                 "execution_applied": False,
                 "status": "NO DATA",
+            },
+        ),
+        "adaptiveLivePolicy": read_json_file(
+            LIVE_POLICY_FILE,
+            {
+                "mode": "AUTO_ADAPTIVE_LIVE",
+                "global_status": "NO DATA",
+                "execution_applied": False,
             },
         ),
     }

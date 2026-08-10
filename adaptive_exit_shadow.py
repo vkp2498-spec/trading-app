@@ -164,6 +164,8 @@ def prepare_episodes(
     horizon_minutes=60,
     entry_start_time="11:00",
     entry_end_time="13:55",
+    qualified_only=True,
+    purge_overlaps=True,
 ):
     if frame is None or frame.empty:
         return []
@@ -187,16 +189,18 @@ def prepare_episodes(
     local_minutes = localized.dt.hour * 60 + localized.dt.minute
     entry_start_minutes = _clock_minutes(entry_start_time)
     entry_end_minutes = _clock_minutes(entry_end_time)
-    working = working[
+    eligible = (
         (working["symbol"] == "NIFTY")
-        & working["action"].eq("buy")
         & working["score"].between(50, 100, inclusive="both")
         & working["score_version"].eq(UNIFIED_SCORE_VERSION)
         & localized.ge(start)
         & localized.lt(end)
         & local_minutes.ge(entry_start_minutes)
         & local_minutes.le(entry_end_minutes)
-    ].copy()
+    )
+    if qualified_only:
+        eligible &= working["action"].eq("buy")
+    working = working[eligible].copy()
     episodes = []
     for _, row in working.sort_values("signal_time_dt").iterrows():
         path = parse_minute_path(row.get("minute_path_json"))
@@ -220,7 +224,10 @@ def prepare_episodes(
             }
         )
 
-    # The audit contains scans every 15 minutes.  Exit research uses a longer
+    if not purge_overlaps:
+        return sorted(episodes, key=lambda item: item["signal_time"])
+
+    # The audit contains scans every 15 minutes. Exit research uses a longer
     # horizon, so purge overlapping paths again to preserve independent episodes.
     selected = []
     next_allowed_by_day = {}

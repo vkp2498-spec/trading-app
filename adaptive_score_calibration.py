@@ -17,6 +17,11 @@ from adaptive_exit_shadow import (
     build_shadow_config,
     parse_grid,
 )
+from adaptive_live_policy import (
+    LIVE_POLICY_FILE,
+    build_live_policy,
+    read_policy,
+)
 from post_market_score_audit import AUDIT_FILE, read_audit
 from safe_storage import atomic_write_json
 from unified_entry_score import UNIFIED_SCORE_VERSION
@@ -411,6 +416,7 @@ def main():
     parser.add_argument("--audit-file", default=str(AUDIT_FILE))
     parser.add_argument("--output", default=str(ADAPTIVE_CONFIG_FILE))
     parser.add_argument("--shadow-output", default=str(SHADOW_CONFIG_FILE))
+    parser.add_argument("--live-policy-output", default=str(LIVE_POLICY_FILE))
     args = parser.parse_args()
     load_env_file()
     effective_date = date.fromisoformat(args.date) if args.date else datetime.now(IST).date()
@@ -499,11 +505,62 @@ def main():
         )
         atomic_write_json(args.shadow_output, shadow_config, sort_keys=True)
 
+    live_policy = build_live_policy(
+        frame,
+        effective_date,
+        previous=read_policy(args.live_policy_output),
+        current_target=_to_float(os.getenv("NIFTY_TARGET_POINTS"), 30.0),
+        current_stop=_to_float(os.getenv("NIFTY_STOP_POINTS"), 30.0),
+        lookback_days=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_LOOKBACK_DAYS"), 90
+        ),
+        horizon_minutes=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_HORIZON_MINUTES"), 60
+        ),
+        target_grid=parse_grid(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_TARGET_GRID"),
+            (10, 15, 20, 25, 30, 35, 40, 45),
+        ),
+        stop_grid=parse_grid(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_STOP_GRID"),
+            (10, 15, 20, 25, 30, 35, 40, 45),
+        ),
+        minimum_samples=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_MIN_SAMPLES_PER_CELL"), 40
+        ),
+        minimum_trading_days=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_MIN_TRADING_DAYS"), 10
+        ),
+        validation_fraction=_to_float(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_VALIDATION_FRACTION"), 0.30
+        ),
+        minimum_validation_samples=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_MIN_VALIDATION_SAMPLES"), 12
+        ),
+        minimum_validation_profit_factor=_to_float(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_MIN_VALIDATION_PROFIT_FACTOR"), 1.20
+        ),
+        minimum_reward_risk=_to_float(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_MIN_REWARD_RISK"), 0.80
+        ),
+        maximum_daily_change_percent=_to_float(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_MAX_DAILY_EXIT_CHANGE_PERCENT"), 10.0
+        ),
+        required_consecutive_calibrations=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_LIVE_REQUIRED_CALIBRATIONS"), 3
+        ),
+        maximum_live_trades_cap=_to_int(
+            os.getenv("VAMSI_ADAPTIVE_MAX_LIVE_TRADES_CAP"), 2
+        ),
+    )
+    atomic_write_json(args.live_policy_output, live_policy, sort_keys=True)
+
     print(
         json.dumps(
             {
                 "score_calibration": config,
                 "shadow_exit_calibration": shadow_config,
+                "adaptive_live_policy": live_policy,
             },
             indent=2,
             sort_keys=True,

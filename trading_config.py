@@ -19,6 +19,7 @@ IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "data" / "trading_config.json"
 DEFAULT_PROFILE_ID = "MAX"
+RISK_LIMIT_OPTIONS = tuple(float(value) for value in range(5_000, 30_001, 5_000))
 
 # Capital is allocated independently to each eligible NIFTY and BANKNIFTY
 # position. Rupee risk and daily P&L fields are derived from the active capital
@@ -105,6 +106,8 @@ def _default_config():
     today = now_ist().date().isoformat()
     return {
         "profileId": configured_default_profile_id(),
+        "dailyProfitTarget": _default_risk_limit("DAILY_PROFIT_TARGET", 5_000),
+        "dailyMaxLoss": _default_risk_limit("DAILY_MAX_LOSS", 5_000),
         "selectedDate": today,
         "selectedAt": None,
         "resetDoneDate": None,
@@ -124,6 +127,19 @@ def _read():
     config.update(value)
     if config.get("profileId") not in CAPITAL_PROFILES:
         config["profileId"] = configured_default_profile_id()
+    for field, env_name in (
+        ("dailyProfitTarget", "DAILY_PROFIT_TARGET"),
+        ("dailyMaxLoss", "DAILY_MAX_LOSS"),
+    ):
+        try:
+            value = float(config.get(field))
+        except (TypeError, ValueError):
+            value = _default_risk_limit(env_name, 5_000)
+        config[field] = (
+            value
+            if value in RISK_LIMIT_OPTIONS
+            else _default_risk_limit(env_name, 5_000)
+        )
     return config
 
 
@@ -143,6 +159,11 @@ def _configured_bool(name, default=False):
     if raw is None:
         return bool(default)
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_risk_limit(name, default):
+    value = _configured_float(name, default)
+    return value if value in RISK_LIMIT_OPTIONS else float(default)
 
 
 ABSOLUTE_LIMIT_CAPS = {
@@ -234,6 +255,10 @@ def _ensure_automatic_reset(config, current=None):
     )
     if stale_from_prior_day or after_daily_reset:
         config["profileId"] = configured_default_profile_id()
+        config["dailyProfitTarget"] = _default_risk_limit(
+            "DAILY_PROFIT_TARGET", 5_000
+        )
+        config["dailyMaxLoss"] = _default_risk_limit("DAILY_MAX_LOSS", 5_000)
         config["selectedDate"] = today
         config["selectedAt"] = current.isoformat()
         config["resetDoneDate"] = today
@@ -246,6 +271,9 @@ def get_config():
     config = _ensure_automatic_reset(_read(), current)
     profile_id = config["profileId"]
     profile = _profile_with_dynamic_limits(CAPITAL_PROFILES[profile_id])
+    profile["dailyProfitTarget"] = float(config["dailyProfitTarget"])
+    profile["dailyMaxLoss"] = float(config["dailyMaxLoss"])
+    profile = _apply_absolute_limit_caps(profile)
     return {
         "profileId": profile_id,
         "profile": profile,
@@ -253,6 +281,9 @@ def get_config():
             {"id": key, **_profile_with_dynamic_limits(value)}
             for key, value in CAPITAL_PROFILES.items()
         ],
+        "dailyProfitTarget": profile["dailyProfitTarget"],
+        "dailyMaxLoss": profile["dailyMaxLoss"],
+        "riskLimitOptions": list(RISK_LIMIT_OPTIONS),
         "serverTime": current.isoformat(),
         "selectionWindowOpen": selection_window_open(current),
         "selectionWindow": "09:00-09:15 IST",
@@ -264,15 +295,29 @@ def get_config():
     }
 
 
-def select_profile(profile_id):
+def select_profile(profile_id, daily_profit_target=None, daily_max_loss=None):
     current = now_ist()
     config = _ensure_automatic_reset(_read(), current)
     if not selection_window_open(current):
         raise PermissionError("Capital selection is available only from 09:00 to 09:15 IST")
     if profile_id not in CAPITAL_PROFILES:
         raise ValueError("Unknown capital profile")
+    daily_profit_target = float(
+        config.get("dailyProfitTarget")
+        if daily_profit_target is None
+        else daily_profit_target
+    )
+    daily_max_loss = float(
+        config.get("dailyMaxLoss") if daily_max_loss is None else daily_max_loss
+    )
+    if daily_profit_target not in RISK_LIMIT_OPTIONS:
+        raise ValueError("Daily profit target must be 5000 to 30000 in steps of 5000")
+    if daily_max_loss not in RISK_LIMIT_OPTIONS:
+        raise ValueError("Daily maximum loss must be 5000 to 30000 in steps of 5000")
     config.update({
         "profileId": profile_id,
+        "dailyProfitTarget": daily_profit_target,
+        "dailyMaxLoss": daily_max_loss,
         "selectedDate": current.date().isoformat(),
         "selectedAt": current.isoformat(),
         "resetDoneDate": None,

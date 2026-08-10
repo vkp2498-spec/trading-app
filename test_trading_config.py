@@ -39,7 +39,49 @@ class TradingConfigTests(unittest.TestCase):
             result = trading_config._ensure_automatic_reset(config, current)
 
         self.assertEqual(result["profileId"], "1_LOT")
+        self.assertEqual(result["dailyProfitTarget"], 5000)
+        self.assertEqual(result["dailyMaxLoss"], 5000)
         self.assertEqual(result["selectedDate"], "2026-07-23")
+
+    def test_selected_risk_limits_override_capital_derived_values(self):
+        config = {
+            "profileId": "MAX",
+            "dailyProfitTarget": 25_000,
+            "dailyMaxLoss": 15_000,
+            "selectedDate": "2026-07-23",
+            "selectedAt": "2026-07-23T09:05:00+05:30",
+            "resetDoneDate": None,
+        }
+        current = datetime(2026, 7, 23, 9, 10, tzinfo=trading_config.IST)
+        with (
+            patch.object(trading_config, "_read", return_value=config),
+            patch.object(trading_config, "now_ist", return_value=current),
+            patch.dict(os.environ, {"DYNAMIC_CAPITAL_RISK_ENABLED": "true"}),
+        ):
+            result = trading_config.get_config()
+
+        self.assertEqual(result["profile"]["optionCapitalPerEntry"], -1)
+        self.assertEqual(result["profile"]["dailyProfitTarget"], 25_000)
+        self.assertEqual(result["profile"]["dailyMaxLoss"], 15_000)
+        self.assertEqual(result["riskLimitOptions"], [5000, 10000, 15000, 20000, 25000, 30000])
+
+    def test_risk_limit_selection_rejects_values_outside_five_thousand_steps(self):
+        current = datetime(2026, 7, 23, 9, 10, tzinfo=trading_config.IST)
+        config = {
+            "profileId": "1_LOT",
+            "dailyProfitTarget": 5_000,
+            "dailyMaxLoss": 5_000,
+            "selectedDate": "2026-07-23",
+            "selectedAt": None,
+            "resetDoneDate": None,
+        }
+        with (
+            patch.object(trading_config, "now_ist", return_value=current),
+            patch.object(trading_config, "_read", return_value=config),
+            patch.object(trading_config, "_write"),
+        ):
+            with self.assertRaisesRegex(ValueError, "steps of 5000"):
+                trading_config.select_profile("1_LOT", 7_500, 5_000)
 
     def test_dynamic_limits_respect_absolute_caps(self):
         with patch.dict(

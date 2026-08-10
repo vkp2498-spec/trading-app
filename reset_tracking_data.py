@@ -29,6 +29,7 @@ DATA_NAMES = {
     "score_followthrough_status.json",
     "vamsi_adaptive_score_config.json",
     "vamsi_adaptive_exit_shadow.json",
+    "vamsi_adaptive_live_policy.json",
 }
 
 DATA_PATTERNS = (

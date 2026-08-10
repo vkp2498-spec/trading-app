@@ -77,6 +77,8 @@ class NotificationDevice(BaseModel):
 
 class CapitalProfileSelection(BaseModel):
     profileId: str
+    dailyProfitTarget: float | None = None
+    dailyMaxLoss: float | None = None
 
 
 class InvestedStock(BaseModel):
@@ -307,7 +309,11 @@ def trading_config():
 def update_trading_config(selection: CapitalProfileSelection):
     """Select the next trading profile during the 09:00-09:15 IST window."""
     try:
-        return select_profile(selection.profileId)
+        return select_profile(
+            selection.profileId,
+            daily_profit_target=selection.dailyProfitTarget,
+            daily_max_loss=selection.dailyMaxLoss,
+        )
     except PermissionError as error:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

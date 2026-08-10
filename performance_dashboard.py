@@ -17,6 +17,7 @@ from datetime import time
 
 from banknifty_post_market import run_banknifty_veto_audit
 from adaptive_exit_shadow import SHADOW_CONFIG_FILE
+from adaptive_live_policy import LIVE_POLICY_FILE
 from adaptive_score_calibration import ADAPTIVE_CONFIG_FILE
 from post_market_review import (
     ask_llm_for_insights,
@@ -840,6 +841,55 @@ def render_score_followthrough_review():
                 "The saved adaptive score rule is not for today. The live engine will ignore "
                 "it and use VAMSI_UNIFIED_SCORE_FALLBACK until today's calibration runs."
             )
+
+    live_policy = read_backtest_json(LIVE_POLICY_FILE, {})
+    st.markdown("#### Automatic Adaptive Live Policy")
+    if live_policy:
+        status = str(live_policy.get("global_status") or "BUILDING_STATIC_COLLECTION")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Policy status", status.replace("_", " ").title())
+        c2.metric("Live-enabled cells", int(live_policy.get("live_cell_count") or 0))
+        c3.metric("Maximum live trades", int(live_policy.get("maximum_live_trades") or 0))
+        policy_rows = []
+        for cell in (live_policy.get("cells") or {}).values():
+            if not int(cell.get("samples") or 0) and cell.get("status") == "BUILDING":
+                continue
+            validation = cell.get("validation") or {}
+            policy_rows.append(
+                {
+                    "Time": cell.get("time_cell"),
+                    "Score": cell.get("score_band"),
+                    "Status": cell.get("status"),
+                    "Samples": int(cell.get("samples") or 0),
+                    "Days": int(cell.get("trading_days") or 0),
+                    "Valid runs": (
+                        f"{int(cell.get('consecutive_valid_calibrations') or 0)}/"
+                        f"{int(cell.get('required_consecutive_calibrations') or 3)}"
+                    ),
+                    "Adaptive T/S": (
+                        f"{float(cell.get('proposed_target_points')):.1f}/"
+                        f"{float(cell.get('proposed_stop_points')):.1f}"
+                        if cell.get("proposed_target_points") is not None
+                        and cell.get("proposed_stop_points") is not None
+                        else "—"
+                    ),
+                    "Held-out expectancy": (
+                        float(validation.get("expectancy_points"))
+                        if validation.get("expectancy_points") is not None
+                        else None
+                    ),
+                    "Held-out PF": validation.get("profit_factor"),
+                }
+            )
+        if policy_rows:
+            st.dataframe(pd.DataFrame(policy_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "BUILDING keeps the static collection strategy. After any cell first reaches "
+            "LIVE ENABLED, missing/stale/failed policies suspend adaptive entries instead "
+            "of falling back. Capital and daily P&L limits remain user-controlled."
+        )
+    else:
+        st.info("The 09:00 calibration has not generated an automatic live policy yet.")
 
     shadow_config = read_backtest_json(SHADOW_CONFIG_FILE, {})
     st.markdown("#### Shadow Exit Calibration — Execution Unchanged")

@@ -193,7 +193,9 @@ For a manually selected static score range, set `VAMSI_ADAPTIVE_SCORE_ENABLED=fa
 
 For multiple disjoint static bands, set `VAMSI_UNIFIED_SCORE_RANGES` to comma-separated inclusive ranges such as `50-59,80-89`. An explicit multi-range setting takes precedence over adaptive calibration and over the fallback/maximum pair; scores in gaps between bands are rejected.
 
-Exit adaptation is now isolated in shadow research. The post-market audit stores up to 60 one-minute OHLC candles for each selected observation. The 09:00 job uses only prior-day, current-version, entry-qualified NIFTY observations from the configured entry window; purges overlapping 60-minute episodes; and replays a target/stop grid with conservative stop-first handling for same-candle ambiguity. Each score band needs at least 40 independent episodes across ten trading days, then must pass a chronological held-out validation set. Proposed changes are capped to 10% per day and written to `data/vamsi_adaptive_exit_shadow.json`. Neither live nor paper execution reads that file: both continue to use `NIFTY_TARGET_POINTS` and `NIFTY_STOP_POINTS` from `.env` until a separate, explicit future promotion is implemented.
+The post-market audit stores up to 60 one-minute OHLC candles for every selected unified-score observation. The 09:00 job first keeps the score-band exit report in `data/vamsi_adaptive_exit_shadow.json`, then builds `data/vamsi_adaptive_live_policy.json` across the dashboard's time and score cells. A cell needs at least 40 within-cell non-overlapping observations across ten trading days, chronological held-out positive conservative expectancy, held-out profit factor of at least 1.20, and three successful calibrations containing new evidence. Target/stop optimization resolves same-candle ambiguity as a stop and limits changes to 10% per calibration.
+
+Before any cell completes promotion, the static 65-69 and 11:00-13:55 collection strategy remains active while scans across 09:15-15:25 populate every research cell. After first promotion, only `LIVE_ENABLED` cells may enter; the policy supplies that cell's score band and target/stop. The daily live-trade allowance is the number of distinct promoted time cells capped by `VAMSI_ADAPTIVE_MAX_LIVE_TRADES_CAP` (default two). A missing, stale, incompatible, or failed policy after first promotion suspends adaptive entries instead of returning to the static rule. The policy is generated from prior dates and remains immutable intraday.
 
 ### 7.3 Contract selection
 
@@ -250,7 +252,7 @@ The trigger/lock values must satisfy the validation ordering enforced by the cod
 - A positive rupee amount: buy the maximum whole lots within that premium allocation.
 - `MAX`: use broker-available capital subject to account caps and safety rules.
 
-The mobile app can select a profile during its configured morning window. The selected amount applies per index opportunity; it is not divided between NIFTY and BANKNIFTY. A Rs 300,000 selection means NIFTY may use up to Rs 300,000, and BANKNIFTY may separately use up to Rs 300,000 if another valid trade is permitted.
+The mobile app can select a profile during its configured morning window. `1 Lot` is the automatic default, while `MAX` resolves against broker-available capital for the selected NIFTY entry when account capital/lot caps are zero. The same request independently selects the daily profit target and daily maximum loss from Rs 5,000 through Rs 30,000 in Rs 5,000 steps. Capital controls quantity; these daily limits control when later live entries stop. They do not resize the selected allocation.
 
 Dynamic risk values scale from the active capital profile, but absolute caps always win. Capital allocation and risk are different:
 
@@ -373,6 +375,7 @@ Typical persistent files include:
 - `data/scan_decisions.csv`: Compact scan results.
 - `data/vamsi_adaptive_score_config.json`: Today's pre-market Vamsi minimum/range decision and its evidence summary.
 - `data/vamsi_adaptive_exit_shadow.json`: Non-executable NIFTY score-band target/stop research, with training and held-out evidence.
+- `data/vamsi_adaptive_live_policy.json`: Today's immutable time x score x target/stop policy and automatic promotion/suspension state.
 - `data/ganesh_gap_scans.csv`: Ganesh gap-state evidence.
 - `data/ganesh_gap_banknifty_scans.csv`: Ganesh BANKNIFTY gap-state evidence.
 - `data/day_risk_state.json`: Day-level risk/circuit state.
@@ -436,10 +439,10 @@ Lightsail servers use UTC. IST is UTC+05:30.
 The established schedule is:
 
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
-- Vamsi score and shadow-exit calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
+- Vamsi score, shadow-exit, and automatic live-policy calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
 - Vamsi entry checks: every 5 minutes beginning at 09:15 IST. Ganesh retains its internal 09:30 strategy start. The bot's internal market window prevents late entries.
 - Position monitor: launch just before 09:15 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
-- Current NIFTY evidence strategy entry window: 11:00 through 13:55 IST; cron may continue scanning outside it, but the engine rejects entry outside the internal window.
+- Before promotion, collection entries use 11:00-13:55 IST while scans cover 09:15-15:25. After promotion, each live-enabled adaptive cell controls its own permitted time window.
 - Forced square-off: 15:29 IST, `59 9 * * 1-5` in UTC cron.
 - Mobile profile default reset: around 15:30 IST when configured.
 - Post-market score audit: 15:45 IST on weekdays (`15 10 * * 1-5` in UTC cron); it stores a 15-minute summary plus the longer minute path used by shadow exit research.
@@ -763,13 +766,15 @@ Check for an active monitor:
 pgrep -af "trade_bot.py --monitor"
 ```
 
-For three accounts that intentionally share the same one-lot NIFTY strategy,
+For three accounts that intentionally share the same default NIFTY strategy,
 run `scripts/deploy_three_aws.sh` from the development machine with three SSH
 aliases or `ubuntu@IP` values. It pulls all three first, refuses to alter `.env`
 or restart while any instance has active bot state, preserves account-specific
 keys/tokens, removes duplicate/deprecated strategy values, writes one canonical
 core block, creates a timestamped `.env` backup, generates calibration output,
-and restarts only installed long-running services. The operation is idempotent.
+and restarts only installed long-running services. It leaves `1 Lot` as the
+daily default but permits a morning `MAX` mobile selection to size from available
+capital. The operation is idempotent.
 
 ## 19. Verify effective engine and configuration
 

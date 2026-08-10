@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - Windows development fallback
     fcntl = None
 
 from analysis_journal import record_analysis
+from adaptive_live_policy import policy_decision, runtime_policy
 from adaptive_score_calibration import read_effective_score_rule
 from scan_journal import record_scan_decision
 from banknifty_breadth import get_banknifty_breadth
@@ -1147,6 +1148,22 @@ def vamsi_score_rule(symbol):
     return fallback
 
 
+def adaptive_live_policy_today():
+    if not configured_bool("VAMSI_AUTO_ADAPTIVE_LIVE_ENABLED", True):
+        return None
+    return runtime_policy(now_ist().date())
+
+
+def adaptive_live_entry_decision(score, timestamp=None):
+    policy = adaptive_live_policy_today()
+    if not policy:
+        return {"adaptive_active": False, "allowed": None}
+    return {
+        **policy_decision(policy, score, timestamp or now_ist()),
+        "policy": policy,
+    }
+
+
 def direct_entry_minimum_score(symbol):
     return float(vamsi_score_rule(symbol)["min_score"])
 
@@ -1159,7 +1176,11 @@ def format_vamsi_score_rule(rule):
         )
         return f"configured ranges {bands}"
     if rule.get("mode") == "RANGE":
-        label = "adaptive range" if rule.get("source") == "ADAPTIVE" else "configured range"
+        label = (
+            "adaptive range"
+            if str(rule.get("source") or "").startswith("ADAPTIVE")
+            else "configured range"
+        )
         return (
             f"{label} {float(rule['min_score']):.1f}-"
             f"{float(rule['max_score']):.1f}"
@@ -1700,6 +1721,10 @@ def first_index_trade_outcome_today(symbol):
 
 def paper_after_first_outcome(symbol):
     outcome = first_index_trade_outcome_today(symbol)
+    policy = adaptive_live_policy_today()
+    if policy and policy.get("global_status") == "LIVE_ENABLED":
+        live_limit = max(int(policy.get("maximum_live_trades") or 0), 0)
+        return bool(outcome and len(today_index_trade_rows()) >= live_limit)
     return bool(
         outcome and after_first_outcome_mode(outcome.get("outcome")) == "paper"
     )
@@ -3297,6 +3322,15 @@ def market_window_ok():
     return configured_clock("VAMSI_FIRST_ENTRY_TIME", "09:15") <= now <= configured_clock(
         "VAMSI_LAST_ENTRY_TIME",
         "15:25",
+    )
+
+
+def static_collection_entry_window_ok():
+    now = now_ist().time()
+    return configured_clock(
+        "VAMSI_STATIC_COLLECTION_FIRST_ENTRY_TIME", "11:00"
+    ) <= now <= configured_clock(
+        "VAMSI_STATIC_COLLECTION_LAST_ENTRY_TIME", "13:55"
     )
 
 
@@ -5103,10 +5137,92 @@ def build_trade_candidate(
         f"components={entry_score.get('components')}"
     )
     score_value = float(entry_score.get("score") or 0)
-    score_rule = vamsi_score_rule(symbol)
-    minimum = float(score_rule["min_score"])
-    maximum = score_rule.get("max_score")
-    score_approved = vamsi_entry_score_qualifies(score_value, symbol)
+    adaptive_decision = adaptive_live_entry_decision(score_value)
+    if (
+        not adaptive_decision.get("adaptive_active")
+        and not static_collection_entry_window_ok()
+    ):
+        return {
+            "allowed": False,
+            "reason": (
+                f"static collection entry window rejected score {score_value:.1f}; "
+                "the scan remains available for adaptive evidence"
+            ),
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+            "entry_score": entry_score,
+        }, None
+    if adaptive_decision.get("adaptive_active") and not adaptive_decision.get("allowed"):
+        return {
+            "allowed": False,
+            "reason": adaptive_decision.get("reason") or "adaptive live policy rejected this cell",
+            "transaction_type": transaction_type,
+            "instrument": instrument,
+            "technicals": technicals,
+            "option_summary": option_summary,
+            "weighted": weighted,
+            "entry_score": entry_score,
+            "adaptive_live_policy": True,
+        }, None
+
+    adaptive_cell = adaptive_decision.get("cell") if adaptive_decision.get("allowed") else None
+    if adaptive_cell:
+        score_minimum, score_maximum = adaptive_cell["score_band"].split("-", 1)
+        score_rule = {
+            "source": "ADAPTIVE_LIVE_CELL",
+            "mode": "RANGE",
+            "min_score": float(score_minimum),
+            "max_score": float(score_maximum),
+        }
+        minimum = float(score_minimum)
+        maximum = float(score_maximum)
+        score_approved = True
+        exit_settings.update(
+            {
+                "target_points": float(adaptive_cell["proposed_target_points"]),
+                "stop_points": float(adaptive_cell["proposed_stop_points"]),
+                "profile": "ADAPTIVE_LIVE",
+                "source": "ADAPTIVE_LIVE_CELL",
+            }
+        )
+        levels = option_levels_from_index_points(
+            symbol,
+            entry_price,
+            target_points=exit_settings["target_points"],
+            stop_points=exit_settings["stop_points"],
+            delta=exit_settings["delta"],
+        )
+        target = levels["target_price"]
+        stop = levels["stop_loss_price"]
+        option_summary.update(
+            {
+                "target_price": target,
+                "stop_loss_price": stop,
+                "target_points": levels["target_points"],
+                "stop_points": levels["stop_points"],
+                "target_profile": "ADAPTIVE_LIVE",
+                "adaptive_live_cell": adaptive_cell.get("cell_id"),
+            }
+        )
+        feasibility = evaluate_trade_feasibility(
+            direction,
+            entry_price,
+            target,
+            stop,
+            technicals,
+            transaction_type=transaction_type,
+            symbol=symbol,
+        )
+        technicals["trade_feasibility"] = feasibility
+        option_summary["trade_feasibility"] = feasibility
+    else:
+        score_rule = vamsi_score_rule(symbol)
+        minimum = float(score_rule["min_score"])
+        maximum = score_rule.get("max_score")
+        score_approved = vamsi_entry_score_qualifies(score_value, symbol)
     cutoff_approved = score_approved
     watch_band = bool(
         not score_approved
