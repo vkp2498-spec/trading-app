@@ -180,7 +180,8 @@ GANESH_GAP_STATE = GANESH_GAP_STATE_BY_SYMBOL["NIFTY"]
 GANESH_GAP_STATE_SLOTS = list(GANESH_GAP_STATE_BY_SYMBOL.values())
 STOCK_FUTURE_STATE = "STOCK_FUTURE"
 VAMSI_STATE_SLOTS = SYMBOLS + [STOCK_FUTURE_STATE]
-BOT_STATE_SLOTS = VAMSI_STATE_SLOTS + GANESH_GAP_STATE_SLOTS
+PAPER_NIFTY_STATE_SLOTS = [f"PAPER_NIFTY_{number:02d}" for number in range(1, 11)]
+BOT_STATE_SLOTS = VAMSI_STATE_SLOTS + GANESH_GAP_STATE_SLOTS + PAPER_NIFTY_STATE_SLOTS
 GANESH_GAP_SCAN_FILE = BASE_DIR / "data" / "ganesh_gap_scans.csv"
 GANESH_GAP_BANKNIFTY_SCAN_FILE = BASE_DIR / "data" / "ganesh_gap_banknifty_scans.csv"
 
@@ -239,6 +240,7 @@ UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exc
 # cached briefly to stay below Upstox rate limits. Order placement is never
 # cached.
 BROKER_READ_CACHE = {}
+THESIS_REVERSAL_SCAN_CACHE = {}
 
 
 def broker_read_cache_seconds():
@@ -1789,6 +1791,10 @@ def active_bot_states():
     ]
 
 
+def active_live_bot_states():
+    return [state for state in active_bot_states() if not state.get("paper_trade")]
+
+
 def underlying_symbol_for_state_slot(state_slot, state=None):
     state = state or {}
     underlying = str(state.get("underlying_symbol") or state.get("symbol") or "").upper()
@@ -2105,7 +2111,7 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
                 "remaining_index_risk_budget": remaining_budget,
             }
 
-    states = active_bot_states()
+    states = active_live_bot_states()
     open_risk_fallback = configured_non_negative_float(
         "MAX_OPEN_PORTFOLIO_RISK", 0.0
     )
@@ -3351,6 +3357,38 @@ def static_collection_entry_window_ok():
     ) <= now <= configured_clock(
         "VAMSI_STATIC_COLLECTION_LAST_ENTRY_TIME", "13:55"
     )
+
+
+def paper_observation_mode_enabled():
+    return configured_bool("PAPER_OBSERVATION_MODE_ENABLED", False)
+
+
+def paper_observation_entry_window_ok():
+    now = now_ist().time()
+    return configured_clock(
+        "PAPER_OBSERVATION_FIRST_ENTRY_TIME", "09:15"
+    ) <= now <= configured_clock(
+        "PAPER_OBSERVATION_LAST_ENTRY_TIME", "15:15"
+    )
+
+
+def maximum_simultaneous_paper_observations():
+    configured = max(
+        to_int(os.getenv("MAX_SIMULTANEOUS_PAPER_OBSERVATIONS"), 10),
+        0,
+    )
+    return min(configured, len(PAPER_NIFTY_STATE_SLOTS))
+
+
+def available_paper_observation_slot(symbol):
+    if str(symbol).upper() != "NIFTY":
+        return None
+    for state_slot in PAPER_NIFTY_STATE_SLOTS[
+        : maximum_simultaneous_paper_observations()
+    ]:
+        if not state_is_active(read_state(state_slot)):
+            return state_slot
+    return None
 
 
 def save_open_position_state(
@@ -4865,36 +4903,60 @@ def evaluate_five_minute_thesis_reversal(symbol, state, ltp, current=None):
         return state, False, ""
     state["thesis_reversal_last_scan_slot"] = slot
 
-    try:
-        technicals = get_technical_analysis(symbol)
-    except Exception as error:
-        state["thesis_reversal_confirmation_count"] = 0
-        state["thesis_reversal_last_error"] = f"technical analysis unavailable: {error}"
-        write_state(symbol, state)
-        log(f"{symbol} 5M thesis reversal scan skipped: {state['thesis_reversal_last_error']}")
-        return state, False, ""
+    # Ten paper observations can share the same contract and underlying. Reuse
+    # one completed-candle/chain snapshot per five-minute slot to avoid an API
+    # burst while retaining a separate confirmation counter for every position.
+    for stale_slot in list(THESIS_REVERSAL_SCAN_CACHE):
+        if stale_slot != slot:
+            THESIS_REVERSAL_SCAN_CACHE.pop(stale_slot, None)
+    slot_cache = THESIS_REVERSAL_SCAN_CACHE.setdefault(slot, {})
+    base_key = (str(symbol).upper(), str(state.get("direction") or "").upper())
+    base_evidence = slot_cache.get(("base",) + base_key)
+    if base_evidence:
+        technicals = deepcopy(base_evidence["technicals"])
+        chain = deepcopy(base_evidence["chain"])
+    else:
+        try:
+            technicals = get_technical_analysis(symbol)
+        except Exception as error:
+            state["thesis_reversal_confirmation_count"] = 0
+            state["thesis_reversal_last_error"] = f"technical analysis unavailable: {error}"
+            write_state(symbol, state)
+            log(f"{symbol} 5M thesis reversal scan skipped: {state['thesis_reversal_last_error']}")
+            return state, False, ""
 
-    try:
-        chain = option_chain_reversal_snapshot(symbol, state.get("direction"))
-    except Exception as error:
-        chain = {
-            "direction": "UNAVAILABLE",
-            "confidence": "LOW",
-            "score": 0,
-            "reasons": [str(error)],
-            "adverse": False,
+        try:
+            chain = option_chain_reversal_snapshot(symbol, state.get("direction"))
+        except Exception as error:
+            chain = {
+                "direction": "UNAVAILABLE",
+                "confidence": "LOW",
+                "score": 0,
+                "reasons": [str(error)],
+                "adverse": False,
+            }
+        slot_cache[("base",) + base_key] = {
+            "technicals": deepcopy(technicals),
+            "chain": deepcopy(chain),
         }
-    try:
-        option_flow = get_option_volume_vwap_analysis(
-            state.get("instrument_key"),
-            side_label=state.get("trading_symbol") or "POSITION_OPTION",
-        )
-    except Exception as error:
-        option_flow = {
-            "bias": "NEUTRAL",
-            "confidence": "LOW",
-            "reasons": [f"option VWAP unavailable: {error}"],
-        }
+
+    flow_key = ("option_flow", state.get("instrument_key"))
+    option_flow = slot_cache.get(flow_key)
+    if option_flow:
+        option_flow = deepcopy(option_flow)
+    else:
+        try:
+            option_flow = get_option_volume_vwap_analysis(
+                state.get("instrument_key"),
+                side_label=state.get("trading_symbol") or "POSITION_OPTION",
+            )
+        except Exception as error:
+            option_flow = {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "reasons": [f"option VWAP unavailable: {error}"],
+            }
+        slot_cache[flow_key] = deepcopy(option_flow)
 
     evidence = thesis_reversal_evidence(state, technicals, chain, option_flow)
     minimum_components = min(
@@ -5134,6 +5196,7 @@ def build_trade_candidate(
     option_trend,
     transaction_type,
     contract_row=None,
+    paper_observation=False,
 ):
     if str(transaction_type).upper() != "BUY":
         return {
@@ -5422,10 +5485,11 @@ def build_trade_candidate(
     )
     score_value = float(entry_score.get("score") or 0)
     adaptive_decision = adaptive_live_entry_decision(score_value)
-    if (
+    static_window_rejected = bool(
         not adaptive_decision.get("adaptive_active")
         and not static_collection_entry_window_ok()
-    ):
+    )
+    if static_window_rejected and not paper_observation:
         return {
             "allowed": False,
             "reason": (
@@ -5439,7 +5503,11 @@ def build_trade_candidate(
             "weighted": weighted,
             "entry_score": entry_score,
         }, None
-    if adaptive_decision.get("adaptive_active") and not adaptive_decision.get("allowed"):
+    adaptive_policy_rejected = bool(
+        adaptive_decision.get("adaptive_active")
+        and not adaptive_decision.get("allowed")
+    )
+    if adaptive_policy_rejected and not paper_observation:
         return {
             "allowed": False,
             "reason": adaptive_decision.get("reason") or "adaptive live policy rejected this cell",
@@ -5515,7 +5583,7 @@ def build_trade_candidate(
         and score_value < minimum
         and (live_gate.get("watch_eligible") or technicals["entry_structure"].get("watch_eligible"))
     )
-    if not score_approved and not watch_band:
+    if not score_approved and not watch_band and not paper_observation:
         return {
             "allowed": False,
             "reason": (
@@ -5536,7 +5604,7 @@ def build_trade_candidate(
     )
     technicals["structural_invalidation"] = structural
 
-    if watch_band:
+    if watch_band and not paper_observation:
         watch_reason = (
             f"watch band unified score {score_value:.1f}; direct entry requires "
             f"{format_vamsi_score_rule(score_rule)}"
@@ -5571,11 +5639,17 @@ def build_trade_candidate(
             "structural_invalidation": structural,
         }, None
 
+    live_approved = bool(
+        score_approved
+        and not static_window_rejected
+        and not adaptive_policy_rejected
+    )
     return {
-        "allowed": True,
+        "allowed": live_approved,
+        "paper_observation_eligible": bool(paper_observation),
         "reason": (
-            f"Vamsi unified entry score approved at {score_value:.1f} using "
-            f"{format_vamsi_score_rule(score_rule)}; "
+            f"Vamsi unified entry score {'approved' if live_approved else 'recorded for paper observation'} "
+            f"at {score_value:.1f} using {format_vamsi_score_rule(score_rule)}; "
             f"{exit_settings['profile'].lower()} target/stop "
             f"{levels['target_points']:.0f}/{levels['stop_points']:.0f} points"
         ),
@@ -5628,6 +5702,7 @@ def evaluate_symbol_buy_or_sell(
     allow_option_sell=False,
     include_rejected=False,
     excluded_instrument_keys=None,
+    paper_observation=False,
 ):
     excluded_instrument_keys = set(excluded_instrument_keys or [])
     rec = get_index_recommendation(symbol)
@@ -5823,6 +5898,7 @@ def evaluate_symbol_buy_or_sell(
                 option_trend,
                 "BUY",
                 contract_row=contract_row,
+                paper_observation=paper_observation,
             )
             if candidate:
                 instrument_key = (candidate.get("instrument") or {}).get("instrument_key")
@@ -5891,6 +5967,7 @@ def evaluate_symbol_buy_or_sell(
                         reversal_trend,
                         "BUY",
                         contract_row=contract_row,
+                        paper_observation=paper_observation,
                     )
                     if candidate:
                         instrument_key = (candidate.get("instrument") or {}).get("instrument_key")
@@ -5925,7 +6002,23 @@ def evaluate_symbol_buy_or_sell(
                         f"{contract_row.get('strike')}: {error}"
                     )
 
-    preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
+    if paper_observation:
+        preferred = max(
+            (
+                candidate
+                for candidate in candidates
+                if candidate
+                and candidate.get("paper_observation_eligible")
+                and candidate.get("transaction_type") == "BUY"
+            ),
+            key=lambda item: (
+                candidate_weighted_score(item),
+                float(item.get("contract_selection_rank") or 0),
+            ),
+            default=None,
+        )
+    else:
+        preferred = select_trade_candidate(candidates, allow_sell=allow_option_sell)
     if not preferred:
         eligible = [
             item for item in candidates
@@ -5954,13 +6047,17 @@ def evaluate_symbol_buy_or_sell(
             return best
         return False
 
-    qualified = [
-        item
-        for item in candidates
-        if item
-        and item.get("allowed")
-        and item.get("transaction_type") == "BUY"
-    ]
+    qualified = (
+        [preferred]
+        if paper_observation
+        else [
+            item
+            for item in candidates
+            if item
+            and item.get("allowed")
+            and item.get("transaction_type") == "BUY"
+        ]
+    )
     ordered = [preferred] + [item for item in qualified if item is not preferred]
 
     for chosen in ordered:
@@ -6024,12 +6121,14 @@ def evaluate_symbol_buy_or_sell(
 
 def execute_selected_candidate(chosen):
     """Serialize entry submission and fill finalization against the monitor."""
-    with position_finalization_lock(chosen["symbol"]):
+    state_slot = chosen.get("state_slot") or chosen["symbol"]
+    with position_finalization_lock(state_slot):
         return _execute_selected_candidate_locked(chosen)
 
 
 def _execute_selected_candidate_locked(chosen):
     symbol = chosen["symbol"]
+    state_slot = chosen.get("state_slot") or symbol
     direction = chosen["direction"]
     confidence = chosen["confidence"]
     score = chosen["signal_score"]
@@ -6041,13 +6140,18 @@ def _execute_selected_candidate_locked(chosen):
     entry_price = chosen["entry_price"]
     target = chosen["target_price"]
     stop = chosen["stop_loss_price"]
-    quantity = order_quantity_for(
-        symbol,
-        instrument,
-        entry_price,
-        stop,
-        transaction_type=transaction_type,
-        capital_override=chosen.get("capital_override"),
+    paper_trade = bool(chosen.get("paper_trade")) or paper_after_first_outcome(symbol)
+    quantity = (
+        int(instrument["lot_size"])
+        if paper_trade and chosen.get("paper_observation")
+        else order_quantity_for(
+            symbol,
+            instrument,
+            entry_price,
+            stop,
+            transaction_type=transaction_type,
+            capital_override=chosen.get("capital_override"),
+        )
     )
     if quantity <= 0:
         log(
@@ -6086,7 +6190,6 @@ def _execute_selected_candidate_locked(chosen):
         "entry_structure": (chosen.get("technicals", {}).get("entry_structure") or {}).get("type"),
     }
 
-    paper_trade = bool(chosen.get("paper_trade")) or paper_after_first_outcome(symbol)
     live = (
         os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
         and not paper_trade
@@ -6110,11 +6213,24 @@ def _execute_selected_candidate_locked(chosen):
     ])
 
     with portfolio_entry_lock():
-        portfolio_decision = pre_order_portfolio_decision(
-            chosen,
-            quantity,
-            entry_price,
-            stop,
+        portfolio_decision = (
+            {
+                "allowed": True,
+                "reason": "independent paper observation",
+                "risk": {
+                    "current_risk": 0.0,
+                    "proposed_risk": planned_risk,
+                    "projected_risk": planned_risk,
+                    "risk_limit": 0.0,
+                },
+            }
+            if paper_trade and chosen.get("paper_observation")
+            else pre_order_portfolio_decision(
+                chosen,
+                quantity,
+                entry_price,
+                stop,
+            )
         )
         if not portfolio_decision.get("allowed"):
             log_scan_decision(
@@ -6155,9 +6271,8 @@ def _execute_selected_candidate_locked(chosen):
                 "technical_context": post_fill.get("technicals", {}),
                 "post_fill_feasibility": post_fill.get("feasibility", {}),
             }
-            increment_trade_count(symbol)
             save_open_position_state(
-                symbol,
+                state_slot,
                 f"PAPER-{now_ist().strftime('%Y%m%d%H%M%S')}",
                 instrument,
                 direction,
@@ -6177,11 +6292,15 @@ def _execute_selected_candidate_locked(chosen):
                 profit_protection_enabled_for_trade=chosen.get(
                     "profit_protection_enabled_for_trade", True
                 ),
+                underlying_symbol=symbol,
                 trade_metadata=paper_metadata,
             )
-            paper_state = read_state(symbol)
+            paper_state = read_state(state_slot)
             paper_state.update(
                 {
+                    "symbol": symbol,
+                    "underlying_symbol": symbol,
+                    "state_slot": state_slot,
                     "target_price": post_fill["target_price"],
                     "stop_loss_price": post_fill["stop_loss_price"],
                     "original_stop_loss_price": post_fill["stop_loss_price"],
@@ -6189,9 +6308,9 @@ def _execute_selected_candidate_locked(chosen):
                     "post_fill_feasibility": post_fill.get("feasibility", {}),
                 }
             )
-            write_state(symbol, paper_state)
+            write_state(state_slot, paper_state)
             log(
-                f"{symbol} PAPER position opened after first live outcome; "
+                f"{symbol} PAPER observation opened in {state_slot}; "
                 f"score={candidate_weighted_score(chosen):.1f} qty={quantity}"
             )
             return True
@@ -7240,6 +7359,11 @@ def run_signal_check():
         log("Outside trading window. No action.")
         return
 
+    paper_observation_mode = bool(
+        paper_observation_mode_enabled() and paper_observation_entry_window_ok()
+    )
+    live_global_block_reason = ""
+
     for state_slot in BOT_STATE_SLOTS:
         state = read_state(state_slot)
         if state:
@@ -7255,13 +7379,21 @@ def run_signal_check():
     try:
         day_circuit = portfolio_day_circuit()
     except Exception as error:
-        log(f"Portfolio day circuit failed; no new entry for safety: {error}")
-        return
+        log(f"Portfolio day circuit failed; live entry disabled for safety: {error}")
+        if not paper_observation_mode:
+            return
+        day_circuit = {
+            "allowed": False,
+            "score_penalty": 0,
+            "reason": f"portfolio day circuit unavailable: {error}",
+        }
     if not day_circuit.get("allowed"):
         for symbol in SYMBOLS:
             expire_watch(symbol, f"portfolio day circuit: {day_circuit.get('reason')}")
-        log(f"Portfolio day circuit blocked all new entries: {day_circuit.get('reason')}")
-        return
+        live_global_block_reason = str(day_circuit.get("reason") or "portfolio day circuit")
+        log(f"Portfolio day circuit blocked live entries: {live_global_block_reason}")
+        if not paper_observation_mode:
+            return
     if to_float(day_circuit.get("score_penalty")) > 0:
         log(
             "Portfolio soft-loss mode active: new-entry minimum scores increased by "
@@ -7272,7 +7404,11 @@ def run_signal_check():
         symbol for symbol in SYMBOLS if state_is_active(read_state(symbol))
     }
     simultaneous_index_positions = allow_simultaneous_index_positions()
-    if active_selective_index and not simultaneous_index_positions:
+    if (
+        active_selective_index
+        and not simultaneous_index_positions
+        and not paper_observation_mode
+    ):
         for symbol in SYMBOLS:
             expire_watch(symbol, "a selective index-option position is already active")
         verbose_log(
@@ -7291,9 +7427,10 @@ def run_signal_check():
 
     try:
         tracked_instrument_keys = {
-            read_state(state_slot).get("instrument_key")
+            state.get("instrument_key")
             for state_slot in BOT_STATE_SLOTS
-            if read_state(state_slot).get("instrument_key")
+            if (state := read_state(state_slot)).get("instrument_key")
+            and not state.get("paper_trade")
         }
         untracked_derivative_positions = [
             position
@@ -7316,19 +7453,23 @@ def run_signal_check():
                 "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS", False
             )
             if not allow_manual_overlap:
+                live_global_block_reason = "an untracked NSE derivatives position exists"
                 log(
-                    "An untracked NSE derivatives position exists; no bot entry. Set "
-                    "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true only when "
-                    "manual positions are intentionally allowed to coexist."
+                    "An untracked NSE derivatives position exists; live bot entry is "
+                    "blocked, but independent paper observations may continue."
                 )
-                return
-            log(
-                "Manual derivative position detected; override enabled. "
-                "Bot may enter index-option positions and will manage only its own state."
-            )
+                if not paper_observation_mode:
+                    return
+            else:
+                log(
+                    "Manual derivative position detected; override enabled. "
+                    "Bot may enter index-option positions and will manage only its own state."
+                )
     except Exception as error:
-        log(f"Global broker-position precheck failed; no new entry for safety: {error}")
-        return
+        live_global_block_reason = f"global broker-position precheck failed: {error}"
+        log(f"{live_global_block_reason}; independent paper observations may continue")
+        if not paper_observation_mode:
+            return
 
     enabled_symbols = enabled_index_symbols()
     for symbol in SYMBOLS:
@@ -7337,11 +7478,13 @@ def run_signal_check():
 
     qualified = []
     for symbol in enabled_symbols:
-        if symbol in active_selective_index:
+        if symbol in active_selective_index and not paper_observation_mode:
             expire_watch(symbol, f"{symbol} already has an active selective position")
             verbose_log(f"{symbol} scan skipped: its selective position is already active")
             continue
-        occupied_contracts = active_index_instrument_keys(symbol)
+        occupied_contracts = (
+            set() if paper_observation_mode else active_index_instrument_keys(symbol)
+        )
         try:
             daily_block = daily_index_entry_block_reason(symbol)
         except Exception as error:
@@ -7359,10 +7502,51 @@ def run_signal_check():
                 symbol,
                 allow_option_sell=False,
                 include_rejected=(
-                    watch_mode_enabled() or bool(read_watch_state(symbol))
+                    paper_observation_mode
+                    or watch_mode_enabled()
+                    or bool(read_watch_state(symbol))
                 ),
                 excluded_instrument_keys=occupied_contracts,
+                paper_observation=paper_observation_mode,
             )
+            if paper_observation_mode:
+                live_allowed = bool(
+                    candidate
+                    and candidate.get("allowed")
+                    and symbol not in active_selective_index
+                    and not daily_block
+                    and not live_global_block_reason
+                )
+                if live_allowed:
+                    candidate["paper_trade"] = False
+                    qualified.append(candidate)
+                elif candidate and candidate.get("paper_observation_eligible"):
+                    state_slot = available_paper_observation_slot(symbol)
+                    if state_slot:
+                        paper_candidate = deepcopy(candidate)
+                        paper_candidate.update(
+                            {
+                                "paper_trade": True,
+                                "paper_observation": True,
+                                "state_slot": state_slot,
+                                "live_entry_block_reason": (
+                                    live_global_block_reason
+                                    or daily_block
+                                    or (
+                                        f"{symbol} live position already active"
+                                        if symbol in active_selective_index
+                                        else candidate.get("reason")
+                                    )
+                                ),
+                            }
+                        )
+                        qualified.append(paper_candidate)
+                    else:
+                        verbose_log(
+                            f"{symbol} paper observation skipped: all "
+                            f"{maximum_simultaneous_paper_observations()} slots are occupied"
+                        )
+                continue
             had_watch = bool(read_watch_state(symbol))
             if (
                 had_watch

@@ -1781,6 +1781,139 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(evaluate.call_args.args[0], "NIFTY")
         execute.assert_called_once_with(nifty_candidate)
 
+    def test_paper_observation_lane_routes_live_ineligible_score_to_free_slot(self):
+        candidate = {
+            "symbol": "NIFTY",
+            "transaction_type": "BUY",
+            "weighted": {"score": 35},
+            "allowed": False,
+            "paper_observation_eligible": True,
+            "reason": "below live score range",
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PAPER_OBSERVATION_MODE_ENABLED": "true",
+                    "TRADE_BANK_NIFTY": "false",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "paper_observation_entry_window_ok", return_value=True),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(trade_bot, "daily_index_entry_block_reason", return_value=""),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=candidate,
+            ),
+            patch.object(
+                trade_bot,
+                "available_paper_observation_slot",
+                return_value="PAPER_NIFTY_01",
+            ),
+            patch.object(trade_bot, "execute_selected_candidate") as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        selected = execute.call_args.args[0]
+        self.assertTrue(selected["paper_trade"])
+        self.assertTrue(selected["paper_observation"])
+        self.assertEqual(selected["state_slot"], "PAPER_NIFTY_01")
+        self.assertEqual(candidate.get("paper_trade"), None)
+
+    def test_paper_observation_slots_are_capped_and_reused_independently(self):
+        def state_for(slot):
+            if slot == "PAPER_NIFTY_01":
+                return {"instrument_key": "NSE_FO|1", "status": "POSITION_OPEN"}
+            return {}
+
+        with (
+            patch.dict(
+                os.environ,
+                {"MAX_SIMULTANEOUS_PAPER_OBSERVATIONS": "10"},
+                clear=False,
+            ),
+            patch.object(trade_bot, "read_state", side_effect=state_for),
+        ):
+            slot = trade_bot.available_paper_observation_slot("NIFTY")
+
+        self.assertEqual(slot, "PAPER_NIFTY_02")
+        self.assertIsNone(trade_bot.available_paper_observation_slot("BANKNIFTY"))
+
+    def test_paper_observation_is_one_lot_and_bypasses_live_portfolio_gate(self):
+        candidate = {
+            "symbol": "NIFTY",
+            "state_slot": "PAPER_NIFTY_03",
+            "paper_trade": True,
+            "paper_observation": True,
+            "direction": "BULLISH",
+            "confidence": "HIGH",
+            "signal_score": 35,
+            "transaction_type": "BUY",
+            "instrument": {
+                "instrument_key": "NSE_FO|PAPER",
+                "trading_symbol": "NIFTY26AUG25000CE",
+                "lot_size": 65,
+            },
+            "entry_price": 100.0,
+            "target_price": 115.0,
+            "stop_loss_price": 85.0,
+            "target_points": 30.0,
+            "stop_points": 30.0,
+            "option_delta_used": 0.5,
+            "target_percent": None,
+            "stop_percent": None,
+            "entry_score": {"score": 35, "score_version": "TEST"},
+            "weighted": {"score": 35},
+            "technicals": {},
+            "option_summary": {"option_type": "CE"},
+        }
+        post_fill = {
+            "target_price": 115.0,
+            "stop_loss_price": 85.0,
+            "technicals": {},
+            "feasibility": {},
+        }
+        saved_state = {"paper_trade": True}
+        with (
+            patch.object(trade_bot, "paper_after_first_outcome", return_value=False),
+            patch.object(trade_bot, "order_quantity_for") as live_sizing,
+            patch.object(trade_bot, "planned_trade_context", return_value={}),
+            patch.object(trade_bot, "write_stream_instruments"),
+            patch.object(trade_bot, "pre_order_portfolio_decision") as live_gate,
+            patch.object(
+                trade_bot,
+                "revalidate_option_after_fill",
+                return_value=post_fill,
+            ),
+            patch.object(
+                trade_bot,
+                "make_post_fill_diagnostic_only",
+                return_value=post_fill,
+            ),
+            patch.object(trade_bot, "save_open_position_state") as save,
+            patch.object(trade_bot, "read_state", return_value=saved_state),
+            patch.object(trade_bot, "write_state") as write,
+        ):
+            opened = trade_bot._execute_selected_candidate_locked(candidate)
+
+        self.assertTrue(opened)
+        live_sizing.assert_not_called()
+        live_gate.assert_not_called()
+        self.assertEqual(save.call_args.args[0], "PAPER_NIFTY_03")
+        self.assertEqual(save.call_args.args[7], 65)
+        self.assertEqual(saved_state["symbol"], "NIFTY")
+        self.assertEqual(saved_state["state_slot"], "PAPER_NIFTY_03")
+        write.assert_called_once_with("PAPER_NIFTY_03", saved_state)
+
     def test_trade_bank_nifty_false_applies_to_ganesh_scans(self):
         with (
             patch.dict(os.environ, {"TRADE_BANK_NIFTY": "false"}, clear=False),

@@ -244,6 +244,10 @@ PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT=35
 
 The trigger/lock values must satisfy the validation ordering enforced by the code. Invalid sequences intentionally stop the monitor rather than run with incoherent protection.
 
+The fresh evidence-collection profile permits one one-lot live NIFTY entry per day from 09:15 through 15:15 for a unified score from 50 through 100. Every other fully constructed NIFTY setup—including scores below 50 and setups blocked from live entry by the daily limit or adaptive cell policy—is opened as an independent one-lot paper observation. Ten paper observations may be open simultaneously. Paper observations use the same target, stop, trailing protection, thesis-reversal, time-stop, and journaling paths as live trades, but do not consume live trade counts or invoke broker, daily-P&L, portfolio-risk, or correlation entry gates.
+
+Automatic promotion remains evidence gated: each time × score cell requires at least 40 independent episodes across 10 trading days, held-out validation, and three consecutive successful daily calibrations. Promotion chooses whether the cell may trade and its target/stop combination; the live cap remains one trade per day.
+
 Vamsi index-option positions also use an active five-minute thesis-reversal exit. After a five-minute grace period, each completed five-minute boundary combines four deterministic components: high-confidence opposite option-chain direction; simultaneous adverse underlying and bought-option VWAP behavior; opposite completed 5M structure; and opposite completed 15M structure. Three of four components must persist for two consecutive scans. A completed 15M close beyond the saved structural invalidation together with adverse underlying VWAP exits immediately. Entry score is deliberately excluded from this exit decision. While this mode is enabled it replaces the legacy tick-level structural exit and the option-chain-only sentiment exit; the 20-minute no-progress time stop and broker-protected premium stop remain active.
 
 ```dotenv
