@@ -25,6 +25,22 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertIn("15 10 * * 1-5", updated)
         self.assertIn("59 9 * * 1-5", updated)
 
+    def test_disable_removes_managed_jobs_and_keeps_unrelated_jobs(self):
+        existing = "\n".join(
+            [
+                "0 0 * * * /usr/local/bin/unrelated-job",
+                *normalized_crontab("", Path("/home/ubuntu/trading-app")).splitlines(),
+            ]
+        )
+        updated = normalized_crontab(
+            existing,
+            Path("/home/ubuntu/trading-app"),
+            enabled=False,
+        )
+
+        self.assertEqual(updated, "0 0 * * * /usr/local/bin/unrelated-job\n")
+        self.assertNotIn("trade_bot.py", updated)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,7 +44,7 @@ for host in "${hosts[@]}"; do
     reset_command="venv/bin/python reset_tracking_data.py --confirm && "
   fi
   ssh "${ssh_options[@]}" "$host" \
-    "set -e; cd $remote_dir_quoted && (pkill -f '[t]rade_bot.py --monitor' || true) && ${reset_command}venv/bin/python scripts/sync_core_env.py --env-file .env --refuse-active-state && venv/bin/python adaptive_score_calibration.py && venv/bin/python scripts/sync_trading_cron.py --app-dir $remote_dir_quoted && for service in nifty-app hk-mobile-api upstox-streams upstox-token-webhook; do if systemctl list-unit-files \"\${service}.service\" --no-legend 2>/dev/null | grep -q \"\${service}.service\"; then sudo systemctl restart \"\${service}\"; fi; done"
+    "set -e; cd $remote_dir_quoted && (pkill -f '[t]rade_bot.py --monitor' || true) && ${reset_command}venv/bin/python scripts/sync_core_env.py --env-file .env --refuse-active-state && venv/bin/python adaptive_score_calibration.py && if [ -f .trading_cron_disabled ]; then venv/bin/python scripts/sync_trading_cron.py --app-dir $remote_dir_quoted --disable; else venv/bin/python scripts/sync_trading_cron.py --app-dir $remote_dir_quoted; fi && for service in nifty-app hk-mobile-api upstox-streams upstox-token-webhook; do if systemctl list-unit-files \"\${service}.service\" --no-legend 2>/dev/null | grep -q \"\${service}.service\"; then sudo systemctl restart \"\${service}\"; fi; done"
 done
 
 echo "Deployment complete on all three instances. Cron will relaunch the monitor when scheduled."

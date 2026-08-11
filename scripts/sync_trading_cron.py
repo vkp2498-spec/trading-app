@@ -37,7 +37,7 @@ def canonical_block(app_dir: Path) -> list[str]:
     ]
 
 
-def normalized_crontab(existing: str, app_dir: Path) -> str:
+def normalized_crontab(existing: str, app_dir: Path, enabled: bool = True) -> str:
     retained = []
     inside_managed_block = False
     for line in existing.splitlines():
@@ -55,10 +55,11 @@ def normalized_crontab(existing: str, app_dir: Path) -> str:
         retained.append(line.rstrip())
     while retained and not retained[-1]:
         retained.pop()
-    if retained:
+    if retained and enabled:
         retained.append("")
-    retained.extend(canonical_block(app_dir))
-    return "\n".join(retained) + "\n"
+    if enabled:
+        retained.extend(canonical_block(app_dir))
+    return "\n".join(retained) + ("\n" if retained else "")
 
 
 def read_crontab() -> str:
@@ -74,15 +75,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app-dir", default=str(Path.cwd()))
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--disable",
+        action="store_true",
+        help="Remove all managed trading jobs while preserving unrelated cron entries.",
+    )
     args = parser.parse_args()
     app_dir = Path(args.app_dir).expanduser().resolve()
-    updated = normalized_crontab(read_crontab(), app_dir)
+    updated = normalized_crontab(read_crontab(), app_dir, enabled=not args.disable)
     if args.dry_run:
         print(updated, end="")
         return
     (app_dir / "logs").mkdir(parents=True, exist_ok=True)
     subprocess.run(["crontab", "-"], input=updated, text=True, check=True)
-    print("Canonical NIFTY trading cron installed")
+    print(
+        "Managed NIFTY trading cron disabled"
+        if args.disable
+        else "Canonical NIFTY trading cron installed"
+    )
 
 
 if __name__ == "__main__":
