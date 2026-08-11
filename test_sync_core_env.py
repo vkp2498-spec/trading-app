@@ -26,7 +26,7 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertIn("UPSTOX_ACCESS_TOKEN=keep-token", updated)
         self.assertIn("GANESH_API_KEY=also-keep-me", updated)
         self.assertEqual(updated.count("VAMSI_UNIFIED_SCORE_RANGES="), 1)
-        self.assertIn("VAMSI_UNIFIED_SCORE_RANGES=50-100", updated)
+        self.assertIn("VAMSI_UNIFIED_SCORE_RANGES=80-89", updated)
         self.assertIn("MAX_INDEX_TRADES_PER_DAY=1", updated)
         self.assertIn("MAX_SIMULTANEOUS_PAPER_OBSERVATIONS=10", updated)
         self.assertIn("ACCOUNT_MAX_LOTS_PER_ENTRY=1", updated)

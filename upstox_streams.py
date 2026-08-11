@@ -94,11 +94,29 @@ def read_portfolio_cache():
 def _unwrap(value):
     if not isinstance(value, dict):
         return {}
-    for key in ("fullFeed", "full_feed", "marketFF", "market_ff", "indexFF", "index_ff", "oc"):
-        nested = value.get(key)
-        if isinstance(nested, dict):
-            return nested
-    return value
+    current = value
+    # V3 full-mode messages commonly arrive as fullFeed -> marketFF/indexFF.
+    # Unwrap every known envelope so the normalized fields are populated from
+    # the actual feed instead of being left as None.
+    for _ in range(5):
+        nested = None
+        for key in (
+            "fullFeed",
+            "full_feed",
+            "marketFF",
+            "market_ff",
+            "indexFF",
+            "index_ff",
+            "oc",
+        ):
+            candidate = current.get(key)
+            if isinstance(candidate, dict):
+                nested = candidate
+                break
+        if nested is None or nested is current:
+            break
+        current = nested
+    return current
 
 
 def _normalise_feed(feed, previous=None):
@@ -117,17 +135,17 @@ def _normalise_feed(feed, previous=None):
         "close": ltpc.get("cp") or extended.get("cp") or extended.get("close"),
         "ltt": ltpc.get("ltt"),
         "ltq": ltpc.get("ltq"),
-        "bid_price": first_quote.get("bp"),
-        "ask_price": first_quote.get("ap"),
-        "bid_qty": first_quote.get("bq"),
-        "ask_qty": first_quote.get("aq"),
+        "bid_price": first_quote.get("bp") or first_quote.get("bidP"),
+        "ask_price": first_quote.get("ap") or first_quote.get("askP"),
+        "bid_qty": first_quote.get("bq") or first_quote.get("bidQ"),
+        "ask_qty": first_quote.get("aq") or first_quote.get("askQ"),
         "option_greeks": greeks,
-        "oi": extended.get("oi"),
+        "oi": feed.get("oi") or extended.get("oi"),
         "prev_oi": extended.get("poi") or extended.get("prev_oi"),
         "change_oi": extended.get("changeOi") or extended.get("change_oi"),
-        "volume": extended.get("vtt") or extended.get("tv"),
-        "total_buy_quantity": extended.get("tbq") or extended.get("mbpBuy"),
-        "total_sell_quantity": extended.get("tsq") or extended.get("mbpSell"),
+        "volume": feed.get("vtt") or extended.get("vtt") or extended.get("tv"),
+        "total_buy_quantity": feed.get("tbq") or extended.get("tbq") or extended.get("mbpBuy"),
+        "total_sell_quantity": feed.get("tsq") or extended.get("tsq") or extended.get("mbpSell"),
         "received_at": received_at,
         "raw": feed,
     }
