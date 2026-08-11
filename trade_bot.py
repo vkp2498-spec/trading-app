@@ -1508,7 +1508,13 @@ def loss_reentry_mode():
 
 
 def register_losing_exit_guard(symbol, state, journal_row, exit_reason):
-    if exit_reason not in {"STOP_LOSS", "SENTIMENT_EXIT"}:
+    if exit_reason not in {
+        "STOP_LOSS",
+        "SENTIMENT_EXIT",
+        "THESIS_REVERSAL",
+        "STRUCTURAL_STOP",
+        "TIME_STOP",
+    }:
         return
     if to_float(journal_row.get("gross_pnl")) >= 0:
         return
@@ -2249,8 +2255,21 @@ def index_trade_count_today():
     return sum(trade_count_for(symbol) for symbol in SYMBOLS)
 
 
+def thesis_reversal_exit_enabled_for_state(state=None):
+    state = state or {}
+    return bool(
+        configured_bool("VAMSI_THESIS_REVERSAL_EXIT_ENABLED", True)
+        and state.get("instrument_class") == "INDEX_OPTION"
+        and not state.get("manual_override")
+        and not is_ganesh_gap_strategy(state)
+    )
+
+
 def sentiment_exit_enabled_for_state(state):
-    return True
+    # The five-minute thesis reversal combines option-chain, VWAP, 5M and 15M
+    # evidence. Do not let the legacy one-minute option-chain-only check exit
+    # the same Vamsi position independently.
+    return not thesis_reversal_exit_enabled_for_state(state)
 
 
 def max_index_trades_per_day():
@@ -4207,6 +4226,7 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
                 f"book_profit_at={booking_price} stop_loss={stop_loss_price}"
             )
 
+        composite_reversal_enabled = thesis_reversal_exit_enabled_for_state(state)
         sentiment_exit = False
         sentiment_reason = ""
         if sentiment_exit_enabled_for_state(state) and sentiment_check_due(state):
@@ -4235,7 +4255,13 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
                 state,
                 underlying_ltp,
                 minutes_since_created(state),
-                structural_enabled=configured_bool("UNDERLYING_STRUCTURAL_STOP_ENABLED", True),
+                # The composite reversal path confirms structural weakness on
+                # completed 5M/15M candles. Retain the legacy tick structural
+                # stop only when that path is disabled.
+                structural_enabled=(
+                    configured_bool("UNDERLYING_STRUCTURAL_STOP_ENABLED", True)
+                    and not composite_reversal_enabled
+                ),
                 time_stop_enabled=configured_bool("INDEX_TIME_STOP_ENABLED", True),
                 time_stop_minutes=configured_positive_float("INDEX_TIME_STOP_MINUTES", 20.0),
                 minimum_progress_percent=configured_non_negative_float(
@@ -4248,9 +4274,23 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
                     f"structural_stop={state.get('underlying_structural_stop')}, "
                     f"age={minutes_since_created(state):.1f}m"
                 )
+        reversal_exit = False
+        reversal_detail = ""
+        if composite_reversal_enabled:
+            state, reversal_exit, reversal_detail = evaluate_five_minute_thesis_reversal(
+                underlying_symbol,
+                state,
+                ltp,
+            )
         target_hit = ltp is not None and (ltp <= booking_price if is_short else ltp >= booking_price)
         stop_hit = ltp is not None and (ltp >= stop_loss_price if is_short else ltp <= stop_loss_price)
-        if ltp is not None and (target_hit or stop_hit or sentiment_exit or thesis_exit_reason):
+        if ltp is not None and (
+            target_hit
+            or stop_hit
+            or reversal_exit
+            or sentiment_exit
+            or thesis_exit_reason
+        ):
             # Stock-future and short-option stops are already protected at the
             # broker. Do not send a second market exit when the local LTP also
             # reaches the stop; let the broker stop fill and confirm it here.
@@ -4275,6 +4315,9 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
                 exit_reason = "TARGET"
             elif stop_hit:
                 exit_reason = "STOP_LOSS"
+            elif reversal_exit:
+                exit_reason = "THESIS_REVERSAL"
+                log(f"{symbol} thesis reversal exit triggered: {reversal_detail}")
             elif thesis_exit_reason:
                 exit_reason = thesis_exit_reason
                 log(f"{symbol} {exit_reason} triggered: {thesis_exit_detail}")
@@ -4644,6 +4687,247 @@ def sentiment_check_due(state):
         return (now_ist() - last_check).total_seconds() >= interval
     except Exception:
         return True
+
+
+def thesis_reversal_scan_slot(current=None):
+    """Return the completed five-minute boundary eligible for one scan."""
+    current = current or now_ist()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    boundary = current.replace(
+        minute=current.minute - (current.minute % 5),
+        second=0,
+        microsecond=0,
+    )
+    grace_seconds = configured_non_negative_float(
+        "COMPLETED_CANDLE_GRACE_SECONDS", 5.0
+    )
+    if current < boundary + timedelta(seconds=grace_seconds):
+        boundary -= timedelta(minutes=5)
+    return boundary.isoformat()
+
+
+def option_chain_reversal_snapshot(symbol, trade_direction):
+    """Return the current nearest-expiry chain direction for exit confirmation."""
+    result = get_index_recommendation(symbol)
+    if isinstance(result, dict) and result.get("direction"):
+        direction = result.get("direction")
+        confidence = result.get("confidence")
+        score = result.get("score")
+        reasons = result.get("reasons") or []
+        opposite = opposite_direction(trade_direction)
+        return {
+            "direction": direction,
+            "confidence": confidence,
+            "score": score,
+            "reasons": reasons,
+            "adverse": direction == opposite and confidence == "HIGH",
+        }
+
+    atm = None
+    if isinstance(result, dict):
+        for key in ("analysis_atm", "df_atm", "atm", "atm_df"):
+            value = result.get(key)
+            if value is not None:
+                atm = value
+                break
+    elif isinstance(result, (tuple, list)) and result:
+        atm = result[0]
+
+    if isinstance(atm, dict):
+        row = atm
+    elif hasattr(atm, "empty"):
+        if atm.empty:
+            raise RuntimeError("option-chain reversal scan returned an empty ATM row")
+        row = atm.iloc[0] if hasattr(atm, "iloc") else atm
+    else:
+        raise RuntimeError("option-chain reversal scan has no usable ATM row")
+
+    direction, confidence, score, reasons = option_chain_signal(row)
+    opposite = opposite_direction(trade_direction)
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "score": score,
+        "reasons": reasons,
+        "adverse": direction == opposite and confidence == "HIGH",
+    }
+
+
+def thesis_reversal_evidence(state, technicals, chain, option_flow):
+    """Build four deterministic reversal components from completed evidence."""
+    direction = str(state.get("direction") or "").upper()
+    opposite = opposite_direction(direction)
+    five = technicals.get("five_min", {}) or {}
+    fifteen = technicals.get("fifteen_min", {}) or {}
+
+    chain_adverse = bool(
+        chain.get("direction") == opposite and chain.get("confidence") == "HIGH"
+    )
+    underlying_vwap_adverse = bool(
+        five.get("vwap_bias") == opposite
+        and to_float(five.get("close"), 0) > 0
+        and to_float(five.get("vwap"), 0) > 0
+    )
+    # A bought CE or PE needs its own premium to remain healthy. A bearish
+    # option-premium VWAP reading is adverse regardless of underlying direction.
+    option_vwap_adverse = bool(
+        option_flow.get("bias") == "BEARISH"
+        and option_flow.get("confidence") in {"MEDIUM", "HIGH"}
+    )
+    vwap_confirmation = underlying_vwap_adverse and option_vwap_adverse
+    five_adverse = bool(
+        five.get("bias") == opposite
+        and five.get("confidence") in {"MEDIUM", "HIGH"}
+    )
+    fifteen_adverse = bool(
+        fifteen.get("bias") == opposite
+        and fifteen.get("confidence") in {"MEDIUM", "HIGH"}
+    )
+
+    structural_stop = to_float(state.get("underlying_structural_stop"), 0)
+    five_close = to_float(five.get("close"), 0)
+    fifteen_close = to_float(fifteen.get("close"), 0)
+    if direction == "BULLISH":
+        five_structural_breach = structural_stop > 0 and 0 < five_close <= structural_stop
+        fifteen_structural_breach = (
+            structural_stop > 0 and 0 < fifteen_close <= structural_stop
+        )
+    else:
+        five_structural_breach = structural_stop > 0 and five_close >= structural_stop
+        fifteen_structural_breach = (
+            structural_stop > 0 and fifteen_close >= structural_stop
+        )
+
+    components = {
+        "option_chain": chain_adverse,
+        "vwap_confirmation": vwap_confirmation,
+        "five_minute_structure": five_adverse or five_structural_breach,
+        "fifteen_minute_structure": fifteen_adverse or fifteen_structural_breach,
+    }
+    adverse_count = sum(bool(value) for value in components.values())
+    return {
+        "components": components,
+        "adverse_count": adverse_count,
+        "component_count": len(components),
+        "hard_reversal": bool(
+            fifteen_structural_breach and underlying_vwap_adverse
+        ),
+        "underlying_vwap_adverse": underlying_vwap_adverse,
+        "option_vwap_adverse": option_vwap_adverse,
+        "five_structural_breach": five_structural_breach,
+        "fifteen_structural_breach": fifteen_structural_breach,
+        "five_candle_time": five.get("candle_time"),
+        "fifteen_candle_time": fifteen.get("candle_time"),
+        "chain": chain,
+        "option_flow": option_flow,
+    }
+
+
+def _consecutive_five_minute_slots(previous, current):
+    try:
+        return datetime.fromisoformat(current) - datetime.fromisoformat(previous) == timedelta(
+            minutes=5
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def evaluate_five_minute_thesis_reversal(symbol, state, ltp, current=None):
+    """Actively evaluate one completed five-minute reversal scan.
+
+    A hard 15M structural/VWAP failure exits immediately. Otherwise at least
+    three of four adverse components must persist for two consecutive scans.
+    """
+    if not thesis_reversal_exit_enabled_for_state(state) or ltp is None:
+        return state, False, ""
+    grace_minutes = configured_non_negative_float(
+        "VAMSI_THESIS_REVERSAL_GRACE_MINUTES", 5.0
+    )
+    if minutes_since_created(state) < grace_minutes:
+        return state, False, ""
+
+    entry = to_float(state.get("entry_price"), 0)
+    target = to_float(
+        state.get("planned_target_price") or state.get("target_price"), 0
+    )
+    if entry > 0 and target > entry:
+        progress = (to_float(ltp) - entry) / (target - entry) * 100.0
+        skip_progress = configured_non_negative_float(
+            "VAMSI_THESIS_REVERSAL_SKIP_AFTER_TARGET_PROGRESS_PERCENT", 70.0
+        )
+        if progress >= skip_progress:
+            return state, False, ""
+
+    slot = thesis_reversal_scan_slot(current)
+    previous_slot = state.get("thesis_reversal_last_scan_slot")
+    if previous_slot == slot:
+        return state, False, ""
+    state["thesis_reversal_last_scan_slot"] = slot
+
+    try:
+        technicals = get_technical_analysis(symbol)
+    except Exception as error:
+        state["thesis_reversal_confirmation_count"] = 0
+        state["thesis_reversal_last_error"] = f"technical analysis unavailable: {error}"
+        write_state(symbol, state)
+        log(f"{symbol} 5M thesis reversal scan skipped: {state['thesis_reversal_last_error']}")
+        return state, False, ""
+
+    try:
+        chain = option_chain_reversal_snapshot(symbol, state.get("direction"))
+    except Exception as error:
+        chain = {
+            "direction": "UNAVAILABLE",
+            "confidence": "LOW",
+            "score": 0,
+            "reasons": [str(error)],
+            "adverse": False,
+        }
+    try:
+        option_flow = get_option_volume_vwap_analysis(
+            state.get("instrument_key"),
+            side_label=state.get("trading_symbol") or "POSITION_OPTION",
+        )
+    except Exception as error:
+        option_flow = {
+            "bias": "NEUTRAL",
+            "confidence": "LOW",
+            "reasons": [f"option VWAP unavailable: {error}"],
+        }
+
+    evidence = thesis_reversal_evidence(state, technicals, chain, option_flow)
+    minimum_components = min(
+        max(to_int(os.getenv("VAMSI_THESIS_REVERSAL_MIN_COMPONENTS"), 3), 1),
+        evidence["component_count"],
+    )
+    required_scans = max(
+        to_int(os.getenv("VAMSI_THESIS_REVERSAL_CONFIRMATION_SCANS"), 2), 1
+    )
+    qualifies = evidence["adverse_count"] >= minimum_components
+    consecutive = _consecutive_five_minute_slots(previous_slot, slot)
+    previous_count = int(to_float(state.get("thesis_reversal_confirmation_count"), 0))
+    confirmation_count = (
+        previous_count + 1 if qualifies and consecutive else 1 if qualifies else 0
+    )
+    state["thesis_reversal_confirmation_count"] = confirmation_count
+    state["thesis_reversal_last_evidence"] = evidence
+    state["thesis_reversal_last_error"] = ""
+    state["thesis_reversal_required_components"] = minimum_components
+    state["thesis_reversal_required_scans"] = required_scans
+
+    hard_reversal = evidence["hard_reversal"]
+    should_exit = hard_reversal or confirmation_count >= required_scans
+    detail = (
+        f"adverse={evidence['adverse_count']}/{evidence['component_count']} "
+        f"confirmations={confirmation_count}/{required_scans} "
+        f"hard={hard_reversal} components={evidence['components']}"
+    )
+    if should_exit:
+        state["thesis_reversal_exit_detail"] = detail
+    write_state(symbol, state)
+    log(f"{symbol} 5M thesis reversal scan: {detail}")
+    return state, should_exit, detail
 
 
 def should_exit_on_sentiment_change(symbol, state, ltp):

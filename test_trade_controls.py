@@ -2995,6 +2995,121 @@ class TradeControlTests(unittest.TestCase):
         find_position.assert_called_once_with("NSE_FO|123", "BUY", force=True)
         write.assert_called_once_with("NIFTY", state)
 
+    def test_thesis_reversal_evidence_requires_both_vwap_views(self):
+        state = {
+            "direction": "BULLISH",
+            "underlying_structural_stop": 99,
+        }
+        technicals = {
+            "five_min": {
+                "bias": "BEARISH",
+                "confidence": "MEDIUM",
+                "close": 98,
+                "vwap": 100,
+                "vwap_bias": "BEARISH",
+            },
+            "fifteen_min": {
+                "bias": "BEARISH",
+                "confidence": "HIGH",
+                "close": 98,
+            },
+        }
+        chain = {"direction": "BEARISH", "confidence": "HIGH"}
+        evidence = trade_bot.thesis_reversal_evidence(
+            state,
+            technicals,
+            chain,
+            {"bias": "NEUTRAL", "confidence": "LOW"},
+        )
+        self.assertFalse(evidence["components"]["vwap_confirmation"])
+
+        confirmed = trade_bot.thesis_reversal_evidence(
+            state,
+            technicals,
+            chain,
+            {"bias": "BEARISH", "confidence": "HIGH"},
+        )
+        self.assertEqual(confirmed["adverse_count"], 4)
+        self.assertTrue(confirmed["hard_reversal"])
+
+    def test_three_reversal_components_must_persist_for_two_five_minute_scans(self):
+        state = {
+            "instrument_class": "INDEX_OPTION",
+            "instrument_key": "NSE_FO|123",
+            "trading_symbol": "NIFTY26AUG25000CE",
+            "direction": "BULLISH",
+            "entry_price": 100,
+            "planned_target_price": 115,
+            "underlying_structural_stop": 90,
+        }
+        technicals = {
+            "five_min": {
+                "bias": "BEARISH",
+                "confidence": "MEDIUM",
+                "close": 98,
+                "vwap": 100,
+                "vwap_bias": "BEARISH",
+                "candle_time": "2026-08-11T10:00:00+05:30",
+            },
+            "fifteen_min": {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "close": 100,
+                "candle_time": "2026-08-11T09:45:00+05:30",
+            },
+        }
+        env = {
+            "VAMSI_THESIS_REVERSAL_EXIT_ENABLED": "true",
+            "VAMSI_THESIS_REVERSAL_MIN_COMPONENTS": "3",
+            "VAMSI_THESIS_REVERSAL_CONFIRMATION_SCANS": "2",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(trade_bot, "minutes_since_created", return_value=10),
+            patch.object(trade_bot, "get_technical_analysis", return_value=technicals),
+            patch.object(
+                trade_bot,
+                "option_chain_reversal_snapshot",
+                return_value={
+                    "direction": "BEARISH",
+                    "confidence": "HIGH",
+                    "score": -4,
+                    "reasons": [],
+                },
+            ),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                return_value={"bias": "BEARISH", "confidence": "HIGH"},
+            ),
+            patch.object(trade_bot, "write_state"),
+            patch.object(trade_bot, "log"),
+        ):
+            state, first_exit, _ = trade_bot.evaluate_five_minute_thesis_reversal(
+                "NIFTY",
+                state,
+                95,
+                datetime.fromisoformat("2026-08-11T10:05:06+05:30"),
+            )
+            state, second_exit, _ = trade_bot.evaluate_five_minute_thesis_reversal(
+                "NIFTY",
+                state,
+                95,
+                datetime.fromisoformat("2026-08-11T10:10:06+05:30"),
+            )
+
+        self.assertFalse(first_exit)
+        self.assertTrue(second_exit)
+        self.assertEqual(state["thesis_reversal_confirmation_count"], 2)
+
+    def test_composite_reversal_replaces_option_chain_only_sentiment_exit(self):
+        state = {"instrument_class": "INDEX_OPTION"}
+        with patch.dict(
+            os.environ,
+            {"VAMSI_THESIS_REVERSAL_EXIT_ENABLED": "true"},
+        ):
+            self.assertFalse(trade_bot.sentiment_exit_enabled_for_state(state))
+
 
 if __name__ == "__main__":
     unittest.main()

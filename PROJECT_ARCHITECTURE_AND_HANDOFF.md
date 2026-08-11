@@ -244,6 +244,16 @@ PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT=35
 
 The trigger/lock values must satisfy the validation ordering enforced by the code. Invalid sequences intentionally stop the monitor rather than run with incoherent protection.
 
+Vamsi index-option positions also use an active five-minute thesis-reversal exit. After a five-minute grace period, each completed five-minute boundary combines four deterministic components: high-confidence opposite option-chain direction; simultaneous adverse underlying and bought-option VWAP behavior; opposite completed 5M structure; and opposite completed 15M structure. Three of four components must persist for two consecutive scans. A completed 15M close beyond the saved structural invalidation together with adverse underlying VWAP exits immediately. Entry score is deliberately excluded from this exit decision. While this mode is enabled it replaces the legacy tick-level structural exit and the option-chain-only sentiment exit; the 20-minute no-progress time stop and broker-protected premium stop remain active.
+
+```dotenv
+VAMSI_THESIS_REVERSAL_EXIT_ENABLED=true
+VAMSI_THESIS_REVERSAL_GRACE_MINUTES=5
+VAMSI_THESIS_REVERSAL_MIN_COMPONENTS=3
+VAMSI_THESIS_REVERSAL_CONFIRMATION_SCANS=2
+VAMSI_THESIS_REVERSAL_SKIP_AFTER_TARGET_PROGRESS_PERCENT=70
+```
+
 ### 7.5 Capital and mobile profile
 
 `OPTION_CAPITAL_PER_ENTRY` supports:

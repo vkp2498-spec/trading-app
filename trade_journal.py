@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 
 from strategy_core import now_ist
@@ -102,6 +103,16 @@ def record_closed_trade(state, exit_price, exit_reason):
         "max_adverse_pnl": round(-adverse * qty, 2),
         "profit_protection_activated_at": state.get(
             "profit_protection_activated_at", ""
+        ),
+        "thesis_reversal_confirmation_count": state.get(
+            "thesis_reversal_confirmation_count", 0
+        ),
+        "thesis_reversal_components": json.dumps(
+            (state.get("thesis_reversal_last_evidence") or {}).get("components", {}),
+            sort_keys=True,
+        ),
+        "thesis_reversal_exit_detail": state.get(
+            "thesis_reversal_exit_detail", ""
         ),
         "protective_stop_order_id": state.get("protective_stop_order_id", ""),
         "broker_day_pnl_at_exit": state.get("broker_day_pnl_at_exit", ""),
