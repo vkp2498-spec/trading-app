@@ -4328,6 +4328,7 @@ def _handle_existing_state_locked(symbol, state, verbose=True):
                 underlying_symbol,
                 state,
                 ltp,
+                state_slot=symbol,
             )
         target_hit = ltp is not None and (ltp <= booking_price if is_short else ltp >= booking_price)
         stop_hit = ltp is not None and (ltp >= stop_loss_price if is_short else ltp <= stop_loss_price)
@@ -4880,12 +4881,19 @@ def _consecutive_five_minute_slots(previous, current):
         return False
 
 
-def evaluate_five_minute_thesis_reversal(symbol, state, ltp, current=None):
+def evaluate_five_minute_thesis_reversal(
+    symbol,
+    state,
+    ltp,
+    current=None,
+    state_slot=None,
+):
     """Actively evaluate one completed five-minute reversal scan.
 
     A hard 15M structural/VWAP failure exits immediately. Otherwise at least
     three of four adverse components must persist for two consecutive scans.
     """
+    state_slot = state_slot or symbol
     if not thesis_reversal_exit_enabled_for_state(state) or ltp is None:
         return state, False, ""
     grace_minutes = configured_non_negative_float(
@@ -4930,7 +4938,7 @@ def evaluate_five_minute_thesis_reversal(symbol, state, ltp, current=None):
         except Exception as error:
             state["thesis_reversal_confirmation_count"] = 0
             state["thesis_reversal_last_error"] = f"technical analysis unavailable: {error}"
-            write_state(symbol, state)
+            write_state(state_slot, state)
             log(f"{symbol} 5M thesis reversal scan skipped: {state['thesis_reversal_last_error']}")
             return state, False, ""
 
@@ -4996,7 +5004,7 @@ def evaluate_five_minute_thesis_reversal(symbol, state, ltp, current=None):
     )
     if should_exit:
         state["thesis_reversal_exit_detail"] = detail
-    write_state(symbol, state)
+    write_state(state_slot, state)
     log(f"{symbol} 5M thesis reversal scan: {detail}")
     return state, should_exit, detail
 

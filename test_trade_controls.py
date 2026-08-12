@@ -3237,6 +3237,69 @@ class TradeControlTests(unittest.TestCase):
         self.assertTrue(second_exit)
         self.assertEqual(state["thesis_reversal_confirmation_count"], 2)
 
+    def test_paper_reversal_scan_updates_its_own_state_slot(self):
+        state = {
+            "instrument_class": "INDEX_OPTION",
+            "instrument_key": "NSE_FO|PAPER",
+            "trading_symbol": "NIFTY26AUG25000CE",
+            "direction": "BULLISH",
+            "entry_price": 100,
+            "planned_target_price": 115,
+            "underlying_structural_stop": 90,
+            "paper_trade": True,
+        }
+        technicals = {
+            "five_min": {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "close": 100,
+                "vwap": 100,
+                "vwap_bias": "NEUTRAL",
+                "candle_time": "2026-08-12T11:15:00+05:30",
+            },
+            "fifteen_min": {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "close": 100,
+                "candle_time": "2026-08-12T11:15:00+05:30",
+            },
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {"VAMSI_THESIS_REVERSAL_EXIT_ENABLED": "true"},
+            ),
+            patch.object(trade_bot, "minutes_since_created", return_value=10),
+            patch.object(trade_bot, "get_technical_analysis", return_value=technicals),
+            patch.object(
+                trade_bot,
+                "option_chain_reversal_snapshot",
+                return_value={
+                    "direction": "NEUTRAL",
+                    "confidence": "LOW",
+                    "score": 0,
+                    "reasons": [],
+                },
+            ),
+            patch.object(
+                trade_bot,
+                "get_option_volume_vwap_analysis",
+                return_value={"bias": "NEUTRAL", "confidence": "LOW"},
+            ),
+            patch.object(trade_bot, "write_state") as write_state,
+            patch.object(trade_bot, "log"),
+        ):
+            trade_bot.evaluate_five_minute_thesis_reversal(
+                "NIFTY",
+                state,
+                100,
+                datetime.fromisoformat("2026-08-12T11:20:06+05:30"),
+                state_slot="PAPER_NIFTY_01",
+            )
+
+        write_state.assert_called_once()
+        self.assertEqual(write_state.call_args.args[0], "PAPER_NIFTY_01")
+
     def test_composite_reversal_replaces_option_chain_only_sentiment_exit(self):
         state = {"instrument_class": "INDEX_OPTION"}
         with patch.dict(
