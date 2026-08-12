@@ -1831,6 +1831,104 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(selected["state_slot"], "PAPER_NIFTY_01")
         self.assertEqual(candidate.get("paper_trade"), None)
 
+    def test_live_qualified_candidate_becomes_managed_paper_when_live_is_disabled(self):
+        candidate = {
+            "symbol": "NIFTY",
+            "transaction_type": "BUY",
+            "weighted": {"score": 84},
+            "allowed": True,
+            "paper_observation_eligible": True,
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ENABLE_LIVE_TRADING": "false",
+                    "PAPER_OBSERVATION_MODE_ENABLED": "true",
+                    "TRADE_BANK_NIFTY": "false",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "market_window_ok", return_value=True),
+            patch.object(trade_bot, "paper_observation_entry_window_ok", return_value=True),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(trade_bot, "daily_index_entry_block_reason", return_value=""),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=candidate,
+            ),
+            patch.object(
+                trade_bot,
+                "available_paper_observation_slot",
+                return_value="PAPER_NIFTY_01",
+            ),
+            patch.object(trade_bot, "execute_selected_candidate") as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        selected = execute.call_args.args[0]
+        self.assertTrue(selected["paper_trade"])
+        self.assertTrue(selected["paper_observation"])
+        self.assertEqual(selected["state_slot"], "PAPER_NIFTY_01")
+        self.assertEqual(selected["live_entry_block_reason"], "live trading is disabled")
+
+    def test_paper_window_can_run_outside_live_entry_window(self):
+        candidate = {
+            "symbol": "NIFTY",
+            "transaction_type": "BUY",
+            "weighted": {"score": 55},
+            "allowed": True,
+            "paper_observation_eligible": True,
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ENABLE_LIVE_TRADING": "true",
+                    "PAPER_OBSERVATION_MODE_ENABLED": "true",
+                    "TRADE_BANK_NIFTY": "false",
+                },
+                clear=False,
+            ),
+            patch.object(trade_bot, "market_window_ok", return_value=False),
+            patch.object(trade_bot, "paper_observation_entry_window_ok", return_value=True),
+            patch.object(trade_bot, "read_state", return_value={}),
+            patch.object(
+                trade_bot,
+                "portfolio_day_circuit",
+                return_value={"allowed": True, "score_penalty": 0},
+            ),
+            patch.object(trade_bot, "get_open_positions", return_value=[]),
+            patch.object(trade_bot, "daily_index_entry_block_reason", return_value=""),
+            patch.object(
+                trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=candidate,
+            ),
+            patch.object(
+                trade_bot,
+                "available_paper_observation_slot",
+                return_value="PAPER_NIFTY_02",
+            ),
+            patch.object(trade_bot, "execute_selected_candidate") as execute,
+        ):
+            trade_bot.run_signal_check()
+
+        selected = execute.call_args.args[0]
+        self.assertTrue(selected["paper_trade"])
+        self.assertEqual(selected["state_slot"], "PAPER_NIFTY_02")
+        self.assertEqual(
+            selected["live_entry_block_reason"],
+            "outside the live-entry window",
+        )
+
     def test_paper_observation_slots_are_capped_and_reused_independently(self):
         def state_for(slot):
             if slot == "PAPER_NIFTY_01":

@@ -7372,13 +7372,16 @@ def _legacy_run_stock_futures_fallback():
 
 
 def run_signal_check():
-    if not market_window_ok():
+    live_entry_window = market_window_ok()
+    paper_observation_window = bool(
+        paper_observation_mode_enabled() and paper_observation_entry_window_ok()
+    )
+    if not live_entry_window and not paper_observation_window:
         log("Outside trading window. No action.")
         return
 
-    paper_observation_mode = bool(
-        paper_observation_mode_enabled() and paper_observation_entry_window_ok()
-    )
+    paper_observation_mode = paper_observation_window
+    live_trading_enabled = configured_bool("ENABLE_LIVE_TRADING", False)
     live_global_block_reason = ""
 
     for state_slot in BOT_STATE_SLOTS:
@@ -7530,6 +7533,8 @@ def run_signal_check():
                 live_allowed = bool(
                     candidate
                     and candidate.get("allowed")
+                    and live_trading_enabled
+                    and live_entry_window
                     and symbol not in active_selective_index
                     and not daily_block
                     and not live_global_block_reason
@@ -7537,7 +7542,13 @@ def run_signal_check():
                 if live_allowed:
                     candidate["paper_trade"] = False
                     qualified.append(candidate)
-                elif candidate and candidate.get("paper_observation_eligible"):
+                elif candidate and (
+                    candidate.get("paper_observation_eligible")
+                    or (
+                        candidate.get("allowed")
+                        and (not live_trading_enabled or not live_entry_window)
+                    )
+                ):
                     state_slot = available_paper_observation_slot(symbol)
                     if state_slot:
                         paper_candidate = deepcopy(candidate)
@@ -7549,6 +7560,13 @@ def run_signal_check():
                                 "live_entry_block_reason": (
                                     live_global_block_reason
                                     or daily_block
+                                    or (
+                                        "live trading is disabled"
+                                        if not live_trading_enabled
+                                        else "outside the live-entry window"
+                                        if not live_entry_window
+                                        else ""
+                                    )
                                     or (
                                         f"{symbol} live position already active"
                                         if symbol in active_selective_index
