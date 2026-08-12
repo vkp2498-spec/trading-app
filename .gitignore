@@ -1,4 +1,5 @@
 .env
+.core_env_overrides
 trade_state.json
 logs/
 venv/

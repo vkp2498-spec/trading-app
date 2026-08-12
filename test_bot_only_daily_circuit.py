@@ -10,6 +10,15 @@ import trade_bot
 
 
 class BotOnlyDailyCircuitTests(unittest.TestCase):
+    def test_daily_pnl_guard_switch_overrides_saved_mobile_limits(self):
+        with patch.dict(
+            os.environ,
+            {"DAILY_PNL_GUARDS_ENABLED": "false"},
+            clear=False,
+        ), patch.object(trade_bot, "active_value", return_value=5000.0):
+            self.assertEqual(trade_bot.daily_profit_target(), 0.0)
+            self.assertEqual(trade_bot.daily_max_loss(), 0.0)
+
     def test_bot_unrealized_pnl_excludes_open_manual_position(self):
         states = {
             "NIFTY": {

@@ -2161,7 +2161,14 @@ def pre_order_portfolio_decision(chosen, quantity, entry_price, stop_loss_price)
     }
 
 
+def daily_pnl_guards_enabled():
+    """Allow an account to ignore saved daily P&L limits without weakening exits."""
+    return configured_bool("DAILY_PNL_GUARDS_ENABLED", True)
+
+
 def daily_profit_target():
+    if not daily_pnl_guards_enabled():
+        return 0.0
     fallback = to_float(os.getenv("DAILY_PROFIT_TARGET"), 10000)
     return to_float(active_value("dailyProfitTarget", fallback), fallback)
 
@@ -2180,6 +2187,8 @@ def daily_profit_target_reached():
 
 
 def daily_max_loss():
+    if not daily_pnl_guards_enabled():
+        return 0.0
     fallback = to_float(os.getenv("DAILY_MAX_LOSS"), 10000)
     return to_float(active_value("dailyMaxLoss", fallback), fallback)
 

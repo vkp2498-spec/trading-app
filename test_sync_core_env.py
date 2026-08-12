@@ -2,7 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.sync_core_env import BLOCK_END, BLOCK_START, CORE_VALUES, normalized_lines
+from scripts.sync_core_env import (
+    BLOCK_END,
+    BLOCK_START,
+    CORE_VALUES,
+    normalized_lines,
+    parse_instance_overrides,
+)
 
 
 class SyncCoreEnvTests(unittest.TestCase):
@@ -42,6 +48,22 @@ class SyncCoreEnvTests(unittest.TestCase):
         lines = second.splitlines()
         for key in CORE_VALUES:
             self.assertEqual(sum(line.startswith(f"{key}=") for line in lines), 1)
+
+    def test_instance_overrides_replace_selected_core_values(self):
+        overrides = parse_instance_overrides(
+            "VAMSI_UNIFIED_SCORE_RANGES=80-100\n"
+            "MAX_INDEX_TRADES_PER_DAY=0\n"
+            "DAILY_PNL_GUARDS_ENABLED=false\n"
+        )
+        updated = "\n".join(normalized_lines("", overrides=overrides))
+
+        self.assertIn("VAMSI_UNIFIED_SCORE_RANGES=80-100", updated)
+        self.assertIn("MAX_INDEX_TRADES_PER_DAY=0", updated)
+        self.assertIn("DAILY_PNL_GUARDS_ENABLED=false", updated)
+
+    def test_instance_overrides_reject_unknown_or_sensitive_keys(self):
+        with self.assertRaises(ValueError):
+            parse_instance_overrides("UPSTOX_ACCESS_TOKEN=do-not-store-here")
 
 
 if __name__ == "__main__":

@@ -268,6 +268,8 @@ VAMSI_THESIS_REVERSAL_SKIP_AFTER_TARGET_PROGRESS_PERCENT=70
 
 The mobile app can select a profile during its configured morning window. `1 Lot` is the automatic default, while `MAX` resolves against broker-available capital for the selected NIFTY entry when account capital/lot caps are zero. The same request independently selects the daily profit target and daily maximum loss from Rs 5,000 through Rs 30,000 in Rs 5,000 steps. Capital controls quantity; these daily limits control when later live entries stop. They do not resize the selected allocation.
 
+`DAILY_PNL_GUARDS_ENABLED=false` is an account-specific override that makes both saved mobile daily P&L limits non-executable while retaining every per-position target, protective stop, trailing rule, thesis-reversal exit, market-hours control, and broker safeguard. The default is `true`. Non-secret per-instance core differences belong in `.core_env_overrides`; `scripts/sync_core_env.py` reapplies that ignored sidecar after canonical defaults so later deployments do not erase intentional account differences.
+
 Dynamic risk values scale from the active capital profile, but absolute caps always win. Capital allocation and risk are different:
 
 ```text

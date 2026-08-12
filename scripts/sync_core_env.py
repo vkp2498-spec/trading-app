@@ -118,6 +118,8 @@ CORE_VALUES = {
     "VAMSI_ADAPTIVE_LIVE_STOP_GRID": "10,15,20,25,30,35,40,45",
 }
 
+INSTANCE_OVERRIDE_KEYS = set(CORE_VALUES) | {"DAILY_PNL_GUARDS_ENABLED"}
+
 DEPRECATED_KEYS = {
     "VAMSI_MIN_WEIGHTED_SCORE",
     "VAMSI_ENTRY_MIN_SCORE",
@@ -161,7 +163,24 @@ def active_state_files(app_dir):
     return active
 
 
-def normalized_lines(existing):
+def parse_instance_overrides(text):
+    overrides = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key = env_key(stripped)
+        if not key or "=" not in stripped:
+            raise ValueError(f"Invalid instance override line: {line!r}")
+        if key not in INSTANCE_OVERRIDE_KEYS:
+            raise ValueError(f"Unsupported instance core override: {key}")
+        overrides[key] = stripped.split("=", 1)[1].strip()
+    return overrides
+
+
+def normalized_lines(existing, overrides=None):
+    values = dict(CORE_VALUES)
+    values.update(overrides or {})
     result = []
     inside_old_block = False
     source_lines = existing.splitlines()
@@ -176,7 +195,7 @@ def normalized_lines(existing):
         if inside_old_block:
             continue
         key = env_key(line)
-        if key in CORE_VALUES or (key and is_deprecated(key)):
+        if key in values or (key and is_deprecated(key)):
             continue
         result.append(line.rstrip())
     while result and not result[-1]:
@@ -187,7 +206,7 @@ def normalized_lines(existing):
             BLOCK_START,
             "# Account-specific API keys, access tokens, and notification secrets above are preserved.",
             "# One real NIFTY trade; later qualified trades are paper observations.",
-            *[f"{key}={value}" for key, value in CORE_VALUES.items()],
+            *[f"{key}={value}" for key, value in values.items()],
             BLOCK_END,
             "",
         ]
@@ -215,11 +234,22 @@ def main():
         description="Make the core NIFTY strategy env values canonical and deduplicated"
     )
     parser.add_argument("--env-file", default=".env")
+    parser.add_argument(
+        "--overrides-file",
+        default=".core_env_overrides",
+        help="Optional non-secret per-instance overrides, resolved beside the env file.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--refuse-active-state", action="store_true")
     args = parser.parse_args()
 
     env_path = Path(args.env_file).expanduser().resolve()
+    overrides_path = Path(args.overrides_file).expanduser()
+    if not overrides_path.is_absolute():
+        overrides_path = env_path.parent / overrides_path
+    overrides = parse_instance_overrides(
+        overrides_path.read_text() if overrides_path.exists() else ""
+    )
     active = active_state_files(env_path.parent)
     if args.refuse_active_state and active:
         raise SystemExit(
@@ -228,10 +258,11 @@ def main():
         )
 
     existing = env_path.read_text() if env_path.exists() else ""
-    updated = "\n".join(normalized_lines(existing))
+    updated = "\n".join(normalized_lines(existing, overrides=overrides))
     if args.dry_run:
         print(
             f"Preflight OK: {len(CORE_VALUES)} canonical core values; "
+            f"{len(overrides)} instance overrides; "
             "account secrets remain untouched"
         )
         return
