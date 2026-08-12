@@ -1386,13 +1386,13 @@ class TradeControlTests(unittest.TestCase):
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "opening"
-            and cell["scoreBand"] == "60-64"
+            and cell["scoreBand"] == "60-69"
         )
         unknown_time = next(
             cell
             for cell in analytics["matrix"]
             if cell["timeBucket"] == "unknown"
-            and cell["scoreBand"] == "80-84"
+            and cell["scoreBand"] == "80-89"
         )
         unscored = next(
             cell
@@ -1406,8 +1406,8 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(
             analytics["scoreBands"],
             [
-                "00-49", "50-59", "60-64", "65-69", "70-74",
-                "75-79", "80-84", "85-89", "90-100", "Unscored",
+                "0-9", "10-19", "20-29", "30-39", "40-49",
+                "50-59", "60-69", "70-79", "80-89", "90-100", "Unscored",
             ],
         )
         self.assertEqual(analytics["scoreVersion"], "VAMSI_UNIFIED_ENTRY_V1")
@@ -1416,17 +1416,19 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(unknown_time["trades"], 1)
         self.assertEqual(unscored["trades"], 1)
         self.assertEqual(analytics["bestZone"]["timeBucket"], "opening")
-        self.assertEqual(analytics["bestZone"]["scoreBand"], "60-64")
+        self.assertEqual(analytics["bestZone"]["scoreBand"], "60-69")
 
     def test_edge_score_bands_cover_the_zero_to_one_hundred_scale(self):
         cases = {
-            0: "00-49",
-            49.9: "00-49",
+            0: "0-9",
+            9.9: "0-9",
+            10: "10-19",
+            49.9: "40-49",
             50: "50-59",
-            60: "60-64",
-            65: "65-69",
-            70: "70-74",
-            80: "80-84",
+            60: "60-69",
+            65: "60-69",
+            70: "70-79",
+            80: "80-89",
             90: "90-100",
             100: "90-100",
             -1: "Unscored",
@@ -1443,7 +1445,7 @@ class TradeControlTests(unittest.TestCase):
                 )
         self.assertEqual(
             dashboard_data.edge_score_band(75, "LEGACY_WEIGHTED_SCORE"),
-            "75-79",
+            "70-79",
         )
         self.assertEqual(
             dashboard_data.edge_score_band(55, ""),

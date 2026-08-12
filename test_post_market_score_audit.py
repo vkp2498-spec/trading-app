@@ -19,19 +19,19 @@ from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
 class PostMarketScoreAuditTests(unittest.TestCase):
-    def test_score_buckets_use_five_point_resolution_below_fifty(self):
-        self.assertEqual(score_bucket(0), "00-04")
-        self.assertEqual(score_bucket(4.9), "00-04")
-        self.assertEqual(score_bucket(5), "05-09")
-        self.assertEqual(score_bucket(19.9), "15-19")
-        self.assertEqual(score_bucket(20), "20-24")
-        self.assertEqual(score_bucket(24.9), "20-24")
-        self.assertEqual(score_bucket(25), "25-29")
-        self.assertEqual(score_bucket(49.9), "45-49")
+    def test_score_buckets_use_ten_point_dashboard_ranges(self):
+        self.assertEqual(score_bucket(0), "0-9")
+        self.assertEqual(score_bucket(9.9), "0-9")
+        self.assertEqual(score_bucket(10), "10-19")
+        self.assertEqual(score_bucket(19.9), "10-19")
+        self.assertEqual(score_bucket(20), "20-29")
+        self.assertEqual(score_bucket(29.9), "20-29")
+        self.assertEqual(score_bucket(30), "30-39")
+        self.assertEqual(score_bucket(49.9), "40-49")
         self.assertEqual(score_bucket(50), "50-59")
-        self.assertEqual(score_bucket(65), "65-69")
-        self.assertEqual(score_bucket(74.9), "70-74")
-        self.assertEqual(score_bucket(75), "75-79")
+        self.assertEqual(score_bucket(65), "60-69")
+        self.assertEqual(score_bucket(79.9), "70-79")
+        self.assertEqual(score_bucket(80), "80-89")
         self.assertEqual(score_bucket(92.5), "90-100")
 
     def test_read_audit_rebuckets_existing_rows(self):
@@ -49,7 +49,7 @@ class PostMarketScoreAuditTests(unittest.TestCase):
 
             audit = read_audit(audit_file)
 
-        self.assertEqual(audit.iloc[0]["score_bucket"], "20-24")
+        self.assertEqual(audit.iloc[0]["score_bucket"], "20-29")
 
     def test_log_parser_keeps_final_score_direction_and_reason(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -170,7 +170,7 @@ class PostMarketScoreAuditTests(unittest.TestCase):
             [
                 {
                     "observation_id": "1",
-                    "score_bucket": "75-79",
+                    "score_bucket": "70-79",
                     "symbol": "NIFTY",
                     "up_points": 12,
                     "down_points": 5,

@@ -45,6 +45,7 @@ from dashboard_data import entry_minutes
 from dashboard_data import normalized_underlying
 from dashboard_data import option_type
 from dashboard_data import read_trade_history
+from dashboard_score_buckets import DASHBOARD_SCORE_BUCKETS, dashboard_score_bucket
 from trade_forensics import (
     analyze_executed_trades as run_executed_trade_forensics,
     analyze_rejected_signals as run_rejected_signal_forensics,
@@ -1057,7 +1058,7 @@ def render_score_followthrough_review():
     st.markdown("#### NIFTY by Score Bucket")
     st.dataframe(wide, use_container_width=True, hide_index=True)
     st.caption(
-        "Scores from 0 through 49 use five-point buckets for additional resolution. "
+        "Scores use consistent ten-point dashboard buckets from 0 through 100. "
         f"BUILDING means fewer than {int(minimum_samples)} observations. Do not change live "
         "thresholds from a BUILDING row."
     )
@@ -1145,9 +1146,9 @@ def daily_pnl_matrix_style(value, trades):
 
 
 def render_daily_trade_pnl_matrix(performance_payload):
-    st.markdown('<div class="dash-title">Time × Score Net P&L</div>', unsafe_allow_html=True)
+    st.markdown('<div class="dash-title">Today: Time × Score Net P&L</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="dash-subtitle">Executed trades grouped by entry time and entry score for one trading day</div>',
+        '<div class="dash-subtitle">Today’s executed trades grouped by entry time and entry score</div>',
         unsafe_allow_html=True,
     )
 
@@ -1157,26 +1158,11 @@ def render_daily_trade_pnl_matrix(performance_payload):
         if normalized_underlying(trade) == "NIFTY"
     ]
     today_text = now_ist().date().isoformat()
-    available_dates = sorted(
-        {
-            str(trade.get("tradeDate") or "").strip()
-            for trade in trades
-            if str(trade.get("tradeDate") or "").strip()
-        }
-        | {today_text},
-        reverse=True,
-    )
-    selected_date = st.selectbox(
-        "Trading day",
-        available_dates,
-        index=available_dates.index(today_text),
-        key="daily_trade_pnl_matrix_date",
-    )
-    daily_trades = [trade for trade in trades if trade.get("tradeDate") == selected_date]
+    daily_trades = [trade for trade in trades if trade.get("tradeDate") == today_text]
 
     edge = performance_payload.get("edgeAnalytics") or {}
     score_bands = edge.get("scoreBands") or [
-        "50-59", "60-69", "70-79", "80-89", "90-100"
+        *DASHBOARD_SCORE_BUCKETS
     ]
     time_buckets = edge.get("timeBuckets") or [
         {"id": "opening", "label": "09:15–10:00"},
@@ -2210,11 +2196,12 @@ def render_banknifty_post_market():
         valid = observations.copy()
         if not valid.empty:
             valid = valid[valid.get("analysis_error", "").fillna("").eq("")]
-            valid["score_band"] = pd.cut(
-                pd.to_numeric(valid["technical_score"], errors="coerce"),
-                bins=[0, 49.999, 59.999, 69.999, 79.999, 89.999, 100],
-                labels=["<50", "50-59", "60-69", "70-79", "80-89", "90-100"],
-                include_lowest=True,
+            valid["score_band"] = pd.Categorical(
+                pd.to_numeric(valid["technical_score"], errors="coerce").map(
+                    dashboard_score_bucket
+                ),
+                categories=DASHBOARD_SCORE_BUCKETS,
+                ordered=True,
             )
         if valid.empty:
             st.info("No reconstructed technical observations were available.")

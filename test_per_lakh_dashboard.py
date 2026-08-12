@@ -90,7 +90,7 @@ class PerLakhDashboardTests(unittest.TestCase):
             analytics,
         )
 
-    def test_edge_heatmap_removes_low_unscored_and_unknown_time_entries(self):
+    def test_edge_heatmap_includes_low_scores_and_removes_unscored_unknown_time(self):
         valid = trade(pnl=1_000.0, quantity=100, entry_price=100.0)
         below_fifty = trade(pnl=20_000.0, quantity=100, entry_price=100.0)
         unscored = trade(pnl=30_000.0, quantity=100, entry_price=100.0)
@@ -110,15 +110,14 @@ class PerLakhDashboardTests(unittest.TestCase):
             [valid, below_fifty, unscored, unknown_time]
         )
 
-        self.assertEqual(analytics["totalTrades"], 1)
-        self.assertEqual(analytics["excludedHiddenCategoryTrades"], 3)
-        self.assertNotIn("<50", analytics["scoreBands"])
-        self.assertNotIn("00-49", analytics["scoreBands"])
+        self.assertEqual(analytics["totalTrades"], 2)
+        self.assertEqual(analytics["excludedHiddenCategoryTrades"], 2)
+        self.assertIn("40-49", analytics["scoreBands"])
         self.assertNotIn("Unscored", analytics["scoreBands"])
         self.assertNotIn("unknown", {item["id"] for item in analytics["timeBuckets"]})
         self.assertTrue(
             all(
-                cell["scoreBand"] not in {"<50", "00-49", "Unscored"}
+                cell["scoreBand"] != "Unscored"
                 and cell["timeBucket"] != "unknown"
                 for cell in analytics["matrix"]
             )

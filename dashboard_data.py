@@ -15,6 +15,7 @@ import requests
 
 from adaptive_exit_shadow import SHADOW_CONFIG_FILE
 from adaptive_live_policy import LIVE_POLICY_FILE
+from dashboard_score_buckets import DASHBOARD_SCORE_BANDS
 from unified_entry_score import UNIFIED_SCORE_VERSION
 
 
@@ -31,17 +32,7 @@ STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
 STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE", "GANESH_GAP_NIFTY", "GANESH_GAP_BANKNIFTY"]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
-EDGE_SCORE_BANDS = (
-    ("00-49", 0.0, 50.0),
-    ("50-59", 50.0, 60.0),
-    ("60-64", 60.0, 65.0),
-    ("65-69", 65.0, 70.0),
-    ("70-74", 70.0, 75.0),
-    ("75-79", 75.0, 80.0),
-    ("80-84", 80.0, 85.0),
-    ("85-89", 85.0, 90.0),
-    ("90-100", 90.0, 101.0),
-)
+EDGE_SCORE_BANDS = DASHBOARD_SCORE_BANDS
 EDGE_UNSCORED_BAND = "Unscored"
 EDGE_TIME_BUCKETS = (
     ("opening", "09:15–10:00", 9 * 60 + 15, 10 * 60),
@@ -1326,17 +1317,13 @@ def normalized_edge_analytics_per_lakh(trades: list[dict]) -> dict:
             continue
         score = safe_float(trade.get("score"), None)
         time_bucket = edge_time_bucket(entry_minutes(trade))
-        if (
-            score is None
-            or score < 50
-            or time_bucket == "unknown"
-        ):
+        if score is None or time_bucket == "unknown":
             excluded_hidden += 1
             continue
         scalable.append(normalize_trade_per_lakh(trade))
 
     analytics = edge_analytics(scalable)
-    hidden_score_bands = {"<50", "00-49", EDGE_UNSCORED_BAND}
+    hidden_score_bands = {EDGE_UNSCORED_BAND}
     analytics["scoreBands"] = [
         band
         for band in analytics.get("scoreBands", [])

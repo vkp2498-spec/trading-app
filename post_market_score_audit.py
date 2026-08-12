@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
+from dashboard_score_buckets import DASHBOARD_SCORE_BUCKETS, dashboard_score_bucket
 from market_technicals import INDEX_KEYS, _parse_candles, fetch_v3_intraday_minutes, upstox_headers
 from strategy_core import now_ist
 
@@ -21,26 +22,7 @@ AUDIT_FILE = DATA_DIR / "score_followthrough_audit.csv"
 STATUS_FILE = DATA_DIR / "score_followthrough_status.json"
 IST = ZoneInfo("Asia/Kolkata")
 SYMBOLS = ("NIFTY", "BANKNIFTY")
-SCORE_BUCKETS = (
-    "00-04",
-    "05-09",
-    "10-14",
-    "15-19",
-    "20-24",
-    "25-29",
-    "30-34",
-    "35-39",
-    "40-44",
-    "45-49",
-    "50-59",
-    "60-64",
-    "65-69",
-    "70-74",
-    "75-79",
-    "80-84",
-    "85-89",
-    "90-100",
-)
+SCORE_BUCKETS = DASHBOARD_SCORE_BUCKETS
 
 LOG_PREFIX = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (?P<message>.*)$"
@@ -103,42 +85,7 @@ AUDIT_COLUMNS = [
 
 
 def score_bucket(score):
-    value = float(score)
-    if value < 5:
-        return "00-04"
-    if value < 10:
-        return "05-09"
-    if value < 15:
-        return "10-14"
-    if value < 20:
-        return "15-19"
-    if value < 25:
-        return "20-24"
-    if value < 30:
-        return "25-29"
-    if value < 35:
-        return "30-34"
-    if value < 40:
-        return "35-39"
-    if value < 45:
-        return "40-44"
-    if value < 50:
-        return "45-49"
-    if value < 60:
-        return "50-59"
-    if value < 65:
-        return "60-64"
-    if value < 70:
-        return "65-69"
-    if value < 75:
-        return "70-74"
-    if value < 80:
-        return "75-79"
-    if value < 85:
-        return "80-84"
-    if value < 90:
-        return "85-89"
-    return "90-100"
+    return dashboard_score_bucket(score)
 
 
 def normalize_score_buckets(frame):
