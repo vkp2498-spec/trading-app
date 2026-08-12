@@ -58,12 +58,17 @@ class SyncCoreEnvTests(unittest.TestCase):
             "VAMSI_UNIFIED_SCORE_RANGES=80-100\n"
             "MAX_INDEX_TRADES_PER_DAY=0\n"
             "DAILY_PNL_GUARDS_ENABLED=false\n"
+            "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true\n"
         )
         updated = "\n".join(normalized_lines("", overrides=overrides))
 
         self.assertIn("VAMSI_UNIFIED_SCORE_RANGES=80-100", updated)
         self.assertIn("MAX_INDEX_TRADES_PER_DAY=0", updated)
         self.assertIn("DAILY_PNL_GUARDS_ENABLED=false", updated)
+        self.assertIn(
+            "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true",
+            updated,
+        )
 
     def test_instance_overrides_reject_unknown_or_sensitive_keys(self):
         with self.assertRaises(ValueError):
