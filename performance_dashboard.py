@@ -39,6 +39,7 @@ from post_market_score_audit import (
 from strategy_core import now_ist
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
+from dashboard_data import build_ml_shadow_status
 from dashboard_data import dashboard_index_trades
 from dashboard_data import edge_time_bucket
 from dashboard_data import entry_minutes
@@ -71,7 +72,12 @@ BACKTEST_STATUS_FILE = BACKTEST_DIR / "status.json"
 BACKTEST_LATEST_FILE = BACKTEST_DIR / "latest.json"
 
 SYMBOLS = ["NIFTY"]
-STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE", "GANESH_GAP_NIFTY", "GANESH_GAP_BANKNIFTY"]
+STATE_SLOTS = SYMBOLS + [
+    "STOCK_FUTURE",
+    "GANESH_GAP_NIFTY",
+    "GANESH_GAP_BANKNIFTY",
+    "ML_SHADOW_NIFTY",
+]
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
 st.set_page_config(
@@ -2571,6 +2577,40 @@ def render_analytics_tab(performance_payload):
         '<div class="dash-subtitle">The same calendar, weekday, cumulative P&L, and edge analytics shown in the iOS app</div>',
         unsafe_allow_html=True,
     )
+
+    ml_status = build_ml_shadow_status()
+    st.markdown("### ML Shadow Evidence")
+    st.caption(
+        "Paper-only 15-minute NIFTY forecasts. Forecast outcomes are measured in "
+        "underlying points; option P&L remains in the trade analytics below."
+    )
+    ml_columns = st.columns(4)
+    ml_columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
+    ml_columns[1].metric("Training days", int(ml_status.get("trainingDays") or 0))
+    ml_columns[2].metric("Resolved forecasts", int(ml_status.get("resolvedForecastCount") or 0))
+    average_points = ml_status.get("selectedForecastAveragePoints")
+    ml_columns[3].metric(
+        "Avg selected points",
+        "—" if average_points is None else f"{float(average_points):.2f}",
+    )
+    recent_forecasts = pd.DataFrame(ml_status.get("recentForecasts") or [])
+    if not recent_forecasts.empty:
+        visible = [
+            column
+            for column in (
+                "candle_time",
+                "call_probability",
+                "put_probability",
+                "direction",
+                "expected_target_points",
+                "expected_stop_points",
+                "action",
+                "selected_outcome",
+                "selected_realized_points",
+            )
+            if column in recent_forecasts.columns
+        ]
+        st.dataframe(recent_forecasts[visible], use_container_width=True, hide_index=True)
 
     st.markdown("### P&L Calendar")
     st.caption("Daily recorded bot results.")

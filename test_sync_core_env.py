@@ -31,15 +31,12 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertIn("UPSTOX_API_KEY=keep-me", updated)
         self.assertIn("UPSTOX_ACCESS_TOKEN=keep-token", updated)
         self.assertIn("GANESH_API_KEY=also-keep-me", updated)
-        self.assertEqual(updated.count("VAMSI_UNIFIED_SCORE_RANGES="), 1)
-        self.assertIn("VAMSI_UNIFIED_SCORE_RANGES=80-89", updated)
-        self.assertIn("MAX_INDEX_TRADES_PER_DAY=1", updated)
-        self.assertIn("MAX_SIMULTANEOUS_PAPER_OBSERVATIONS=10", updated)
-        self.assertIn("ACCOUNT_MAX_LOTS_PER_ENTRY=1", updated)
-        self.assertIn("PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT=40", updated)
-        self.assertIn("PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT=10", updated)
-        self.assertIn("PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT=60", updated)
-        self.assertIn("PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT=25", updated)
+        self.assertNotIn("VAMSI_UNIFIED_SCORE_RANGES", updated)
+        self.assertIn("TRADING_ENGINE=ML_SHADOW_V1", updated)
+        self.assertIn("ENABLE_LIVE_TRADING=false", updated)
+        self.assertIn("ML_SHADOW_PAPER_ENABLED=true", updated)
+        self.assertIn("ML_SHADOW_MIN_PROBABILITY=0.70", updated)
+        self.assertIn("ML_SHADOW_MIN_REWARD_RISK=0.80", updated)
         self.assertNotIn("T20_MODE_ENABLED", updated)
         self.assertNotIn("GANESH_MAX_TRADES", updated)
         self.assertEqual(updated.count(BLOCK_START), 1)
@@ -55,15 +52,15 @@ class SyncCoreEnvTests(unittest.TestCase):
 
     def test_instance_overrides_replace_selected_core_values(self):
         overrides = parse_instance_overrides(
-            "VAMSI_UNIFIED_SCORE_RANGES=80-100\n"
-            "MAX_INDEX_TRADES_PER_DAY=0\n"
+            "ML_SHADOW_MIN_PROBABILITY=0.75\n"
+            "ML_SHADOW_NIFTY_LOT_SIZE=50\n"
             "DAILY_PNL_GUARDS_ENABLED=false\n"
             "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true\n"
         )
         updated = "\n".join(normalized_lines("", overrides=overrides))
 
-        self.assertIn("VAMSI_UNIFIED_SCORE_RANGES=80-100", updated)
-        self.assertIn("MAX_INDEX_TRADES_PER_DAY=0", updated)
+        self.assertIn("ML_SHADOW_MIN_PROBABILITY=0.75", updated)
+        self.assertIn("ML_SHADOW_NIFTY_LOT_SIZE=50", updated)
         self.assertIn("DAILY_PNL_GUARDS_ENABLED=false", updated)
         self.assertIn(
             "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true",

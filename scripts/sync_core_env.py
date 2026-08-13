@@ -21,7 +21,7 @@ ACTIVE_STATUSES = {
     "SELL_PLACED_NOT_COMPLETE",
 }
 
-CORE_VALUES = {
+LEGACY_CORE_VALUES = {
     "TRADING_ENGINE": "VAMSI",
     "ENABLE_LIVE_TRADING": "true",
     "TRADE_BANK_NIFTY": "false",
@@ -118,6 +118,34 @@ CORE_VALUES = {
     "VAMSI_ADAPTIVE_LIVE_STOP_GRID": "10,15,20,25,30,35,40,45",
 }
 
+# ML_SHADOW_V1 is intentionally a small, paper-only contract. The old Vamsi
+# and Ganesh values are removed from the managed block so deployments cannot
+# accidentally reactivate either legacy decision engine.
+CORE_VALUES = {
+    "TRADING_ENGINE": "ML_SHADOW_V1",
+    "ENABLE_LIVE_TRADING": "false",
+    "TRADE_BANK_NIFTY": "false",
+    "PAPER_OBSERVATION_MODE_ENABLED": "false",
+    "ML_SHADOW_PAPER_ENABLED": "true",
+    "ML_SHADOW_TRAINING_DAYS": "180",
+    "ML_SHADOW_HISTORY_CALENDAR_DAYS": "300",
+    "ML_SHADOW_HORIZON_CANDLES": "4",
+    "ML_SHADOW_MIN_TRAINING_ROWS": "1500",
+    "ML_SHADOW_MAX_MODEL_AGE_DAYS": "4",
+    "ML_SHADOW_MIN_PROBABILITY": "0.70",
+    "ML_SHADOW_MIN_EXPECTED_POINTS": "10",
+    "ML_SHADOW_MIN_REWARD_RISK": "0.80",
+    "ML_SHADOW_MIN_DIRECTION_PROBABILITY_GAP": "0.05",
+    "ML_SHADOW_OPENING_OBSERVATION_CANDLES": "2",
+    "ML_SHADOW_FIRST_ENTRY_TIME": "09:45",
+    "ML_SHADOW_LAST_ENTRY_TIME": "14:16",
+    "ML_SHADOW_CANDLE_GRACE_SECONDS": "8",
+    "ML_SHADOW_MAX_OPTION_SPREAD_PERCENT": "5",
+    "ML_SHADOW_NIFTY_LOT_SIZE": "65",
+    "ML_SHADOW_QUOTE_MAX_AGE_SECONDS": "20",
+    "ML_SHADOW_MONITOR_INTERVAL_SECONDS": "2",
+}
+
 INSTANCE_OVERRIDE_KEYS = set(CORE_VALUES) | {
     "DAILY_PNL_GUARDS_ENABLED",
     "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS",
@@ -136,7 +164,7 @@ DEPRECATED_KEYS = {
     "BANKNIFTY_TARGET_POINTS",
     "BANKNIFTY_STOP_POINTS",
     "BANKNIFTY_EXTREME_TARGET_POINTS",
-}
+} | set(LEGACY_CORE_VALUES)
 
 
 def env_key(line):
@@ -151,7 +179,7 @@ def is_deprecated(key):
     sensitive_terms = ("API", "TOKEN", "SECRET", "PASSWORD", "CLIENT", "WEBHOOK")
     if any(term in key.upper() for term in sensitive_terms):
         return False
-    return key in DEPRECATED_KEYS or key.startswith(("T20_", "GANESH_"))
+    return key in DEPRECATED_KEYS or key.startswith(("T20_", "GANESH_", "VAMSI_"))
 
 
 def active_state_files(app_dir):
@@ -175,6 +203,8 @@ def parse_instance_overrides(text):
         key = env_key(stripped)
         if not key or "=" not in stripped:
             raise ValueError(f"Invalid instance override line: {line!r}")
+        if key in DEPRECATED_KEYS:
+            continue
         if key not in INSTANCE_OVERRIDE_KEYS:
             raise ValueError(f"Unsupported instance core override: {key}")
         overrides[key] = stripped.split("=", 1)[1].strip()
@@ -208,7 +238,7 @@ def normalized_lines(existing, overrides=None):
             "",
             BLOCK_START,
             "# Account-specific API keys, access tokens, and notification secrets above are preserved.",
-            "# One real NIFTY trade; later qualified trades are paper observations.",
+            "# ML_SHADOW_V1 is NIFTY-only and structurally incapable of broker orders.",
             *[f"{key}={value}" for key, value in values.items()],
             BLOCK_END,
             "",
@@ -244,6 +274,11 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--refuse-active-state", action="store_true")
+    parser.add_argument(
+        "--role",
+        choices=("ml-shadow", "disabled"),
+        help="Force the instance paper role after reading optional local overrides.",
+    )
     args = parser.parse_args()
 
     env_path = Path(args.env_file).expanduser().resolve()
@@ -253,6 +288,11 @@ def main():
     overrides = parse_instance_overrides(
         overrides_path.read_text() if overrides_path.exists() else ""
     )
+    if args.role:
+        overrides["ENABLE_LIVE_TRADING"] = "false"
+        overrides["ML_SHADOW_PAPER_ENABLED"] = (
+            "true" if args.role == "ml-shadow" else "false"
+        )
     active = active_state_files(env_path.parent)
     if args.refuse_active_state and active:
         raise SystemExit(

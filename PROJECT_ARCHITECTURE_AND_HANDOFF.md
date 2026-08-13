@@ -1,6 +1,6 @@
 # Hare Krishna Trading Bot: Architecture and Project Handoff
 
-Last updated: 2026-08-03 IST
+Last updated: 2026-08-13 IST
 Repository: `git@github.com:vkp2498-spec/trading-app.git`  
 Primary branch: `main`
 
@@ -14,11 +14,15 @@ Never add API keys, access tokens, webhook secrets, APNs private keys, Android k
 
 ## 2. Current project state
 
-The project is an experimental automated trading platform for Indian markets using Upstox. It has:
+The project is an experimental automated trading platform for Indian markets using Upstox. As of 2026-08-13, the only scheduled decision engine is `ML_SHADOW_V1`:
 
-- A shared Python codebase deployed to two AWS Lightsail Ubuntu instances.
-- Separate Vamsi and Ganesh strategy engines selected through `.env`.
-- Intraday option entry checks, live position monitoring, broker-side protective stops, risk controls, and forced square-off.
+- A shared Python codebase deployed to three AWS Lightsail Ubuntu instances.
+- Vamsi runs `ML_SHADOW_V1` in one-lot, non-overlapping NIFTY paper mode.
+- Ganesh and Sastry have all managed trading schedules disabled.
+- `ML_SHADOW_V1` has no broker-order code path and refuses to run if `ENABLE_LIVE_TRADING=true`.
+- The former Vamsi/Ganesh engine remains in the repository only as historical rollback/reference code and is not scheduled.
+- Nightly point-in-time training uses the prior 180 trading days through the previous trading day. Completed 15-minute candles are scored intraday.
+- Every matured forecast is resolved against its exact future horizon, while qualifying forecasts also simulate an ATM NIFTY option position with model-derived target and stop.
 - A Streamlit web dashboard.
 - A FastAPI mobile backend used by iOS and Android clients.
 - Daily Upstox notifier-token automation through a webhook.
@@ -26,7 +30,7 @@ The project is an experimental automated trading platform for Indian markets usi
 - Post-market reviews, forensic analysis, score follow-through audits, and historical replay tools.
 - A safe utility for resetting dashboard/mobile tracking while preserving configuration and credentials.
 
-The system uses real capital, but historical research has not established a stable profitable edge. It must be treated as experimental and safety-critical. A clean run, a high score, or a profitable day is not evidence of future profitability.
+Historical research has not established a stable profitable edge. The current engine is evidence collection only; it must not be promoted to live trading from an attractive backtest or a small shadow sample.
 
 ## 3. Source-of-truth order
 
@@ -45,21 +49,15 @@ The AWS `.env` files are deliberately not in Git, so account behavior can differ
 
 ```mermaid
 flowchart TD
-    CRON["AWS cron schedules"] --> BOT["trade_bot.py"]
-    BOT --> SELECT{"TRADING_ENGINE"}
-    SELECT -->|VAMSI| VE["Vamsi signal engine"]
-    SELECT -->|GANESH| GE["Ganesh gap-reversal engine"]
-
-    VE --> CORE["Option chain, technicals, breadth, institutional context"]
-    GE --> GAP["Opening gap, active 2H candle, pivots, Bollinger middle"]
-
-    CORE --> RISK["Shared execution and portfolio-risk layer"]
-    GAP --> RISK
-    RISK --> UPSTOX["Upstox orders and broker protective stops"]
-
-    MON["Long-running position monitor"] --> STATE["Bot state slots"]
-    STATE --> UPSTOX
-    UPSTOX --> JOURNAL["Trade and analysis journals"]
+    CRON["Vamsi AWS cron"] --> TRAIN["Nightly prior-day training"]
+    CRON --> SCORE["Completed 15-minute candle scoring"]
+    TRAIN --> MODEL["Calibrated direction and quantile excursion models"]
+    MODEL --> SCORE
+    SCORE --> RULE["Probability, points and reward/risk rule"]
+    RULE --> PAPER["One non-overlapping ATM NIFTY paper position"]
+    MON["Paper monitor"] --> PAPER
+    PAPER --> JOURNAL["Paper trade journal"]
+    SCORE --> EVIDENCE["Forecast and realized-horizon evidence"]
 
     JOURNAL --> DASH["Streamlit dashboard"]
     JOURNAL --> API["FastAPI mobile API"]
@@ -71,14 +69,17 @@ flowchart TD
     NGINX --> WEBHOOK["token_webhook.py on port 9000"]
     WEBHOOK --> ENV["Atomic .env token update"]
 
-    STREAM["upstox_streams.py"] --> CORE
+    STREAM["upstox_streams.py"] --> SCORE
     STREAM --> MON
+
+    DISABLED["Ganesh and Sastry"] --> OFF["Managed trading cron disabled"]
 ```
 
 ## 5. Repository map
 
 ### Live trading and strategy
 
+- `ml_shadow_v1.py`: Active paper-only NIFTY engine, training, scoring, evidence resolution, option simulation, monitoring, and horizon exits.
 - `trade_bot.py`: Main orchestration, entry dispatch, broker execution, persistent state, live monitor, exits, square-off, and shared safety controls.
 - `strategy_core.py`: Upstox option-chain access, expiry selection, option recommendations, and directional signal construction.
 - `market_technicals.py`: 5-minute, 15-minute, and 2-hour technical analysis, pivots, Bollinger Bands, moving averages, momentum, and option-premium level conversion.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install one canonical NIFTY bot cron block without disturbing other jobs."""
+"""Install the canonical ML_SHADOW_V1 paper cron without disturbing other jobs."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ MANAGED_COMMANDS = (
     "trade_bot.py",
     "adaptive_score_calibration.py",
     "post_market_score_audit.py",
+    "ml_shadow_v1.py",
 )
 
 
@@ -23,16 +24,14 @@ def canonical_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# AWS cron uses UTC. Entry scans cover 09:15-15:15 IST; Python enforces the final boundary.",
-        f"45,50,55 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/index_entry_bot.lock {python} {root}/trade_bot.py >> {log_dir}/trade_bot.log 2>&1",
-        f"*/5 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/index_entry_bot.lock {python} {root}/trade_bot.py >> {log_dir}/trade_bot.log 2>&1",
-        "# Continuous monitor begins before entry scans and exits itself at 15:30 IST.",
-        f"44-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/index_monitor_bot.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
-        f"* 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/index_monitor_bot.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
-        f"59 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/index_squareoff.lock {python} {root}/trade_bot.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
-        "# Prior-day evidence only: calibrate at 09:00 IST and audit at 15:45 IST.",
-        f"30 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_score_calibration.lock {python} {root}/adaptive_score_calibration.py >> {log_dir}/adaptive_score_calibration.log 2>&1",
-        f"15 10 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/post_market_score_audit.lock {python} {root}/post_market_score_audit.py >> {log_dir}/post_market_score_audit.log 2>&1",
+        "# AWS cron uses UTC. Train at 08:45 IST using data only through the prior day.",
+        f"15 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_train.lock {python} {root}/ml_shadow_v1.py --train >> {log_dir}/ml_shadow_v1.log 2>&1",
+        "# Score each completed 15-minute NIFTY candle from 09:31 through 14:16 IST.",
+        f"1,16,31,46 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
+        "# A single flock-protected paper monitor runs for the session.",
+        f"44-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
+        f"* 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
+        f"59 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_squareoff.lock {python} {root}/ml_shadow_v1.py --squareoff >> {log_dir}/ml_shadow_v1.log 2>&1",
         BLOCK_END,
     ]
 
@@ -91,7 +90,7 @@ def main():
     print(
         "Managed NIFTY trading cron disabled"
         if args.disable
-        else "Canonical NIFTY trading cron installed"
+        else "Canonical ML_SHADOW_V1 paper cron installed"
     )
 
 

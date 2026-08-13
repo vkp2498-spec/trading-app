@@ -27,10 +27,18 @@ ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 ANALYSIS_HISTORY_FILE = DATA_DIR / "analysis_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
+ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
+ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_v1" / "metadata.json"
+ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_v1" / "predictions.csv"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
-STATE_SLOTS = SYMBOLS + ["STOCK_FUTURE", "GANESH_GAP_NIFTY", "GANESH_GAP_BANKNIFTY"]
+STATE_SLOTS = SYMBOLS + [
+    "STOCK_FUTURE",
+    "GANESH_GAP_NIFTY",
+    "GANESH_GAP_BANKNIFTY",
+    "ML_SHADOW_NIFTY",
+]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 EDGE_SCORE_BANDS = DASHBOARD_SCORE_BANDS
 EDGE_UNSCORED_BAND = "Unscored"
@@ -2188,6 +2196,42 @@ def normalize_live_positions_per_lakh(live: dict) -> dict:
     )
     return normalized
 
+
+def build_ml_shadow_status() -> dict:
+    metadata = read_json_file(ML_SHADOW_METADATA_FILE, {})
+    rows = []
+    if ML_SHADOW_PREDICTIONS_FILE.exists():
+        try:
+            with ML_SHADOW_PREDICTIONS_FILE.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except (OSError, ValueError):
+            rows = []
+    resolved = [row for row in rows if row.get("resolved_at")]
+    entries = [row for row in rows if row.get("action") == "PAPER_ENTRY"]
+    selected_results = [
+        safe_float(row.get("selected_realized_points"))
+        for row in resolved
+        if row.get("selected_outcome")
+    ]
+    return {
+        "status": metadata.get("status", "NOT_TRAINED"),
+        "trainedThrough": metadata.get("trained_through"),
+        "generatedAt": metadata.get("generated_at"),
+        "modelHash": metadata.get("model_hash"),
+        "trainingRows": safe_int(metadata.get("training_rows")),
+        "trainingDays": safe_int(metadata.get("training_days")),
+        "validation": metadata.get("validation") or {},
+        "forecastCount": len(rows),
+        "resolvedForecastCount": len(resolved),
+        "paperEntryCount": len(entries),
+        "selectedForecastAveragePoints": round(
+            sum(selected_results) / len(selected_results), 2
+        )
+        if selected_results
+        else None,
+        "recentForecasts": rows[-12:][::-1],
+    }
+
 def build_health_snapshot() -> dict:
     load_env()
 
@@ -2245,6 +2289,9 @@ def build_health_snapshot() -> dict:
                 ANALYSIS_HISTORY_FILE
             ),
             "botLog": file_status(LOG_FILE),
+            "mlShadowLog": file_status(ML_SHADOW_LOG_FILE),
+            "mlShadowModel": file_status(ML_SHADOW_METADATA_FILE),
+            "mlShadowPredictions": file_status(ML_SHADOW_PREDICTIONS_FILE),
             "stockScannerStatus": file_status(STOCK_SCANNER_STATUS_FILE),
             "environmentFilePresent": ENV_FILE.exists(),
         },
@@ -2256,6 +2303,7 @@ def build_health_snapshot() -> dict:
         "bot": bot_status,
         "lastRuns": latest_analyses,
         "todayScans": build_today_scans(),
+        "mlShadow": build_ml_shadow_status(),
         "performance": trade_performance,
         "live": live_positions,
         "upstoxAccount": {
