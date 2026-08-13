@@ -998,6 +998,12 @@ def scan() -> dict:
     artifact, metadata = load_artifact()
     features, candle_time, today_count = fetch_live_features()
     resolved = resolve_prediction_outcomes(features)
+    current_minutes = now_ist().hour * 60 + now_ist().minute
+    first_entry = _configured_minutes("ML_SHADOW_FIRST_ENTRY_TIME", "09:45")
+    last_entry = _configured_minutes("ML_SHADOW_LAST_ENTRY_TIME", "14:16")
+    if current_minutes > last_entry:
+        log(f"resolution-only pass; resolved={resolved}")
+        return {"action": "RESOLVE_ONLY", "resolved": resolved}
     prediction = score_latest(
         artifact,
         metadata,
@@ -1007,9 +1013,6 @@ def scan() -> dict:
         log(f"candle {prediction['candle_time']} already scored")
         return {"action": "DUPLICATE", **prediction}
     decision = choose_action(prediction)
-    current_minutes = now_ist().hour * 60 + now_ist().minute
-    first_entry = _configured_minutes("ML_SHADOW_FIRST_ENTRY_TIME", "09:45")
-    last_entry = _configured_minutes("ML_SHADOW_LAST_ENTRY_TIME", "14:16")
     if decision["action"] == "PAPER_ENTRY" and not first_entry <= current_minutes <= last_entry:
         decision = {
             **decision,
