@@ -576,7 +576,9 @@ def load_artifact():
 
 
 def fetch_live_features() -> tuple[pd.DataFrame, pd.Timestamp, int]:
-    historical = fetch_v3_historical_minutes(NIFTY_KEY, minutes=15, lookback_days=45)
+    # Upstox rejects oversized minute-history windows in one request. Twenty
+    # calendar days comfortably warms the longest 16-candle feature.
+    historical = fetch_v3_historical_minutes(NIFTY_KEY, minutes=15, lookback_days=20)
     intraday = fetch_v3_intraday_minutes(NIFTY_KEY, minutes=15)
     candles = merge_candles(historical, intraday)
     candles = completed_candles(
