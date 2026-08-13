@@ -1,11 +1,75 @@
+import csv
+import json
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import dashboard_data
 
 
 class NiftyOnlyDashboardTests(unittest.TestCase):
+    def test_ml_shadow_payload_keeps_rejected_forecast_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata_path = root / "metadata.json"
+            predictions_path = root / "predictions.csv"
+            metadata_path.write_text(json.dumps({
+                "status": "READY_SHADOW",
+                "trained_through": "2026-08-12",
+                "training_rows": 2000,
+                "training_days": 100,
+                "validation": {"accuracy": 0.61, "rows": 400},
+            }))
+            fieldnames = [
+                "candle_time", "call_probability", "put_probability",
+                "call_target_points", "call_stop_points", "call_reward_risk",
+                "put_target_points", "put_stop_points", "put_reward_risk",
+                "direction", "selected_probability", "action", "reason",
+                "underlying_entry_price", "future_up_points", "future_down_points",
+                "selected_outcome", "selected_realized_points", "resolved_at",
+            ]
+            with predictions_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({
+                    "candle_time": "2026-08-13T10:00:00+05:30",
+                    "call_probability": "0.62",
+                    "put_probability": "0.38",
+                    "call_target_points": "12",
+                    "call_stop_points": "9",
+                    "call_reward_risk": "1.33",
+                    "put_target_points": "8",
+                    "put_stop_points": "11",
+                    "put_reward_risk": "0.73",
+                    "action": "NO_TRADE",
+                    "reason": "probability below threshold",
+                    "underlying_entry_price": "25000",
+                    "future_up_points": "15",
+                    "future_down_points": "4",
+                    "selected_outcome": "TARGET",
+                    "selected_realized_points": "12",
+                    "resolved_at": "2026-08-13T11:00:00+05:30",
+                })
+
+            paper_trade = {
+                "strategy": "ML_SHADOW_V1_PAPER",
+                "optionType": "CALL",
+                "direction": "BULLISH",
+            }
+            with patch.object(dashboard_data, "ML_SHADOW_METADATA_FILE", metadata_path), \
+                 patch.object(dashboard_data, "ML_SHADOW_PREDICTIONS_FILE", predictions_path), \
+                 patch.object(dashboard_data, "read_trade_history", return_value=[paper_trade]):
+                status = dashboard_data.build_ml_shadow_status()
+
+        forecast = status["recentForecasts"][0]
+        self.assertEqual(forecast["direction"], "CALL")
+        self.assertEqual(forecast["selectedProbability"], 0.62)
+        self.assertEqual(forecast["expectedTargetPoints"], 12.0)
+        self.assertEqual(status["resolvedForecastCount"], 1)
+        self.assertEqual(status["paperTrades"][0]["direction"], "CALL")
+
     def test_historical_numeric_score_without_version_populates_heatmap(self):
         today = datetime.now(dashboard_data.IST).date().isoformat()
         trade = {

@@ -1013,6 +1013,12 @@ def scan() -> dict:
         log(f"candle {prediction['candle_time']} already scored")
         return {"action": "DUPLICATE", **prediction}
     decision = choose_action(prediction)
+    predicted_direction = (
+        "CALL"
+        if prediction["call_probability"] >= prediction["put_probability"]
+        else "PUT"
+    )
+    predicted_prefix = predicted_direction.lower()
     if decision["action"] == "PAPER_ENTRY" and not first_entry <= current_minutes <= last_entry:
         decision = {
             **decision,
@@ -1022,11 +1028,19 @@ def scan() -> dict:
     prediction.update(
         {
             "scan_time": now_ist().isoformat(),
-            "direction": decision.get("direction", ""),
-            "selected_probability": decision.get("probability", ""),
-            "expected_target_points": decision.get("target_points", ""),
-            "expected_stop_points": decision.get("stop_points", ""),
-            "reward_risk": decision.get("reward_risk", ""),
+            "direction": decision.get("direction", predicted_direction),
+            "selected_probability": decision.get(
+                "probability", prediction[f"{predicted_prefix}_probability"]
+            ),
+            "expected_target_points": decision.get(
+                "target_points", prediction[f"{predicted_prefix}_target_points"]
+            ),
+            "expected_stop_points": decision.get(
+                "stop_points", prediction[f"{predicted_prefix}_stop_points"]
+            ),
+            "reward_risk": decision.get(
+                "reward_risk", prediction[f"{predicted_prefix}_reward_risk"]
+            ),
             "action": decision["action"],
             "reason": decision["reason"],
         }

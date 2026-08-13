@@ -2649,82 +2649,145 @@ def render_analytics_tab(performance_payload):
     render_edge_matrix(performance_payload.get("edgeAnalytics") or {})
 
 
-st.markdown('<div class="dash-title">Nifty Options Trading</div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-title">ML Shadow V1</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="dash-subtitle">NIFTY option performance and score follow-through research</div>',
+    '<div class="dash-subtitle">Paper-only NIFTY forecasting from completed 15-minute candles</div>',
     unsafe_allow_html=True,
 )
 
-performance_tab, analytics_tab, score_review_tab = st.tabs(
-    ["Performance", "Analytics", "Post Market Review"]
+ml_status = build_ml_shadow_status()
+overview_tab, forecasts_tab, evidence_tab, paper_tab = st.tabs(
+    ["Overview", "Forecasts", "Evidence", "Paper Trades"]
 )
 
-with performance_tab:
-    today = performance.get("today", {})
-    cumulative = performance.get("cumulative", {})
-
-    section_header("Today")
-    today_summaries = section_stats(today, "closedTrades", "closedPnL")
-    today_cols = st.columns(len(today_summaries))
-    for column, (title, summary) in zip(
-        today_cols,
-        today_summaries,
-    ):
-        with column:
-            st.markdown(summary_card_html(title, summary), unsafe_allow_html=True)
-
-    section_header("Cumulative")
-    cumulative_summaries = section_stats(cumulative, "totalTrades", "totalPnL")
-    summary_cols = st.columns(len(cumulative_summaries))
-    for column, (title, summary) in zip(
-        summary_cols,
-        cumulative_summaries,
-    ):
-        with column:
-            st.markdown(
-                summary_card_html(title, summary, show_averages=True),
-                unsafe_allow_html=True,
-            )
-
-    section_header("Index Trade Sequence")
-    seq_today, seq_cumulative = st.columns(2)
-    with seq_today:
-        st.markdown("**Today**")
-        st.dataframe(
-            sequence_table(today.get("indexTradeSequencePerformance")),
-            use_container_width=True,
-            hide_index=True,
-        )
-    with seq_cumulative:
-        st.markdown("**Cumulative**")
-        st.dataframe(
-            sequence_table(cumulative.get("indexTradeSequencePerformance")),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    second_context = sequence_table(cumulative.get("secondTradeContextPerformance"))
-    if not second_context.empty:
-        st.markdown("**Second Trade Context**")
-        st.dataframe(second_context, use_container_width=True, hide_index=True)
-
-with analytics_tab:
-    analytics_scope = st.segmented_control(
-        "Analytics data",
-        options=["Real only", "Real + Paper"],
-        default="Real only",
-        key="analytics_trade_scope",
+with overview_tab:
+    st.info(
+        "Shadow mode only. This engine cannot place broker orders. A forecast "
+        "becomes a paper entry only when probability, expected movement, and "
+        "reward/risk all qualify."
     )
-    analytics_performance = (
-        mixed_performance if analytics_scope == "Real + Paper" else performance
+    configuration = ml_status.get("configuration") or {}
+    validation = ml_status.get("validation") or {}
+    columns = st.columns(4)
+    columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
+    columns[1].metric("Trained through", ml_status.get("trainedThrough") or "—")
+    columns[2].metric("Training candles", int(ml_status.get("trainingRows") or 0))
+    columns[3].metric("Training days", int(ml_status.get("trainingDays") or 0))
+
+    rule_columns = st.columns(4)
+    rule_columns[0].metric(
+        "Minimum probability",
+        f"{float(configuration.get('minimumProbability') or 0) * 100:.0f}%",
     )
+    rule_columns[1].metric(
+        "Minimum expected move",
+        f"{float(configuration.get('minimumExpectedPoints') or 0):.0f} pts",
+    )
+    rule_columns[2].metric(
+        "Minimum reward/risk",
+        f"{float(configuration.get('minimumRewardRisk') or 0):.2f}",
+    )
+    rule_columns[3].metric(
+        "Entry window",
+        f"{configuration.get('firstEntryTime', '—')}–{configuration.get('lastEntryTime', '—')}",
+    )
+
+    st.markdown("### Current paper position")
+    live_positions = api_build_live_positions()
+    ml_positions = [
+        position for position in live_positions.get("positions", [])
+        if "ML_SHADOW" in str(position.get("strategy") or "").upper()
+    ]
+    if ml_positions:
+        st.dataframe(pd.DataFrame(ml_positions), use_container_width=True, hide_index=True)
+    else:
+        st.success("No paper position is open. The monitor is waiting for a qualified forecast.")
+
+    st.markdown("### Honest validation snapshot")
+    validation_columns = st.columns(4)
+    validation_columns[0].metric(
+        "Direction accuracy", f"{float(validation.get('accuracy') or 0) * 100:.1f}%"
+    )
+    validation_columns[1].metric(
+        "Majority baseline",
+        f"{float(validation.get('majority_baseline_accuracy') or 0) * 100:.1f}%",
+    )
+    validation_columns[2].metric(
+        "High-confidence signals", int(validation.get("qualified_direction_count") or 0)
+    )
+    validation_columns[3].metric(
+        "Validation rows", int(validation.get("rows") or 0)
+    )
+
+with forecasts_tab:
+    st.markdown("### Latest completed-candle forecasts")
     st.caption(
-        "Real + Paper includes simulated trades taken after the first real "
-        "profit or loss. Live account P&L remains real-only."
+        "CALL/PUT probabilities and predicted NIFTY-point excursions. NO_TRADE "
+        "is evidence too—it means at least one entry threshold was not met."
     )
-    render_analytics_tab(analytics_performance)
+    forecasts = pd.DataFrame(ml_status.get("recentForecasts") or [])
+    if forecasts.empty:
+        st.info("The first forecast will appear after a scheduled 15-minute scan.")
+    else:
+        visible = [
+            column for column in (
+                "candleTime", "callProbability", "putProbability", "direction",
+                "selectedProbability", "expectedTargetPoints", "expectedStopPoints",
+                "rewardRisk", "action", "reason", "futureUpPoints",
+                "futureDownPoints", "outcome", "realizedPoints",
+            ) if column in forecasts.columns
+        ]
+        st.dataframe(forecasts[visible], use_container_width=True, hide_index=True)
 
-with score_review_tab:
-    render_score_followthrough_review()
-    st.divider()
-    render_daily_trade_pnl_matrix(performance)
+with evidence_tab:
+    st.markdown("### Accumulated out-of-sample evidence")
+    evidence_columns = st.columns(4)
+    evidence_columns[0].metric("Forecasts", int(ml_status.get("forecastCount") or 0))
+    evidence_columns[1].metric(
+        "Resolved", int(ml_status.get("resolvedForecastCount") or 0)
+    )
+    evidence_columns[2].metric(
+        "Direction accuracy",
+        "—" if ml_status.get("directionAccuracy") is None
+        else f"{float(ml_status['directionAccuracy']):.1f}%",
+    )
+    evidence_columns[3].metric(
+        "Average realized points",
+        "—" if ml_status.get("selectedForecastAveragePoints") is None
+        else f"{float(ml_status['selectedForecastAveragePoints']):.2f}",
+    )
+
+    confidence, time_column = st.columns(2)
+    with confidence:
+        st.markdown("#### By confidence")
+        st.dataframe(
+            pd.DataFrame(ml_status.get("confidenceBuckets") or []),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with time_column:
+        st.markdown("#### By candle time")
+        st.dataframe(
+            pd.DataFrame(ml_status.get("timeBuckets") or []),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.caption(
+        "No live promotion is automatic. Evidence must materially beat the "
+        "baseline across unseen days before live execution is even considered."
+    )
+
+with paper_tab:
+    st.markdown("### Completed ML paper trades")
+    paper_trades = pd.DataFrame(ml_status.get("paperTrades") or [])
+    if paper_trades.empty:
+        st.info("No ML_SHADOW_V1 paper trade has closed yet.")
+    else:
+        visible = [
+            column for column in (
+                "tradeDate", "entryTime", "exitTime", "tradingSymbol", "direction",
+                "quantity", "entryPrice", "exitPrice", "targetPrice", "stopLossPrice",
+                "exitReason", "grossPnL", "score",
+            ) if column in paper_trades.columns
+        ]
+        st.dataframe(paper_trades[visible], use_container_width=True, hide_index=True)

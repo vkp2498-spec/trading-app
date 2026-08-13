@@ -17,6 +17,7 @@ from adaptive_exit_shadow import SHADOW_CONFIG_FILE
 from adaptive_live_policy import LIVE_POLICY_FILE
 from dashboard_score_buckets import DASHBOARD_SCORE_BANDS
 from unified_entry_score import UNIFIED_SCORE_VERSION
+from upstox_streams import read_market_cache
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2000,6 +2001,13 @@ def build_live_positions() -> dict:
 
             if broker_entry is not None:
                 entry_price = broker_entry
+        elif state.get("paper_trade"):
+            quote = read_market_cache(instrument_key) or {}
+            quote_age = datetime.now().timestamp() - safe_float(
+                quote.get("received_at")
+            )
+            if 0 <= quote_age <= 60:
+                last_price = safe_float(quote.get("ltp"), None)
 
         planned_target_price = safe_float(
             state.get("target_price")
@@ -2071,6 +2079,9 @@ def build_live_positions() -> dict:
                 "symbol": symbol,
                 "underlyingSymbol": state.get("underlying_symbol", symbol),
                 "instrumentClass": state.get("instrument_class", "INDEX_OPTION"),
+                "strategy": state.get("strategy", ""),
+                "paperTrade": bool(state.get("paper_trade", False)),
+                "executionMode": state.get("execution_mode", "LIVE"),
                 "tradingSymbol": state.get(
                     "trading_symbol",
                     "",
@@ -2206,13 +2217,129 @@ def build_ml_shadow_status() -> dict:
                 rows = list(csv.DictReader(handle))
         except (OSError, ValueError):
             rows = []
-    resolved = [row for row in rows if row.get("resolved_at")]
+    def probability(row, direction):
+        return safe_float(row.get(f"{direction.lower()}_probability"))
+
+    def forecast_direction(row):
+        explicit = str(row.get("direction") or "").upper()
+        if explicit in {"CALL", "PUT"}:
+            return explicit
+        return "CALL" if probability(row, "CALL") >= probability(row, "PUT") else "PUT"
+
+    def forecast_probability(row):
+        direction = forecast_direction(row)
+        selected = safe_float(row.get("selected_probability"), None)
+        return selected if selected is not None else probability(row, direction)
+
+    def typed_forecast(row, index):
+        direction = forecast_direction(row)
+        prefix = direction.lower()
+        selected_probability = forecast_probability(row)
+        return {
+            "id": f"{row.get('candle_time', '')}-{index}",
+            "scanTime": row.get("scan_time") or None,
+            "candleTime": row.get("candle_time") or None,
+            "modelTrainedThrough": row.get("model_trained_through") or None,
+            "modelHash": row.get("model_hash") or None,
+            "callProbability": safe_float(row.get("call_probability")),
+            "putProbability": safe_float(row.get("put_probability")),
+            "direction": direction,
+            "selectedProbability": selected_probability,
+            "expectedTargetPoints": safe_float(
+                row.get("expected_target_points") or row.get(f"{prefix}_target_points")
+            ),
+            "expectedStopPoints": safe_float(
+                row.get("expected_stop_points") or row.get(f"{prefix}_stop_points")
+            ),
+            "rewardRisk": safe_float(
+                row.get("reward_risk") or row.get(f"{prefix}_reward_risk")
+            ),
+            "action": row.get("action") or "NO_TRADE",
+            "reason": row.get("reason") or "",
+            "underlyingEntryPrice": safe_float(row.get("underlying_entry_price")),
+            "futureUpPoints": safe_float(row.get("future_up_points"), None),
+            "futureDownPoints": safe_float(row.get("future_down_points"), None),
+            "outcome": row.get("selected_outcome") or None,
+            "realizedPoints": safe_float(row.get("selected_realized_points"), None),
+            "resolvedAt": row.get("resolved_at") or None,
+        }
+
+    typed_rows = [typed_forecast(row, index) for index, row in enumerate(rows)]
+    resolved = [row for row in typed_rows if row.get("resolvedAt")]
     entries = [row for row in rows if row.get("action") == "PAPER_ENTRY"]
     selected_results = [
-        safe_float(row.get("selected_realized_points"))
+        safe_float(row.get("realizedPoints"))
         for row in resolved
-        if row.get("selected_outcome")
+        if row.get("outcome")
     ]
+
+    def correct(row):
+        up = safe_float(row.get("futureUpPoints"))
+        down = safe_float(row.get("futureDownPoints"))
+        actual = "CALL" if up >= down else "PUT"
+        return row.get("direction") == actual
+
+    confidence_buckets = []
+    for lower in range(50, 100, 10):
+        upper = 100 if lower == 90 else lower + 9
+        matching = [
+            row for row in resolved
+            if lower <= safe_float(row.get("selectedProbability")) * 100 <= upper + 0.999
+        ]
+        results = [safe_float(row.get("realizedPoints")) for row in matching]
+        confidence_buckets.append(
+            {
+                "id": f"{lower}-{upper}",
+                "label": f"{lower}-{upper}",
+                "forecasts": len(matching),
+                "accuracy": round(
+                    sum(1 for row in matching if correct(row)) / len(matching) * 100, 1
+                ) if matching else None,
+                "averageRealizedPoints": round(sum(results) / len(results), 2)
+                if results else None,
+            }
+        )
+
+    time_definitions = (
+        ("opening", "09:30-10:30", 9 * 60 + 30, 10 * 60 + 30),
+        ("morning", "10:30-12:00", 10 * 60 + 30, 12 * 60),
+        ("midday", "12:00-13:30", 12 * 60, 13 * 60 + 30),
+        ("afternoon", "13:30-14:30", 13 * 60 + 30, 14 * 60 + 30),
+    )
+    time_buckets = []
+    for bucket_id, label, start, end in time_definitions:
+        matching = []
+        for row in resolved:
+            try:
+                candle = datetime.fromisoformat(str(row.get("candleTime")))
+                minutes = candle.hour * 60 + candle.minute
+            except (TypeError, ValueError):
+                continue
+            if start <= minutes < end:
+                matching.append(row)
+        results = [safe_float(row.get("realizedPoints")) for row in matching]
+        time_buckets.append(
+            {
+                "id": bucket_id,
+                "label": label,
+                "forecasts": len(matching),
+                "accuracy": round(
+                    sum(1 for row in matching if correct(row)) / len(matching) * 100, 1
+                ) if matching else None,
+                "averageRealizedPoints": round(sum(results) / len(results), 2)
+                if results else None,
+            }
+        )
+
+    paper_trades = []
+    for trade in read_trade_history():
+        if str(trade.get("strategy") or "").upper() != "ML_SHADOW_V1_PAPER":
+            continue
+        normalized = dict(trade)
+        if normalized.get("optionType") in {"CALL", "PUT"}:
+            normalized["direction"] = normalized["optionType"]
+        paper_trades.append(normalized)
+    paper_trades = paper_trades[-30:][::-1]
     return {
         "status": metadata.get("status", "NOT_TRAINED"),
         "trainedThrough": metadata.get("trained_through"),
@@ -2221,15 +2348,34 @@ def build_ml_shadow_status() -> dict:
         "trainingRows": safe_int(metadata.get("training_rows")),
         "trainingDays": safe_int(metadata.get("training_days")),
         "validation": metadata.get("validation") or {},
+        "configuration": {
+            "minimumProbability": safe_float(os.getenv("ML_SHADOW_MIN_PROBABILITY"), 0.70),
+            "minimumExpectedPoints": safe_float(os.getenv("ML_SHADOW_MIN_EXPECTED_POINTS"), 10),
+            "minimumRewardRisk": safe_float(os.getenv("ML_SHADOW_MIN_REWARD_RISK"), 0.80),
+            "horizonCandles": safe_int(os.getenv("ML_SHADOW_HORIZON_CANDLES"), 4),
+            "firstEntryTime": os.getenv("ML_SHADOW_FIRST_ENTRY_TIME", "09:45"),
+            "lastEntryTime": os.getenv("ML_SHADOW_LAST_ENTRY_TIME", "14:16"),
+            "paperOnly": True,
+        },
         "forecastCount": len(rows),
         "resolvedForecastCount": len(resolved),
         "paperEntryCount": len(entries),
+        "directionAccuracy": round(
+            sum(1 for row in resolved if correct(row)) / len(resolved) * 100, 1
+        ) if resolved else None,
         "selectedForecastAveragePoints": round(
             sum(selected_results) / len(selected_results), 2
         )
         if selected_results
         else None,
-        "recentForecasts": rows[-12:][::-1],
+        "actionCounts": {
+            action: sum(1 for row in rows if (row.get("action") or "NO_TRADE") == action)
+            for action in sorted({row.get("action") or "NO_TRADE" for row in rows})
+        },
+        "confidenceBuckets": confidence_buckets,
+        "timeBuckets": time_buckets,
+        "recentForecasts": typed_rows[-30:][::-1],
+        "paperTrades": paper_trades,
     }
 
 def build_health_snapshot() -> dict:
