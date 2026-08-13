@@ -28,7 +28,7 @@ def canonical_block(app_dir: Path) -> list[str]:
         f"15 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_train.lock {python} {root}/ml_shadow_v1.py --train >> {log_dir}/ml_shadow_v1.log 2>&1",
         "# Forecast once from the opening print, with retries at 09:17/09:22/09:27 IST.",
         f"47,52,57 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# A flock-protected monitor follows paper positions until the first candle closes.",
+        "# A flock-protected monitor follows paper or live-GTT state until the first candle closes.",
         f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
         f"* 4-6 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
         f"0-46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
@@ -93,7 +93,7 @@ def main():
     print(
         "Managed NIFTY trading cron disabled"
         if args.disable
-        else "Canonical ML_SHADOW_V1 paper cron installed"
+        else "Canonical first-4H ML_SHADOW_V1 cron installed"
     )
 
 
