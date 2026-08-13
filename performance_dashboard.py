@@ -76,7 +76,8 @@ STATE_SLOTS = SYMBOLS + [
     "STOCK_FUTURE",
     "GANESH_GAP_NIFTY",
     "GANESH_GAP_BANKNIFTY",
-    "ML_SHADOW_NIFTY",
+    "ML_SHADOW_CALL",
+    "ML_SHADOW_PUT",
 ]
 UPSTOX_POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
@@ -2579,34 +2580,29 @@ def render_analytics_tab(performance_payload):
     )
 
     ml_status = build_ml_shadow_status()
-    st.markdown("### ML Shadow Evidence")
+    st.markdown("### First-4H ML Evidence")
     st.caption(
-        "Paper-only 15-minute NIFTY forecasts. Forecast outcomes are measured in "
-        "underlying points; option P&L remains in the trade analytics below."
+        "One daily NIFTY forecast for the 09:15–13:15 candle. CALL and PUT are "
+        "evaluated independently in percentage terms."
     )
     ml_columns = st.columns(4)
     ml_columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
     ml_columns[1].metric("Training days", int(ml_status.get("trainingDays") or 0))
     ml_columns[2].metric("Resolved forecasts", int(ml_status.get("resolvedForecastCount") or 0))
-    average_points = ml_status.get("selectedForecastAveragePoints")
+    average_points = ml_status.get("averageRealizedPercent")
     ml_columns[3].metric(
-        "Avg selected points",
-        "—" if average_points is None else f"{float(average_points):.2f}",
+        "Avg forecast result",
+        "—" if average_points is None else f"{float(average_points):.3f}%",
     )
     recent_forecasts = pd.DataFrame(ml_status.get("recentForecasts") or [])
     if not recent_forecasts.empty:
         visible = [
             column
             for column in (
-                "candle_time",
-                "call_probability",
-                "put_probability",
-                "direction",
-                "expected_target_points",
-                "expected_stop_points",
-                "action",
-                "selected_outcome",
-                "selected_realized_points",
+                "candleTime", "callProbability", "callTargetPercent",
+                "callStopPercent", "callAction", "putProbability",
+                "putTargetPercent", "putStopPercent", "putAction",
+                "futureUpPercent", "futureDownPercent",
             )
             if column in recent_forecasts.columns
         ]
@@ -2649,9 +2645,9 @@ def render_analytics_tab(performance_payload):
     render_edge_matrix(performance_payload.get("edgeAnalytics") or {})
 
 
-st.markdown('<div class="dash-title">ML Shadow V1</div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-title">ML First-4H Shadow</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="dash-subtitle">Paper-only NIFTY forecasting from completed 15-minute candles</div>',
+    '<div class="dash-subtitle">One NIFTY forecast each day for the 09:15–13:15 candle</div>',
     unsafe_allow_html=True,
 )
 
@@ -2661,17 +2657,19 @@ overview_tab, forecasts_tab, evidence_tab, paper_tab = st.tabs(
 )
 
 with overview_tab:
-    st.info(
-        "Shadow mode only. This engine cannot place broker orders. A forecast "
-        "becomes a paper entry only when probability, expected movement, and "
-        "reward/risk all qualify."
-    )
     configuration = ml_status.get("configuration") or {}
     validation = ml_status.get("validation") or {}
+    if configuration.get("liveTradingEnabled"):
+        st.error("LIVE GTT MODE is enabled. Qualified CALL/PUT sides can reach Upstox.")
+    else:
+        st.info(
+            "Paper mode is active. CALL and PUT qualify independently when probability "
+            "is above 50% and predicted reward/risk is at least 0.75."
+        )
     columns = st.columns(4)
     columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
     columns[1].metric("Trained through", ml_status.get("trainedThrough") or "—")
-    columns[2].metric("Training candles", int(ml_status.get("trainingRows") or 0))
+    columns[2].metric("Training first candles", int(ml_status.get("trainingRows") or 0))
     columns[3].metric("Training days", int(ml_status.get("trainingDays") or 0))
 
     rule_columns = st.columns(4)
@@ -2680,19 +2678,19 @@ with overview_tab:
         f"{float(configuration.get('minimumProbability') or 0) * 100:.0f}%",
     )
     rule_columns[1].metric(
-        "Minimum expected move",
-        f"{float(configuration.get('minimumExpectedPoints') or 0):.0f} pts",
+        "Event move",
+        f"{float(configuration.get('eventMovePercent') or 0):.2f}%",
     )
     rule_columns[2].metric(
         "Minimum reward/risk",
         f"{float(configuration.get('minimumRewardRisk') or 0):.2f}",
     )
     rule_columns[3].metric(
-        "Entry window",
+        "Forecast window",
         f"{configuration.get('firstEntryTime', '—')}–{configuration.get('lastEntryTime', '—')}",
     )
 
-    st.markdown("### Current paper position")
+    st.markdown("### Current ML positions")
     live_positions = api_build_live_positions()
     ml_positions = [
         position for position in live_positions.get("positions", [])
@@ -2701,7 +2699,7 @@ with overview_tab:
     if ml_positions:
         st.dataframe(pd.DataFrame(ml_positions), use_container_width=True, hide_index=True)
     else:
-        st.success("No paper position is open. The monitor is waiting for a qualified forecast.")
+        st.success("No ML position is open. The next decision is made just after 09:15 IST.")
 
     st.markdown("### Honest validation snapshot")
     validation_columns = st.columns(4)
@@ -2720,21 +2718,23 @@ with overview_tab:
     )
 
 with forecasts_tab:
-    st.markdown("### Latest completed-candle forecasts")
+    st.markdown("### Daily first-candle forecasts")
     st.caption(
-        "CALL/PUT probabilities and predicted NIFTY-point excursions. NO_TRADE "
-        "is evidence too—it means at least one entry threshold was not met."
+        "Targets and stops are percentages of the NIFTY opening price. Both sides can "
+        "qualify; outcomes use the first four-hour candle only."
     )
     forecasts = pd.DataFrame(ml_status.get("recentForecasts") or [])
     if forecasts.empty:
-        st.info("The first forecast will appear after a scheduled 15-minute scan.")
+        st.info("The first forecast will appear shortly after the 09:15 opening print.")
     else:
         visible = [
             column for column in (
-                "candleTime", "callProbability", "putProbability", "direction",
-                "selectedProbability", "expectedTargetPoints", "expectedStopPoints",
-                "rewardRisk", "action", "reason", "futureUpPoints",
-                "futureDownPoints", "outcome", "realizedPoints",
+                "candleTime", "underlyingOpen", "callProbability",
+                "callTargetPercent", "callStopPercent", "callRewardRisk", "callAction",
+                "putProbability", "putTargetPercent", "putStopPercent", "putRewardRisk",
+                "putAction", "overallAction", "executionMode", "futureUpPercent",
+                "futureDownPercent", "callOutcome", "callRealizedPercent",
+                "putOutcome", "putRealizedPercent",
             ) if column in forecasts.columns
         ]
         st.dataframe(forecasts[visible], use_container_width=True, hide_index=True)
@@ -2747,14 +2747,14 @@ with evidence_tab:
         "Resolved", int(ml_status.get("resolvedForecastCount") or 0)
     )
     evidence_columns[2].metric(
-        "Direction accuracy",
+        "Profitable forecasts",
         "—" if ml_status.get("directionAccuracy") is None
         else f"{float(ml_status['directionAccuracy']):.1f}%",
     )
     evidence_columns[3].metric(
-        "Average realized points",
-        "—" if ml_status.get("selectedForecastAveragePoints") is None
-        else f"{float(ml_status['selectedForecastAveragePoints']):.2f}",
+        "Average realized %",
+        "—" if ml_status.get("averageRealizedPercent") is None
+        else f"{float(ml_status['averageRealizedPercent']):.3f}%",
     )
 
     confidence, time_column = st.columns(2)
@@ -2766,22 +2766,22 @@ with evidence_tab:
             hide_index=True,
         )
     with time_column:
-        st.markdown("#### By candle time")
+        st.markdown("#### By direction")
         st.dataframe(
-            pd.DataFrame(ml_status.get("timeBuckets") or []),
+            pd.DataFrame(ml_status.get("directionBuckets") or []),
             use_container_width=True,
             hide_index=True,
         )
     st.caption(
-        "No live promotion is automatic. Evidence must materially beat the "
-        "baseline across unseen days before live execution is even considered."
+        "Paper evidence is stored separately from the former 15-minute engine. "
+        "Live mode always requires two explicit environment switches."
     )
 
 with paper_tab:
     st.markdown("### Completed ML paper trades")
     paper_trades = pd.DataFrame(ml_status.get("paperTrades") or [])
     if paper_trades.empty:
-        st.info("No ML_SHADOW_V1 paper trade has closed yet.")
+        st.info("No first-4H ML paper trade has closed yet.")
     else:
         visible = [
             column for column in (

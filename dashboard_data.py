@@ -29,8 +29,8 @@ TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 ANALYSIS_HISTORY_FILE = DATA_DIR / "analysis_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
-ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_v1" / "metadata.json"
-ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_v1" / "predictions.csv"
+ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_4h_v2" / "metadata.json"
+ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_4h_v2" / "predictions.csv"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
@@ -38,7 +38,8 @@ STATE_SLOTS = SYMBOLS + [
     "STOCK_FUTURE",
     "GANESH_GAP_NIFTY",
     "GANESH_GAP_BANKNIFTY",
-    "ML_SHADOW_NIFTY",
+    "ML_SHADOW_CALL",
+    "ML_SHADOW_PUT",
 ]
 UPSTOX_SYNC_EXIT_REASON = "UPSTOX_SYNC_ADJUSTMENT"
 EDGE_SCORE_BANDS = DASHBOARD_SCORE_BANDS
@@ -2217,123 +2218,98 @@ def build_ml_shadow_status() -> dict:
                 rows = list(csv.DictReader(handle))
         except (OSError, ValueError):
             rows = []
-    def probability(row, direction):
-        return safe_float(row.get(f"{direction.lower()}_probability"))
-
-    def forecast_direction(row):
-        explicit = str(row.get("direction") or "").upper()
-        if explicit in {"CALL", "PUT"}:
-            return explicit
-        return "CALL" if probability(row, "CALL") >= probability(row, "PUT") else "PUT"
-
-    def forecast_probability(row):
-        direction = forecast_direction(row)
-        selected = safe_float(row.get("selected_probability"), None)
-        return selected if selected is not None else probability(row, direction)
-
     def typed_forecast(row, index):
-        direction = forecast_direction(row)
-        prefix = direction.lower()
-        selected_probability = forecast_probability(row)
         return {
             "id": f"{row.get('candle_time', '')}-{index}",
             "scanTime": row.get("scan_time") or None,
             "candleTime": row.get("candle_time") or None,
             "modelTrainedThrough": row.get("model_trained_through") or None,
             "modelHash": row.get("model_hash") or None,
-            "callProbability": safe_float(row.get("call_probability")),
-            "putProbability": safe_float(row.get("put_probability")),
-            "direction": direction,
-            "selectedProbability": selected_probability,
-            "expectedTargetPoints": safe_float(
-                row.get("expected_target_points") or row.get(f"{prefix}_target_points")
-            ),
-            "expectedStopPoints": safe_float(
-                row.get("expected_stop_points") or row.get(f"{prefix}_stop_points")
-            ),
-            "rewardRisk": safe_float(
-                row.get("reward_risk") or row.get(f"{prefix}_reward_risk")
-            ),
-            "action": row.get("action") or "NO_TRADE",
-            "reason": row.get("reason") or "",
+            "underlyingOpen": safe_float(row.get("underlying_open")),
             "underlyingEntryPrice": safe_float(row.get("underlying_entry_price")),
-            "futureUpPoints": safe_float(row.get("future_up_points"), None),
-            "futureDownPoints": safe_float(row.get("future_down_points"), None),
-            "outcome": row.get("selected_outcome") or None,
-            "realizedPoints": safe_float(row.get("selected_realized_points"), None),
+            "callProbability": safe_float(row.get("call_probability")),
+            "callTargetPercent": safe_float(row.get("call_target_percent")),
+            "callStopPercent": safe_float(row.get("call_stop_percent")),
+            "callRewardRisk": safe_float(row.get("call_reward_risk")),
+            "callAction": row.get("call_action") or "NO_TRADE",
+            "callReason": row.get("call_reason") or "",
+            "putProbability": safe_float(row.get("put_probability")),
+            "putTargetPercent": safe_float(row.get("put_target_percent")),
+            "putStopPercent": safe_float(row.get("put_stop_percent")),
+            "putRewardRisk": safe_float(row.get("put_reward_risk")),
+            "putAction": row.get("put_action") or "NO_TRADE",
+            "putReason": row.get("put_reason") or "",
+            "overallAction": row.get("overall_action") or "NO_TRADE",
+            "executionMode": row.get("execution_mode") or "PAPER",
+            "futureUpPercent": safe_float(row.get("future_up_percent"), None),
+            "futureDownPercent": safe_float(row.get("future_down_percent"), None),
+            "callOutcome": row.get("call_outcome") or None,
+            "callRealizedPercent": safe_float(row.get("call_realized_percent"), None),
+            "putOutcome": row.get("put_outcome") or None,
+            "putRealizedPercent": safe_float(row.get("put_realized_percent"), None),
             "resolvedAt": row.get("resolved_at") or None,
         }
 
     typed_rows = [typed_forecast(row, index) for index, row in enumerate(rows)]
     resolved = [row for row in typed_rows if row.get("resolvedAt")]
-    entries = [row for row in rows if row.get("action") == "PAPER_ENTRY"]
-    selected_results = [
-        safe_float(row.get("realizedPoints"))
-        for row in resolved
-        if row.get("outcome")
+    entries = sum(
+        1 for row in rows for prefix in ("call", "put")
+        if row.get(f"{prefix}_action") in {"PAPER_ENTRY", "LIVE_GTT"}
+    )
+    evidence = []
+    for row in resolved:
+        for direction, prefix in (("CALL", "call"), ("PUT", "put")):
+            evidence.append({
+                "direction": direction,
+                "probability": safe_float(row.get(f"{prefix}Probability")),
+                "action": row.get(f"{prefix}Action"),
+                "outcome": row.get(f"{prefix}Outcome"),
+                "realizedPercent": safe_float(row.get(f"{prefix}RealizedPercent"), None),
+            })
+    realized_results = [
+        item["realizedPercent"] for item in evidence
+        if item.get("realizedPercent") is not None
     ]
-
-    def correct(row):
-        up = safe_float(row.get("futureUpPoints"))
-        down = safe_float(row.get("futureDownPoints"))
-        actual = "CALL" if up >= down else "PUT"
-        return row.get("direction") == actual
 
     confidence_buckets = []
     for lower in range(50, 100, 10):
         upper = 100 if lower == 90 else lower + 9
         matching = [
-            row for row in resolved
-            if lower <= safe_float(row.get("selectedProbability")) * 100 <= upper + 0.999
+            item for item in evidence
+            if lower <= safe_float(item.get("probability")) * 100 <= upper + 0.999
         ]
-        results = [safe_float(row.get("realizedPoints")) for row in matching]
+        results = [item["realizedPercent"] for item in matching if item.get("realizedPercent") is not None]
         confidence_buckets.append(
             {
                 "id": f"{lower}-{upper}",
                 "label": f"{lower}-{upper}",
                 "forecasts": len(matching),
-                "accuracy": round(
-                    sum(1 for row in matching if correct(row)) / len(matching) * 100, 1
-                ) if matching else None,
-                "averageRealizedPoints": round(sum(results) / len(results), 2)
+                "accuracy": round(sum(value > 0 for value in results) / len(results) * 100, 1)
+                if results else None,
+                "averageRealizedPercent": round(sum(results) / len(results), 4)
                 if results else None,
             }
         )
 
-    time_definitions = (
-        ("opening", "09:30-10:30", 9 * 60 + 30, 10 * 60 + 30),
-        ("morning", "10:30-12:00", 10 * 60 + 30, 12 * 60),
-        ("midday", "12:00-13:30", 12 * 60, 13 * 60 + 30),
-        ("afternoon", "13:30-14:30", 13 * 60 + 30, 14 * 60 + 30),
-    )
-    time_buckets = []
-    for bucket_id, label, start, end in time_definitions:
-        matching = []
-        for row in resolved:
-            try:
-                candle = datetime.fromisoformat(str(row.get("candleTime")))
-                minutes = candle.hour * 60 + candle.minute
-            except (TypeError, ValueError):
-                continue
-            if start <= minutes < end:
-                matching.append(row)
-        results = [safe_float(row.get("realizedPoints")) for row in matching]
-        time_buckets.append(
+    direction_buckets = []
+    for direction in ("CALL", "PUT"):
+        matching = [item for item in evidence if item["direction"] == direction]
+        results = [item["realizedPercent"] for item in matching if item.get("realizedPercent") is not None]
+        direction_buckets.append(
             {
-                "id": bucket_id,
-                "label": label,
+                "id": direction.lower(),
+                "label": direction,
                 "forecasts": len(matching),
-                "accuracy": round(
-                    sum(1 for row in matching if correct(row)) / len(matching) * 100, 1
-                ) if matching else None,
-                "averageRealizedPoints": round(sum(results) / len(results), 2)
+                "accuracy": round(sum(value > 0 for value in results) / len(results) * 100, 1)
+                if results else None,
+                "averageRealizedPercent": round(sum(results) / len(results), 4)
                 if results else None,
             }
         )
 
     paper_trades = []
     for trade in read_trade_history():
-        if str(trade.get("strategy") or "").upper() != "ML_SHADOW_V1_PAPER":
+        if not str(trade.get("strategy") or "").upper().startswith("ML_SHADOW_4H_PERCENT_V2"):
             continue
         normalized = dict(trade)
         if normalized.get("optionType") in {"CALL", "PUT"}:
@@ -2349,31 +2325,42 @@ def build_ml_shadow_status() -> dict:
         "trainingDays": safe_int(metadata.get("training_days")),
         "validation": metadata.get("validation") or {},
         "configuration": {
-            "minimumProbability": safe_float(os.getenv("ML_SHADOW_MIN_PROBABILITY"), 0.70),
-            "minimumExpectedPoints": safe_float(os.getenv("ML_SHADOW_MIN_EXPECTED_POINTS"), 10),
-            "minimumRewardRisk": safe_float(os.getenv("ML_SHADOW_MIN_REWARD_RISK"), 0.80),
-            "horizonCandles": safe_int(os.getenv("ML_SHADOW_HORIZON_CANDLES"), 4),
-            "firstEntryTime": os.getenv("ML_SHADOW_FIRST_ENTRY_TIME", "09:45"),
-            "lastEntryTime": os.getenv("ML_SHADOW_LAST_ENTRY_TIME", "14:16"),
-            "paperOnly": True,
+            "minimumProbability": safe_float(os.getenv("ML_SHADOW_MIN_PROBABILITY"), 0.50),
+            "minimumRewardRisk": safe_float(os.getenv("ML_SHADOW_MIN_REWARD_RISK"), 0.75),
+            "eventMovePercent": safe_float(os.getenv("ML_SHADOW_EVENT_MOVE_PERCENT"), 0.10),
+            "trailingGapFraction": safe_float(os.getenv("ML_SHADOW_TRAILING_GAP_FRACTION"), 0.25),
+            "firstEntryTime": os.getenv("ML_SHADOW_FIRST_ENTRY_TIME", "09:17"),
+            "lastEntryTime": os.getenv("ML_SHADOW_LAST_ENTRY_TIME", "09:30"),
+            "timeframe": "09:15–13:15 first 4H candle",
+            "liveTradingEnabled": (
+                os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+                and os.getenv("ML_SHADOW_LIVE_TRADING_ENABLED", "false").lower() == "true"
+            ),
         },
         "forecastCount": len(rows),
         "resolvedForecastCount": len(resolved),
-        "paperEntryCount": len(entries),
+        "paperEntryCount": entries,
         "directionAccuracy": round(
-            sum(1 for row in resolved if correct(row)) / len(resolved) * 100, 1
-        ) if resolved else None,
-        "selectedForecastAveragePoints": round(
-            sum(selected_results) / len(selected_results), 2
+            sum(value > 0 for value in realized_results) / len(realized_results) * 100, 1
+        ) if realized_results else None,
+        "averageRealizedPercent": round(
+            sum(realized_results) / len(realized_results), 4
         )
-        if selected_results
+        if realized_results
         else None,
         "actionCounts": {
-            action: sum(1 for row in rows if (row.get("action") or "NO_TRADE") == action)
-            for action in sorted({row.get("action") or "NO_TRADE" for row in rows})
+            action: sum(
+                1 for row in rows for prefix in ("call", "put")
+                if (row.get(f"{prefix}_action") or "NO_TRADE") == action
+            )
+            for action in sorted({
+                row.get(f"{prefix}_action") or "NO_TRADE"
+                for row in rows for prefix in ("call", "put")
+            })
         },
         "confidenceBuckets": confidence_buckets,
-        "timeBuckets": time_buckets,
+        "directionBuckets": direction_buckets,
+        "timeBuckets": direction_buckets,
         "recentForecasts": typed_rows[-30:][::-1],
         "paperTrades": paper_trades,
     }

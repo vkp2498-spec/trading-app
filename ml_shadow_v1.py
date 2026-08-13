@@ -1,9 +1,11 @@
-"""ML_SHADOW_V1: leakage-safe NIFTY 15-minute paper-trading engine.
+"""ML Shadow: leakage-safe first-four-hour NIFTY model.
 
-The model is trained nightly through the previous trading day. During the
-session it scores only completed 15-minute candles and may open at most one
-non-overlapping one-lot NIFTY option paper position. It never places a broker
-order, even if account-level live trading variables are accidentally enabled.
+One sample is created per trading day from the 09:15-13:15 NIFTY candle.
+The live forecast is made just after the open using prior-day features and
+today's opening price only. CALL and PUT are independent questions, so either,
+neither, or both can qualify. Paper execution is the default. Live execution
+requires two explicit switches and uses an Upstox multi-leg GTT with target,
+stop loss, and broker-managed trailing stop loss.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import hashlib
 import json
 import math
 import os
-import sys
 import time
 from calendar import monthrange
 from datetime import date, datetime, time as clock_time, timedelta
@@ -23,14 +24,10 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 
 from backtest_data import UpstoxBacktestData
-from market_technicals import (
-    completed_candles,
-    fetch_v3_historical_minutes,
-    fetch_v3_intraday_minutes,
-    merge_candles,
-)
+from market_technicals import completed_candles, fetch_v3_intraday_minutes
 from safe_storage import atomic_write_json, file_lock, locked_append_csv
 from strategy_core import (
     choose_expiry,
@@ -39,56 +36,65 @@ from strategy_core import (
     now_ist,
 )
 from trade_journal import record_closed_trade
-from upstox_streams import (
-    read_market_cache,
-    read_stream_instruments,
-    write_stream_instruments,
-)
+from upstox_streams import read_market_cache, read_stream_instruments, write_stream_instruments
 
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "ml_shadow_v1"
+DATA_DIR = BASE_DIR / "data" / "ml_shadow_4h_v2"
 MODEL_FILE = DATA_DIR / "model.joblib"
 METADATA_FILE = DATA_DIR / "metadata.json"
 PREDICTIONS_FILE = DATA_DIR / "predictions.csv"
-STATE_FILE = BASE_DIR / "trade_state_ML_SHADOW_NIFTY.json"
 ENV_FILE = BASE_DIR / ".env"
-LOG_PREFIX = "ML_SHADOW_V1"
-VERSION = "ML_SHADOW_V1"
+LEGACY_STATE_FILE = BASE_DIR / "trade_state_ML_SHADOW_NIFTY.json"
+STATE_FILES = {
+    "CALL": BASE_DIR / "trade_state_ML_SHADOW_CALL.json",
+    "PUT": BASE_DIR / "trade_state_ML_SHADOW_PUT.json",
+}
+LOG_PREFIX = "ML_SHADOW_4H_V2"
+ENGINE = "ML_SHADOW_V1"
+MODEL_VERSION = "ML_SHADOW_4H_PERCENT_V2"
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
+GTT_PLACE_URL = "https://api.upstox.com/v3/order/gtt/place"
+GTT_DETAILS_URL = "https://api.upstox.com/v3/order/gtt"
+GTT_CANCEL_URL = "https://api.upstox.com/v3/order/gtt/cancel"
+ORDER_PLACE_URL = "https://api-hft.upstox.com/v3/order/place"
+POSITIONS_URL = "https://api.upstox.com/v2/portfolio/short-term-positions"
 
 FEATURE_COLUMNS = [
-    "return_1",
-    "return_2",
-    "return_4",
-    "return_8",
-    "candle_range",
-    "body",
-    "body_ratio",
-    "upper_wick_ratio",
-    "lower_wick_ratio",
-    "close_location",
-    "atr_4",
-    "atr_8",
-    "atr_14",
-    "realized_vol_4",
-    "realized_vol_8",
-    "realized_vol_16",
-    "distance_ema_4",
-    "distance_ema_8",
-    "distance_ema_16",
-    "distance_vwap",
-    "distance_session_open",
-    "distance_session_high",
-    "distance_session_low",
-    "opening_gap",
-    "volume_ratio_8",
-    "range_ratio_8",
+    "previous_return_percent",
+    "previous_range_percent",
+    "previous_body_percent",
+    "previous_up_percent",
+    "previous_down_percent",
+    "previous_close_location",
+    "opening_gap_percent",
+    "previous_volume_ratio_20",
+    "trend_5_percent",
+    "trend_20_percent",
+    "return_mean_5",
+    "return_std_5",
+    "range_mean_5",
+    "up_mean_5",
+    "down_mean_5",
+    "return_mean_10",
+    "return_std_10",
+    "range_mean_10",
+    "up_mean_10",
+    "down_mean_10",
+    "return_mean_20",
+    "return_std_20",
+    "range_mean_20",
+    "up_mean_20",
+    "down_mean_20",
+    "return_mean_60",
+    "return_std_60",
+    "range_mean_60",
+    "up_mean_60",
+    "down_mean_60",
     "day_of_week",
-    "time_sin",
-    "time_cos",
-    "session_candle_number",
+    "month_sin",
+    "month_cos",
 ]
 
 PREDICTION_COLUMNS = [
@@ -96,31 +102,28 @@ PREDICTION_COLUMNS = [
     "candle_time",
     "model_trained_through",
     "model_hash",
-    "call_probability",
-    "put_probability",
-    "none_probability",
-    "call_target_points",
-    "call_stop_points",
-    "call_reward_risk",
-    "put_target_points",
-    "put_stop_points",
-    "put_reward_risk",
-    "direction",
-    "selected_probability",
-    "expected_target_points",
-    "expected_stop_points",
-    "reward_risk",
-    "action",
-    "reason",
+    "underlying_open",
     "underlying_entry_price",
-    "future_up_points",
-    "future_down_points",
-    "call_target_hit",
-    "call_stop_hit",
-    "put_target_hit",
-    "put_stop_hit",
-    "selected_outcome",
-    "selected_realized_points",
+    "call_probability",
+    "call_target_percent",
+    "call_stop_percent",
+    "call_reward_risk",
+    "call_action",
+    "call_reason",
+    "put_probability",
+    "put_target_percent",
+    "put_stop_percent",
+    "put_reward_risk",
+    "put_action",
+    "put_reason",
+    "overall_action",
+    "execution_mode",
+    "future_up_percent",
+    "future_down_percent",
+    "call_outcome",
+    "call_realized_percent",
+    "put_outcome",
+    "put_realized_percent",
     "resolved_at",
 ]
 
@@ -138,9 +141,7 @@ def load_env() -> None:
 
 def configured_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def configured_float(name: str, default: float) -> float:
@@ -166,20 +167,19 @@ def _as_ist(frame: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     result = frame.copy()
     index = pd.DatetimeIndex(result.index)
-    if index.tz is None:
-        index = index.tz_localize(IST)
-    else:
-        index = index.tz_convert(IST)
+    index = index.tz_localize(IST) if index.tz is None else index.tz_convert(IST)
     result.index = index
     return result.sort_index()[~result.index.duplicated(keep="last")]
 
 
-def market_candles_only(frame: pd.DataFrame) -> pd.DataFrame:
-    frame = _as_ist(frame)
+def first_candle_per_day(candles: pd.DataFrame) -> pd.DataFrame:
+    """Return exactly the first 4-hour candle from each session."""
+    frame = _as_ist(candles)
     if frame.empty:
         return frame
     times = frame.index.time
-    return frame[(times >= clock_time(9, 15)) & (times <= clock_time(15, 15))].copy()
+    frame = frame[(times >= clock_time(9, 15)) & (times < clock_time(13, 15))]
+    return frame.groupby(frame.index.date, sort=True).head(1).copy()
 
 
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -187,109 +187,79 @@ def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
 
 
 def build_feature_frame(candles: pd.DataFrame) -> pd.DataFrame:
-    """Create point-in-time features using current/past candles only."""
-    frame = market_candles_only(candles)
+    """Build one daily feature row without using that day's high/low/close."""
+    frame = first_candle_per_day(candles)
     if frame.empty:
         return frame
     required = {"open", "high", "low", "close"}
     missing = required - set(frame.columns)
     if missing:
         raise ValueError("Missing candle fields: " + ", ".join(sorted(missing)))
-    for column in ["open", "high", "low", "close", "volume"]:
+    for column in ("open", "high", "low", "close", "volume"):
         if column not in frame:
             frame[column] = 0.0
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
-    session = pd.Series(frame.index.date, index=frame.index)
-    grouped = frame.groupby(session, sort=False)
-    previous_close = frame["close"].shift(1)
-    true_range = pd.concat(
-        [
-            frame["high"] - frame["low"],
-            (frame["high"] - previous_close).abs(),
-            (frame["low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    candle_range = frame["high"] - frame["low"]
-    body = frame["close"] - frame["open"]
-    upper_wick = frame["high"] - frame[["open", "close"]].max(axis=1)
-    lower_wick = frame[["open", "close"]].min(axis=1) - frame["low"]
-    typical = (frame["high"] + frame["low"] + frame["close"]) / 3.0
-
+    open_price = frame["open"]
+    close = frame["close"]
+    high = frame["high"]
+    low = frame["low"]
     volume = frame["volume"].fillna(0.0)
-    cumulative_volume = volume.groupby(session).cumsum()
-    volume_vwap = (typical * volume).groupby(session).cumsum()
-    fallback_vwap = typical.groupby(session).expanding().mean().reset_index(level=0, drop=True)
-    session_vwap = (volume_vwap / cumulative_volume.replace(0, np.nan)).fillna(fallback_vwap)
-    session_open = grouped["open"].transform("first")
-    session_high = grouped["high"].cummax()
-    session_low = grouped["low"].cummin()
-    session_number = grouped.cumcount() + 1
-
-    daily_last_close = frame.groupby(session)["close"].last()
-    previous_daily_close = daily_last_close.shift(1)
-    previous_close_by_day = session.map(previous_daily_close)
-    opening_gap = _safe_divide(session_open - previous_close_by_day, previous_close_by_day)
+    candle_return = _safe_divide(close - open_price, open_price) * 100
+    candle_range = _safe_divide(high - low, open_price) * 100
+    candle_body = _safe_divide(close - open_price, open_price) * 100
+    up_percent = _safe_divide(high - open_price, open_price) * 100
+    down_percent = _safe_divide(open_price - low, open_price) * 100
+    close_location = _safe_divide(close - low, high - low)
 
     result = frame.copy()
-    result["return_1"] = frame["close"].pct_change(1)
-    result["return_2"] = frame["close"].pct_change(2)
-    result["return_4"] = frame["close"].pct_change(4)
-    result["return_8"] = frame["close"].pct_change(8)
-    result["candle_range"] = candle_range
-    result["body"] = body
-    result["body_ratio"] = _safe_divide(body, candle_range)
-    result["upper_wick_ratio"] = _safe_divide(upper_wick, candle_range)
-    result["lower_wick_ratio"] = _safe_divide(lower_wick, candle_range)
-    result["close_location"] = _safe_divide(frame["close"] - frame["low"], candle_range)
-    for window in (4, 8, 14):
-        result[f"atr_{window}"] = true_range.rolling(window, min_periods=window).mean()
-    returns = frame["close"].pct_change()
-    for window in (4, 8, 16):
-        result[f"realized_vol_{window}"] = returns.rolling(window, min_periods=window).std()
-        ema = frame["close"].ewm(span=window, adjust=False, min_periods=window).mean()
-        result[f"distance_ema_{window}"] = _safe_divide(frame["close"] - ema, ema)
-    result["distance_vwap"] = _safe_divide(frame["close"] - session_vwap, session_vwap)
-    result["distance_session_open"] = _safe_divide(frame["close"] - session_open, session_open)
-    result["distance_session_high"] = _safe_divide(frame["close"] - session_high, session_high)
-    result["distance_session_low"] = _safe_divide(frame["close"] - session_low, session_low)
-    result["opening_gap"] = opening_gap
-    rolling_volume = volume.rolling(8, min_periods=4).mean()
-    result["volume_ratio_8"] = _safe_divide(volume, rolling_volume).fillna(1.0)
-    rolling_range = candle_range.rolling(8, min_periods=4).mean()
-    result["range_ratio_8"] = _safe_divide(candle_range, rolling_range)
+    result["previous_return_percent"] = candle_return.shift(1)
+    result["previous_range_percent"] = candle_range.shift(1)
+    result["previous_body_percent"] = candle_body.shift(1)
+    result["previous_up_percent"] = up_percent.shift(1)
+    result["previous_down_percent"] = down_percent.shift(1)
+    result["previous_close_location"] = close_location.shift(1)
+    result["opening_gap_percent"] = _safe_divide(open_price - close.shift(1), close.shift(1)) * 100
+    volume_average = volume.rolling(20, min_periods=5).mean().shift(1)
+    result["previous_volume_ratio_20"] = _safe_divide(volume.shift(1), volume_average).fillna(1.0)
+    result["trend_5_percent"] = (_safe_divide(close.shift(1), close.shift(6)) - 1) * 100
+    result["trend_20_percent"] = (_safe_divide(close.shift(1), close.shift(21)) - 1) * 100
+    for window in (5, 10, 20, 60):
+        result[f"return_mean_{window}"] = candle_return.rolling(window).mean().shift(1)
+        result[f"return_std_{window}"] = candle_return.rolling(window).std().shift(1)
+        result[f"range_mean_{window}"] = candle_range.rolling(window).mean().shift(1)
+        result[f"up_mean_{window}"] = up_percent.rolling(window).mean().shift(1)
+        result[f"down_mean_{window}"] = down_percent.rolling(window).mean().shift(1)
     result["day_of_week"] = frame.index.dayofweek.astype(float)
-    minutes = frame.index.hour * 60 + frame.index.minute
-    phase = (minutes - (9 * 60 + 15)) / (6.25 * 60) * 2 * math.pi
-    result["time_sin"] = np.sin(phase)
-    result["time_cos"] = np.cos(phase)
-    result["session_candle_number"] = session_number.astype(float)
+    month_phase = (frame.index.month - 1) / 12 * 2 * math.pi
+    result["month_sin"] = np.sin(month_phase)
+    result["month_cos"] = np.cos(month_phase)
     result.replace([np.inf, -np.inf], np.nan, inplace=True)
     return result
 
 
-def add_forward_labels(features: pd.DataFrame, horizon_candles: int, minimum_move: float) -> pd.DataFrame:
-    """Attach same-session future excursions without exposing them as features."""
+def add_forward_labels(
+    features: pd.DataFrame,
+    horizon_candles: int = 1,
+    minimum_move: float | None = None,
+) -> pd.DataFrame:
+    """Attach same-first-candle percentage excursions as independent labels."""
+    del horizon_candles
+    threshold = (
+        configured_float("ML_SHADOW_EVENT_MOVE_PERCENT", 0.10)
+        if minimum_move is None
+        else float(minimum_move)
+    )
     labeled = features.copy()
-    upward = pd.Series(np.nan, index=labeled.index, dtype=float)
-    downward = pd.Series(np.nan, index=labeled.index, dtype=float)
-    for _day, positions in labeled.groupby(labeled.index.date, sort=False).groups.items():
-        day_frame = labeled.loc[positions]
-        for offset in range(len(day_frame)):
-            future = day_frame.iloc[offset + 1 : offset + 1 + horizon_candles]
-            if len(future) != horizon_candles:
-                continue
-            close = float(day_frame.iloc[offset]["close"])
-            upward.loc[day_frame.index[offset]] = max(float(future["high"].max()) - close, 0.0)
-            downward.loc[day_frame.index[offset]] = max(close - float(future["low"].min()), 0.0)
-    labeled["future_up_points"] = upward
-    labeled["future_down_points"] = downward
-    # Direction is a binary calibrated question: which side has the larger
-    # excursion over the forecast horizon? The separate predicted-move and
-    # reward/risk gates decide whether that direction is actually tradable.
-    labeled["label"] = np.where(upward >= downward, "CALL", "PUT")
-    return labeled.dropna(subset=["future_up_points", "future_down_points"])
+    labeled["future_up_percent"] = (
+        _safe_divide(labeled["high"] - labeled["open"], labeled["open"]) * 100
+    ).clip(lower=0)
+    labeled["future_down_percent"] = (
+        _safe_divide(labeled["open"] - labeled["low"], labeled["open"]) * 100
+    ).clip(lower=0)
+    labeled["call_label"] = (labeled["future_up_percent"] >= threshold).astype(int)
+    labeled["put_label"] = (labeled["future_down_percent"] >= threshold).astype(int)
+    return labeled
 
 
 def _sklearn_imports():
@@ -298,260 +268,192 @@ def _sklearn_imports():
         from sklearn.calibration import CalibratedClassifierCV
         from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingClassifier
         from sklearn.impute import SimpleImputer
-        from sklearn.metrics import accuracy_score, log_loss
+        from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, precision_score
         from sklearn.model_selection import TimeSeriesSplit
         from sklearn.pipeline import Pipeline
     except ImportError as error:
-        raise RuntimeError("Install requirements.txt before training ML_SHADOW_V1") from error
-    return {
-        "joblib": joblib,
-        "CalibratedClassifierCV": CalibratedClassifierCV,
-        "GradientBoostingRegressor": GradientBoostingRegressor,
-        "HistGradientBoostingClassifier": HistGradientBoostingClassifier,
-        "SimpleImputer": SimpleImputer,
-        "accuracy_score": accuracy_score,
-        "log_loss": log_loss,
-        "TimeSeriesSplit": TimeSeriesSplit,
-        "Pipeline": Pipeline,
-    }
+        raise RuntimeError("Install requirements.txt before training ML Shadow") from error
+    return locals()
 
 
-def _classifier(sk, horizon: int):
-    base = sk["Pipeline"](
-        [
-            ("imputer", sk["SimpleImputer"](strategy="median")),
-            (
-                "model",
-                sk["HistGradientBoostingClassifier"](
-                    learning_rate=0.04,
-                    max_iter=180,
-                    max_leaf_nodes=15,
-                    l2_regularization=1.0,
-                    random_state=41,
-                ),
-            ),
-        ]
+def _classifier(sk):
+    base = sk["Pipeline"]([
+        ("imputer", sk["SimpleImputer"](strategy="median")),
+        ("model", sk["HistGradientBoostingClassifier"](
+            learning_rate=0.04,
+            max_iter=180,
+            max_leaf_nodes=15,
+            l2_regularization=1.0,
+            random_state=41,
+        )),
+    ])
+    return sk["CalibratedClassifierCV"](
+        base,
+        method="sigmoid",
+        cv=sk["TimeSeriesSplit"](n_splits=5, gap=1),
     )
-    splitter = sk["TimeSeriesSplit"](n_splits=5, gap=max(horizon, 1))
-    return sk["CalibratedClassifierCV"](base, method="sigmoid", cv=splitter)
 
 
 def _regressor(sk, quantile: float):
-    return sk["Pipeline"](
-        [
-            ("imputer", sk["SimpleImputer"](strategy="median")),
-            (
-                "model",
-                sk["GradientBoostingRegressor"](
-                    loss="quantile",
-                    alpha=quantile,
-                    n_estimators=140,
-                    learning_rate=0.04,
-                    max_depth=2,
-                    min_samples_leaf=12,
-                    random_state=41,
-                ),
-            ),
-        ]
-    )
+    return sk["Pipeline"]([
+        ("imputer", sk["SimpleImputer"](strategy="median")),
+        ("model", sk["GradientBoostingRegressor"](
+            loss="quantile",
+            alpha=quantile,
+            n_estimators=140,
+            learning_rate=0.04,
+            max_depth=2,
+            min_samples_leaf=12,
+            random_state=41,
+        )),
+    ])
 
 
-def _probability_map(model, values) -> dict[str, float]:
-    return {str(label): float(value) for label, value in zip(model.classes_, values)}
+def _positive_probability(model, frame: pd.DataFrame) -> np.ndarray:
+    classes = list(model.classes_)
+    if 1 not in classes:
+        return np.zeros(len(frame), dtype=float)
+    return model.predict_proba(frame)[:, classes.index(1)]
 
 
 def fetch_training_candles() -> pd.DataFrame:
-    calendar_days = max(configured_int("ML_SHADOW_HISTORY_CALENDAR_DAYS", 300), 200)
-    trading_days = max(configured_int("ML_SHADOW_TRAINING_DAYS", 180), 60)
+    calendar_days = max(configured_int("ML_SHADOW_HISTORY_CALENDAR_DAYS", 800), 730)
+    trading_days = max(configured_int("ML_SHADOW_TRAINING_DAYS", 504), 300)
     end = now_ist().date() - timedelta(days=1)
     start = end - timedelta(days=calendar_days)
-    source = UpstoxBacktestData(
-        DATA_DIR / "history_cache",
-        progress=log,
-        pause_seconds=0.15,
-    )
-    # Use calendar-month cache keys. Completed months remain immutable, so the
-    # daily trainer normally downloads only the current partial month.
+    source = UpstoxBacktestData(DATA_DIR / "history_cache", progress=log, pause_seconds=0.15)
     frames = []
     cursor = start.replace(day=1)
     while cursor <= end:
         chunk_start = max(start, cursor)
         chunk_end = min(end, cursor.replace(day=monthrange(cursor.year, cursor.month)[1]))
-        frame = source.candles(
-            NIFTY_KEY,
-            "15minute",
-            chunk_start,
-            chunk_end,
-            expired=False,
-        )
+        frame = source.candles(NIFTY_KEY, "4hour", chunk_start, chunk_end, expired=False)
         if not frame.empty:
             frames.append(frame)
         cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
-    candles = pd.concat(frames).sort_index() if frames else pd.DataFrame()
-    candles = market_candles_only(candles)
-    available_days = sorted(set(candles.index.date))
-    if len(available_days) > trading_days:
-        candles = candles[candles.index.date >= available_days[-trading_days]]
+    candles = first_candle_per_day(pd.concat(frames).sort_index() if frames else pd.DataFrame())
+    available = sorted(set(candles.index.date))
+    if len(available) > trading_days:
+        candles = candles[candles.index.date >= available[-trading_days]]
     return candles
+
+
+def _binary_metrics(sk, actual, probability, threshold: float) -> dict:
+    predicted = (probability > threshold).astype(int)
+    qualified = probability > threshold
+    return {
+        "accuracy": round(float(sk["accuracy_score"](actual, predicted)), 4),
+        "baseline_accuracy": round(float(max(actual.mean(), 1 - actual.mean())), 4),
+        "log_loss": round(float(sk["log_loss"](actual, np.c_[1 - probability, probability], labels=[0, 1])), 4),
+        "brier_score": round(float(sk["brier_score_loss"](actual, probability)), 4),
+        "qualified_count": int(qualified.sum()),
+        "qualified_coverage": round(float(qualified.mean()), 4),
+        "qualified_precision": round(float(sk["precision_score"](actual, predicted, zero_division=0)), 4),
+    }
 
 
 def train() -> dict:
     load_env()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    horizon = max(configured_int("ML_SHADOW_HORIZON_CANDLES", 4), 1)
-    minimum_move = max(configured_float("ML_SHADOW_MIN_EXPECTED_POINTS", 10.0), 0.1)
-    minimum_rows = max(configured_int("ML_SHADOW_MIN_TRAINING_ROWS", 1500), 300)
+    minimum_rows = max(configured_int("ML_SHADOW_MIN_TRAINING_ROWS", 300), 240)
+    event_move = max(configured_float("ML_SHADOW_EVENT_MOVE_PERCENT", 0.10), 0.01)
     candles = fetch_training_candles()
     features = build_feature_frame(candles)
-    labeled = add_forward_labels(features, horizon, minimum_move)
-    usable = labeled.dropna(subset=FEATURE_COLUMNS + ["label"])
+    labeled = add_forward_labels(features, minimum_move=event_move)
+    usable = labeled.dropna(subset=FEATURE_COLUMNS + ["call_label", "put_label"])
     if len(usable) < minimum_rows:
         metadata = {
-            "version": VERSION,
+            "version": MODEL_VERSION,
             "status": "INSUFFICIENT_DATA",
-            "rows": int(len(usable)),
+            "training_rows": int(len(usable)),
             "minimum_rows": minimum_rows,
             "generated_at": now_ist().isoformat(),
         }
         atomic_write_json(METADATA_FILE, metadata, sort_keys=True)
-        raise RuntimeError(f"Need {minimum_rows} labeled candles; found {len(usable)}")
-    class_counts = usable["label"].value_counts().to_dict()
-    if set(class_counts) != {"CALL", "PUT"}:
-        raise RuntimeError(f"Both CALL and PUT classes are required: {class_counts}")
+        raise RuntimeError(f"Need {minimum_rows} first-candle rows; found {len(usable)}")
+    for label in ("call_label", "put_label"):
+        if usable[label].nunique() < 2:
+            raise RuntimeError(f"{label} requires both classes; adjust ML_SHADOW_EVENT_MOVE_PERCENT")
 
     sk = _sklearn_imports()
-    validation_rows = max(int(len(usable) * 0.20), 200)
-    validation_start = len(usable) - validation_rows
-    # Forward labels span `horizon` future candles. Purge those rows from the
-    # training edge so no validation candle contributes to a training label.
-    train_frame = usable.iloc[: max(validation_start - horizon, 1)]
+    validation_rows = min(max(int(len(usable) * 0.20), 60), len(usable) - 180)
+    training = usable.iloc[: -validation_rows]
     validation = usable.iloc[-validation_rows:]
-    X_train = train_frame[FEATURE_COLUMNS]
-    y_train = train_frame["label"]
-    validation_model = _classifier(sk, horizon)
-    validation_model.fit(X_train, y_train)
-    validation_probabilities = validation_model.predict_proba(validation[FEATURE_COLUMNS])
-    validation_prediction = validation_model.classes_[np.argmax(validation_probabilities, axis=1)]
-    validation_confidence = np.max(validation_probabilities, axis=1)
-    shadow_threshold = configured_float("ML_SHADOW_MIN_PROBABILITY", 0.70)
-    qualified_mask = validation_confidence >= shadow_threshold
-    validation_targets = pd.get_dummies(validation["label"]).reindex(
-        columns=validation_model.classes_, fill_value=0
+    X_train = training[FEATURE_COLUMNS]
+    X_validation = validation[FEATURE_COLUMNS]
+    threshold = configured_float("ML_SHADOW_MIN_PROBABILITY", 0.50)
+
+    call_validation_model = _classifier(sk).fit(X_train, training["call_label"])
+    put_validation_model = _classifier(sk).fit(X_train, training["put_label"])
+    call_probability = _positive_probability(call_validation_model, X_validation)
+    put_probability = _positive_probability(put_validation_model, X_validation)
+    call_metrics = _binary_metrics(sk, validation["call_label"], call_probability, threshold)
+    put_metrics = _binary_metrics(sk, validation["put_label"], put_probability, threshold)
+
+    call_target_validation = _regressor(sk, 0.50).fit(X_train, training["future_up_percent"])
+    put_target_validation = _regressor(sk, 0.50).fit(X_train, training["future_down_percent"])
+    call_stop_validation = _regressor(sk, 0.75).fit(X_train, training["future_down_percent"])
+    put_stop_validation = _regressor(sk, 0.75).fit(X_train, training["future_up_percent"])
+    call_target_pred = call_target_validation.predict(X_validation)
+    put_target_pred = put_target_validation.predict(X_validation)
+    call_stop_pred = call_stop_validation.predict(X_validation)
+    put_stop_pred = put_stop_validation.predict(X_validation)
+    rr_min = configured_float("ML_SHADOW_MIN_REWARD_RISK", 0.75)
+    qualified = (
+        ((call_probability > threshold) & (call_target_pred / np.maximum(call_stop_pred, 0.001) >= rr_min)).sum()
+        + ((put_probability > threshold) & (put_target_pred / np.maximum(put_stop_pred, 0.001) >= rr_min)).sum()
     )
-    call_target_validation = _regressor(sk, 0.50).fit(
-        X_train, train_frame["future_up_points"]
-    )
-    put_target_validation = _regressor(sk, 0.50).fit(
-        X_train, train_frame["future_down_points"]
-    )
-    call_stop_validation = _regressor(sk, 0.75).fit(
-        X_train, train_frame["future_down_points"]
-    )
-    put_stop_validation = _regressor(sk, 0.75).fit(
-        X_train, train_frame["future_up_points"]
-    )
-    predicted_call_target = call_target_validation.predict(validation[FEATURE_COLUMNS])
-    predicted_put_target = put_target_validation.predict(validation[FEATURE_COLUMNS])
-    predicted_call_stop = call_stop_validation.predict(validation[FEATURE_COLUMNS])
-    predicted_put_stop = put_stop_validation.predict(validation[FEATURE_COLUMNS])
     metrics = {
-        "accuracy": round(float(sk["accuracy_score"](validation["label"], validation_prediction)), 4),
-        "majority_baseline_accuracy": round(
-            float(validation["label"].value_counts(normalize=True).max()), 4
-        ),
-        "log_loss": round(
-            float(
-                sk["log_loss"](
-                    validation["label"],
-                    validation_probabilities,
-                    labels=list(validation_model.classes_),
-                )
-            ),
-            4,
-        ),
-        "multiclass_brier_score": round(
-            float(
-                np.mean(
-                    np.sum(
-                        (validation_probabilities - validation_targets.to_numpy()) ** 2,
-                        axis=1,
-                    )
-                )
-            ),
-            4,
-        ),
-        "qualified_direction_count": int(qualified_mask.sum()),
-        "qualified_direction_coverage": round(float(qualified_mask.mean()), 4),
-        "qualified_direction_precision": round(
-            float(
-                np.mean(
-                    validation_prediction[qualified_mask]
-                    == validation["label"].to_numpy()[qualified_mask]
-                )
-            ),
-            4,
-        )
-        if qualified_mask.any()
-        else None,
-        "call_target_mae_points": round(
-            float(np.mean(np.abs(predicted_call_target - validation["future_up_points"]))), 2
-        ),
-        "put_target_mae_points": round(
-            float(np.mean(np.abs(predicted_put_target - validation["future_down_points"]))), 2
-        ),
-        "call_stop_coverage": round(
-            float(np.mean(validation["future_down_points"] <= predicted_call_stop)), 4
-        ),
-        "put_stop_coverage": round(
-            float(np.mean(validation["future_up_points"] <= predicted_put_stop)), 4
-        ),
+        "accuracy": round((call_metrics["accuracy"] + put_metrics["accuracy"]) / 2, 4),
+        "majority_baseline_accuracy": round((call_metrics["baseline_accuracy"] + put_metrics["baseline_accuracy"]) / 2, 4),
+        "log_loss": round((call_metrics["log_loss"] + put_metrics["log_loss"]) / 2, 4),
+        "qualified_direction_count": int(qualified),
+        "qualified_direction_coverage": round(float(qualified / (validation_rows * 2)), 4),
         "rows": validation_rows,
         "start": validation.index.min().isoformat(),
         "end": validation.index.max().isoformat(),
+        "call": call_metrics,
+        "put": put_metrics,
+        "call_target_mae_percent": round(float(np.mean(np.abs(call_target_pred - validation["future_up_percent"]))), 4),
+        "put_target_mae_percent": round(float(np.mean(np.abs(put_target_pred - validation["future_down_percent"]))), 4),
+        "call_stop_coverage": round(float(np.mean(validation["future_down_percent"] <= call_stop_pred)), 4),
+        "put_stop_coverage": round(float(np.mean(validation["future_up_percent"] <= put_stop_pred)), 4),
     }
 
     X = usable[FEATURE_COLUMNS]
-    classifier = _classifier(sk, horizon)
-    classifier.fit(X, usable["label"])
-    call_target = _regressor(sk, 0.50).fit(X, usable["future_up_points"])
-    put_target = _regressor(sk, 0.50).fit(X, usable["future_down_points"])
-    call_stop = _regressor(sk, 0.75).fit(X, usable["future_down_points"])
-    put_stop = _regressor(sk, 0.75).fit(X, usable["future_up_points"])
-
-    trained_through = max(candles.index.date).isoformat()
     artifact = {
-        "version": VERSION,
+        "version": MODEL_VERSION,
         "feature_columns": FEATURE_COLUMNS,
-        "classifier": classifier,
-        "call_target": call_target,
-        "put_target": put_target,
-        "call_stop": call_stop,
-        "put_stop": put_stop,
-        "horizon_candles": horizon,
-        "minimum_move": minimum_move,
-        "trained_through": trained_through,
+        "call_classifier": _classifier(sk).fit(X, usable["call_label"]),
+        "put_classifier": _classifier(sk).fit(X, usable["put_label"]),
+        "call_target": _regressor(sk, 0.50).fit(X, usable["future_up_percent"]),
+        "put_target": _regressor(sk, 0.50).fit(X, usable["future_down_percent"]),
+        "call_stop": _regressor(sk, 0.75).fit(X, usable["future_down_percent"]),
+        "put_stop": _regressor(sk, 0.75).fit(X, usable["future_up_percent"]),
+        "event_move_percent": event_move,
+        "trained_through": max(candles.index.date).isoformat(),
+        "history_tail": first_candle_per_day(candles).tail(90),
     }
     sk["joblib"].dump(artifact, MODEL_FILE)
     model_hash = hashlib.sha256(MODEL_FILE.read_bytes()).hexdigest()[:16]
     metadata = {
-        "version": VERSION,
+        "version": MODEL_VERSION,
         "status": "READY_SHADOW",
+        "timeframe": "FIRST_4H",
         "generated_at": now_ist().isoformat(),
-        "trained_through": trained_through,
+        "trained_through": artifact["trained_through"],
         "training_rows": int(len(usable)),
         "training_days": int(len(set(usable.index.date))),
-        "class_counts": {str(key): int(value) for key, value in class_counts.items()},
-        "horizon_candles": horizon,
-        "horizon_minutes": horizon * 15,
-        "minimum_move": minimum_move,
+        "history_calendar_days": configured_int("ML_SHADOW_HISTORY_CALENDAR_DAYS", 800),
+        "event_move_percent": event_move,
         "validation": metrics,
         "model_hash": model_hash,
         "feature_columns": FEATURE_COLUMNS,
     }
     atomic_write_json(METADATA_FILE, metadata, sort_keys=True)
     log(
-        f"trained through {trained_through}; rows={len(usable)} days={metadata['training_days']} "
-        f"validation_accuracy={metrics['accuracy']} log_loss={metrics['log_loss']}"
+        f"trained first-4H percent model through {artifact['trained_through']}; "
+        f"rows={len(usable)} validation_accuracy={metrics['accuracy']}"
     )
     return metadata
 
@@ -562,230 +464,139 @@ def load_artifact():
     sk = _sklearn_imports()
     artifact = sk["joblib"].load(MODEL_FILE)
     metadata = json.loads(METADATA_FILE.read_text())
-    if artifact.get("version") != VERSION or metadata.get("status") != "READY_SHADOW":
-        raise RuntimeError("ML model is not READY_SHADOW")
+    if artifact.get("version") != MODEL_VERSION or metadata.get("status") != "READY_SHADOW":
+        raise RuntimeError("First-4H ML model is not READY_SHADOW")
     if artifact.get("trained_through") >= now_ist().date().isoformat():
         raise RuntimeError("ML model includes the current live day")
-    trained_date = date.fromisoformat(str(artifact.get("trained_through")))
+    trained_date = date.fromisoformat(str(artifact["trained_through"]))
     maximum_age = max(configured_int("ML_SHADOW_MAX_MODEL_AGE_DAYS", 4), 1)
     if (now_ist().date() - trained_date).days > maximum_age:
-        raise RuntimeError(
-            f"ML model is stale: trained through {trained_date}; max age is {maximum_age} days"
-        )
+        raise RuntimeError(f"ML model is stale: trained through {trained_date}")
     return artifact, metadata
 
 
-def fetch_live_features() -> tuple[pd.DataFrame, pd.Timestamp, int]:
-    # Upstox rejects oversized minute-history windows in one request. Twenty
-    # calendar days comfortably warms the longest 16-candle feature.
-    historical = fetch_v3_historical_minutes(NIFTY_KEY, minutes=15, lookback_days=20)
-    intraday = fetch_v3_intraday_minutes(NIFTY_KEY, minutes=15)
-    candles = merge_candles(historical, intraday)
+def fetch_today_open() -> tuple[pd.Timestamp, float, float]:
+    candles = _as_ist(fetch_v3_intraday_minutes(NIFTY_KEY, minutes=1))
     candles = completed_candles(
         candles,
-        15,
+        1,
         current_time=now_ist(),
-        grace_seconds=max(configured_float("ML_SHADOW_CANDLE_GRACE_SECONDS", 8.0), 5.0),
+        grace_seconds=max(configured_float("ML_SHADOW_CANDLE_GRACE_SECONDS", 8), 5),
     )
-    candles = market_candles_only(candles)
-    if candles.empty:
-        raise RuntimeError("No completed NIFTY 15-minute candle is available")
-    features = build_feature_frame(candles)
-    latest_time = pd.Timestamp(candles.index[-1])
-    today_count = int(sum(day == now_ist().date() for day in candles.index.date))
-    return features, latest_time, today_count
+    today = candles[candles.index.date == now_ist().date()]
+    if today.empty:
+        raise RuntimeError("The first completed NIFTY minute is not available")
+    opening = float(today.iloc[0]["open"])
+    current_quote = read_market_cache(NIFTY_KEY) or {}
+    current_price = float(current_quote.get("ltp") or today.iloc[-1]["close"])
+    candle_time = pd.Timestamp.combine(now_ist().date(), clock_time(9, 15)).tz_localize(IST)
+    return candle_time, opening, current_price
 
 
 def score_latest(artifact, metadata, live_data=None) -> dict:
-    features, candle_time, today_count = live_data or fetch_live_features()
-    minimum_session_candles = max(configured_int("ML_SHADOW_OPENING_OBSERVATION_CANDLES", 2), 0)
-    if candle_time.date() != now_ist().date():
-        raise RuntimeError("Latest completed candle is not from today")
-    if today_count < minimum_session_candles:
-        raise RuntimeError(
-            f"Opening observation incomplete: {today_count}/{minimum_session_candles} candles"
-        )
+    candle_time, opening, current_price = live_data or fetch_today_open()
+    history = first_candle_per_day(artifact["history_tail"])
+    synthetic = pd.DataFrame(
+        [{"open": opening, "high": opening, "low": opening, "close": opening, "volume": 0.0}],
+        index=pd.DatetimeIndex([candle_time]),
+    )
+    features = build_feature_frame(pd.concat([history, synthetic]).sort_index())
     row = features.loc[[candle_time], artifact["feature_columns"]]
-    if row.isna().any(axis=None):
-        # The stored pipeline imputes ordinary missing values, but a completely
-        # unavailable feature family indicates insufficient current context.
-        missing_fraction = float(row.isna().mean(axis=1).iloc[0])
-        if missing_fraction > 0.20:
-            raise RuntimeError(f"Latest feature row is {missing_fraction:.0%} incomplete")
-    probability_values = artifact["classifier"].predict_proba(row)[0]
-    probabilities = _probability_map(artifact["classifier"], probability_values)
-    call_target = max(float(artifact["call_target"].predict(row)[0]), 0.0)
-    put_target = max(float(artifact["put_target"].predict(row)[0]), 0.0)
-    call_stop = max(float(artifact["call_stop"].predict(row)[0]), 0.1)
-    put_stop = max(float(artifact["put_stop"].predict(row)[0]), 0.1)
-    call_rr = call_target / call_stop
-    put_rr = put_target / put_stop
+    missing_fraction = float(row.isna().mean(axis=1).iloc[0])
+    if missing_fraction > 0.10:
+        raise RuntimeError(f"Opening feature row is {missing_fraction:.0%} incomplete")
+    call_probability = float(_positive_probability(artifact["call_classifier"], row)[0])
+    put_probability = float(_positive_probability(artifact["put_classifier"], row)[0])
+    call_target = max(float(artifact["call_target"].predict(row)[0]), 0.001)
+    put_target = max(float(artifact["put_target"].predict(row)[0]), 0.001)
+    call_stop = max(float(artifact["call_stop"].predict(row)[0]), 0.001)
+    put_stop = max(float(artifact["put_stop"].predict(row)[0]), 0.001)
     return {
         "candle_time": candle_time.isoformat(),
         "model_trained_through": artifact["trained_through"],
         "model_hash": metadata["model_hash"],
-        "call_probability": probabilities.get("CALL", 0.0),
-        "put_probability": probabilities.get("PUT", 0.0),
-        "none_probability": probabilities.get("NONE", 0.0),
-        "call_target_points": call_target,
-        "call_stop_points": call_stop,
-        "call_reward_risk": call_rr,
-        "put_target_points": put_target,
-        "put_stop_points": put_stop,
-        "put_reward_risk": put_rr,
-        "underlying_entry_price": float(features.loc[candle_time, "close"]),
-        "session_candle_number": today_count,
+        "underlying_open": opening,
+        "underlying_entry_price": current_price,
+        "call_probability": call_probability,
+        "call_target_percent": call_target,
+        "call_stop_percent": call_stop,
+        "call_reward_risk": call_target / call_stop,
+        "put_probability": put_probability,
+        "put_target_percent": put_target,
+        "put_stop_percent": put_stop,
+        "put_reward_risk": put_target / put_stop,
     }
 
 
-def choose_action(prediction: dict) -> dict:
-    threshold = configured_float("ML_SHADOW_MIN_PROBABILITY", 0.70)
-    minimum_points = configured_float("ML_SHADOW_MIN_EXPECTED_POINTS", 10.0)
-    minimum_rr = configured_float("ML_SHADOW_MIN_REWARD_RISK", 0.80)
-    probability_gap = configured_float("ML_SHADOW_MIN_DIRECTION_PROBABILITY_GAP", 0.05)
-    candidates = []
+def choose_actions(prediction: dict) -> dict[str, dict]:
+    threshold = configured_float("ML_SHADOW_MIN_PROBABILITY", 0.50)
+    minimum_rr = configured_float("ML_SHADOW_MIN_REWARD_RISK", 0.75)
+    decisions = {}
     for direction, prefix in (("CALL", "call"), ("PUT", "put")):
         probability = float(prediction[f"{prefix}_probability"])
-        target = float(prediction[f"{prefix}_target_points"])
-        stop = float(prediction[f"{prefix}_stop_points"])
+        target = float(prediction[f"{prefix}_target_percent"])
+        stop = float(prediction[f"{prefix}_stop_percent"])
         reward_risk = float(prediction[f"{prefix}_reward_risk"])
-        expected_value = probability * target - (1.0 - probability) * stop
-        if probability >= threshold and target >= minimum_points and reward_risk >= minimum_rr and expected_value > 0:
-            candidates.append(
-                {
-                    "direction": direction,
-                    "probability": probability,
-                    "target_points": target,
-                    "stop_points": stop,
-                    "reward_risk": reward_risk,
-                    "expected_value_points": expected_value,
-                }
-            )
-    if not candidates:
-        return {"action": "NO_TRADE", "reason": "probability/points/reward-risk rule did not qualify"}
-    candidates.sort(key=lambda item: (item["expected_value_points"], item["probability"]), reverse=True)
-    if len(candidates) > 1 and abs(candidates[0]["probability"] - candidates[1]["probability"]) < probability_gap:
-        return {"action": "NO_TRADE", "reason": "CALL and PUT probabilities are too close"}
-    selected = candidates[0]
-    selected.update({"action": "PAPER_ENTRY", "reason": "calibrated ML rule qualified"})
-    return selected
+        qualified = probability > threshold and reward_risk >= minimum_rr
+        decisions[direction] = {
+            "direction": direction,
+            "qualified": qualified,
+            "probability": probability,
+            "target_percent": target,
+            "stop_percent": stop,
+            "reward_risk": reward_risk,
+            "reason": (
+                "independent probability and reward/risk qualified"
+                if qualified
+                else f"requires probability > {threshold:.0%} and reward/risk >= {minimum_rr:.2f}"
+            ),
+        }
+    return decisions
 
 
-def read_state() -> dict:
+def choose_action(prediction: dict) -> dict:
+    """Compatibility helper; returns the strongest independently qualified side."""
+    qualified = [item for item in choose_actions(prediction).values() if item["qualified"]]
+    if not qualified:
+        return {"action": "NO_TRADE", "reason": "neither direction qualified"}
+    selected = max(qualified, key=lambda item: (item["probability"], item["reward_risk"]))
+    return {**selected, "action": "ENTRY"}
+
+
+def read_state(direction: str) -> dict:
     try:
-        value = json.loads(STATE_FILE.read_text())
+        value = json.loads(STATE_FILES[direction].read_text())
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
 
 
-def write_state(state: dict) -> None:
-    atomic_write_json(STATE_FILE, state, sort_keys=True)
+def write_state(direction: str, state: dict) -> None:
+    atomic_write_json(STATE_FILES[direction], state, sort_keys=True)
+
+
+def migrate_legacy_state() -> None:
+    try:
+        state = json.loads(LEGACY_STATE_FILE.read_text())
+    except (OSError, ValueError, TypeError):
+        return
+    if state.get("status") != "POSITION_OPEN" or not state.get("instrument_key"):
+        return
+    direction = str(state.get("ml_direction") or "CALL").upper()
+    if direction not in STATE_FILES or read_state(direction):
+        return
+    state["state_slot"] = f"ML_SHADOW_{direction}"
+    write_state(direction, state)
+    atomic_write_json(LEGACY_STATE_FILE, {}, sort_keys=True)
+    log(f"migrated legacy paper state into {direction} lane")
 
 
 def append_prediction(prediction: dict) -> None:
-    row = {column: prediction.get(column, "") for column in PREDICTION_COLUMNS}
-    locked_append_csv(PREDICTIONS_FILE, PREDICTION_COLUMNS, row)
-
-
-def _selected_forecast_outcome(
-    future: pd.DataFrame,
-    direction: str,
-    entry: float,
-    target: float,
-    stop: float,
-) -> tuple[str, float]:
-    if direction not in {"CALL", "PUT"} or target <= 0 or stop <= 0:
-        return "", 0.0
-    for _, candle in future.iterrows():
-        if direction == "CALL":
-            target_hit = float(candle["high"]) >= entry + target
-            stop_hit = float(candle["low"]) <= entry - stop
-        else:
-            target_hit = float(candle["low"]) <= entry - target
-            stop_hit = float(candle["high"]) >= entry + stop
-        # OHLC cannot reveal intrabar ordering. Score an ambiguous candle
-        # conservatively as a stop rather than inflating shadow performance.
-        if stop_hit:
-            return "STOP", -stop
-        if target_hit:
-            return "TARGET", target
-    final_close = float(future.iloc[-1]["close"])
-    realized = final_close - entry if direction == "CALL" else entry - final_close
-    return "HORIZON", realized
-
-
-def resolve_prediction_outcomes(candles: pd.DataFrame) -> int:
-    """Resolve matured forecasts with the exact future candles predicted."""
-    if not PREDICTIONS_FILE.exists() or candles.empty:
-        return 0
-    horizon = max(configured_int("ML_SHADOW_HORIZON_CANDLES", 4), 1)
-    frame = market_candles_only(candles)
-    changed = 0
-    lock_path = PREDICTIONS_FILE.with_suffix(PREDICTIONS_FILE.suffix + ".lock")
-    with file_lock(lock_path):
-        with PREDICTIONS_FILE.open(newline="") as handle:
-            rows = list(csv.DictReader(handle))
-        lookup = {
-            timestamp.isoformat(): position
-            for position, timestamp in enumerate(frame.index)
-        }
-        for row in rows:
-            if row.get("resolved_at") or not row.get("candle_time"):
-                continue
-            try:
-                candle_time = pd.Timestamp(row["candle_time"])
-                if candle_time.tzinfo is None:
-                    candle_time = candle_time.tz_localize(IST)
-                else:
-                    candle_time = candle_time.tz_convert(IST)
-                position = lookup.get(candle_time.isoformat())
-                entry = float(row.get("underlying_entry_price") or 0)
-            except (TypeError, ValueError):
-                continue
-            if position is None or entry <= 0:
-                continue
-            future = frame.iloc[position + 1 : position + 1 + horizon]
-            if len(future) != horizon or len(set(future.index.date)) != 1:
-                continue
-            future_up = max(float(future["high"].max()) - entry, 0.0)
-            future_down = max(entry - float(future["low"].min()), 0.0)
-            row["future_up_points"] = round(future_up, 2)
-            row["future_down_points"] = round(future_down, 2)
-            call_target = float(row.get("call_target_points") or 0)
-            call_stop = float(row.get("call_stop_points") or 0)
-            put_target = float(row.get("put_target_points") or 0)
-            put_stop = float(row.get("put_stop_points") or 0)
-            row["call_target_hit"] = str(future_up >= call_target).lower()
-            row["call_stop_hit"] = str(future_down >= call_stop).lower()
-            row["put_target_hit"] = str(future_down >= put_target).lower()
-            row["put_stop_hit"] = str(future_up >= put_stop).lower()
-            outcome, realized = _selected_forecast_outcome(
-                future,
-                str(row.get("direction") or "").upper(),
-                entry,
-                float(row.get("expected_target_points") or 0),
-                float(row.get("expected_stop_points") or 0),
-            )
-            row["selected_outcome"] = outcome
-            row["selected_realized_points"] = round(realized, 2) if outcome else ""
-            row["resolved_at"] = now_ist().isoformat()
-            changed += 1
-        if changed:
-            temporary = PREDICTIONS_FILE.with_suffix(".csv.tmp")
-            with temporary.open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=PREDICTION_COLUMNS)
-                writer.writeheader()
-                writer.writerows(
-                    [
-                        {column: row.get(column, "") for column in PREDICTION_COLUMNS}
-                        for row in rows
-                    ]
-                )
-                handle.flush()
-                os.fsync(handle.fileno())
-            temporary.replace(PREDICTIONS_FILE)
-    return changed
+    locked_append_csv(
+        PREDICTIONS_FILE,
+        PREDICTION_COLUMNS,
+        {column: prediction.get(column, "") for column in PREDICTION_COLUMNS},
+    )
 
 
 def prediction_already_recorded(candle_time: str) -> bool:
@@ -798,14 +609,89 @@ def prediction_already_recorded(candle_time: str) -> bool:
         return False
 
 
+def _direction_outcome(
+    direction: str,
+    up_percent: float,
+    down_percent: float,
+    close_percent: float,
+    target_percent: float,
+    stop_percent: float,
+) -> tuple[str, float]:
+    favorable = up_percent if direction == "CALL" else down_percent
+    adverse = down_percent if direction == "CALL" else up_percent
+    if adverse >= stop_percent:
+        return "STOP", -stop_percent
+    if favorable >= target_percent:
+        return "TARGET", target_percent
+    return "CLOSE", close_percent if direction == "CALL" else -close_percent
+
+
+def resolve_prediction_outcomes(candles: pd.DataFrame) -> int:
+    if not PREDICTIONS_FILE.exists() or candles.empty:
+        return 0
+    first = first_candle_per_day(candles)
+    by_date = {timestamp.date(): row for timestamp, row in first.iterrows()}
+    changed = 0
+    lock_path = PREDICTIONS_FILE.with_suffix(PREDICTIONS_FILE.suffix + ".lock")
+    with file_lock(lock_path):
+        with PREDICTIONS_FILE.open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        for row in rows:
+            if row.get("resolved_at") or not row.get("candle_time"):
+                continue
+            try:
+                candle_date = pd.Timestamp(row["candle_time"]).date()
+                candle = by_date[candle_date]
+                opening = float(candle["open"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            up = max((float(candle["high"]) - opening) / opening * 100, 0)
+            down = max((opening - float(candle["low"])) / opening * 100, 0)
+            close_change = (float(candle["close"]) - opening) / opening * 100
+            row["future_up_percent"] = round(up, 4)
+            row["future_down_percent"] = round(down, 4)
+            for direction, prefix in (("CALL", "call"), ("PUT", "put")):
+                outcome, realized = _direction_outcome(
+                    direction,
+                    up,
+                    down,
+                    close_change,
+                    float(row.get(f"{prefix}_target_percent") or 0),
+                    float(row.get(f"{prefix}_stop_percent") or 0),
+                )
+                row[f"{prefix}_outcome"] = outcome
+                row[f"{prefix}_realized_percent"] = round(realized, 4)
+            row["resolved_at"] = now_ist().isoformat()
+            changed += 1
+        if changed:
+            temporary = PREDICTIONS_FILE.with_suffix(".csv.tmp")
+            with temporary.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=PREDICTION_COLUMNS)
+                writer.writeheader()
+                writer.writerows([{column: row.get(column, "") for column in PREDICTION_COLUMNS} for row in rows])
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(PREDICTIONS_FILE)
+    return changed
+
+
+def fetch_resolution_candles() -> pd.DataFrame:
+    end = now_ist().date()
+    start = end - timedelta(days=10)
+    source = UpstoxBacktestData(DATA_DIR / "history_cache", progress=log, pause_seconds=0.1)
+    historical = source.candles(NIFTY_KEY, "4hour", start, end - timedelta(days=1), expired=False)
+    intraday = source.candles(NIFTY_KEY, "4hour", end, end, expired=False)
+    valid = [frame for frame in (historical, intraday) if not frame.empty]
+    return pd.concat(valid).sort_index() if valid else pd.DataFrame()
+
+
 def _round_tick(value: float) -> float:
     return round(round(float(value) / 0.05) * 0.05, 2)
 
 
-def select_paper_option(direction: str) -> dict:
+def select_option(direction: str) -> dict:
     option_type = "CE" if direction == "CALL" else "PE"
-    expiries = get_expiries_from_upstox("NIFTY")
-    expiry = choose_expiry("NIFTY", expiries)
+    expiry = choose_expiry("NIFTY", get_expiries_from_upstox("NIFTY"))
     atm, _nearby, _chain = fetch_upstox_option_chain(
         "NIFTY", nearby=1, expiry_role="execution", expiry=expiry
     )
@@ -817,56 +703,77 @@ def select_paper_option(direction: str) -> dict:
     delta = abs(float(row.get(f"{option_type}_delta") or 0.50))
     strike = float(row.get("strike") or 0)
     if not instrument_key or ltp <= 0:
-        raise RuntimeError("ATM paper option has no valid instrument key/LTP")
-    if ask > 0 and bid > 0 and (ask - bid) / ltp * 100 > configured_float("ML_SHADOW_MAX_OPTION_SPREAD_PERCENT", 5.0):
-        raise RuntimeError("ATM paper option spread is too wide")
-    entry = ask if ask > 0 else ltp
-    # The option-contract API does not expose lot size in the chain response.
-    # NIFTY lot size is made explicit and can be changed without model retraining.
-    lot_size = max(configured_int("ML_SHADOW_NIFTY_LOT_SIZE", 65), 1)
+        raise RuntimeError(f"ATM {direction} option has no valid instrument/LTP")
+    if ask > 0 and bid > 0 and (ask - bid) / ltp * 100 > configured_float("ML_SHADOW_MAX_OPTION_SPREAD_PERCENT", 5):
+        raise RuntimeError(f"ATM {direction} option spread is too wide")
     return {
         "instrument_key": str(instrument_key),
         "trading_symbol": f"NIFTY {int(strike)} {option_type} {expiry}",
         "option_type": option_type,
-        "expiry": str(expiry),
-        "strike": strike,
-        "entry_price": _round_tick(entry),
+        "entry_price": _round_tick(ask if ask > 0 else ltp),
         "delta": max(min(delta, 1.0), 0.05),
-        "lot_size": lot_size,
+        "lot_size": max(configured_int("ML_SHADOW_NIFTY_LOT_SIZE", 65), 1),
     }
 
 
-def open_paper_position(prediction: dict, decision: dict) -> dict:
-    if read_state().get("status") == "POSITION_OPEN":
-        raise RuntimeError("An ML shadow paper position is already open")
-    option = select_paper_option(decision["direction"])
-    target_points = float(decision["target_points"])
-    stop_points = float(decision["stop_points"])
-    delta = option["delta"]
-    entry = option["entry_price"]
-    option_target = _round_tick(entry + target_points * delta)
-    option_stop = _round_tick(max(entry - stop_points * delta, 0.05))
-    underlying_entry = float(prediction["underlying_entry_price"])
+def option_levels(prediction: dict, decision: dict, option: dict) -> dict:
+    opening = float(prediction["underlying_open"])
+    current_underlying = float(prediction["underlying_entry_price"])
+    entry = float(option["entry_price"])
+    delta = float(option["delta"])
     if decision["direction"] == "CALL":
-        underlying_target = underlying_entry + target_points
-        underlying_stop = underlying_entry - stop_points
-        market_direction = "BULLISH"
+        underlying_target = opening * (1 + decision["target_percent"] / 100)
+        underlying_stop = opening * (1 - decision["stop_percent"] / 100)
+        target_points = underlying_target - current_underlying
+        stop_points = current_underlying - underlying_stop
     else:
-        underlying_target = underlying_entry - target_points
-        underlying_stop = underlying_entry + stop_points
-        market_direction = "BEARISH"
-    now = now_ist()
-    horizon_minutes = configured_int("ML_SHADOW_HORIZON_CANDLES", 4) * 15
-    state = {
-        "date": now.date().isoformat(),
+        underlying_target = opening * (1 - decision["target_percent"] / 100)
+        underlying_stop = opening * (1 + decision["stop_percent"] / 100)
+        target_points = current_underlying - underlying_target
+        stop_points = underlying_stop - current_underlying
+    if target_points <= 0:
+        raise RuntimeError(f"{decision['direction']} predicted underlying target was already reached")
+    if stop_points <= 0:
+        raise RuntimeError(f"{decision['direction']} predicted underlying stop was already crossed")
+    execution_reward_risk = target_points / stop_points
+    minimum_rr = configured_float("ML_SHADOW_MIN_REWARD_RISK", 0.75)
+    if execution_reward_risk < minimum_rr:
+        raise RuntimeError(
+            f"{decision['direction']} remaining reward/risk {execution_reward_risk:.2f} "
+            f"is below {minimum_rr:.2f}"
+        )
+    target_distance = max(target_points * delta, 0.05)
+    stop_distance = min(max(stop_points * delta, 0.05), max(entry - 0.05, 0.05))
+    target = _round_tick(entry + target_distance)
+    stop = _round_tick(max(entry - stop_distance, 0.05))
+    stop_distance = max(entry - stop, 0.05)
+    fraction = max(configured_float("ML_SHADOW_TRAILING_GAP_FRACTION", 0.25), 0.10)
+    trailing_gap = _round_tick(max(stop_distance * fraction, 0.05))
+    return {
+        "target_price": target,
+        "stop_loss_price": stop,
+        "trailing_gap": trailing_gap,
+        "option_target_percent": round((target - entry) / entry * 100, 3),
+        "option_stop_percent": round((entry - stop) / entry * 100, 3),
+        "underlying_target_price": round(underlying_target, 2),
+        "underlying_stop_price": round(underlying_stop, 2),
+        "execution_reward_risk": round(execution_reward_risk, 4),
+    }
+
+
+def _base_state(prediction: dict, decision: dict, option: dict, levels: dict, mode: str) -> dict:
+    direction = decision["direction"]
+    expires = datetime.combine(now_ist().date(), clock_time(13, 15), tzinfo=IST)
+    return {
+        "date": now_ist().date().isoformat(),
         "symbol": "NIFTY",
         "underlying_symbol": "NIFTY",
-        "state_slot": "ML_SHADOW_NIFTY",
+        "state_slot": f"ML_SHADOW_{direction}",
         "instrument_class": "INDEX_OPTION",
-        "strategy": "ML_SHADOW_V1_PAPER",
-        "paper_trade": True,
-        "execution_mode": "PAPER",
-        "status": "POSITION_OPEN",
+        "strategy": f"{MODEL_VERSION}_{mode}",
+        "paper_trade": mode == "PAPER",
+        "execution_mode": mode,
+        "status": "POSITION_OPEN" if mode == "PAPER" else "GTT_SUBMITTING",
         "entry_transaction_type": "BUY",
         "position_side": "LONG_OPTION",
         "instrument_key": option["instrument_key"],
@@ -874,106 +781,246 @@ def open_paper_position(prediction: dict, decision: dict) -> dict:
         "option_type": option["option_type"],
         "quantity": option["lot_size"],
         "lot_size": option["lot_size"],
-        "direction": market_direction,
-        "ml_direction": decision["direction"],
-        "confidence": "CALIBRATED",
-        "score": round(float(decision["probability"]) * 100.0, 2),
-        "weighted_score": round(float(decision["probability"]) * 100.0, 2),
-        "entry_score_version": VERSION,
-        "entry_price": entry,
-        "target_price": option_target,
-        "planned_target_price": option_target,
-        "stop_loss_price": option_stop,
-        "original_stop_loss_price": option_stop,
-        "target_points": round(target_points, 2),
-        "stop_points": round(stop_points, 2),
-        "option_delta_used": delta,
-        "underlying_entry_price": round(underlying_entry, 2),
-        "underlying_target_price": round(underlying_target, 2),
-        "underlying_stop_price": round(underlying_stop, 2),
-        "ml_probability": round(float(decision["probability"]), 6),
-        "ml_reward_risk": round(float(decision["reward_risk"]), 4),
-        "ml_expected_value_points": round(float(decision["expected_value_points"]), 4),
+        "direction": "BULLISH" if direction == "CALL" else "BEARISH",
+        "ml_direction": direction,
+        "score": round(decision["probability"] * 100, 2),
+        "weighted_score": round(decision["probability"] * 100, 2),
+        "entry_score_version": MODEL_VERSION,
+        "entry_price": option["entry_price"],
+        "target_price": levels["target_price"],
+        "planned_target_price": levels["target_price"],
+        "stop_loss_price": levels["stop_loss_price"],
+        "original_stop_loss_price": levels["stop_loss_price"],
+        "trailing_gap": levels["trailing_gap"],
+        "trailing_stop_active": True,
+        "trailing_stop_reason": "Upstox-style fixed trailing gap",
+        "underlying_open": prediction["underlying_open"],
+        "underlying_entry_price": prediction["underlying_entry_price"],
+        "underlying_target_price": levels["underlying_target_price"],
+        "underlying_stop_price": levels["underlying_stop_price"],
+        "target_percent": round(decision["target_percent"], 4),
+        "stop_percent": round(decision["stop_percent"], 4),
+        "option_target_percent": levels["option_target_percent"],
+        "option_stop_percent": levels["option_stop_percent"],
+        "ml_probability": round(decision["probability"], 6),
+        "ml_reward_risk": round(decision["reward_risk"], 4),
+        "execution_reward_risk": levels["execution_reward_risk"],
         "ml_model_hash": prediction["model_hash"],
         "ml_model_trained_through": prediction["model_trained_through"],
         "ml_candle_time": prediction["candle_time"],
-        "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(minutes=horizon_minutes)).isoformat(),
-        "highest_ltp": entry,
-        "lowest_ltp": entry,
-        "profit_booking_price": option_target,
-        "profit_protection_stage": 0,
-        "protective_stop_order_id": "PAPER_ONLY",
+        "created_at": now_ist().isoformat(),
+        "expires_at": expires.isoformat(),
+        "highest_ltp": option["entry_price"],
+        "lowest_ltp": option["entry_price"],
+        "profit_booking_price": levels["target_price"],
+        "profit_protection_stage": 1,
     }
-    write_state(state)
-    write_stream_instruments(
-        [*read_stream_instruments(), NIFTY_KEY, option["instrument_key"]]
-    )
+
+
+def open_paper_position(prediction: dict, decision: dict) -> dict:
+    direction = decision["direction"]
+    if read_state(direction).get("instrument_key"):
+        raise RuntimeError(f"{direction} lane already has a position")
+    option = select_option(direction)
+    levels = option_levels(prediction, decision, option)
+    state = _base_state(prediction, decision, option, levels, "PAPER")
+    state["protective_stop_order_id"] = "PAPER_GTT_TRAILING"
+    write_state(direction, state)
+    write_stream_instruments([*read_stream_instruments(), NIFTY_KEY, option["instrument_key"]])
     log(
-        f"PAPER {decision['direction']} opened {option['trading_symbol']} entry={entry} "
-        f"target={option_target} stop={option_stop} probability={decision['probability']:.3f} "
-        f"expected={target_points:.1f}/{stop_points:.1f} NIFTY points"
+        f"PAPER {direction} opened {option['trading_symbol']} entry={option['entry_price']} "
+        f"target={levels['target_price']} stop={levels['stop_loss_price']} trail={levels['trailing_gap']}"
     )
     return state
 
 
-def _fresh_quote(instrument_key: str, maximum_age: float = 20.0) -> dict:
+def _auth_headers() -> dict:
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("UPSTOX_ACCESS_TOKEN is required for live GTT execution")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    algo_name = os.getenv("UPSTOX_ALGO_NAME", "").strip()
+    if algo_name:
+        headers["X-Algo-Name"] = algo_name
+    return headers
+
+
+def _response_json(response: requests.Response, action: str) -> dict:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"raw": response.text[:500]}
+    if response.status_code >= 300 or payload.get("status") == "error":
+        raise RuntimeError(f"Upstox {action} failed ({response.status_code}): {payload}")
+    return payload
+
+
+def place_live_gtt(prediction: dict, decision: dict) -> dict:
+    direction = decision["direction"]
+    if read_state(direction).get("instrument_key"):
+        raise RuntimeError(f"{direction} lane already has state")
+    option = select_option(direction)
+    levels = option_levels(prediction, decision, option)
+    state = _base_state(prediction, decision, option, levels, "LIVE_GTT")
+    write_state(direction, state)  # durable intent prevents a retry after an ambiguous timeout
+    payload = {
+        "type": "MULTIPLE",
+        "quantity": option["lot_size"],
+        "product": "I",
+        "instrument_token": option["instrument_key"],
+        "transaction_type": "BUY",
+        "rules": [
+            {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": option["entry_price"], "market_protection": -1},
+            {"strategy": "TARGET", "trigger_type": "IMMEDIATE", "trigger_price": levels["target_price"], "market_protection": -1},
+            {"strategy": "STOPLOSS", "trigger_type": "IMMEDIATE", "trigger_price": levels["stop_loss_price"], "trailing_gap": levels["trailing_gap"], "market_protection": -1},
+        ],
+    }
+    try:
+        response = requests.post(GTT_PLACE_URL, headers=_auth_headers(), json=payload, timeout=20)
+        result = _response_json(response, "GTT placement")
+        identifiers = (result.get("data") or {}).get("gtt_order_ids") or []
+        if not identifiers:
+            raise RuntimeError(f"Upstox GTT response has no ID: {result}")
+        state["gtt_order_id"] = identifiers[0]
+        state["status"] = "GTT_ACTIVE"
+        state["gtt_payload"] = payload
+        write_state(direction, state)
+        log(f"LIVE {direction} GTT active id={identifiers[0]} target/stop/trailing managed by Upstox")
+        return state
+    except Exception as error:
+        state["status"] = "GTT_SUBMISSION_UNKNOWN"
+        state["submission_error"] = str(error)
+        write_state(direction, state)
+        raise
+
+
+def _fresh_quote(instrument_key: str, maximum_age: float = 20) -> dict:
     quote = read_market_cache(instrument_key) or {}
     received = float(quote.get("received_at") or 0)
-    age = time.time() - received if received else 999999.0
-    if age > maximum_age:
+    if not received or time.time() - received > maximum_age:
         return {}
     return quote
 
 
-def close_paper_position(state: dict, option_exit: float, reason: str) -> dict:
+def close_paper_position(direction: str, state: dict, option_exit: float, reason: str) -> dict:
     state["highest_ltp"] = max(float(state.get("highest_ltp") or option_exit), option_exit)
     state["lowest_ltp"] = min(float(state.get("lowest_ltp") or option_exit), option_exit)
     row = record_closed_trade(state, option_exit, reason)
-    write_state({})
-    log(
-        f"PAPER closed {state.get('trading_symbol')} entry={state.get('entry_price')} "
-        f"exit={option_exit} pnl={row.get('gross_pnl')} reason={reason}"
-    )
+    write_state(direction, {})
+    log(f"PAPER {direction} closed exit={option_exit} pnl={row.get('gross_pnl')} reason={reason}")
     return row
 
 
-def monitor_once(force_squareoff: bool = False) -> bool:
-    state = read_state()
-    if state.get("status") != "POSITION_OPEN":
+def monitor_paper_direction(direction: str, state: dict, force_squareoff: bool = False) -> bool:
+    quote = _fresh_quote(
+        state["instrument_key"],
+        configured_float("ML_SHADOW_QUOTE_MAX_AGE_SECONDS", 20),
+    )
+    option_ltp = float(quote.get("bid_price") or quote.get("ltp") or 0)
+    if option_ltp <= 0:
         return False
-    maximum_age = configured_float("ML_SHADOW_QUOTE_MAX_AGE_SECONDS", 20.0)
-    option_quote = _fresh_quote(state["instrument_key"], maximum_age)
-    underlying_quote = _fresh_quote(NIFTY_KEY, maximum_age)
-    option_ltp = float(option_quote.get("bid_price") or option_quote.get("ltp") or 0)
-    underlying_ltp = float(underlying_quote.get("ltp") or 0)
-    if option_ltp <= 0 or underlying_ltp <= 0:
-        return False
-    state["highest_ltp"] = max(float(state.get("highest_ltp") or option_ltp), option_ltp)
+    highest = max(float(state.get("highest_ltp") or option_ltp), option_ltp)
+    state["highest_ltp"] = highest
     state["lowest_ltp"] = min(float(state.get("lowest_ltp") or option_ltp), option_ltp)
     state["last_option_ltp"] = option_ltp
-    state["last_underlying_ltp"] = underlying_ltp
     state["last_monitored_at"] = now_ist().isoformat()
-    direction = state.get("ml_direction")
-    if force_squareoff or now_ist().time() >= clock_time(15, 29):
-        return bool(close_paper_position(state, _round_tick(option_ltp), "SQUAREOFF"))
-    if direction == "CALL":
-        target_hit = underlying_ltp >= float(state["underlying_target_price"])
-        stop_hit = underlying_ltp <= float(state["underlying_stop_price"])
-    else:
-        target_hit = underlying_ltp <= float(state["underlying_target_price"])
-        stop_hit = underlying_ltp >= float(state["underlying_stop_price"])
-    option_target_hit = option_ltp >= float(state["target_price"])
-    option_stop_hit = option_ltp <= float(state["stop_loss_price"])
-    expired = now_ist() >= datetime.fromisoformat(state["expires_at"])
-    if stop_hit or option_stop_hit:
-        return bool(close_paper_position(state, _round_tick(option_ltp), "STOP_LOSS"))
-    if target_hit or option_target_hit:
-        return bool(close_paper_position(state, _round_tick(option_ltp), "TARGET"))
-    if expired:
-        return bool(close_paper_position(state, _round_tick(option_ltp), "HORIZON_EXIT"))
-    write_state(state)
+    original_stop = float(state.get("original_stop_loss_price") or state["stop_loss_price"])
+    entry = float(state["entry_price"])
+    trailing_gap = max(float(state.get("trailing_gap") or 0.05), 0.05)
+    favorable_steps = max(math.floor((highest - entry) / trailing_gap), 0)
+    trailed_stop = _round_tick(original_stop + favorable_steps * trailing_gap)
+    state["stop_loss_price"] = trailed_stop
+    if force_squareoff or now_ist() >= datetime.fromisoformat(state["expires_at"]):
+        close_paper_position(direction, state, _round_tick(option_ltp), "FIRST_4H_CLOSE")
+        return True
+    if option_ltp <= trailed_stop:
+        close_paper_position(direction, state, _round_tick(option_ltp), "TRAILING_STOP")
+        return True
+    if option_ltp >= float(state["target_price"]):
+        close_paper_position(direction, state, _round_tick(option_ltp), "TARGET")
+        return True
+    write_state(direction, state)
     return True
+
+
+def fetch_live_positions() -> list[dict]:
+    response = requests.get(POSITIONS_URL, headers=_auth_headers(), timeout=15)
+    payload = _response_json(response, "positions")
+    data = payload.get("data") or []
+    return data if isinstance(data, list) else []
+
+
+def cancel_gtt(gtt_order_id: str) -> None:
+    response = requests.delete(
+        GTT_CANCEL_URL,
+        headers=_auth_headers(),
+        json={"gtt_order_id": gtt_order_id},
+        timeout=15,
+    )
+    _response_json(response, "GTT cancellation")
+
+
+def squareoff_live_direction(direction: str, state: dict) -> bool:
+    gtt_order_id = str(state.get("gtt_order_id") or "")
+    if gtt_order_id:
+        try:
+            cancel_gtt(gtt_order_id)
+        except Exception as error:
+            log(f"{direction} GTT cancel check: {error}")
+    position = next(
+        (
+            item for item in fetch_live_positions()
+            if str(item.get("instrument_token") or item.get("instrument_key")) == state["instrument_key"]
+            and int(float(item.get("quantity") or 0)) != 0
+        ),
+        None,
+    )
+    if position is None:
+        write_state(direction, {})
+        log(f"LIVE {direction} GTT has no open broker quantity at first-4H close")
+        return True
+    quantity = abs(int(float(position.get("quantity") or 0)))
+    payload = {
+        "quantity": quantity,
+        "product": "I",
+        "validity": "DAY",
+        "price": 0,
+        "tag": f"ml4h_{direction.lower()}_close",
+        "instrument_token": state["instrument_key"],
+        "order_type": "MARKET",
+        "transaction_type": "SELL",
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False,
+        "slice": True,
+        "market_protection": -1,
+    }
+    response = requests.post(ORDER_PLACE_URL, headers=_auth_headers(), json=payload, timeout=20)
+    result = _response_json(response, "first-4H square-off")
+    state["status"] = "SQUAREOFF_SENT"
+    state["squareoff_response"] = result
+    write_state(direction, state)
+    log(f"LIVE {direction} first-4H square-off sent for qty={quantity}")
+    return True
+
+
+def monitor_once(force_squareoff: bool = False) -> bool:
+    migrate_legacy_state()
+    active = False
+    for direction in ("CALL", "PUT"):
+        state = read_state(direction)
+        if not state.get("instrument_key"):
+            continue
+        active = True
+        if state.get("paper_trade"):
+            monitor_paper_direction(direction, state, force_squareoff)
+        elif force_squareoff or now_ist() >= datetime.fromisoformat(state["expires_at"]):
+            squareoff_live_direction(direction, state)
+    return active
 
 
 def _configured_minutes(name: str, default: str) -> int:
@@ -987,89 +1034,89 @@ def _configured_minutes(name: str, default: str) -> int:
     return hour * 60 + minute
 
 
+def live_enabled() -> bool:
+    return configured_bool("ENABLE_LIVE_TRADING", False) and configured_bool(
+        "ML_SHADOW_LIVE_TRADING_ENABLED", False
+    )
+
+
 def scan() -> dict:
     load_env()
-    if os.getenv("TRADING_ENGINE", "").strip().upper() != VERSION:
-        raise RuntimeError(f"TRADING_ENGINE must be {VERSION}")
-    if configured_bool("ENABLE_LIVE_TRADING", False):
-        raise RuntimeError("ML_SHADOW_V1 refuses to run while ENABLE_LIVE_TRADING=true")
-    if not configured_bool("ML_SHADOW_PAPER_ENABLED", True):
-        raise RuntimeError("ML_SHADOW_PAPER_ENABLED must be true")
-    artifact, metadata = load_artifact()
-    features, candle_time, today_count = fetch_live_features()
-    resolved = resolve_prediction_outcomes(features)
+    migrate_legacy_state()
+    if os.getenv("TRADING_ENGINE", "").strip().upper() != ENGINE:
+        raise RuntimeError(f"TRADING_ENGINE must be {ENGINE}")
+    mode = "LIVE_GTT" if live_enabled() else "PAPER"
+    if mode == "PAPER" and not configured_bool("ML_SHADOW_PAPER_ENABLED", True):
+        raise RuntimeError("Paper mode is disabled and both live switches are not enabled")
+    if configured_bool("ML_SHADOW_LIVE_TRADING_ENABLED", False) != configured_bool("ENABLE_LIVE_TRADING", False):
+        raise RuntimeError("Both ENABLE_LIVE_TRADING and ML_SHADOW_LIVE_TRADING_ENABLED must match")
+
     current_minutes = now_ist().hour * 60 + now_ist().minute
-    first_entry = _configured_minutes("ML_SHADOW_FIRST_ENTRY_TIME", "09:45")
-    last_entry = _configured_minutes("ML_SHADOW_LAST_ENTRY_TIME", "14:16")
-    if current_minutes > last_entry:
-        log(f"resolution-only pass; resolved={resolved}")
-        return {"action": "RESOLVE_ONLY", "resolved": resolved}
-    prediction = score_latest(
-        artifact,
-        metadata,
-        live_data=(features, candle_time, today_count),
-    )
+    first_entry = _configured_minutes("ML_SHADOW_FIRST_ENTRY_TIME", "09:17")
+    last_entry = _configured_minutes("ML_SHADOW_LAST_ENTRY_TIME", "09:30")
+    if current_minutes >= 13 * 60 + 16:
+        resolved = resolve_prediction_outcomes(fetch_resolution_candles())
+        log(f"first-4H resolution pass; resolved={resolved}")
+        return {"overall_action": "RESOLVE_ONLY", "resolved": resolved}
+    if not first_entry <= current_minutes <= last_entry:
+        raise RuntimeError("Outside first-4H forecast entry window")
+
+    artifact, metadata = load_artifact()
+    prediction = score_latest(artifact, metadata)
     if prediction_already_recorded(prediction["candle_time"]):
-        log(f"candle {prediction['candle_time']} already scored")
-        return {"action": "DUPLICATE", **prediction}
-    decision = choose_action(prediction)
-    predicted_direction = (
-        "CALL"
-        if prediction["call_probability"] >= prediction["put_probability"]
-        else "PUT"
-    )
-    predicted_prefix = predicted_direction.lower()
-    if decision["action"] == "PAPER_ENTRY" and not first_entry <= current_minutes <= last_entry:
-        decision = {
-            **decision,
-            "action": "NO_TRADE",
-            "reason": "outside ML shadow entry window",
-        }
-    prediction.update(
-        {
-            "scan_time": now_ist().isoformat(),
-            "direction": decision.get("direction", predicted_direction),
-            "selected_probability": decision.get(
-                "probability", prediction[f"{predicted_prefix}_probability"]
-            ),
-            "expected_target_points": decision.get(
-                "target_points", prediction[f"{predicted_prefix}_target_points"]
-            ),
-            "expected_stop_points": decision.get(
-                "stop_points", prediction[f"{predicted_prefix}_stop_points"]
-            ),
-            "reward_risk": decision.get(
-                "reward_risk", prediction[f"{predicted_prefix}_reward_risk"]
-            ),
-            "action": decision["action"],
-            "reason": decision["reason"],
-        }
-    )
-    if decision["action"] == "PAPER_ENTRY" and read_state().get("status") == "POSITION_OPEN":
-        prediction["action"] = "NO_TRADE"
-        prediction["reason"] = "one non-overlapping ML paper position is already open"
+        log(f"first-4H forecast for {prediction['candle_time']} already recorded")
+        return {"overall_action": "DUPLICATE", **prediction}
+    decisions = choose_actions(prediction)
+    actions = []
+    for direction, prefix in (("CALL", "call"), ("PUT", "put")):
+        decision = decisions[direction]
+        action = "NO_TRADE"
+        reason = decision["reason"]
+        if decision["qualified"]:
+            if read_state(direction).get("instrument_key"):
+                reason = f"{direction} lane already has active state"
+            else:
+                try:
+                    if mode == "LIVE_GTT":
+                        place_live_gtt(prediction, decision)
+                        action = "LIVE_GTT"
+                    else:
+                        open_paper_position(prediction, decision)
+                        action = "PAPER_ENTRY"
+                    reason = "independent probability and reward/risk qualified"
+                except Exception as error:
+                    action = "ERROR"
+                    reason = str(error)
+        prediction[f"{prefix}_action"] = action
+        prediction[f"{prefix}_reason"] = reason
+        actions.append(action)
+    entries = [action for action in actions if action in {"PAPER_ENTRY", "LIVE_GTT"}]
+    prediction.update({
+        "scan_time": now_ist().isoformat(),
+        "execution_mode": mode,
+        "overall_action": "BOTH" if len(entries) == 2 else entries[0] if entries else "NO_TRADE",
+    })
     append_prediction(prediction)
-    if prediction["action"] == "PAPER_ENTRY":
-        open_paper_position(prediction, decision)
     log(
-        f"candle={prediction['candle_time']} call={prediction['call_probability']:.3f} "
-        f"put={prediction['put_probability']:.3f} none={prediction['none_probability']:.3f} "
-        f"action={prediction['action']} reason={prediction['reason']} resolved={resolved}"
+        f"first4h={prediction['candle_time']} call={prediction['call_probability']:.3f}/"
+        f"rr{prediction['call_reward_risk']:.2f}/{prediction['call_action']} "
+        f"put={prediction['put_probability']:.3f}/rr{prediction['put_reward_risk']:.2f}/"
+        f"{prediction['put_action']} mode={mode}"
     )
     return prediction
 
 
 def monitor_loop() -> None:
     load_env()
-    interval = max(configured_float("ML_SHADOW_MONITOR_INTERVAL_SECONDS", 2.0), 1.0)
-    log(f"paper monitor started at {interval:g}-second cadence")
-    while now_ist().time() <= clock_time(15, 30):
+    interval = max(configured_float("ML_SHADOW_MONITOR_INTERVAL_SECONDS", 2), 1)
+    log(f"CALL/PUT GTT-style monitor started at {interval:g}-second cadence")
+    while now_ist().time() <= clock_time(13, 20):
         try:
             monitor_once()
         except Exception as error:
             log(f"monitor error: {error}")
         time.sleep(interval)
-    log("paper monitor stopped")
+    log("first-4H monitor stopped")
 
 
 def main() -> None:
@@ -1087,7 +1134,7 @@ def main() -> None:
         scan()
     elif args.monitor:
         monitor_loop()
-    elif args.squareoff:
+    else:
         monitor_once(force_squareoff=True)
 
 

@@ -19,6 +19,10 @@ ACTIVE_STATUSES = {
     "EXIT_PENDING",
     "BUY_PLACED_NOT_COMPLETE",
     "SELL_PLACED_NOT_COMPLETE",
+    "GTT_SUBMITTING",
+    "GTT_ACTIVE",
+    "GTT_SUBMISSION_UNKNOWN",
+    "SQUAREOFF_SENT",
 }
 
 LEGACY_CORE_VALUES = {
@@ -118,30 +122,28 @@ LEGACY_CORE_VALUES = {
     "VAMSI_ADAPTIVE_LIVE_STOP_GRID": "10,15,20,25,30,35,40,45",
 }
 
-# ML_SHADOW_V1 is intentionally a small, paper-only contract. The old Vamsi
-# and Ganesh values are removed from the managed block so deployments cannot
-# accidentally reactivate either legacy decision engine.
+# ML_SHADOW_V1 is a first-four-hour NIFTY percentage model. Paper is the safe
+# default; live GTT execution requires two matching switches.
 CORE_VALUES = {
     "TRADING_ENGINE": "ML_SHADOW_V1",
     "ENABLE_LIVE_TRADING": "false",
     "TRADE_BANK_NIFTY": "false",
     "PAPER_OBSERVATION_MODE_ENABLED": "false",
     "ML_SHADOW_PAPER_ENABLED": "true",
-    "ML_SHADOW_TRAINING_DAYS": "180",
-    "ML_SHADOW_HISTORY_CALENDAR_DAYS": "300",
-    "ML_SHADOW_HORIZON_CANDLES": "4",
-    "ML_SHADOW_MIN_TRAINING_ROWS": "1500",
+    "ML_SHADOW_LIVE_TRADING_ENABLED": "false",
+    "ML_SHADOW_TRAINING_DAYS": "504",
+    "ML_SHADOW_HISTORY_CALENDAR_DAYS": "800",
+    "ML_SHADOW_MIN_TRAINING_ROWS": "300",
     "ML_SHADOW_MAX_MODEL_AGE_DAYS": "4",
-    "ML_SHADOW_MIN_PROBABILITY": "0.70",
-    "ML_SHADOW_MIN_EXPECTED_POINTS": "10",
-    "ML_SHADOW_MIN_REWARD_RISK": "0.80",
-    "ML_SHADOW_MIN_DIRECTION_PROBABILITY_GAP": "0.05",
-    "ML_SHADOW_OPENING_OBSERVATION_CANDLES": "2",
-    "ML_SHADOW_FIRST_ENTRY_TIME": "09:45",
-    "ML_SHADOW_LAST_ENTRY_TIME": "14:16",
+    "ML_SHADOW_EVENT_MOVE_PERCENT": "0.10",
+    "ML_SHADOW_MIN_PROBABILITY": "0.50",
+    "ML_SHADOW_MIN_REWARD_RISK": "0.75",
+    "ML_SHADOW_FIRST_ENTRY_TIME": "09:17",
+    "ML_SHADOW_LAST_ENTRY_TIME": "09:30",
     "ML_SHADOW_CANDLE_GRACE_SECONDS": "8",
     "ML_SHADOW_MAX_OPTION_SPREAD_PERCENT": "5",
     "ML_SHADOW_NIFTY_LOT_SIZE": "65",
+    "ML_SHADOW_TRAILING_GAP_FRACTION": "0.25",
     "ML_SHADOW_QUOTE_MAX_AGE_SECONDS": "20",
     "ML_SHADOW_MONITOR_INTERVAL_SECONDS": "2",
 }
@@ -164,6 +166,10 @@ DEPRECATED_KEYS = {
     "BANKNIFTY_TARGET_POINTS",
     "BANKNIFTY_STOP_POINTS",
     "BANKNIFTY_EXTREME_TARGET_POINTS",
+    "ML_SHADOW_HORIZON_CANDLES",
+    "ML_SHADOW_MIN_EXPECTED_POINTS",
+    "ML_SHADOW_MIN_DIRECTION_PROBABILITY_GAP",
+    "ML_SHADOW_OPENING_OBSERVATION_CANDLES",
 } | set(LEGACY_CORE_VALUES)
 
 
@@ -238,7 +244,7 @@ def normalized_lines(existing, overrides=None):
             "",
             BLOCK_START,
             "# Account-specific API keys, access tokens, and notification secrets above are preserved.",
-            "# ML_SHADOW_V1 is NIFTY-only and structurally incapable of broker orders.",
+            "# ML_SHADOW_V1 is NIFTY-only; live GTT requires both live switches to be true.",
             *[f"{key}={value}" for key, value in values.items()],
             BLOCK_END,
             "",
@@ -276,7 +282,7 @@ def main():
     parser.add_argument("--refuse-active-state", action="store_true")
     parser.add_argument(
         "--role",
-        choices=("ml-shadow", "disabled"),
+        choices=("ml-shadow", "ml-live", "disabled"),
         help="Force the instance paper role after reading optional local overrides.",
     )
     args = parser.parse_args()
@@ -289,9 +295,11 @@ def main():
         overrides_path.read_text() if overrides_path.exists() else ""
     )
     if args.role:
-        overrides["ENABLE_LIVE_TRADING"] = "false"
+        live_role = args.role == "ml-live"
+        overrides["ENABLE_LIVE_TRADING"] = "true" if live_role else "false"
+        overrides["ML_SHADOW_LIVE_TRADING_ENABLED"] = "true" if live_role else "false"
         overrides["ML_SHADOW_PAPER_ENABLED"] = (
-            "true" if args.role == "ml-shadow" else "false"
+            "true" if args.role in {"ml-shadow", "ml-live"} else "false"
         )
     active = active_state_files(env_path.parent)
     if args.refuse_active_state and active:

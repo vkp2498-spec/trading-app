@@ -34,6 +34,7 @@ DATA_NAMES = {
     "vamsi_adaptive_exit_shadow.json",
     "vamsi_adaptive_live_policy.json",
     "ml_shadow_v1/predictions.csv",
+    "ml_shadow_4h_v2/predictions.csv",
 }
 
 DATA_PATTERNS = (
@@ -71,6 +72,10 @@ def active_local_states() -> list[Path]:
             "EXIT_PENDING",
             "BUY_PLACED_NOT_COMPLETE",
             "SELL_PLACED_NOT_COMPLETE",
+            "GTT_SUBMITTING",
+            "GTT_ACTIVE",
+            "GTT_SUBMISSION_UNKNOWN",
+            "SQUAREOFF_SENT",
         }:
             active.append(path)
     return active

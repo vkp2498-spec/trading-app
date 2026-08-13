@@ -24,11 +24,13 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
             }))
             fieldnames = [
                 "candle_time", "call_probability", "put_probability",
-                "call_target_points", "call_stop_points", "call_reward_risk",
-                "put_target_points", "put_stop_points", "put_reward_risk",
-                "direction", "selected_probability", "action", "reason",
-                "underlying_entry_price", "future_up_points", "future_down_points",
-                "selected_outcome", "selected_realized_points", "resolved_at",
+                "call_target_percent", "call_stop_percent", "call_reward_risk",
+                "put_target_percent", "put_stop_percent", "put_reward_risk",
+                "call_action", "call_reason", "put_action", "put_reason",
+                "overall_action", "execution_mode", "underlying_open",
+                "underlying_entry_price", "future_up_percent", "future_down_percent",
+                "call_outcome", "call_realized_percent", "put_outcome",
+                "put_realized_percent", "resolved_at",
             ]
             with predictions_path.open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -37,24 +39,31 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
                     "candle_time": "2026-08-13T10:00:00+05:30",
                     "call_probability": "0.62",
                     "put_probability": "0.38",
-                    "call_target_points": "12",
-                    "call_stop_points": "9",
+                    "call_target_percent": "0.12",
+                    "call_stop_percent": "0.09",
                     "call_reward_risk": "1.33",
-                    "put_target_points": "8",
-                    "put_stop_points": "11",
+                    "put_target_percent": "0.08",
+                    "put_stop_percent": "0.11",
                     "put_reward_risk": "0.73",
-                    "action": "NO_TRADE",
-                    "reason": "probability below threshold",
+                    "call_action": "PAPER_ENTRY",
+                    "call_reason": "qualified",
+                    "put_action": "NO_TRADE",
+                    "put_reason": "probability below threshold",
+                    "overall_action": "PAPER_ENTRY",
+                    "execution_mode": "PAPER",
+                    "underlying_open": "24995",
                     "underlying_entry_price": "25000",
-                    "future_up_points": "15",
-                    "future_down_points": "4",
-                    "selected_outcome": "TARGET",
-                    "selected_realized_points": "12",
+                    "future_up_percent": "0.15",
+                    "future_down_percent": "0.04",
+                    "call_outcome": "TARGET",
+                    "call_realized_percent": "0.12",
+                    "put_outcome": "CLOSE",
+                    "put_realized_percent": "-0.03",
                     "resolved_at": "2026-08-13T11:00:00+05:30",
                 })
 
             paper_trade = {
-                "strategy": "ML_SHADOW_V1_PAPER",
+                "strategy": "ML_SHADOW_4H_PERCENT_V2_PAPER",
                 "optionType": "CALL",
                 "direction": "BULLISH",
             }
@@ -64,9 +73,9 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
                 status = dashboard_data.build_ml_shadow_status()
 
         forecast = status["recentForecasts"][0]
-        self.assertEqual(forecast["direction"], "CALL")
-        self.assertEqual(forecast["selectedProbability"], 0.62)
-        self.assertEqual(forecast["expectedTargetPoints"], 12.0)
+        self.assertEqual(forecast["callAction"], "PAPER_ENTRY")
+        self.assertEqual(forecast["callProbability"], 0.62)
+        self.assertEqual(forecast["callTargetPercent"], 0.12)
         self.assertEqual(status["resolvedForecastCount"], 1)
         self.assertEqual(status["paperTrades"][0]["direction"], "CALL")
 

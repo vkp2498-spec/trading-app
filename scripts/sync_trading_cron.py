@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the canonical ML_SHADOW_V1 paper cron without disturbing other jobs."""
+"""Install the canonical first-4H ML_SHADOW_V1 cron without disturbing other jobs."""
 
 from __future__ import annotations
 
@@ -24,14 +24,17 @@ def canonical_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# AWS cron uses UTC. Train at 08:45 IST using data only through the prior day.",
+        "# AWS cron uses UTC. Train at 08:45 IST using first-4H data through the prior day.",
         f"15 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_train.lock {python} {root}/ml_shadow_v1.py --train >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# Score through 14:16 IST, then run resolution-only passes through 15:16 IST.",
-        f"1,16,31,46 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# A single flock-protected paper monitor runs for the session.",
-        f"44-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
-        f"* 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
-        f"59 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_squareoff.lock {python} {root}/ml_shadow_v1.py --squareoff >> {log_dir}/ml_shadow_v1.log 2>&1",
+        "# Forecast once from the opening print, with retries at 09:17/09:22/09:27 IST.",
+        f"47,52,57 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
+        "# A flock-protected monitor follows paper positions until the first candle closes.",
+        f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
+        f"* 4-6 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
+        f"0-46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
+        "# Cancel/flatten any remaining live GTT at 13:16 IST; resolve evidence at 13:18.",
+        f"46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_squareoff.lock {python} {root}/ml_shadow_v1.py --squareoff >> {log_dir}/ml_shadow_v1.log 2>&1",
+        f"48 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
         BLOCK_END,
     ]
 
