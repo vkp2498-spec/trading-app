@@ -22,7 +22,9 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertNotIn("cd /old", updated)
         self.assertEqual(updated.count(BLOCK_START), 1)
         self.assertEqual(updated.count(BLOCK_END), 1)
-        self.assertIn("15 10 * * 1-5", updated)
+        self.assertIn("15 3 * * 1-5", updated)
+        self.assertIn("1,16,31,46 4-8 * * 1-5", updated)
+        self.assertIn("ml_shadow_v1.py --scan", updated)
         self.assertIn("59 9 * * 1-5", updated)
 
     def test_disable_removes_managed_jobs_and_keeps_unrelated_jobs(self):
@@ -40,6 +42,7 @@ class SyncTradingCronTests(unittest.TestCase):
 
         self.assertEqual(updated, "0 0 * * * /usr/local/bin/unrelated-job\n")
         self.assertNotIn("trade_bot.py", updated)
+        self.assertNotIn("ml_shadow_v1.py", updated)
 
 
 if __name__ == "__main__":

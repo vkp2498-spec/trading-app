@@ -33,6 +33,7 @@ DATA_NAMES = {
     "vamsi_adaptive_score_config.json",
     "vamsi_adaptive_exit_shadow.json",
     "vamsi_adaptive_live_policy.json",
+    "ml_shadow_v1/predictions.csv",
 }
 
 DATA_PATTERNS = (
@@ -87,6 +88,7 @@ def reset_candidates(new_account: bool = False) -> list[Path]:
         candidates.extend(DATA_DIR / name for name in NEW_ACCOUNT_DATA_NAMES)
     candidates.append(DATA_DIR / "watch_states")
     candidates.append(LOG_DIR / "trade_bot.log")
+    candidates.append(LOG_DIR / "ml_shadow_v1.log")
     return sorted({path for path in candidates if path.exists()}, key=lambda path: str(path))
 
 
