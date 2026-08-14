@@ -152,7 +152,7 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
         self.assertEqual(mixed["cumulative"]["totalPnL"], 325.0)
         self.assertEqual(mixed["analyticsMode"], "MIXED")
 
-    def test_all_dashboard_analytics_exclude_banknifty_trades(self):
+    def test_dashboard_analytics_include_all_supported_index_trades(self):
         today = datetime.now(dashboard_data.IST).date().isoformat()
         trades = [
             {
@@ -192,22 +192,19 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
         with patch.object(dashboard_data, "read_trade_history", return_value=trades):
             performance = dashboard_data.build_trade_performance()
 
-        self.assertEqual(performance["today"]["closedTrades"], 1)
-        self.assertEqual(performance["today"]["closedPnL"], 650.0)
+        self.assertEqual(performance["today"]["closedTrades"], 2)
+        self.assertEqual(performance["today"]["closedPnL"], 6650.0)
         self.assertEqual(performance["today"]["symbolTrades"]["NIFTY"], 1)
-        self.assertEqual(performance["today"]["symbolTrades"].get("BANKNIFTY", 0), 0)
-        self.assertEqual(performance["cumulative"]["totalTrades"], 1)
-        self.assertEqual(performance["cumulative"]["totalPnL"], 650.0)
+        self.assertEqual(performance["today"]["symbolTrades"]["BANKNIFTY"], 1)
+        self.assertEqual(performance["cumulative"]["totalTrades"], 2)
+        self.assertEqual(performance["cumulative"]["totalPnL"], 6650.0)
         weekday = performance["cumulative"]["dayOfWeekPerformance"]
         self.assertTrue(any(row["symbol"] == "NIFTY" for row in weekday))
-        self.assertTrue(
-            all(row["netPnL"] == 0 for row in weekday if row["symbol"] == "BANKNIFTY")
-        )
-        self.assertEqual(performance["edgeAnalytics"]["totalTrades"], 1)
+        self.assertTrue(any(row["symbol"] == "BANKNIFTY" for row in weekday))
+        self.assertEqual(performance["edgeAnalytics"]["totalTrades"], 2)
         self.assertEqual(performance["edgeAnalytics"]["symbolTrades"]["NIFTY"], 1)
-        self.assertEqual(performance["edgeAnalytics"]["symbolTrades"].get("BANKNIFTY", 0), 0)
-        self.assertEqual(len(performance["recentTrades"]), 1)
-        self.assertEqual(performance["recentTrades"][0]["underlyingSymbol"], "NIFTY")
+        self.assertEqual(performance["edgeAnalytics"]["symbolTrades"]["BANKNIFTY"], 1)
+        self.assertEqual(len(performance["recentTrades"]), 2)
 
 
 if __name__ == "__main__":

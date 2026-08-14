@@ -36,7 +36,7 @@ ML_SHADOW_V2_METADATA_FILE = DATA_DIR / "ml_shadow_4h_v2" / "metadata.json"
 ML_SHADOW_V2_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_4h_v2" / "predictions.csv"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
-SYMBOLS = ["NIFTY", "BANKNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"]
 STATE_SLOTS = SYMBOLS + [
     "STOCK_FUTURE",
     "GANESH_GAP_NIFTY",
@@ -593,9 +593,13 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                 "timestamp": bucket.isoformat(),
                 "nifty": None,
                 "bankNifty": None,
+                "sensex": None,
             },
         )
-        key = "bankNifty" if symbol == "BANKNIFTY" else "nifty"
+        key = {
+            "BANKNIFTY": "bankNifty",
+            "SENSEX": "sensex",
+        }.get(symbol, "nifty")
         if row[key] is None:
             row[key] = {
                 "decision": "REJECTED",
@@ -633,15 +637,15 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
     latest_events: dict[str, tuple[datetime, dict]] = {}
     decision_pattern = re.compile(
         r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| "
-        r"(NIFTY|BANKNIFTY) score ([^ ]+) (reject|buy)"
+        r"(NIFTY|BANKNIFTY|SENSEX) score ([^ ]+) (reject|buy)"
         r"(?: version=([A-Z0-9_-]+))?$",
         re.IGNORECASE,
     )
     reason_patterns = (
-        re.compile(r"^(NIFTY|BANKNIFTY) no trade: (.+)$", re.IGNORECASE),
-        re.compile(r"^(NIFTY|BANKNIFTY) portfolio gate rejected entry: (.+)$", re.IGNORECASE),
-        re.compile(r"^(NIFTY|BANKNIFTY) MARKET BUY rejected: (.+)$", re.IGNORECASE),
-        re.compile(r"^(NIFTY|BANKNIFTY) order execution ERROR: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY|SENSEX) no trade: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY|SENSEX) portfolio gate rejected entry: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY|SENSEX) MARKET BUY rejected: (.+)$", re.IGNORECASE),
+        re.compile(r"^(NIFTY|BANKNIFTY|SENSEX) order execution ERROR: (.+)$", re.IGNORECASE),
     )
     for raw_line in read_last_lines(LOG_FILE, max_lines=10000):
         line = raw_line.strip()
@@ -711,6 +715,11 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
             "NO_CANDIDATE": ("NO SETUP", "No complete option-buying candidate"),
             "ACTIVE_POSITION": ("SKIPPED", "A bot position is already active"),
             "DAILY_STOP": ("SKIPPED", "Daily trade limit reached"),
+            "QUALIFIED_NOT_SELECTED": (
+                "NOT SELECTED",
+                "Another qualified index had the better score",
+            ),
+            "ERROR": ("UNAVAILABLE", "Index scan was temporarily unavailable"),
         }
         try:
             with VAMSI_KB_SCAN_FILE.open("r", newline="", errors="ignore") as file:
@@ -726,12 +735,23 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                         (action.replace("_", " ") or "SCANNED", "Scan completed"),
                     )
                     blockers = str(raw_row.get("blockers") or "").replace(" | ", "; ")
-                    result = result_for(scan_bucket(timestamp), "NIFTY")
+                    symbol = str(raw_row.get("symbol") or "").upper()
+                    if symbol not in SYMBOLS:
+                        instrument = str(raw_row.get("instrument") or "").upper()
+                        symbol = (
+                            "SENSEX" if "SENSEX" in instrument
+                            else "BANKNIFTY" if "BANKNIFTY" in instrument
+                            else "NIFTY"
+                        )
+                    result = result_for(scan_bucket(timestamp), symbol)
                     result.update(
                         {
                             "decision": decision,
                             "reason": short_scan_reason(blockers, fallback),
                             "score": safe_float(raw_row.get("knowledge_score"), None),
+                            "selectionScore": safe_float(
+                                raw_row.get("selection_score"), None
+                            ),
                             "scoreVersion": "VAMSI_KB_INTRADAY_V1_ALL_GATES",
                             "direction": str(raw_row.get("direction") or "").upper() or None,
                             "setup": str(raw_row.get("setup") or "").replace("_", " ") or None,
@@ -906,6 +926,8 @@ def symbol_pnl(trades: list[dict]) -> dict:
         ).upper()
         if "BANKNIFTY" in symbol:
             symbol = "BANKNIFTY"
+        elif "SENSEX" in symbol:
+            symbol = "SENSEX"
         elif "NIFTY" in symbol:
             symbol = "NIFTY"
 
@@ -976,6 +998,8 @@ def category_performance(
         ("NIFTY", "OPTION_BUY"),
         ("BANKNIFTY", "OPTION_SELL"),
         ("BANKNIFTY", "OPTION_BUY"),
+        ("SENSEX", "OPTION_SELL"),
+        ("SENSEX", "OPTION_BUY"),
         ("ALL", "STOCK_FUTURES"),
     ]
 
@@ -1030,6 +1054,8 @@ def normalized_underlying(trade: dict) -> str:
     ).upper()
     if "BANKNIFTY" in symbol:
         return "BANKNIFTY"
+    if "SENSEX" in symbol:
+        return "SENSEX"
     if "NIFTY" in symbol:
         return "NIFTY"
     return symbol
@@ -1648,7 +1674,11 @@ def fetch_upstox_today_pnl() -> tuple[float | None, str | None, int, dict[str, f
             if not isinstance(row, dict):
                 continue
             name = str(row.get("scrip_name") or "").upper()
-            symbol = "BANKNIFTY" if "BANKNIFTY" in name else "NIFTY"
+            symbol = (
+                "BANKNIFTY" if "BANKNIFTY" in name
+                else "SENSEX" if "SENSEX" in name
+                else "NIFTY"
+            )
             symbol_counts[symbol] += 1
             symbol_totals[symbol] += (
                 safe_float(row.get("sell_amount"))
@@ -1783,7 +1813,7 @@ def build_trade_performance(analytics_mode: str = "real") -> dict:
     trades = [
         trade
         for trade in selective_index_trades(history)
-        if normalized_underlying(trade) == "NIFTY"
+        if normalized_underlying(trade) in SYMBOLS
         and (analytics_mode == "mixed" or not is_paper_trade(trade))
     ]
     raw = _build_trade_performance_payload(trades, today_text)

@@ -1,4 +1,4 @@
-"""Minimal NIFTY dashboard: headline P/L, calendar and today's scans."""
+"""Minimal index-options dashboard: headline P/L, calendar and scans."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent
 APP_ICON = BASE_DIR / "assets" / "vamsi_icon_v2.jpg"
 
 st.set_page_config(
-    page_title="NIFTY Trading",
+    page_title="Index Options Trading",
     page_icon=str(APP_ICON) if APP_ICON.exists() else "📈",
     layout="wide",
 )
@@ -106,7 +106,7 @@ def parse_calendar_days(days: list[dict]) -> list[dict]:
 def render_pnl_calendar(days: list[dict]) -> None:
     parsed = parse_calendar_days(days)
     if not parsed:
-        st.info("Completed NIFTY trades will populate the P/L calendar.")
+        st.info("Completed index-option trades will populate the P/L calendar.")
         return
 
     available = sorted({(item["date"].year, item["date"].month) for item in parsed})
@@ -149,12 +149,21 @@ def render_pnl_calendar(days: list[dict]) -> None:
 
 
 def render_scans(scans: list[dict]) -> None:
-    visible = [row for row in scans or [] if row.get("nifty")]
+    symbol_keys = (
+        ("NIFTY", "nifty"),
+        ("BANKNIFTY", "bankNifty"),
+        ("SENSEX", "sensex"),
+    )
+    visible = [
+        (row, symbol, row.get(key))
+        for row in scans or []
+        for symbol, key in symbol_keys
+        if row.get(key)
+    ]
     if not visible:
         st.info("Today’s completed five-minute scans will appear here.")
         return
-    for row in visible:
-        decision = row.get("nifty") or {}
+    for row, symbol, decision in visible:
         try:
             timestamp = datetime.fromisoformat(str(row.get("timestamp") or ""))
             time_text = timestamp.strftime("%I:%M %p").lstrip("0")
@@ -163,12 +172,16 @@ def render_scans(scans: list[dict]) -> None:
         status = str(decision.get("decision") or "SCANNED")
         badge_class = "entered" if status in {"ENTERED", "SELECTED"} else ""
         metadata = [
+            symbol,
             str(decision.get("direction") or "").title(),
             str(decision.get("setup") or "").title(),
         ]
         score = decision.get("score")
         if score is not None:
             metadata.append(f"Knowledge {float(score):.1f}")
+        selection = decision.get("selectionScore")
+        if selection is not None:
+            metadata.append(f"Rank {float(selection):.1f}")
         instrument = decision.get("instrument")
         if instrument:
             metadata.append(str(instrument))
@@ -192,7 +205,7 @@ cumulative_pnl = float(cumulative.get("netPnL", cumulative.get("totalPnL", 0)) o
 today_trades = int(today.get("closedTrades", 0) or 0)
 total_trades = int(cumulative.get("totalTrades", 0) or 0)
 
-st.markdown('<div class="page-title">NIFTY Options Trading</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-title">Index Options Trading</div>', unsafe_allow_html=True)
 st.markdown(
     f'<div class="page-subtitle">Updated {now_ist().strftime("%d %b %Y · %I:%M:%S %p")} IST</div>',
     unsafe_allow_html=True,

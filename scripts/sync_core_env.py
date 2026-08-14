@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalize the shared NIFTY strategy block without touching account secrets."""
+"""Normalize the shared index-options strategy block without touching secrets."""
 
 from __future__ import annotations
 
@@ -122,14 +122,15 @@ LEGACY_CORE_VALUES = {
     "VAMSI_ADAPTIVE_LIVE_STOP_GRID": "10,15,20,25,30,35,40,45",
 }
 
-# The knowledge engine scans only completed five-minute candles.  Direction is
-# taken from the NIFTY underlying; option-chain, option VWAP/volume, breadth,
+# The knowledge engine scans only completed five-minute candles for NIFTY,
+# BANKNIFTY and SENSEX. Option-chain, option VWAP/volume, constituent breadth,
 # spread, and delta are independent mandatory confirmations.  The role switch
 # below is the only deployment code allowed to enable live order submission.
 CORE_VALUES = {
     "TRADING_ENGINE": "VAMSI_KB_INTRADAY_V1",
     "ENABLE_LIVE_TRADING": "false",
-    "TRADE_BANK_NIFTY": "false",
+    "TRADE_BANK_NIFTY": "true",
+    "TRADE_SENSEX": "true",
     "PAPER_OBSERVATION_MODE_ENABLED": "false",
     "DEFAULT_TRADING_PROFILE": "1_LOT",
     "OPTION_CAPITAL_PER_ENTRY": "1",
@@ -143,12 +144,21 @@ CORE_VALUES = {
     "OPTION_DELTA_APPROXIMATION": "0.50",
     "VAMSI_KB_TARGET_POINTS": "30",
     "VAMSI_KB_STOP_POINTS": "30",
+    "VAMSI_KB_NIFTY_TARGET_POINTS": "30",
+    "VAMSI_KB_NIFTY_STOP_POINTS": "30",
+    "VAMSI_KB_BANKNIFTY_TARGET_POINTS": "30",
+    "VAMSI_KB_BANKNIFTY_STOP_POINTS": "30",
+    "VAMSI_KB_SENSEX_TARGET_POINTS": "30",
+    "VAMSI_KB_SENSEX_STOP_POINTS": "30",
     "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
     "VAMSI_KB_FIRST_ENTRY_TIME": "09:20",
     "VAMSI_KB_LAST_ENTRY_TIME": "15:15",
     "VAMSI_KB_CANDLE_GRACE_SECONDS": "8",
     "VAMSI_KB_MAX_CANDLE_AGE_MINUTES": "7",
     "VAMSI_KB_MIN_BREADTH_COVERAGE": "30",
+    "VAMSI_KB_NIFTY_MIN_BREADTH_COVERAGE": "30",
+    "VAMSI_KB_BANKNIFTY_MIN_BREADTH_COVERAGE": "3",
+    "VAMSI_KB_SENSEX_MIN_BREADTH_COVERAGE": "20",
     "VAMSI_KB_MIN_BREADTH_SCORE": "18",
     "VAMSI_KB_ALLOW_NEUTRAL_CHAIN": "false",
     "VAMSI_KB_MIN_OPTION_VOLUME_RATIO": "1.0",
@@ -339,7 +349,7 @@ def normalized_lines(existing, overrides=None):
             "",
             BLOCK_START,
             "# Account-specific API keys, access tokens, and notification secrets above are preserved.",
-            "# ML_SHADOW_V1 is NIFTY-only; live GTT requires both live switches to be true.",
+            "# The active knowledge engine ranks qualified NIFTY, BANKNIFTY and SENSEX setups.",
             *[f"{key}={value}" for key, value in values.items()],
             BLOCK_END,
             "",
@@ -365,7 +375,7 @@ def write_atomic(path, text):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Make the core NIFTY strategy env values canonical and deduplicated"
+        description="Make the core index-options env values canonical and deduplicated"
     )
     parser.add_argument("--env-file", default=".env")
     parser.add_argument(

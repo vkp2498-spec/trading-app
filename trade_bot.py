@@ -27,6 +27,7 @@ from adaptive_score_calibration import read_effective_score_rule
 from scan_journal import record_scan_decision
 from banknifty_breadth import get_banknifty_breadth
 from nifty_breadth import get_nifty_breadth
+from sensex_breadth import get_sensex_breadth
 from institutional_flow import (
     get_institutional_footprint,
     neutral_institutional_footprint,
@@ -171,9 +172,10 @@ ENTRY_NOTIFICATION_RECEIPTS_LOCK_FILE = BASE_DIR / ".entry_notification_receipts
 PORTFOLIO_ENTRY_LOCK_FILE = BASE_DIR / ".portfolio_entry.lock"
 WATCH_STATE_DIR = BASE_DIR / "data" / "watch_states"
 
-SYMBOLS = ["NIFTY", "BANKNIFTY"]
+SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"]
+GANESH_GAP_SYMBOLS = ["NIFTY", "BANKNIFTY"]
 GANESH_GAP_STATE_BY_SYMBOL = {
-    symbol: f"GANESH_GAP_{symbol}" for symbol in SYMBOLS
+    symbol: f"GANESH_GAP_{symbol}" for symbol in GANESH_GAP_SYMBOLS
 }
 # Backward-compatible alias for the original NIFTY-only state slot.
 GANESH_GAP_STATE = GANESH_GAP_STATE_BY_SYMBOL["NIFTY"]
@@ -189,11 +191,13 @@ GANESH_GAP_BANKNIFTY_SCAN_FILE = BASE_DIR / "data" / "ganesh_gap_banknifty_scans
 DEFAULT_LOT_MULTIPLIERS = {
     "NIFTY": 1,
     "BANKNIFTY": 1,
+    "SENSEX": 1,
 }
 
 MIN_SCORE_BY_SYMBOL = {
     "NIFTY": 70,
     "BANKNIFTY": 65,
+    "SENSEX": 65,
 }
 DEFAULT_CAUTIOUS_OVERRIDE_SCORE = 50
 
@@ -204,6 +208,7 @@ DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
 DEFAULT_INDEX_EXIT_POINTS = {
     "NIFTY": {"target": 20.0, "stop": 20.0},
     "BANKNIFTY": {"target": 40.0, "stop": 40.0},
+    "SENSEX": {"target": 80.0, "stop": 80.0},
 }
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 0.8
@@ -219,11 +224,17 @@ SYMBOL_CONFIG = {
     },
     "BANKNIFTY": {
         "underlying_candidates": ["BANKNIFTY", "NIFTY BANK"],
+        "derivative_segments": ["NSE_FO"],
+    },
+    "SENSEX": {
+        "underlying_candidates": ["SENSEX"],
+        "derivative_segments": ["BSE_FO"],
     },
 }
 UNDERLYING_INDEX_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "SENSEX": "BSE_INDEX|SENSEX",
 }
 
 UPSTOX_PLACE_ORDER_URL = "https://api-hft.upstox.com/v2/order/place"
@@ -407,6 +418,11 @@ def enabled_index_symbols():
     symbols = ["NIFTY"]
     if configured_bool("TRADE_BANK_NIFTY", True):
         symbols.append("BANKNIFTY")
+    # SENSEX is owned by the deterministic multi-index scanner. Keep legacy
+    # VAMSI entry loops opt-in so older deployments cannot start a new lane
+    # merely by receiving this code.
+    if configured_bool("TRADE_SENSEX", False):
+        symbols.append("SENSEX")
     return symbols
 
 
@@ -3067,6 +3083,9 @@ def find_index_option_instrument(symbol, expiry_text, strike, option_type):
     wanted_expiry = parse_expiry(expiry_text)
     wanted_strike = float(strike)
     underlying_candidates = set(SYMBOL_CONFIG[symbol]["underlying_candidates"])
+    derivative_segments = set(
+        SYMBOL_CONFIG[symbol].get("derivative_segments", ["NSE_FO"])
+    )
 
     with gzip.open(INSTRUMENT_CACHE, "rt", encoding="utf-8") as f:
         instruments = json.load(f)
@@ -3074,7 +3093,7 @@ def find_index_option_instrument(symbol, expiry_text, strike, option_type):
     matches = []
 
     for item in instruments:
-        if item.get("segment") != "NSE_FO":
+        if item.get("segment") not in derivative_segments:
             continue
         if item.get("underlying_symbol") not in underlying_candidates:
             continue
@@ -5304,8 +5323,7 @@ def build_trade_candidate(
     # The stream is dynamic because the ATM strike changes. The persistent
     # service will subscribe to the next set on its next refresh/restart.
     write_stream_instruments([
-        "NSE_INDEX|Nifty 50",
-        "NSE_INDEX|Nifty Bank",
+        *UNDERLYING_INDEX_KEYS.values(),
         "NSE_INDEX|India VIX",
         analysis_instrument.get("instrument_key"),
         instrument.get("instrument_key"),
@@ -5750,9 +5768,8 @@ def evaluate_symbol_buy_or_sell(
     # 100-point assessment; weak evidence simply earns fewer points.
     directional_chain = direction in {"BULLISH", "BEARISH"}
     observe_signal_reset(symbol, direction)
-    neutral_banknifty_candidate = symbol == "BANKNIFTY" and direction == "NEUTRAL"
-    neutral_nifty_candidate = symbol == "NIFTY" and direction == "NEUTRAL"
-    if not directional_chain and not neutral_banknifty_candidate and not neutral_nifty_candidate:
+    neutral_index_candidate = symbol in SYMBOLS and direction == "NEUTRAL"
+    if not directional_chain and not neutral_index_candidate:
         collect_institutional_footprint(symbol, rec)
         log_scan_decision(symbol, score, "reject")
         return False
@@ -5800,6 +5817,23 @@ def evaluate_symbol_buy_or_sell(
             f"confidence={breadth.get('confidence')} score={breadth.get('score')} "
             f"reasons={breadth.get('reasons')}"
         )
+    elif symbol == "SENSEX":
+        try:
+            breadth = get_sensex_breadth(INSTRUMENT_CACHE, upstox_request)
+        except Exception as error:
+            breadth = {
+                "bias": "NEUTRAL",
+                "confidence": "LOW",
+                "score": 0,
+                "coverage": 0,
+                "reasons": [f"SENSEX breadth unavailable: {error}"],
+            }
+        base_technicals["sensex_breadth"] = breadth
+        verbose_log(
+            f"SENSEX breadth: bias={breadth.get('bias')} "
+            f"confidence={breadth.get('confidence')} score={breadth.get('score')} "
+            f"reasons={breadth.get('reasons')}"
+        )
 
     reversal = bollinger_exhaustion_reversal(
         base_technicals,
@@ -5826,45 +5860,25 @@ def evaluate_symbol_buy_or_sell(
             f"reasons={reversal.get('reasons')}"
         )
 
-    if neutral_banknifty_candidate:
+    if neutral_index_candidate:
         if score_cutoff_mode_enabled():
             inferred_direction = score_direction_from_technicals(base_technicals)
             blockers = [] if inferred_direction else ["technical direction is unavailable"]
-        else:
+        elif symbol == "BANKNIFTY":
             inferred_direction, blockers = banknifty_neutral_chain_direction(base_technicals)
-        if (
-            not inferred_direction
-            and reversal_enabled
-            and reversal.get("confirmed")
-        ):
-            inferred_direction = reversal.get("direction")
-            blockers = []
-        if not inferred_direction:
-            collect_institutional_footprint(symbol, rec)
-            log_scan_decision(symbol, score, "reject")
-            return False
-        original_direction = direction
-        original_confidence = confidence
-        rec = deepcopy(rec)
-        rec.update(
-            {
-                "chain_bias": original_direction,
-                "chain_confidence": original_confidence,
-                "neutral_chain_override": True,
-                "direction": inferred_direction,
-            }
-        )
-        direction = inferred_direction
-        verbose_log(
-            f"BANKNIFTY neutral-chain override candidate: direction={direction}; "
-            "the complete 100-point score will decide"
-        )
-    elif neutral_nifty_candidate:
-        if score_cutoff_mode_enabled():
-            inferred_direction = score_direction_from_technicals(base_technicals)
-            blockers = [] if inferred_direction else ["technical direction is unavailable"]
         else:
-            inferred_direction, blockers = nifty_neutral_chain_direction(base_technicals)
+            # The NIFTY helper uses the same completed-candle requirements.
+            # Expose SENSEX breadth through the expected generic slot only for
+            # this neutral-chain inference.
+            inference_technicals = base_technicals
+            if symbol == "SENSEX":
+                inference_technicals = deepcopy(base_technicals)
+                inference_technicals["nifty_breadth"] = base_technicals.get(
+                    "sensex_breadth", {}
+                )
+            inferred_direction, blockers = nifty_neutral_chain_direction(
+                inference_technicals
+            )
         if (
             not inferred_direction
             and reversal_enabled
@@ -5889,7 +5903,7 @@ def evaluate_symbol_buy_or_sell(
         )
         direction = inferred_direction
         verbose_log(
-            f"NIFTY neutral-chain override candidate: direction={direction}; "
+            f"{symbol} neutral-chain override candidate: direction={direction}; "
             "the complete 100-point score will decide"
         )
 
@@ -6238,8 +6252,7 @@ def _execute_selected_candidate_locked(chosen):
         dry_run_note = ""
 
     write_stream_instruments([
-        "NSE_INDEX|Nifty 50",
-        "NSE_INDEX|Nifty Bank",
+        *UNDERLYING_INDEX_KEYS.values(),
         "NSE_INDEX|India VIX",
         instrument.get("instrument_key"),
     ])
@@ -7251,7 +7264,10 @@ def run_ganesh_gap_signal_check():
             "NSE_INDEX|India VIX",
         ]
     )
-    for symbol in enabled_index_symbols():
+    ganesh_symbols = ["NIFTY"]
+    if configured_bool("TRADE_BANK_NIFTY", True):
+        ganesh_symbols.append("BANKNIFTY")
+    for symbol in ganesh_symbols:
         run_ganesh_gap_symbol_signal_check(symbol, now=now)
         if any(
             state_is_active(read_state(slot)) for slot in GANESH_GAP_STATE_SLOTS
@@ -7481,12 +7497,12 @@ def run_signal_check():
             not in tracked_instrument_keys
             and (
                 str(position.get("exchange") or position.get("segment") or "").upper()
-                in {"NSE_FO", "NFO"}
+                in {"NSE_FO", "NFO", "BSE_FO", "BFO"}
                 or str(
                     position.get("instrument_token")
                     or position.get("instrument_key")
                     or ""
-                ).startswith("NSE_FO|")
+                ).startswith(("NSE_FO|", "BSE_FO|"))
             )
         ]
         if untracked_derivative_positions:
@@ -7494,9 +7510,9 @@ def run_signal_check():
                 "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS", False
             )
             if not allow_manual_overlap:
-                live_global_block_reason = "an untracked NSE derivatives position exists"
+                live_global_block_reason = "an untracked index-derivatives position exists"
                 log(
-                    "An untracked NSE derivatives position exists; live bot entry is "
+                    "An untracked index-derivatives position exists; live bot entry is "
                     "blocked, but independent paper observations may continue."
                 )
                 if not paper_observation_mode:

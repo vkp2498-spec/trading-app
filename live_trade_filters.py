@@ -316,6 +316,7 @@ def live_entry_gate(
     )
     breadth = (
         technicals.get("banknifty_breadth", {})
+        or technicals.get("sensex_breadth", {})
         or technicals.get("nifty_breadth", {})
         or {}
     )

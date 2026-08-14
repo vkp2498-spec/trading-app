@@ -29,6 +29,12 @@ INDEX_CONFIG = {
     "BANKNIFTY": {
         "spot_key": "NSE_INDEX|Nifty Bank",
         "underlying_candidates": {"BANKNIFTY", "NIFTY BANK"},
+        "derivative_segment": "NSE_FO",
+    },
+    "SENSEX": {
+        "spot_key": "BSE_INDEX|SENSEX",
+        "underlying_candidates": {"SENSEX"},
+        "derivative_segment": "BSE_FO",
     },
 }
 
@@ -132,7 +138,9 @@ def nearest_index_future(symbol):
         instruments = json.load(file)
 
     for instrument in instruments:
-        if instrument.get("segment") != "NSE_FO":
+        if instrument.get("segment") != INDEX_CONFIG[symbol].get(
+            "derivative_segment", "NSE_FO"
+        ):
             continue
         if str(instrument.get("instrument_type", "")).upper() not in {"FUT", "FUTIDX"}:
             continue

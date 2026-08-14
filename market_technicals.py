@@ -15,6 +15,7 @@ UPSTOX_BASE = "https://api.upstox.com"
 INDEX_KEYS = {
     "NIFTY": "NSE_INDEX|Nifty 50",
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "SENSEX": "BSE_INDEX|SENSEX",
 }
 IST = ZoneInfo("Asia/Kolkata")
 

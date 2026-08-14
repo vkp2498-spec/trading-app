@@ -1,8 +1,8 @@
-"""Deterministic NIFTY option-buying engine built from independent evidence.
+"""Deterministic multi-index option-buying engine built from independent evidence.
 
 The engine deliberately does not treat a weighted score as a probability.  A
 live entry needs every evidence family to pass: completed-candle structure,
-market regime, NIFTY breadth, option-chain direction, bought-option
+market regime, constituent breadth, option-chain direction, bought-option
 VWAP/volume, and executable contract quality.  It reuses ``trade_bot`` only
 for broker reconciliation, capital sizing, order placement, protection,
 monitoring, and idempotent finalization.
@@ -11,6 +11,7 @@ monitoring, and idempotent finalization.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 from copy import deepcopy
@@ -23,6 +24,7 @@ import trade_bot
 
 ENGINE = "VAMSI_KB_INTRADAY_V1"
 SCORE_VERSION = "VAMSI_KB_INTRADAY_V1_ALL_GATES"
+INDEX_SYMBOLS = ("NIFTY", "BANKNIFTY", "SENSEX")
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "vamsi_kb_intraday"
 SCAN_STATE_FILE = DATA_DIR / "scan_state.json"
@@ -31,10 +33,12 @@ SCAN_LOCK_FILE = BASE_DIR / ".vamsi_kb_scan.lock"
 SCAN_COLUMNS = [
     "scan_time",
     "scan_slot",
+    "symbol",
     "action",
     "direction",
     "setup",
     "knowledge_score",
+    "selection_score",
     "instrument",
     "entry_price",
     "target_price",
@@ -122,6 +126,7 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
     """Apply all option-buying gates without using the legacy unified score."""
     current = current or trade_bot.now_ist()
     candidate = candidate or {}
+    symbol = str(candidate.get("symbol") or "NIFTY").upper()
     direction = str(candidate.get("direction") or "").upper()
     technicals = candidate.get("technicals") or {}
     summary = candidate.get("option_summary") or {}
@@ -130,7 +135,12 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
     regime = technicals.get("market_regime") or {}
     structure = technicals.get("entry_structure") or {}
     reversal = technicals.get("bollinger_reversal") or {}
-    breadth = technicals.get("nifty_breadth") or {}
+    breadth = (
+        technicals.get("banknifty_breadth")
+        or technicals.get("sensex_breadth")
+        or technicals.get("nifty_breadth")
+        or {}
+    )
     flow = (
         technicals.get("execution_atm_option_flow")
         or technicals.get("atm_option_flow")
@@ -199,8 +209,22 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
 
     breadth_score = _number(breadth.get("score"))
     oriented_breadth = breadth_score if direction == "BULLISH" else -breadth_score
+    default_coverage = {"NIFTY": 30, "BANKNIFTY": 3, "SENSEX": 20}.get(
+        symbol, 20
+    )
+    legacy_default = (
+        _configured_float("VAMSI_KB_MIN_BREADTH_COVERAGE", default_coverage)
+        if symbol == "NIFTY"
+        else default_coverage
+    )
+    minimum_coverage = int(
+        _configured_float(
+            f"VAMSI_KB_{symbol}_MIN_BREADTH_COVERAGE",
+            legacy_default,
+        )
+    )
     breadth_passed = bool(
-        breadth.get("coverage", 0) >= int(_configured_float("VAMSI_KB_MIN_BREADTH_COVERAGE", 30))
+        breadth.get("coverage", 0) >= minimum_coverage
         and breadth.get("bias") == direction
         and oriented_breadth >= _configured_float("VAMSI_KB_MIN_BREADTH_SCORE", 18.0)
     )
@@ -210,9 +234,10 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
         "confidence": breadth.get("confidence"),
         "score": breadth_score,
         "coverage": breadth.get("coverage"),
+        "minimum_coverage": minimum_coverage,
     }
     if not breadth_passed:
-        blockers.append("NIFTY constituent breadth does not confirm direction")
+        blockers.append(f"{symbol} constituent breadth does not confirm direction")
 
     chain_bias = str(summary.get("chain_bias") or "NEUTRAL").upper()
     chain_confidence = str(summary.get("chain_confidence") or "LOW").upper()
@@ -305,8 +330,14 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
     }
 
 
+def selection_score(candidate: dict) -> float:
+    """Continuous rank used only after every hard gate has passed."""
+    return round(trade_bot.candidate_weighted_score(candidate or {}), 1)
+
+
 def prepare_candidate(candidate: dict, decision: dict) -> dict:
     prepared = deepcopy(candidate)
+    symbol = str(prepared.get("symbol") or "NIFTY").upper()
     quality = (
         (prepared.get("option_summary") or {}).get("option_market_quality")
         or (prepared.get("technicals") or {}).get("option_market_quality")
@@ -315,10 +346,16 @@ def prepare_candidate(candidate: dict, decision: dict) -> dict:
     delta = abs(_number(quality.get("delta"), _configured_float(
         "OPTION_DELTA_APPROXIMATION", 0.50
     )))
-    target_points = _configured_float("VAMSI_KB_TARGET_POINTS", 30.0)
-    stop_points = _configured_float("VAMSI_KB_STOP_POINTS", 30.0)
+    target_points = _configured_float(
+        f"VAMSI_KB_{symbol}_TARGET_POINTS",
+        _configured_float("VAMSI_KB_TARGET_POINTS", 30.0),
+    )
+    stop_points = _configured_float(
+        f"VAMSI_KB_{symbol}_STOP_POINTS",
+        _configured_float("VAMSI_KB_STOP_POINTS", 30.0),
+    )
     levels = trade_bot.option_levels_from_index_points(
-        "NIFTY",
+        symbol,
         prepared["entry_price"],
         target_points=target_points,
         stop_points=stop_points,
@@ -328,7 +365,7 @@ def prepare_candidate(candidate: dict, decision: dict) -> dict:
         {
             "allowed": True,
             "strategy": ENGINE,
-            "symbol": "NIFTY",
+            "symbol": symbol,
             "confidence": "HIGH",
             "signal_score": decision["score"],
             "target_price": levels["target_price"],
@@ -338,7 +375,7 @@ def prepare_candidate(candidate: dict, decision: dict) -> dict:
             "option_delta_used": delta,
             "target_percent": None,
             "stop_percent": None,
-            "target_profile": "KB_FIXED_NIFTY_POINTS",
+            "target_profile": f"KB_FIXED_{symbol}_POINTS",
             "profit_protection_enabled_for_trade": True,
             "score_cutoff_approved": True,
             "score_rule_source": ENGINE,
@@ -360,20 +397,51 @@ def prepare_candidate(candidate: dict, decision: dict) -> dict:
     return prepared
 
 
-def _record_scan(slot: str, action: str, decision=None, candidate=None, quantity=None) -> None:
+def _ensure_scan_schema() -> None:
+    """Migrate the original NIFTY-only ledger without losing its history."""
+    if not SCAN_FILE.exists() or SCAN_FILE.stat().st_size == 0:
+        return
+    with SCAN_FILE.open("r", newline="", errors="ignore") as handle:
+        reader = csv.DictReader(handle)
+        fields = reader.fieldnames or []
+        if fields == SCAN_COLUMNS:
+            return
+        rows = list(reader)
+    temporary = SCAN_FILE.with_suffix(".migration.tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SCAN_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            migrated = {field: row.get(field, "") for field in SCAN_COLUMNS}
+            migrated["symbol"] = migrated["symbol"] or "NIFTY"
+            writer.writerow(migrated)
+    temporary.replace(SCAN_FILE)
+
+
+def _record_scan(
+    slot: str,
+    symbol: str,
+    action: str,
+    decision=None,
+    candidate=None,
+    quantity=None,
+) -> None:
     decision = decision or {}
     candidate = candidate or {}
     instrument = candidate.get("instrument") or {}
+    _ensure_scan_schema()
     locked_append_csv(
         SCAN_FILE,
         SCAN_COLUMNS,
         {
             "scan_time": trade_bot.now_ist().isoformat(),
             "scan_slot": slot,
+            "symbol": symbol,
             "action": action,
             "direction": decision.get("direction") or candidate.get("direction") or "",
             "setup": decision.get("setup") or "",
             "knowledge_score": decision.get("score") if decision else "",
+            "selection_score": decision.get("selection_score") if decision else "",
             "instrument": instrument.get("trading_symbol") or "",
             "entry_price": candidate.get("entry_price") or "",
             "target_price": candidate.get("target_price") or "",
@@ -422,42 +490,115 @@ def scan() -> dict:
             sort_keys=True,
         )
 
-        if trade_bot.state_is_active(trade_bot.read_state("NIFTY")):
-            _record_scan(slot, "ACTIVE_POSITION")
-            return {"action": "ACTIVE_POSITION", "scan_slot": slot}
+        active_symbols = [
+            symbol
+            for symbol in INDEX_SYMBOLS
+            if trade_bot.state_is_active(trade_bot.read_state(symbol))
+        ]
+        if active_symbols:
+            for symbol in INDEX_SYMBOLS:
+                _record_scan(slot, symbol, "ACTIVE_POSITION")
+            return {
+                "action": "ACTIVE_POSITION",
+                "symbols": active_symbols,
+                "scan_slot": slot,
+            }
+        if trade_bot.index_trade_count_today() >= 1:
+            reason = "one account-wide index trade already used today"
+            for symbol in INDEX_SYMBOLS:
+                _record_scan(slot, symbol, "DAILY_STOP")
+            log(reason)
+            return {"action": "DAILY_STOP", "reason": reason, "scan_slot": slot}
         daily_block = trade_bot.daily_index_entry_block_reason("NIFTY")
         if daily_block:
-            _record_scan(slot, "DAILY_STOP")
+            for symbol in INDEX_SYMBOLS:
+                _record_scan(slot, symbol, "DAILY_STOP")
             log(daily_block)
             return {"action": "DAILY_STOP", "reason": daily_block, "scan_slot": slot}
 
-        candidate = trade_bot.evaluate_symbol_buy_or_sell(
-            "NIFTY",
-            allow_option_sell=False,
-            include_rejected=True,
-            paper_observation=True,
-        )
-        if not candidate:
-            _record_scan(slot, "NO_CANDIDATE")
-            log("no complete option-buying candidate was available")
-            return {"action": "NO_CANDIDATE", "scan_slot": slot}
+        qualified = []
+        outcomes = []
+        for symbol in INDEX_SYMBOLS:
+            try:
+                candidate = trade_bot.evaluate_symbol_buy_or_sell(
+                    symbol,
+                    allow_option_sell=False,
+                    include_rejected=True,
+                    paper_observation=True,
+                )
+            except Exception as error:
+                message = f"{symbol} scan unavailable: {error}"
+                decision = {
+                    "allowed": False,
+                    "direction": "",
+                    "setup": "",
+                    "score": 0.0,
+                    "selection_score": 0.0,
+                    "blockers": [message],
+                    "evidence": {},
+                }
+                _record_scan(slot, symbol, "ERROR", decision)
+                log(message)
+                outcomes.append({"symbol": symbol, "action": "ERROR", **decision})
+                continue
+            if not candidate:
+                _record_scan(slot, symbol, "NO_CANDIDATE")
+                outcomes.append({"symbol": symbol, "action": "NO_CANDIDATE"})
+                log(f"{symbol} no complete option-buying candidate was available")
+                continue
 
-        decision = evaluate_knowledge_setup(candidate)
-        if not decision["allowed"]:
-            _record_scan(slot, "REJECT", decision, candidate)
-            short_reasons = decision["blockers"][:2]
-            omitted = len(decision["blockers"]) - len(short_reasons)
-            log(
-                f"{decision['direction']} {decision['setup']} reject "
-                f"knowledge={decision['score']:.1f}: "
-                + "; ".join(short_reasons)
-                + (f" (+{omitted} audit reasons)" if omitted > 0 else "")
+            decision = evaluate_knowledge_setup(candidate)
+            decision["selection_score"] = selection_score(candidate)
+            if not decision["allowed"]:
+                _record_scan(slot, symbol, "REJECT", decision, candidate)
+                short_reasons = decision["blockers"][:2]
+                omitted = len(decision["blockers"]) - len(short_reasons)
+                log(
+                    f"{symbol} {decision['direction']} {decision['setup']} reject "
+                    f"knowledge={decision['score']:.1f} rank={decision['selection_score']:.1f}: "
+                    + "; ".join(short_reasons)
+                    + (f" (+{omitted} audit reasons)" if omitted > 0 else "")
+                )
+                outcomes.append({"symbol": symbol, "action": "REJECT", **decision})
+                continue
+            qualified.append((symbol, candidate, decision))
+            outcomes.append({"symbol": symbol, "action": "QUALIFIED", **decision})
+
+        if not qualified:
+            log("no fully qualified NIFTY, BANKNIFTY or SENSEX setup")
+            return {
+                "action": "NO_QUALIFIED_CANDIDATE",
+                "scan_slot": slot,
+                "outcomes": outcomes,
+            }
+
+        symbol, candidate, decision = max(
+            qualified,
+            key=lambda item: (
+                item[2]["selection_score"],
+                float(item[1].get("contract_selection_rank") or 0),
+                -INDEX_SYMBOLS.index(item[0]),
+            ),
+        )
+        for other_symbol, other_candidate, other_decision in qualified:
+            if other_symbol == symbol:
+                continue
+            other_decision["blockers"] = [
+                f"{symbol} had the higher qualified selection score "
+                f"({decision['selection_score']:.1f} vs "
+                f"{other_decision['selection_score']:.1f})"
+            ]
+            _record_scan(
+                slot,
+                other_symbol,
+                "QUALIFIED_NOT_SELECTED",
+                other_decision,
+                other_candidate,
             )
-            return {"action": "REJECT", "scan_slot": slot, **decision}
 
         prepared = prepare_candidate(candidate, decision)
         quantity = trade_bot.order_quantity_for(
-            "NIFTY",
+            symbol,
             prepared["instrument"],
             prepared["entry_price"],
             prepared["stop_loss_price"],
@@ -466,22 +607,31 @@ def scan() -> dict:
         if quantity <= 0:
             decision["blockers"] = ["available capital cannot fund one whole lot"]
             decision["allowed"] = False
-            _record_scan(slot, "CAPITAL_REJECT", decision, prepared, 0)
-            return {"action": "CAPITAL_REJECT", "scan_slot": slot, **decision}
+            _record_scan(slot, symbol, "CAPITAL_REJECT", decision, prepared, 0)
+            return {
+                "action": "CAPITAL_REJECT",
+                "symbol": symbol,
+                "scan_slot": slot,
+                **decision,
+            }
 
-        _record_scan(slot, "ENTRY_SELECTED", decision, prepared, quantity)
+        _record_scan(slot, symbol, "ENTRY_SELECTED", decision, prepared, quantity)
         log(
-            f"{decision['direction']} {decision['setup']} selected; "
-            f"knowledge={decision['score']:.1f} qty={quantity} "
-            f"target/stop={prepared['target_points']:.0f}/{prepared['stop_points']:.0f} NIFTY points"
+            f"{symbol} {decision['direction']} {decision['setup']} selected from "
+            f"{len(qualified)} qualified index setup(s); "
+            f"knowledge={decision['score']:.1f} rank={decision['selection_score']:.1f} "
+            f"qty={quantity} target/stop={prepared['target_points']:.0f}/"
+            f"{prepared['stop_points']:.0f} {symbol} points"
         )
         placed = trade_bot.execute_selected_candidate(prepared)
         action = "LIVE_ENTRY" if placed else "EXECUTION_REJECT"
-        _record_scan(slot, action, decision, prepared, quantity)
+        _record_scan(slot, symbol, action, decision, prepared, quantity)
         return {
             "action": action,
+            "symbol": symbol,
             "scan_slot": slot,
             "quantity": quantity,
+            "outcomes": outcomes,
             **decision,
         }
 

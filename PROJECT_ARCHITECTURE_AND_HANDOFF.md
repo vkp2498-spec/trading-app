@@ -17,7 +17,7 @@ Never add API keys, access tokens, webhook secrets, APNs private keys, Android k
 The project is an experimental automated trading platform for Indian markets using Upstox. As of 2026-08-14, the only scheduled decision engine is `VAMSI_KB_INTRADAY_V1`:
 
 - A shared Python codebase deployed to three AWS Lightsail Ubuntu instances.
-- Vamsi and Ganesh run the same deterministic NIFTY option-buying engine live;
+- Vamsi and Ganesh run the same deterministic multi-index option-buying engine live;
   Sastry has all managed trading schedules disabled.
 - Every entry requires completed 5M/15M structure, directional regime,
   constituent breadth, medium/high option-chain agreement, bought-option
@@ -26,7 +26,10 @@ The project is an experimental automated trading platform for Indian markets usi
 - Vamsi uses the maximum whole-lot quantity supported by 95% of available
   option capital after a Rs 1,000 reserve. Ganesh is hard-capped at one lot and
   may operate beside his untracked manual delivery positions. Both accounts
-  allow one live entry per day. Target and hard stop are both 30 NIFTY points.
+  allow one account-wide live entry per day. Every completed-candle scan checks
+  NIFTY, BANKNIFTY, and SENSEX; if multiple setups pass every hard gate, only
+  the highest continuous selection score is eligible for execution. Target and
+  hard stop currently default to 30 underlying-index points for each index.
 - Staged protection locks 10% of the planned move after 40% progress, 25%
   after 60%, and 55% after 80%. Persistent five-minute thesis reversal remains
   enabled independently of the entry score.
@@ -63,14 +66,15 @@ flowchart TD
     CRON["Vamsi/Ganesh five-minute cron"] --> KB["VAMSI_KB_INTRADAY_V1"]
     STREAM["Upstox market streams"] --> KB
     KB --> CANDLE["Completed 5M and 15M structure"]
-    KB --> BREADTH["NIFTY breadth"]
+    KB --> BREADTH["Index-specific constituent breadth"]
     KB --> CHAIN["Option chain and contract quality"]
     KB --> FLOW["Bought-option VWAP and volume"]
     CANDLE --> ALL["All gates must pass"]
     BREADTH --> ALL
     CHAIN --> ALL
     FLOW --> ALL
-    ALL --> EXEC["MAX whole-lot market buy"]
+    ALL --> RANK["Rank fully qualified indices"]
+    RANK --> EXEC["Best candidate only"]
     EXEC --> STOP["Broker protective stop"]
     MON["Two-second position monitor"] --> STOP
     MON --> TRAIL["Staged profit locks and thesis reversal"]
@@ -94,7 +98,7 @@ flowchart TD
 
 ### Live trading and strategy
 
-- `vamsi_kb_intraday.py`: Active all-gates NIFTY option-buying scanner.
+- `vamsi_kb_intraday.py`: Active all-gates NIFTY/BANKNIFTY/SENSEX scanner and winner selection.
 - `ml_shadow_4h_v2_live.py`: Live opening V2 trainer/scanner with the `+0.10R` probability-adjusted payoff filter.
 - `ml_shadow_v1.py`: Post-opening V3 trainer/scanner, 09:15–09:20 observation features, forecast-only evidence, shared live-state monitoring, and 13:15 exits.
 - `trade_bot.py`: Main orchestration, entry dispatch, broker execution, persistent state, live monitor, exits, square-off, and shared safety controls.
@@ -107,6 +111,7 @@ flowchart TD
 - `institutional_flow.py`: Futures/OI, nearby option flow, VIX, FII/DII, PCR, max pain, and persistence context.
 - `banknifty_breadth.py`: Major-bank breadth for BANKNIFTY.
 - `nifty_breadth.py`: NIFTY constituent and heavyweight breadth.
+- `sensex_breadth.py`: Current 30-stock SENSEX participation breadth.
 - `market_information.py`: Upstox Plus market-information data and caching.
 - `ganesh_gap_reversal.py`: Pure functions for Ganesh's opening-gap reversal strategy.
 - `option_chain_trend.py`: Persistent option-chain trend snapshots.
@@ -191,13 +196,18 @@ after each completed five-minute candle. Calling `trade_bot.py` without
 `--monitor` or `--squareoff` cannot fall through to the legacy Vamsi entry path
 while this engine is selected.
 
-Current state slots include the Vamsi NIFTY/BANKNIFTY lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
+Current state slots include the Vamsi NIFTY/BANKNIFTY/SENSEX lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
 
 ## 7. Vamsi engine
 
 ### 7.1 Intent
 
-The Vamsi engine is the evolved multi-signal intraday long-option engine. Its primary instruments are NIFTY and BANKNIFTY call/put options. It combines market structure, option-chain evidence, option-premium flow, breadth, and institutional context before constructing an entry.
+The active Vamsi engine is a deterministic intraday long-option engine for
+NIFTY, BANKNIFTY, and SENSEX calls/puts. Each index is evaluated independently
+on every completed five-minute scan. Failed gates cannot be offset by a score.
+Only after every gate passes does the continuous legacy alignment score rank
+qualified indices; the winner alone proceeds to sizing and the serialized
+broker-entry safety checks.
 
 ### 7.2 Main evidence families
 
@@ -207,7 +217,7 @@ The Vamsi engine is the evolved multi-signal intraday long-option engine. Its pr
 - Classic pivots.
 - Bollinger upper/lower bands and middle-band moving average.
 - ATM or selected-option VWAP, slope, volume ratio, spread, and Greeks.
-- NIFTY constituent breadth or BANKNIFTY major-bank breadth.
+- NIFTY constituent breadth, BANKNIFTY major-bank breadth, or SENSEX 30-stock breadth.
 - Futures price/OI behavior, basis, VIX, FII/DII context, PCR, and max pain.
 - Market regime and entry structure.
 - Reachable technical reward/risk and entry extension.
@@ -239,6 +249,9 @@ Before any cell completes promotion, the static 65-69 and 11:00-13:55 collection
 - Ganesh uses the same NIFTY expiry split. In FAITHFUL mode the nearest-expiry
   evidence is recorded as context without silently adding a new entry veto.
 - BANKNIFTY continues to analyze and execute the configured nearest contract.
+- SENSEX analyzes and executes the nearest BSE weekly contract through
+  `BSE_INDEX|SENSEX` and `BSE_FO`; BSE positions are included in reconciliation,
+  protective monitoring, square-off, and dashboard P/L.
 - Non-NIFTY contract comparison can include suitable ATM and nearby one-strike-ITM contracts when enabled.
 - Both candidates must pass hard spread/Greek/depth validity checks. Structure and feasibility contribute to the unified score.
 - Capital allocation is converted into whole lots and rounded down.
@@ -870,7 +883,7 @@ Use the example for local paper/research defaults. Do not copy production creden
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
 ```
 
-At the time this handoff was last updated, the latest full suite had 274 passing tests. The number will change as tests are added.
+At the time this handoff was last updated, the latest full suite had 289 passing tests. The number will change as tests are added.
 
 ### 20.3 Run dashboard locally
 

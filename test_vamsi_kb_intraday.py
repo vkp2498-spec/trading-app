@@ -10,12 +10,12 @@ import vamsi_kb_intraday as kb
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def qualified_candidate(direction="BULLISH", current=None):
+def qualified_candidate(direction="BULLISH", current=None, symbol="NIFTY"):
     current = current or datetime(2026, 8, 14, 11, 6, tzinfo=IST)
     breadth_score = 45 if direction == "BULLISH" else -45
     option_type = "CE" if direction == "BULLISH" else "PE"
     return {
-        "symbol": "NIFTY",
+        "symbol": symbol,
         "direction": direction,
         "entry_price": 150.0,
         "instrument": {
@@ -91,6 +91,22 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
         )
         self.assertTrue(result["allowed"])
 
+    def test_symbol_specific_breadth_coverage_is_not_nifty_hardcoded(self):
+        current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
+        bank = qualified_candidate(current=current, symbol="BANKNIFTY")
+        bank["technicals"]["banknifty_breadth"] = bank["technicals"].pop(
+            "nifty_breadth"
+        )
+        bank["technicals"]["banknifty_breadth"]["coverage"] = 5
+        self.assertTrue(kb.evaluate_knowledge_setup(bank, current)["allowed"])
+
+        sensex = qualified_candidate(current=current, symbol="SENSEX")
+        sensex["technicals"]["sensex_breadth"] = sensex["technicals"].pop(
+            "nifty_breadth"
+        )
+        sensex["technicals"]["sensex_breadth"]["coverage"] = 25
+        self.assertTrue(kb.evaluate_knowledge_setup(sensex, current)["allowed"])
+
     def test_neutral_chain_is_rejected_by_default(self):
         current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
         candidate = qualified_candidate(current=current)
@@ -118,6 +134,71 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
         self.assertEqual(prepared["target_price"], 165.6)
         self.assertEqual(prepared["stop_loss_price"], 134.4)
         self.assertEqual(prepared["entry_score"]["score_version"], kb.SCORE_VERSION)
+
+    def test_scan_evaluates_all_indices_and_executes_highest_qualified_score(self):
+        candidates = {
+            symbol: {
+                "symbol": symbol,
+                "direction": "BULLISH",
+                "entry_price": 100.0,
+                "stop_loss_price": 85.0,
+                "contract_selection_rank": 5.0,
+                "instrument": {
+                    "instrument_key": f"TEST|{symbol}",
+                    "trading_symbol": f"{symbol} CE",
+                    "lot_size": 10,
+                },
+            }
+            for symbol in kb.INDEX_SYMBOLS
+        }
+        rank = {"NIFTY": 75.0, "BANKNIFTY": 82.0, "SENSEX": 88.0}
+
+        def evaluate(symbol, **_kwargs):
+            return candidates[symbol]
+
+        def decision(candidate, current=None):
+            return {
+                "allowed": True,
+                "direction": "BULLISH",
+                "setup": "PULLBACK_HOLD",
+                "score": 100.0,
+                "blockers": [],
+                "evidence": {},
+            }
+
+        def prepare(candidate, result):
+            return {
+                **candidate,
+                "target_price": 115.0,
+                "stop_loss_price": 85.0,
+                "target_points": 30.0,
+                "stop_points": 30.0,
+                "knowledge_decision": result,
+            }
+
+        with (
+            patch.object(kb.trade_bot, "load_env"),
+            patch.object(kb.trade_bot, "trading_engine", return_value=kb.ENGINE),
+            patch.object(kb, "_entry_window_ok", return_value=True),
+            patch.object(kb, "_read_scan_state", return_value={}),
+            patch.object(kb, "atomic_write_json"),
+            patch.object(kb.trade_bot, "read_state", return_value={}),
+            patch.object(kb.trade_bot, "state_is_active", return_value=False),
+            patch.object(kb.trade_bot, "index_trade_count_today", return_value=0),
+            patch.object(kb.trade_bot, "daily_index_entry_block_reason", return_value=""),
+            patch.object(kb.trade_bot, "evaluate_symbol_buy_or_sell", side_effect=evaluate) as evaluate_mock,
+            patch.object(kb, "evaluate_knowledge_setup", side_effect=decision),
+            patch.object(kb, "selection_score", side_effect=lambda item: rank[item["symbol"]]),
+            patch.object(kb, "prepare_candidate", side_effect=prepare),
+            patch.object(kb.trade_bot, "order_quantity_for", return_value=20),
+            patch.object(kb.trade_bot, "execute_selected_candidate", return_value=True) as execute,
+            patch.object(kb, "_record_scan"),
+        ):
+            result = kb.scan()
+
+        self.assertEqual(evaluate_mock.call_count, 3)
+        self.assertEqual(result["symbol"], "SENSEX")
+        self.assertEqual(execute.call_args.args[0]["symbol"], "SENSEX")
 
 
 if __name__ == "__main__":

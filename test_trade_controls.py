@@ -1,5 +1,6 @@
 import os
 import json
+import gzip
 import sys
 import tempfile
 import types
@@ -58,6 +59,34 @@ from market_technicals import candle_confirmation, completed_candles
 
 
 class TradeControlTests(unittest.TestCase):
+    def test_sensex_option_lookup_accepts_bse_derivative_segment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir) / "instruments.json.gz"
+            with gzip.open(cache, "wt", encoding="utf-8") as handle:
+                json.dump(
+                    [
+                        {
+                            "segment": "BSE_FO",
+                            "underlying_symbol": "SENSEX",
+                            "instrument_type": "CE",
+                            "strike_price": 80000.0,
+                            "expiry": "2026-08-20",
+                            "instrument_key": "BSE_FO|1",
+                            "trading_symbol": "SENSEX 80000 CE 20 AUG 26",
+                            "lot_size": 20,
+                        }
+                    ],
+                    handle,
+                )
+            with (
+                patch.object(trade_bot, "INSTRUMENT_CACHE", cache),
+                patch.object(trade_bot, "ensure_instruments_file"),
+            ):
+                result = trade_bot.find_index_option_instrument(
+                    "SENSEX", "2026-08-20", 80000, "CE"
+                )
+        self.assertEqual(result["instrument_key"], "BSE_FO|1")
+
     def test_vamsi_unified_fallback_is_strictly_above_fifty_five(self):
         with patch.dict(
             os.environ,
@@ -255,6 +284,10 @@ class TradeControlTests(unittest.TestCase):
     def test_banknifty_keeps_nearest_expiry(self):
         expiries = ["2026-08-25", "2026-09-29"]
         self.assertEqual(choose_expiry("BANKNIFTY", expiries), "2026-08-25")
+
+    def test_sensex_keeps_nearest_expiry(self):
+        expiries = ["2026-08-20", "2026-08-27"]
+        self.assertEqual(choose_expiry("SENSEX", expiries), "2026-08-20")
 
     def test_nifty_recommendation_separates_analysis_and_execution_expiries(self):
         def chain(expiry, *, bullish):
@@ -1402,7 +1435,10 @@ class TradeControlTests(unittest.TestCase):
         )
 
         self.assertEqual(analytics["totalTrades"], 7)
-        self.assertEqual(analytics["symbolTrades"], {"NIFTY": 4, "BANKNIFTY": 3})
+        self.assertEqual(
+            analytics["symbolTrades"],
+            {"NIFTY": 4, "BANKNIFTY": 3, "SENSEX": 0},
+        )
         self.assertEqual(
             analytics["scoreBands"],
             [

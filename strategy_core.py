@@ -32,6 +32,11 @@ INDEX_CONFIG = {
         "analysis_expiry_offset": 0,
         "execution_expiry_offset": 0,
     },
+    "SENSEX": {
+        "instrument_key": "BSE_INDEX|SENSEX",
+        "analysis_expiry_offset": 0,
+        "execution_expiry_offset": 0,
+    },
 }
 
 
@@ -549,3 +554,7 @@ def get_nifty_recommendation():
 
 def get_banknifty_recommendation():
     return get_index_recommendation("BANKNIFTY")
+
+
+def get_sensex_recommendation():
+    return get_index_recommendation("SENSEX")
