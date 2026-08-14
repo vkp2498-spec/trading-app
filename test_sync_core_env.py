@@ -40,6 +40,7 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertIn("MAX_INDEX_TRADES_PER_DAY=1", updated)
         self.assertIn("VAMSI_KB_TARGET_POINTS=30", updated)
         self.assertIn("VAMSI_KB_STOP_POINTS=30", updated)
+        self.assertIn("CONCISE_TRADE_LOGS=true", updated)
         self.assertIn("ML_SHADOW_LIVE_TRADING_ENABLED=false", updated)
         self.assertIn("ML_SHADOW_V2_LIVE_ENABLED=false", updated)
         self.assertIn("ML_SHADOW_FORECAST_ONLY=true", updated)

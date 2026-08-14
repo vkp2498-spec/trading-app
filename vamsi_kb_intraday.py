@@ -445,9 +445,13 @@ def scan() -> dict:
         decision = evaluate_knowledge_setup(candidate)
         if not decision["allowed"]:
             _record_scan(slot, "REJECT", decision, candidate)
+            short_reasons = decision["blockers"][:2]
+            omitted = len(decision["blockers"]) - len(short_reasons)
             log(
-                f"{decision['direction']} {decision['setup']} rejected: "
-                + "; ".join(decision["blockers"])
+                f"{decision['direction']} {decision['setup']} reject "
+                f"knowledge={decision['score']:.1f}: "
+                + "; ".join(short_reasons)
+                + (f" (+{omitted} audit reasons)" if omitted > 0 else "")
             )
             return {"action": "REJECT", "scan_slot": slot, **decision}
 
