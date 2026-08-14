@@ -5,7 +5,9 @@ import pandas as pd
 from ml_v2_simulator import (
     SimulationAssumptions,
     compare_rr_cutoffs,
+    probability_portfolio_curve,
     probability_rr_surface,
+    simulate_portfolio,
     simulate_trades,
     split_samples,
     summarize,
@@ -78,6 +80,90 @@ class MlV2SimulatorTests(unittest.TestCase):
             surface[(surface["probability_cutoff"] == 0.9)]["trades"].sum(),
             0,
         )
+
+    def test_portfolio_uses_whole_lots_and_current_cash(self):
+        trades = simulate_trades(
+            self.forecasts().iloc[[1]],
+            SimulationAssumptions(round_trip_cost=250, round_trip_cost_percent=0),
+        )
+        ledger, portfolio = simulate_portfolio(
+            trades,
+            SimulationAssumptions(round_trip_cost=250, round_trip_cost_percent=0),
+        )
+        self.assertEqual(ledger.iloc[0]["lots"], 10)
+        self.assertEqual(ledger.iloc[0]["quantity"], 650)
+        self.assertEqual(ledger.iloc[0]["deployed_capital"], 97_500)
+        self.assertEqual(portfolio["executed_trades"], 1)
+        self.assertAlmostEqual(
+            portfolio["final_equity"],
+            100_000 + 0.5 * 650 - 250,
+        )
+
+    def test_simultaneous_signals_split_available_equity(self):
+        forecasts = self.forecasts().iloc[[1]].copy()
+        forecasts.loc[:, "put_probability"] = 0.8
+        forecasts.loc[:, "put_expected_value_r"] = 0.6
+        trades = simulate_trades(
+            forecasts,
+            SimulationAssumptions(round_trip_cost=0, round_trip_cost_percent=0),
+        )
+        ledger, portfolio = simulate_portfolio(
+            trades,
+            SimulationAssumptions(round_trip_cost=0, round_trip_cost_percent=0),
+        )
+        self.assertEqual(len(ledger), 2)
+        self.assertEqual(set(ledger["lots"]), {5})
+        self.assertEqual(set(ledger["deployed_capital"]), {48_750})
+        self.assertTrue(portfolio["completed_all_signals"])
+
+    def test_portfolio_skips_signal_when_one_lot_is_unaffordable(self):
+        trades = simulate_trades(
+            self.forecasts().iloc[[1]],
+            SimulationAssumptions(round_trip_cost=0, round_trip_cost_percent=0),
+        )
+        ledger, portfolio = simulate_portfolio(
+            trades,
+            SimulationAssumptions(
+                capital_per_trade=9_000,
+                round_trip_cost=0,
+                round_trip_cost_percent=0,
+            ),
+        )
+        self.assertEqual(ledger.iloc[0]["status"], "SKIPPED_INSUFFICIENT_CAPITAL")
+        self.assertEqual(portfolio["executed_trades"], 0)
+        self.assertEqual(portfolio["skipped_trades"], 1)
+        self.assertFalse(portfolio["completed_all_signals"])
+
+    def test_fixed_nifty_points_replace_model_exit_levels(self):
+        assumptions = SimulationAssumptions(
+            fixed_target_underlying_points=30,
+            fixed_stop_underlying_points=30,
+            round_trip_cost_percent=0,
+        )
+        trades = simulate_trades(self.forecasts().iloc[[1]], assumptions)
+        self.assertEqual(trades.iloc[0]["exit_source"], "FIXED_NIFTY_POINTS")
+        self.assertEqual(trades.iloc[0]["underlying_target_points"], 30)
+        self.assertEqual(trades.iloc[0]["underlying_stop_points"], 30)
+        self.assertEqual(trades.iloc[0]["applied_reward_risk"], 1)
+        self.assertEqual(trades.iloc[0]["option_target_points"], 15)
+        self.assertEqual(trades.iloc[0]["option_stop_points"], 15)
+
+    def test_probability_curve_keeps_call_and_put_separate(self):
+        forecasts = self.forecasts().copy()
+        forecasts.loc[:, "put_probability"] = 0.8
+        curve = probability_portfolio_curve(
+            forecasts,
+            SimulationAssumptions(
+                fixed_target_underlying_points=30,
+                fixed_stop_underlying_points=30,
+                round_trip_cost_percent=0,
+            ),
+            probability_cutoffs=(0.5, 0.85),
+        )
+        self.assertEqual(len(curve), 4)
+        self.assertEqual(set(curve["direction"]), {"CALL", "PUT"})
+        self.assertEqual(curve[curve["probability_cutoff"] == 0.5]["signals"].sum(), 4)
+        self.assertEqual(curve[curve["probability_cutoff"] == 0.85]["signals"].sum(), 0)
 
     def test_fixed_train_and_test_windows_do_not_overlap(self):
         index = pd.date_range("2023-01-02", periods=520, freq="B", tz="Asia/Kolkata")

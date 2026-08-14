@@ -849,7 +849,7 @@ Use the example for local paper/research defaults. Do not copy production creden
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
 ```
 
-At the time this handoff was last updated, the latest full suite had 269 passing tests. The number will change as tests are added.
+At the time this handoff was last updated, the latest full suite had 274 passing tests. The number will change as tests are added.
 
 ### 20.3 Run dashboard locally
 
@@ -865,7 +865,7 @@ Live dashboard features require a valid token and expected data files. Offline/p
 venv/bin/streamlit run ml_v2_simulator_app.py
 ```
 
-The local cache is stored under `data/ml_v2_simulator/` and is intentionally excluded from Git. Use the app's refresh button with a valid local Upstox token, or initialize the cache from an existing market-data-only AWS cache. The study trains the production V2 model family on 18 calendar months and freezes it for the following six months. Its ₹1 lakh results use an adjustable fixed option premium and delta, conservatively resolve ambiguous 4H target/stop candles as stop-first, and are not a substitute for a historical option-chain replay.
+The local cache is stored under `data/ml_v2_simulator/` and is intentionally excluded from Git. Use the app's refresh button with a valid local Upstox token, or initialize the cache from an existing market-data-only AWS cache. The study trains the production V2 model family on 18 calendar months and freezes it for the following six months. Its cash-constrained portfolio begins with the selected capital, uses whole NIFTY lots, compounds current equity, splits simultaneous CALL/PUT capital equally, scales estimated costs with premium deployed, and never injects replacement capital. Fixed NIFTY-point target/stop mode defaults to 30/30 for probability-cutoff experiments; model-predicted exits remain available for comparison. The option replay still uses an adjustable fixed premium and delta, conservatively resolves ambiguous 4H target/stop candles as stop-first, and is not a substitute for historical option-chain data.
 
 ### 20.5 Files that must stay out of Git
 

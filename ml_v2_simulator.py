@@ -37,6 +37,11 @@ class SimulationAssumptions:
     option_delta: float = 0.50
     capital_per_trade: float = 100_000.0
     round_trip_cost: float = 0.0
+    round_trip_cost_percent: float = 0.25
+    lot_size: int = 65
+    allocation_fraction: float = 1.0
+    fixed_target_underlying_points: float | None = None
+    fixed_stop_underlying_points: float | None = None
 
 
 def _as_timestamp(value) -> pd.Timestamp:
@@ -191,10 +196,23 @@ def fit_and_forecast(
 def _trade_outcome(row: pd.Series, direction: str, assumptions: SimulationAssumptions) -> dict:
     prefix = direction.lower()
     opening = float(row["open"])
-    target_percent = float(row[f"{prefix}_target_percent"])
-    stop_percent = float(row[f"{prefix}_stop_percent"])
-    target_underlying_points = opening * target_percent / 100
-    stop_underlying_points = opening * stop_percent / 100
+    if (
+        assumptions.fixed_target_underlying_points is not None
+        and assumptions.fixed_stop_underlying_points is not None
+    ):
+        target_underlying_points = max(float(assumptions.fixed_target_underlying_points), 0.05)
+        stop_underlying_points = max(float(assumptions.fixed_stop_underlying_points), 0.05)
+        target_percent = target_underlying_points / opening * 100
+        stop_percent = stop_underlying_points / opening * 100
+        applied_reward_risk = target_underlying_points / stop_underlying_points
+        exit_source = "FIXED_NIFTY_POINTS"
+    else:
+        target_percent = float(row[f"{prefix}_target_percent"])
+        stop_percent = float(row[f"{prefix}_stop_percent"])
+        target_underlying_points = opening * target_percent / 100
+        stop_underlying_points = opening * stop_percent / 100
+        applied_reward_risk = float(row[f"{prefix}_reward_risk"])
+        exit_source = "MODEL_PREDICTED"
     if direction == "CALL":
         target_hit = float(row["high"]) >= opening + target_underlying_points
         stop_hit = float(row["low"]) <= opening - stop_underlying_points
@@ -222,19 +240,29 @@ def _trade_outcome(row: pd.Series, direction: str, assumptions: SimulationAssump
 
     quantity = assumptions.capital_per_trade / assumptions.option_premium
     gross_pnl = option_points * quantity
-    net_pnl = gross_pnl - assumptions.round_trip_cost
+    estimated_cost = (
+        float(assumptions.round_trip_cost)
+        + assumptions.capital_per_trade * float(assumptions.round_trip_cost_percent) / 100
+    )
+    net_pnl = gross_pnl - estimated_cost
     return {
         "direction": direction,
         "probability": float(row[f"{prefix}_probability"]),
         "predicted_target_percent": target_percent,
         "predicted_stop_percent": stop_percent,
         "predicted_reward_risk": float(row[f"{prefix}_reward_risk"]),
+        "applied_reward_risk": applied_reward_risk,
+        "exit_source": exit_source,
+        "underlying_target_points": target_underlying_points,
+        "underlying_stop_points": stop_underlying_points,
         "expected_value_r": float(row[f"{prefix}_expected_value_r"]),
         "option_entry": assumptions.option_premium,
         "option_target_points": option_target_points,
         "option_stop_points": option_stop_points,
+        "option_pnl_points": option_points,
         "outcome": outcome,
         "gross_pnl": gross_pnl,
+        "estimated_cost": estimated_cost,
         "net_pnl": net_pnl,
     }
 
@@ -251,7 +279,15 @@ def simulate_trades(
         for direction in ("CALL", "PUT"):
             prefix = direction.lower()
             probability = float(forecast[f"{prefix}_probability"])
-            rr = float(forecast[f"{prefix}_reward_risk"])
+            if (
+                assumptions.fixed_target_underlying_points is not None
+                and assumptions.fixed_stop_underlying_points is not None
+            ):
+                rr = max(float(assumptions.fixed_target_underlying_points), 0.05) / max(
+                    float(assumptions.fixed_stop_underlying_points), 0.05
+                )
+            else:
+                rr = float(forecast[f"{prefix}_reward_risk"])
             ev = float(forecast[f"{prefix}_expected_value_r"])
             qualifies = probability > assumptions.probability_cutoff
             if rule == "ev":
@@ -268,9 +304,133 @@ def simulate_trades(
             "timestamp", "direction", "probability", "predicted_target_percent",
             "predicted_stop_percent", "predicted_reward_risk", "expected_value_r",
             "option_entry", "option_target_points", "option_stop_points", "outcome",
-            "gross_pnl", "net_pnl",
+            "option_pnl_points", "gross_pnl", "net_pnl",
         ])
     return pd.DataFrame(rows).sort_values(["timestamp", "direction"]).reset_index(drop=True)
+
+
+def simulate_portfolio(
+    trades: pd.DataFrame,
+    assumptions: SimulationAssumptions,
+) -> tuple[pd.DataFrame, dict]:
+    """Replay signals through one cash account using whole lots and current equity.
+
+    Signals sharing a date are treated as simultaneous and receive equal shares
+    of that day's deployable equity.  Their P&L is applied together after the
+    first 4H candle completes.
+    """
+    starting_capital = max(float(assumptions.capital_per_trade), 0.0)
+    lot_size = max(int(assumptions.lot_size), 1)
+    allocation_fraction = min(max(float(assumptions.allocation_fraction), 0.0), 1.0)
+    equity = starting_capital
+    peak = starting_capital
+    maximum_drawdown = 0.0
+    maximum_drawdown_percent = 0.0
+    minimum_equity = starting_capital
+    ledger = []
+    skipped = 0
+    stopped_early = False
+
+    if trades.empty:
+        summary = {
+            "starting_capital": starting_capital,
+            "final_equity": starting_capital,
+            "net_profit": 0.0,
+            "return_percent": 0.0,
+            "executed_trades": 0,
+            "skipped_trades": 0,
+            "winning_trades": 0,
+            "win_probability": 0.0,
+            "maximum_drawdown": 0.0,
+            "maximum_drawdown_percent": 0.0,
+            "minimum_equity": starting_capital,
+            "survived": True,
+            "completed_all_signals": True,
+        }
+        return pd.DataFrame(), summary
+
+    frame = trades.copy()
+    frame["_day"] = pd.to_datetime(frame["timestamp"]).dt.date
+    for _day, day_trades in frame.groupby("_day", sort=True):
+        if equity <= 0:
+            skipped += len(day_trades)
+            stopped_early = True
+            continue
+        equity_before = equity
+        deployable = equity_before * allocation_fraction
+        per_signal_budget = deployable / len(day_trades)
+        day_rows = []
+        day_pnl = 0.0
+        for _, trade in day_trades.sort_values("direction").iterrows():
+            entry = max(float(trade["option_entry"]), 0.05)
+            one_lot_capital = entry * lot_size
+            lots = int(per_signal_budget // one_lot_capital)
+            if lots < 1:
+                skipped += 1
+                day_rows.append({
+                    **trade.drop(labels=["_day"]).to_dict(),
+                    "status": "SKIPPED_INSUFFICIENT_CAPITAL",
+                    "lots": 0,
+                    "quantity": 0,
+                    "deployed_capital": 0.0,
+                    "estimated_cost": 0.0,
+                    "equity_before": equity_before,
+                    "portfolio_pnl": 0.0,
+                })
+                continue
+            quantity = lots * lot_size
+            deployed = entry * quantity
+            estimated_cost = (
+                float(assumptions.round_trip_cost)
+                + deployed * float(assumptions.round_trip_cost_percent) / 100
+            )
+            trade_pnl = float(trade["option_pnl_points"]) * quantity - estimated_cost
+            day_pnl += trade_pnl
+            day_rows.append({
+                **trade.drop(labels=["_day"]).to_dict(),
+                "status": "EXECUTED",
+                "lots": lots,
+                "quantity": quantity,
+                "deployed_capital": deployed,
+                "estimated_cost": estimated_cost,
+                "equity_before": equity_before,
+                "portfolio_pnl": trade_pnl,
+            })
+        equity = max(equity_before + day_pnl, 0.0)
+        peak = max(peak, equity)
+        current_drawdown = peak - equity
+        maximum_drawdown = max(maximum_drawdown, current_drawdown)
+        maximum_drawdown_percent = max(
+            maximum_drawdown_percent,
+            current_drawdown / peak * 100 if peak else 0.0,
+        )
+        minimum_equity = min(minimum_equity, equity)
+        for row in day_rows:
+            row["equity_after"] = equity
+            ledger.append(row)
+        if equity <= 0:
+            stopped_early = True
+
+    ledger_frame = pd.DataFrame(ledger)
+    executed = ledger_frame[ledger_frame.get("status", pd.Series(dtype=str)) == "EXECUTED"] if not ledger_frame.empty else ledger_frame
+    winners = int((pd.to_numeric(executed.get("portfolio_pnl", pd.Series(dtype=float)), errors="coerce") > 0).sum())
+    executed_count = len(executed)
+    summary = {
+        "starting_capital": starting_capital,
+        "final_equity": equity,
+        "net_profit": equity - starting_capital,
+        "return_percent": ((equity / starting_capital) - 1) * 100 if starting_capital else 0.0,
+        "executed_trades": executed_count,
+        "skipped_trades": skipped,
+        "winning_trades": winners,
+        "win_probability": winners / executed_count if executed_count else 0.0,
+        "maximum_drawdown": maximum_drawdown,
+        "maximum_drawdown_percent": maximum_drawdown_percent,
+        "minimum_equity": minimum_equity,
+        "survived": equity > 0,
+        "completed_all_signals": not stopped_early and skipped == 0,
+    }
+    return ledger_frame, summary
 
 
 def summarize(trades: pd.DataFrame) -> dict:
@@ -318,8 +478,21 @@ def compare_rr_cutoffs(
     rows = []
     for cutoff in cutoffs:
         assumptions = SimulationAssumptions(**{**base_assumptions.__dict__, "rr_cutoff": cutoff})
-        summary = summarize(simulate_trades(forecasts, assumptions, rule="rr"))
-        rows.append({"rr_cutoff": "Any" if cutoff is None else f"{cutoff:g}", **summary})
+        trades = simulate_trades(forecasts, assumptions, rule="rr")
+        summary = summarize(trades)
+        _ledger, portfolio = simulate_portfolio(trades, assumptions)
+        rows.append({
+            "rr_cutoff": "Any" if cutoff is None else f"{cutoff:g}",
+            **summary,
+            "portfolio_net_profit": portfolio["net_profit"],
+            "portfolio_final_equity": portfolio["final_equity"],
+            "portfolio_return_percent": portfolio["return_percent"],
+            "portfolio_maximum_drawdown": portfolio["maximum_drawdown"],
+            "portfolio_executed_trades": portfolio["executed_trades"],
+            "portfolio_skipped_trades": portfolio["skipped_trades"],
+            "portfolio_survived": portfolio["survived"],
+            "portfolio_completed_all_signals": portfolio["completed_all_signals"],
+        })
     return pd.DataFrame(rows)
 
 
@@ -344,14 +517,51 @@ def probability_rr_surface(
             for direction in ("CALL", "PUT"):
                 side = trades[trades["direction"] == direction]
                 summary = summarize(side)
+                _ledger, portfolio = simulate_portfolio(side, assumptions)
                 rows.append({
                     "direction": direction,
                     "probability_cutoff": float(probability),
                     "rr_cutoff": float(reward_risk),
                     "trades": summary["trades"],
-                    "net_pnl": summary["net_pnl"],
+                    "net_pnl": portfolio["net_profit"],
                     "win_probability": summary["win_probability"],
+                    "final_equity": portfolio["final_equity"],
+                    "maximum_drawdown": portfolio["maximum_drawdown"],
+                    "survived": portfolio["survived"],
                 })
+    return pd.DataFrame(rows)
+
+
+def probability_portfolio_curve(
+    forecasts: pd.DataFrame,
+    base_assumptions: SimulationAssumptions,
+    probability_cutoffs=None,
+) -> pd.DataFrame:
+    """Portfolio results across probability cutoffs for fixed NIFTY exits."""
+    probabilities = probability_cutoffs or tuple(np.round(np.arange(0.50, 0.91, 0.05), 2))
+    rows = []
+    for probability in probabilities:
+        assumptions = SimulationAssumptions(**{
+            **base_assumptions.__dict__,
+            "probability_cutoff": float(probability),
+            "rr_cutoff": None,
+        })
+        trades = simulate_trades(forecasts, assumptions, rule="rr")
+        for direction in ("CALL", "PUT"):
+            side = trades[trades["direction"] == direction]
+            _ledger, portfolio = simulate_portfolio(side, assumptions)
+            rows.append({
+                "direction": direction,
+                "probability_cutoff": float(probability),
+                "signals": len(side),
+                "executed_trades": portfolio["executed_trades"],
+                "skipped_trades": portfolio["skipped_trades"],
+                "final_equity": portfolio["final_equity"],
+                "net_profit": portfolio["net_profit"],
+                "return_percent": portfolio["return_percent"],
+                "maximum_drawdown": portfolio["maximum_drawdown"],
+                "survived": portfolio["survived"],
+            })
     return pd.DataFrame(rows)
 
 
