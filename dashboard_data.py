@@ -28,6 +28,7 @@ ENV_FILE = BASE_DIR / ".env"
 TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 ANALYSIS_HISTORY_FILE = DATA_DIR / "analysis_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
+VAMSI_KB_SCAN_FILE = DATA_DIR / "vamsi_kb_intraday" / "scans.csv"
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
 ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
 ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
@@ -696,6 +697,49 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                     "Entry rules not met",
                 )
             break
+
+    # The deterministic knowledge engine keeps its authoritative decisions in
+    # a dedicated ledger. Read it last so its final action wins over any older
+    # legacy analysis/log interpretation for the same five-minute candle.
+    if VAMSI_KB_SCAN_FILE.exists():
+        action_labels = {
+            "LIVE_ENTRY": ("ENTERED", "Live trade entered"),
+            "ENTRY_SELECTED": ("SELECTED", "Qualified setup selected"),
+            "EXECUTION_REJECT": ("REJECTED", "Order execution was rejected"),
+            "CAPITAL_REJECT": ("REJECTED", "Available capital cannot fund one lot"),
+            "REJECT": ("REJECTED", "Knowledge gates rejected the setup"),
+            "NO_CANDIDATE": ("NO SETUP", "No complete option-buying candidate"),
+            "ACTIVE_POSITION": ("SKIPPED", "A bot position is already active"),
+            "DAILY_STOP": ("SKIPPED", "Daily trade limit reached"),
+        }
+        try:
+            with VAMSI_KB_SCAN_FILE.open("r", newline="", errors="ignore") as file:
+                for raw_row in csv.DictReader(file):
+                    timestamp = parse_history_timestamp(
+                        raw_row.get("scan_time") or raw_row.get("scan_slot")
+                    )
+                    if timestamp is None or timestamp.date() != today:
+                        continue
+                    action = str(raw_row.get("action") or "").upper()
+                    decision, fallback = action_labels.get(
+                        action,
+                        (action.replace("_", " ") or "SCANNED", "Scan completed"),
+                    )
+                    blockers = str(raw_row.get("blockers") or "").replace(" | ", "; ")
+                    result = result_for(scan_bucket(timestamp), "NIFTY")
+                    result.update(
+                        {
+                            "decision": decision,
+                            "reason": short_scan_reason(blockers, fallback),
+                            "score": safe_float(raw_row.get("knowledge_score"), None),
+                            "scoreVersion": "VAMSI_KB_INTRADAY_V1_ALL_GATES",
+                            "direction": str(raw_row.get("direction") or "").upper() or None,
+                            "setup": str(raw_row.get("setup") or "").replace("_", " ") or None,
+                            "instrument": str(raw_row.get("instrument") or "") or None,
+                        }
+                    )
+        except (OSError, csv.Error):
+            pass
 
     return [grouped[key] for key in sorted(grouped, reverse=True)]
 

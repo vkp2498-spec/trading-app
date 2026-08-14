@@ -83,6 +83,54 @@ class TodayScansTests(unittest.TestCase):
             self.assertEqual(scans[1]["bankNifty"]["score"], 68)
             self.assertEqual(scans[1]["bankNifty"]["scoreVersion"], "VAMSI_UNIFIED_ENTRY_V1")
 
+    def test_knowledge_engine_ledger_is_authoritative_for_current_scans(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            analysis_file = root / "analysis_history.csv"
+            log_file = root / "trade_bot.log"
+            scan_file = root / "vamsi_kb_intraday" / "scans.csv"
+            scan_file.parent.mkdir()
+            analysis_file.write_text("")
+            log_file.write_text("")
+            with scan_file.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "scan_time", "scan_slot", "action", "direction", "setup",
+                        "knowledge_score", "instrument", "blockers",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "scan_time": "2026-08-14T11:36:04+05:30",
+                        "scan_slot": "2026-08-14T11:35:00+05:30",
+                        "action": "REJECT",
+                        "direction": "BEARISH",
+                        "setup": "NONE",
+                        "knowledge_score": "42.9",
+                        "instrument": "NIFTY2681424500PE",
+                        "blockers": "breadth does not confirm | option flow below VWAP",
+                    }
+                )
+
+            with (
+                patch.object(dashboard_data, "ANALYSIS_HISTORY_FILE", analysis_file),
+                patch.object(dashboard_data, "LOG_FILE", log_file),
+                patch.object(dashboard_data, "VAMSI_KB_SCAN_FILE", scan_file),
+            ):
+                scans = dashboard_data.build_today_scans(
+                    datetime(2026, 8, 14, 12, 0, tzinfo=IST)
+                )
+
+            self.assertEqual(len(scans), 1)
+            decision = scans[0]["nifty"]
+            self.assertEqual(decision["decision"], "REJECTED")
+            self.assertEqual(decision["direction"], "BEARISH")
+            self.assertEqual(decision["score"], 42.9)
+            self.assertEqual(decision["setup"], "NONE")
+            self.assertIn("breadth does not confirm", decision["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

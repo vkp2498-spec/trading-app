@@ -477,6 +477,7 @@ def scan() -> dict:
         )
         placed = trade_bot.execute_selected_candidate(prepared)
         action = "LIVE_ENTRY" if placed else "EXECUTION_REJECT"
+        _record_scan(slot, action, decision, prepared, quantity)
         return {
             "action": action,
             "scan_slot": slot,
