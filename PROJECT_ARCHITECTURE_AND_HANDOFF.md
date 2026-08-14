@@ -142,6 +142,7 @@ flowchart TD
 - `counterfactual_replay.py`: Counterfactual decision replay.
 - `strategy_replay.py`, `run_strategy_replay.py`: Historical strategy replay.
 - `backtest_data.py`, `backtest_report.py`: Historical data and reporting helpers.
+- `ml_v2_simulator.py`, `ml_v2_simulator_app.py`: Local 18-month/6-month V2 holdout simulator with RR-cutoff comparisons and explicit fixed-premium/delta assumptions.
 - `check_pnl.py`: Quick P&L reporting.
 
 ### Operations
@@ -848,7 +849,7 @@ Use the example for local paper/research defaults. Do not copy production creden
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
 ```
 
-At the time this handoff was last updated, the latest full suite had 162 passing tests. The number will change as tests are added.
+At the time this handoff was last updated, the latest full suite had 268 passing tests. The number will change as tests are added.
 
 ### 20.3 Run dashboard locally
 
@@ -858,7 +859,15 @@ streamlit run performance_dashboard.py
 
 Live dashboard features require a valid token and expected data files. Offline/post-market sections can work from preserved journals and downloaded data.
 
-### 20.4 Files that must stay out of Git
+### 20.4 Run the V2 holdout simulator locally
+
+```bash
+venv/bin/streamlit run ml_v2_simulator_app.py
+```
+
+The local cache is stored under `data/ml_v2_simulator/` and is intentionally excluded from Git. Use the app's refresh button with a valid local Upstox token, or initialize the cache from an existing market-data-only AWS cache. The study trains the production V2 model family on 18 calendar months and freezes it for the following six months. Its ₹1 lakh results use an adjustable fixed option premium and delta, conservatively resolve ambiguous 4H target/stop candles as stop-first, and are not a substitute for a historical option-chain replay.
+
+### 20.5 Files that must stay out of Git
 
 - `.env`
 - Upstox access/API tokens and webhook secrets
