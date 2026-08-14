@@ -460,12 +460,19 @@ def _entry_window_ok(current=None) -> bool:
     return first <= current.time() <= last
 
 
+def _observation_window_ok(current=None) -> bool:
+    current = current or trade_bot.now_ist()
+    first = trade_bot.configured_clock("VAMSI_KB_OBSERVATION_FIRST_TIME", "09:20")
+    last = trade_bot.configured_clock("VAMSI_KB_OBSERVATION_LAST_TIME", "15:27")
+    return first <= current.time() <= last
+
+
 def scan() -> dict:
     trade_bot.load_env()
     if trade_bot.trading_engine() != ENGINE:
         raise RuntimeError(f"TRADING_ENGINE must be {ENGINE}")
-    if not _entry_window_ok():
-        raise RuntimeError("Outside VAMSI knowledge-engine entry window")
+    if not _observation_window_ok():
+        raise RuntimeError("Outside VAMSI knowledge-engine observation window")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     slot = completed_scan_slot()
@@ -495,26 +502,15 @@ def scan() -> dict:
             for symbol in INDEX_SYMBOLS
             if trade_bot.state_is_active(trade_bot.read_state(symbol))
         ]
+        entry_block = ""
         if active_symbols:
-            for symbol in INDEX_SYMBOLS:
-                _record_scan(slot, symbol, "ACTIVE_POSITION")
-            return {
-                "action": "ACTIVE_POSITION",
-                "symbols": active_symbols,
-                "scan_slot": slot,
-            }
-        if trade_bot.index_trade_count_today() >= 1:
-            reason = "one account-wide index trade already used today"
-            for symbol in INDEX_SYMBOLS:
-                _record_scan(slot, symbol, "DAILY_STOP")
-            log(reason)
-            return {"action": "DAILY_STOP", "reason": reason, "scan_slot": slot}
-        daily_block = trade_bot.daily_index_entry_block_reason("NIFTY")
-        if daily_block:
-            for symbol in INDEX_SYMBOLS:
-                _record_scan(slot, symbol, "DAILY_STOP")
-            log(daily_block)
-            return {"action": "DAILY_STOP", "reason": daily_block, "scan_slot": slot}
+            entry_block = "active bot position: " + ", ".join(active_symbols)
+        elif trade_bot.index_trade_count_today() >= 1:
+            entry_block = "one account-wide index trade already used today"
+        elif not _entry_window_ok():
+            entry_block = "outside VAMSI knowledge-engine entry window"
+        else:
+            entry_block = trade_bot.daily_index_entry_block_reason("NIFTY") or ""
 
         qualified = []
         outcomes = []
@@ -568,6 +564,25 @@ def scan() -> dict:
             log("no fully qualified NIFTY, BANKNIFTY or SENSEX setup")
             return {
                 "action": "NO_QUALIFIED_CANDIDATE",
+                "scan_slot": slot,
+                "outcomes": outcomes,
+            }
+
+        if entry_block:
+            for symbol, candidate, decision in qualified:
+                observed = deepcopy(decision)
+                observed["blockers"] = [entry_block]
+                _record_scan(
+                    slot,
+                    symbol,
+                    "QUALIFIED_OBSERVATION",
+                    observed,
+                    candidate,
+                )
+            log(f"qualified setup observed but entry blocked: {entry_block}")
+            return {
+                "action": "QUALIFIED_OBSERVATION",
+                "reason": entry_block,
                 "scan_slot": slot,
                 "outcomes": outcomes,
             }

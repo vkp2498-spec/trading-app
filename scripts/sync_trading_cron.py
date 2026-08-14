@@ -29,13 +29,15 @@ def canonical_block(app_dir: Path) -> list[str]:
         "# AWS cron uses UTC. Scan one minute after each completed 5M candle.",
         f"51,56 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
         f"1-56/5 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
-        f"1,6,11,16,21,26,31,36,41,46 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        f"1,6,11,16,21,26,31,36,41,46,51,56 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
         "# One flock-protected monitor owns protection, staged trailing and exits.",
         f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
         f"* 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
         f"0 10 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
         "# Final bot square-off is 15:29 IST.",
         f"59 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_squareoff.lock {python} {root}/trade_bot.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
+        "# Every five-minute verdict is audited at 16:00 IST, including overlaps.",
+        f"30 10 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/post_market_score_audit.lock {python} {root}/post_market_score_audit.py --knowledge-engine-all-scans >> {log_dir}/post_market_audit.log 2>&1",
         BLOCK_END,
     ]
 

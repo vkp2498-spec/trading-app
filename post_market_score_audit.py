@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,48 @@ STATUS_FILE = DATA_DIR / "score_followthrough_status.json"
 IST = ZoneInfo("Asia/Kolkata")
 SYMBOLS = ("NIFTY", "BANKNIFTY")
 SCORE_BUCKETS = DASHBOARD_SCORE_BUCKETS
+KNOWLEDGE_SYMBOLS = ("NIFTY", "BANKNIFTY", "SENSEX")
+KNOWLEDGE_SCAN_FILE = DATA_DIR / "vamsi_kb_intraday" / "scans.csv"
+KNOWLEDGE_AUDIT_FILE = DATA_DIR / "vamsi_kb_intraday" / "post_market_followthrough.csv"
+KNOWLEDGE_SUMMARY_FILE = DATA_DIR / "vamsi_kb_intraday" / "post_market_summary.json"
+KNOWLEDGE_STATUS_FILE = DATA_DIR / "vamsi_kb_intraday" / "post_market_status.json"
+KNOWLEDGE_EXIT_DEFAULTS = {
+    "NIFTY": {"target": 30.0, "stop": 30.0},
+    "BANKNIFTY": {"target": 60.0, "stop": 60.0},
+    "SENSEX": {"target": 80.0, "stop": 80.0},
+}
+KNOWLEDGE_AUDIT_COLUMNS = [
+    "observation_id",
+    "trading_date",
+    "scan_time",
+    "scan_slot",
+    "symbol",
+    "action",
+    "direction",
+    "knowledge_score",
+    "score_bucket",
+    "selection_score",
+    "categories_json",
+    "blockers",
+    "reference_price",
+    "target_points",
+    "stop_points",
+    "favorable_points_before_stop",
+    "adverse_points_before_stop",
+    "target_hit_before_stop",
+    "stop_hit",
+    "bars_evaluated",
+    "window_end",
+]
+KNOWLEDGE_GATE_LABELS = {
+    "setup": "SETUP / REGIME",
+    "completed_candles": "5M + 15M ALIGNMENT",
+    "breadth": "CONSTITUENT BREADTH",
+    "option_chain": "OPTION CHAIN",
+    "option_flow": "OPTION VWAP / VOLUME",
+    "contract_quality": "SPREAD / DELTA / QUOTE",
+    "entry_freshness": "ENTRY FRESHNESS",
+}
 
 LOG_PREFIX = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (?P<message>.*)$"
@@ -545,6 +588,357 @@ def build_reason_summary(frame, minimum_samples=20):
     return grouped
 
 
+def knowledge_exit_points(symbol):
+    symbol = str(symbol or "").upper()
+    defaults = KNOWLEDGE_EXIT_DEFAULTS[symbol]
+
+    def configured(kind):
+        names = (
+            f"VAMSI_KB_{symbol}_{kind}_POINTS",
+            f"{symbol}_{kind}_POINTS",
+        )
+        for name in names:
+            value = os.getenv(name)
+            if value not in (None, ""):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    return number
+        return defaults[kind.lower()]
+
+    return {"target": configured("TARGET"), "stop": configured("STOP")}
+
+
+def read_knowledge_scans(trading_date, scan_file=KNOWLEDGE_SCAN_FILE):
+    path = Path(scan_file)
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        frame = pd.read_csv(path)
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+        return pd.DataFrame()
+    if frame.empty:
+        return frame
+    if "symbol" not in frame.columns:
+        frame["symbol"] = "NIFTY"
+    frame["symbol"] = frame["symbol"].fillna("NIFTY").astype(str).str.upper()
+    frame.loc[~frame["symbol"].isin(KNOWLEDGE_SYMBOLS), "symbol"] = "NIFTY"
+    slot_values = frame.get("scan_slot", frame.get("scan_time"))
+    frame["scan_slot_timestamp"] = pd.to_datetime(slot_values, errors="coerce", utc=True)
+    if "scan_time" not in frame.columns:
+        frame["scan_time"] = slot_values
+    fallback = pd.to_datetime(frame["scan_time"], errors="coerce", utc=True)
+    frame["scan_slot_timestamp"] = frame["scan_slot_timestamp"].fillna(fallback)
+    frame = frame.dropna(subset=["scan_slot_timestamp"])
+    frame["scan_slot_timestamp"] = frame["scan_slot_timestamp"].dt.tz_convert(IST)
+    date_value = trading_date.isoformat() if hasattr(trading_date, "isoformat") else str(trading_date)
+    frame = frame[
+        frame["scan_slot_timestamp"].dt.date.astype(str) == date_value
+    ].copy()
+    for column in ("knowledge_score", "selection_score"):
+        if column not in frame.columns:
+            frame[column] = None
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    for column in ("action", "direction", "blockers", "evidence"):
+        if column not in frame.columns:
+            frame[column] = ""
+        frame[column] = frame[column].fillna("").astype(str)
+    return frame.sort_values(["scan_slot_timestamp", "symbol"])
+
+
+def knowledge_categories(scan):
+    categories = []
+    score = scan.get("knowledge_score")
+    if score is not None and not pd.isna(score):
+        categories.append(f"SCORE {score_bucket(float(score))}")
+    try:
+        evidence = json.loads(scan.get("evidence") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        evidence = {}
+    for key, item in evidence.items() if isinstance(evidence, dict) else ():
+        if isinstance(item, dict) and not bool(item.get("passed")):
+            label = KNOWLEDGE_GATE_LABELS.get(
+                str(key), str(key).replace("_", " ").upper()
+            )
+            categories.append(f"REJECT · {label}")
+    action = str(scan.get("action") or "").upper()
+    if action == "NO_CANDIDATE":
+        categories.append("REJECT · NO COMPLETE CANDIDATE")
+    elif action == "ERROR":
+        categories.append("REJECT · DATA UNAVAILABLE")
+    elif action in {"CAPITAL_REJECT", "EXECUTION_REJECT"}:
+        categories.append(f"REJECT · {action.replace('_', ' ')}")
+    elif action == "REJECT" and not any(
+        category.startswith("REJECT ·") for category in categories
+    ):
+        categories.append("REJECT · OTHER")
+    return list(dict.fromkeys(categories))
+
+
+def evaluate_knowledge_followthrough(scan, candles, market_close="15:30"):
+    direction = str(scan.get("direction") or "").upper()
+    symbol = str(scan.get("symbol") or "").upper()
+    if direction not in {"BULLISH", "BEARISH"} or symbol not in KNOWLEDGE_SYMBOLS:
+        return None
+    if candles is None or candles.empty:
+        return None
+    slot = _timestamp(scan.get("scan_slot_timestamp") or scan.get("scan_slot"))
+    closing_time = datetime.strptime(market_close, "%H:%M").time()
+    end = pd.Timestamp.combine(slot.date(), closing_time).tz_localize(IST)
+    window = candles[(candles.index >= slot) & (candles.index < end)]
+    if window.empty:
+        return None
+
+    levels = knowledge_exit_points(symbol)
+    target_points = float(levels["target"])
+    stop_points = float(levels["stop"])
+    reference = float(window.iloc[0]["open"])
+    best_favorable = 0.0
+    worst_adverse = 0.0
+    target_hit = False
+    stop_hit = False
+    bars_evaluated = 0
+    last_timestamp = window.index[0]
+
+    for timestamp, candle in window.iterrows():
+        high = float(candle["high"])
+        low = float(candle["low"])
+        if direction == "BULLISH":
+            stopped_this_bar = low <= reference - stop_points
+            favorable = max(high - reference, 0.0)
+            adverse = max(reference - low, 0.0)
+        else:
+            stopped_this_bar = high >= reference + stop_points
+            favorable = max(reference - low, 0.0)
+            adverse = max(high - reference, 0.0)
+
+        # Minute candles cannot reveal whether their high or low happened
+        # first. A bar touching the stop is conservatively treated stop-first,
+        # so only movement from earlier bars qualifies as available evidence.
+        if stopped_this_bar:
+            stop_hit = True
+            last_timestamp = timestamp
+            break
+        best_favorable = max(best_favorable, favorable)
+        worst_adverse = max(worst_adverse, adverse)
+        target_hit = target_hit or favorable >= target_points
+        bars_evaluated += 1
+        last_timestamp = timestamp
+
+    score = scan.get("knowledge_score")
+    numeric_score = None if score is None or pd.isna(score) else float(score)
+    categories = knowledge_categories(scan)
+    if not categories:
+        return None
+    slot_iso = slot.isoformat()
+    return {
+        "observation_id": f"{slot.date()}|{symbol}|{slot_iso}",
+        "trading_date": str(slot.date()),
+        "scan_time": str(scan.get("scan_time") or ""),
+        "scan_slot": slot_iso,
+        "symbol": symbol,
+        "action": str(scan.get("action") or ""),
+        "direction": direction,
+        "knowledge_score": round(numeric_score, 2) if numeric_score is not None else None,
+        "score_bucket": score_bucket(numeric_score) if numeric_score is not None else "",
+        "selection_score": (
+            round(float(scan.get("selection_score")), 2)
+            if scan.get("selection_score") is not None
+            and not pd.isna(scan.get("selection_score"))
+            else None
+        ),
+        "categories_json": json.dumps(categories, separators=(",", ":")),
+        "blockers": str(scan.get("blockers") or ""),
+        "reference_price": round(reference, 2),
+        "target_points": target_points,
+        "stop_points": stop_points,
+        "favorable_points_before_stop": round(best_favorable, 2),
+        "adverse_points_before_stop": round(worst_adverse, 2),
+        "target_hit_before_stop": bool(target_hit),
+        "stop_hit": bool(stop_hit),
+        "bars_evaluated": bars_evaluated,
+        "window_end": _timestamp(last_timestamp).isoformat(),
+    }
+
+
+def upsert_knowledge_audit(rows, audit_file=KNOWLEDGE_AUDIT_FILE):
+    path = Path(audit_file)
+    incoming = pd.DataFrame(rows, columns=KNOWLEDGE_AUDIT_COLUMNS)
+    if path.exists():
+        try:
+            existing = pd.read_csv(path)
+        except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+            existing = pd.DataFrame(columns=KNOWLEDGE_AUDIT_COLUMNS)
+        combined = pd.concat([existing, incoming], ignore_index=True, sort=False)
+    else:
+        combined = incoming
+    if not combined.empty:
+        combined = combined.drop_duplicates("observation_id", keep="last")
+        combined = combined.reindex(columns=KNOWLEDGE_AUDIT_COLUMNS).sort_values(
+            ["trading_date", "scan_slot", "symbol"]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    combined.to_csv(temporary, index=False)
+    temporary.replace(path)
+    return combined
+
+
+def build_knowledge_summary(frame, trading_date=None, status="COMPLETE", message=""):
+    score_order = [f"SCORE {bucket}" for bucket in DASHBOARD_SCORE_BUCKETS]
+    gate_order = [f"REJECT · {label}" for label in KNOWLEDGE_GATE_LABELS.values()]
+    observed_categories = []
+    expanded = []
+    if frame is not None and not frame.empty:
+        for _, row in frame.iterrows():
+            try:
+                categories = json.loads(row.get("categories_json") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                categories = []
+            for category in categories:
+                observed_categories.append(category)
+                expanded.append(
+                    {
+                        "symbol": str(row.get("symbol") or "").upper(),
+                        "category": str(category),
+                        "favorable": pd.to_numeric(
+                            row.get("favorable_points_before_stop"), errors="coerce"
+                        ),
+                        "target_hit": str(row.get("target_hit_before_stop")).lower()
+                        in {"true", "1"},
+                    }
+                )
+    preferred = score_order + gate_order
+    extras = sorted(set(observed_categories) - set(preferred))
+    columns = [item for item in preferred if item in observed_categories] + extras
+    expanded_frame = pd.DataFrame(expanded)
+    rows = []
+    for symbol in KNOWLEDGE_SYMBOLS:
+        levels = knowledge_exit_points(symbol)
+        cells = []
+        for category in columns:
+            if expanded_frame.empty:
+                subset = expanded_frame
+            else:
+                subset = expanded_frame[
+                    (expanded_frame["symbol"] == symbol)
+                    & (expanded_frame["category"] == category)
+                ]
+            favorable = pd.to_numeric(
+                subset.get("favorable", pd.Series(dtype=float)), errors="coerce"
+            ).dropna()
+            samples = int(len(favorable))
+            cells.append(
+                {
+                    "column": category,
+                    "averageFavorablePoints": (
+                        round(float(favorable.mean()), 2) if samples else None
+                    ),
+                    "samples": samples,
+                    "targetHitRate": (
+                        round(float(subset.loc[favorable.index, "target_hit"].mean()) * 100, 1)
+                        if samples
+                        else None
+                    ),
+                }
+            )
+        rows.append(
+            {
+                "symbol": symbol,
+                "targetPoints": levels["target"],
+                "stopPoints": levels["stop"],
+                "cells": cells,
+            }
+        )
+    cumulative_observations = int(len(frame)) if frame is not None else 0
+    return {
+        "status": status,
+        "message": message,
+        "tradingDate": (
+            trading_date.isoformat() if hasattr(trading_date, "isoformat") else str(trading_date or "")
+        ),
+        "updatedAt": now_ist().isoformat(),
+        "cumulativeObservations": cumulative_observations,
+        "columns": columns,
+        "rows": rows,
+        "method": (
+            "Every overlapping five-minute scan; favourable movement is measured "
+            "from the next tradable minute until the configured stop first touches "
+            "or the session ends. Same-minute target/stop ambiguity is stop-first."
+        ),
+    }
+
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    temporary.replace(path)
+
+
+def run_knowledge_engine_audit(
+    trading_date=None,
+    skip_holiday_check=False,
+    scan_file=KNOWLEDGE_SCAN_FILE,
+    audit_file=KNOWLEDGE_AUDIT_FILE,
+    summary_file=KNOWLEDGE_SUMMARY_FILE,
+    status_file=KNOWLEDGE_STATUS_FILE,
+    candles_by_symbol=None,
+):
+    trading_date = trading_date or now_ist().date()
+    if not skip_holiday_check:
+        closed, explanation = market_is_closed(trading_date)
+        if closed:
+            status = "SKIPPED"
+            scans = pd.DataFrame()
+            message = explanation
+        else:
+            status = "COMPLETE"
+            scans = read_knowledge_scans(trading_date, scan_file)
+            message = ""
+    else:
+        status = "COMPLETE"
+        scans = read_knowledge_scans(trading_date, scan_file)
+        message = ""
+
+    rows = []
+    skipped_without_direction = 0
+    if status == "COMPLETE" and not scans.empty:
+        candles_by_symbol = candles_by_symbol or {
+            symbol: fetch_day_candles(symbol, trading_date)
+            for symbol in KNOWLEDGE_SYMBOLS
+            if symbol in set(scans["symbol"])
+        }
+        for _, scan in scans.iterrows():
+            evaluated = evaluate_knowledge_followthrough(
+                scan, candles_by_symbol.get(scan["symbol"], pd.DataFrame())
+            )
+            if evaluated is None:
+                skipped_without_direction += 1
+            else:
+                rows.append(evaluated)
+        message = f"Saved {len(rows)} overlapping five-minute observations"
+    elif status == "COMPLETE":
+        status = "SKIPPED"
+        message = "No knowledge-engine scan decisions were found"
+
+    combined = upsert_knowledge_audit(rows, audit_file)
+    summary = build_knowledge_summary(
+        combined,
+        trading_date=trading_date,
+        status=status,
+        message=message,
+    )
+    summary["todayObservations"] = len(rows)
+    summary["todayScansWithoutDirectionalEvidence"] = skipped_without_direction
+    _atomic_write_json(summary_file, summary)
+    _atomic_write_json(status_file, summary)
+    return summary
+
+
 def _write_status(status, message, **extra):
     DATA_DIR.mkdir(exist_ok=True)
     payload = {
@@ -621,6 +1015,11 @@ def run_audit(
 def main():
     parser = argparse.ArgumentParser(description="Audit scan scores against the following 15 minutes")
     parser.add_argument("--date", help="Trading date in YYYY-MM-DD format")
+    parser.add_argument(
+        "--knowledge-engine-all-scans",
+        action="store_true",
+        help="Audit every overlapping VAMSI knowledge-engine five-minute scan through session end",
+    )
     parser.add_argument("--horizon-minutes", type=int, default=15)
     parser.add_argument(
         "--exit-path-minutes",
@@ -632,15 +1031,30 @@ def main():
     args = parser.parse_args()
     trading_date = date.fromisoformat(args.date) if args.date else now_ist().date()
     try:
-        result = run_audit(
-            trading_date=trading_date,
-            horizon_minutes=args.horizon_minutes,
-            exit_path_minutes=args.exit_path_minutes,
-            skip_holiday_check=args.skip_holiday_check,
-        )
+        if args.knowledge_engine_all_scans:
+            result = run_knowledge_engine_audit(
+                trading_date=trading_date,
+                skip_holiday_check=args.skip_holiday_check,
+            )
+        else:
+            result = run_audit(
+                trading_date=trading_date,
+                horizon_minutes=args.horizon_minutes,
+                exit_path_minutes=args.exit_path_minutes,
+                skip_holiday_check=args.skip_holiday_check,
+            )
         print(json.dumps(result, indent=2, sort_keys=True))
     except Exception as error:
-        _write_status("FAILED", str(error), trading_date=trading_date.isoformat(), rows=0)
+        if args.knowledge_engine_all_scans:
+            failure = build_knowledge_summary(
+                pd.DataFrame(columns=KNOWLEDGE_AUDIT_COLUMNS),
+                trading_date=trading_date,
+                status="FAILED",
+                message=str(error),
+            )
+            _atomic_write_json(KNOWLEDGE_STATUS_FILE, failure)
+        else:
+            _write_status("FAILED", str(error), trading_date=trading_date.isoformat(), rows=0)
         raise
 
 

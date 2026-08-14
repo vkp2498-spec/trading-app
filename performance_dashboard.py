@@ -9,7 +9,11 @@ from pathlib import Path
 
 import streamlit as st
 
-from dashboard_data import build_today_scans, build_trade_performance
+from dashboard_data import (
+    build_post_market_review,
+    build_today_scans,
+    build_trade_performance,
+)
 from strategy_core import now_ist
 
 
@@ -55,6 +59,14 @@ st.markdown(
     .scan-badge.entered { background: #dff5e8; color: #13723e; }
     .scan-detail { color: #64748b; font-size: .78rem; margin-top: 8px; }
     .scan-meta { color: #334b69; font-size: .72rem; font-weight: 700; margin-top: 7px; }
+    .review-wrap { overflow-x: auto; padding-bottom: 7px; }
+    .review-table { border-collapse: separate; border-spacing: 0; min-width: 100%; }
+    .review-table th, .review-table td { background: #fff; border-bottom: 1px solid #dde5ef; border-right: 1px solid #dde5ef; padding: 11px 12px; text-align: center; white-space: nowrap; }
+    .review-table th { background: #eef3f8; color: #52657d; font-size: .68rem; font-weight: 850; }
+    .review-table th:first-child, .review-table td:first-child { border-left: 1px solid #dde5ef; position: sticky; left: 0; text-align: left; z-index: 1; }
+    .review-table td:first-child { color: #0b2343; font-weight: 850; }
+    .review-value { color: #0b2343; font-size: .84rem; font-weight: 850; }
+    .review-samples { color: #738197; font-size: .62rem; margin-top: 2px; }
     @media (max-width: 720px) {
         .summary-grid { grid-template-columns: 1fr; }
         .page-title { font-size: 1.75rem; }
@@ -197,6 +209,54 @@ def render_scans(scans: list[dict]) -> None:
         )
 
 
+def render_post_market_review(review: dict) -> None:
+    columns = review.get("columns") or []
+    rows = review.get("rows") or []
+    if not columns:
+        st.info(str(review.get("message") or "Post-market evidence will appear after the 4 PM audit."))
+        return
+    header = "".join(f"<th>{html.escape(str(column))}</th>" for column in columns)
+    body = []
+    for row in rows:
+        by_column = {
+            str(cell.get("column")): cell
+            for cell in row.get("cells") or []
+        }
+        cells = []
+        for column in columns:
+            cell = by_column.get(str(column)) or {}
+            average = cell.get("averageFavorablePoints")
+            samples = int(cell.get("samples") or 0)
+            value = "—" if average is None else f"{float(average):,.1f} pts"
+            cells.append(
+                "<td>"
+                f'<div class="review-value">{html.escape(value)}</div>'
+                f'<div class="review-samples">{samples} scan{"s" if samples != 1 else ""}</div>'
+                "</td>"
+            )
+        symbol = str(row.get("symbol") or "—")
+        target = float(row.get("targetPoints") or 0)
+        stop = float(row.get("stopPoints") or 0)
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(symbol)}<div class=\"review-samples\">T/S {target:g}/{stop:g}</div></td>"
+            + "".join(cells)
+            + "</tr>"
+        )
+    st.markdown(
+        '<div class="review-wrap"><table class="review-table"><thead><tr><th>Index</th>'
+        + header
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Cumulative: {int(review.get('cumulativeObservations') or 0)} directional scans · "
+        f"Last audit: {review.get('tradingDate') or '—'} · same-minute target/stop is treated stop-first."
+    )
+
+
 performance = build_trade_performance(analytics_mode="real")
 today = performance.get("today") or {}
 cumulative = performance.get("cumulative") or {}
@@ -230,3 +290,10 @@ render_pnl_calendar(performance.get("pnlCalendar") or [])
 st.markdown('<div class="section-title">Today’s Scans</div>', unsafe_allow_html=True)
 st.markdown('<div class="section-subtitle">Latest completed five-minute scan first</div>', unsafe_allow_html=True)
 render_scans(build_today_scans())
+
+st.markdown('<div class="section-title">Post-Market Review</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-subtitle">Average favourable index points before the configured stop, accumulated from every overlapping five-minute scan</div>',
+    unsafe_allow_html=True,
+)
+render_post_market_review(build_post_market_review())

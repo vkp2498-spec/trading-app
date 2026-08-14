@@ -29,6 +29,9 @@ TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 ANALYSIS_HISTORY_FILE = DATA_DIR / "analysis_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
 VAMSI_KB_SCAN_FILE = DATA_DIR / "vamsi_kb_intraday" / "scans.csv"
+VAMSI_KB_POST_MARKET_SUMMARY_FILE = (
+    DATA_DIR / "vamsi_kb_intraday" / "post_market_summary.json"
+)
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
 ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
 ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
@@ -719,6 +722,10 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
                 "NOT SELECTED",
                 "Another qualified index had the better score",
             ),
+            "QUALIFIED_OBSERVATION": (
+                "OBSERVED",
+                "Qualified setup recorded after live entry was blocked",
+            ),
             "ERROR": ("UNAVAILABLE", "Index scan was temporarily unavailable"),
         }
         try:
@@ -762,6 +769,26 @@ def build_today_scans(now: datetime | None = None) -> list[dict]:
             pass
 
     return [grouped[key] for key in sorted(grouped, reverse=True)]
+
+
+def build_post_market_review() -> dict:
+    defaults = {
+        "status": "NO DATA",
+        "message": "The 4 PM post-market audit has not run yet",
+        "tradingDate": "",
+        "updatedAt": None,
+        "cumulativeObservations": 0,
+        "todayObservations": 0,
+        "columns": [],
+        "rows": [
+            {"symbol": "NIFTY", "targetPoints": 30, "stopPoints": 30, "cells": []},
+            {"symbol": "BANKNIFTY", "targetPoints": 60, "stopPoints": 60, "cells": []},
+            {"symbol": "SENSEX", "targetPoints": 80, "stopPoints": 80, "cells": []},
+        ],
+        "method": "Every overlapping five-minute scan is evaluated until stop or session end.",
+    }
+    payload = read_json_file(VAMSI_KB_POST_MARKET_SUMMARY_FILE, defaults)
+    return payload if isinstance(payload, dict) else defaults
 
 
 def empty_trade_performance() -> dict:
@@ -2549,6 +2576,7 @@ def build_health_snapshot() -> dict:
             "mlShadowModel": file_status(ML_SHADOW_METADATA_FILE),
             "mlShadowPredictions": file_status(ML_SHADOW_PREDICTIONS_FILE),
             "stockScannerStatus": file_status(STOCK_SCANNER_STATUS_FILE),
+            "postMarketReview": file_status(VAMSI_KB_POST_MARKET_SUMMARY_FILE),
             "environmentFilePresent": ENV_FILE.exists(),
         },
         "configuration": {
@@ -2559,6 +2587,7 @@ def build_health_snapshot() -> dict:
         "bot": bot_status,
         "lastRuns": latest_analyses,
         "todayScans": build_today_scans(),
+        "postMarketReview": build_post_market_review(),
         "mlShadow": build_ml_shadow_status(),
         "mlShadowV2": build_ml_shadow_v2_status(),
         "performance": trade_performance,

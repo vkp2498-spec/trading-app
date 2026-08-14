@@ -28,6 +28,8 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertIn("trade_bot.py --monitor", updated)
         self.assertIn("59 9 * * 1-5", updated)
         self.assertIn("trade_bot.py --squareoff", updated)
+        self.assertIn("30 10 * * 1-5", updated)
+        self.assertIn("post_market_score_audit.py --knowledge-engine-all-scans", updated)
         self.assertNotIn("ml_shadow_v1.py --scan", updated)
 
     def test_disable_removes_managed_jobs_and_keeps_unrelated_jobs(self):

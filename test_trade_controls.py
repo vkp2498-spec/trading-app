@@ -3046,19 +3046,19 @@ class TradeControlTests(unittest.TestCase):
 
         self.assertEqual(
             (standard_nifty["target_points"], standard_nifty["stop_points"]),
-            (20, 20),
+            (30, 30),
         )
         self.assertEqual(
             (extreme_nifty["target_points"], extreme_nifty["stop_points"]),
-            (30, 20),
+            (30, 30),
         )
         self.assertEqual(
             (standard_bank["target_points"], standard_bank["stop_points"]),
-            (40, 40),
+            (60, 60),
         )
         self.assertEqual(
             (extreme_bank["target_points"], extreme_bank["stop_points"]),
-            (60, 40),
+            (60, 60),
         )
 
     def test_max_capital_uses_available_funds_and_rounds_down(self):

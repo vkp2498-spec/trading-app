@@ -1,13 +1,18 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
 from post_market_score_audit import (
     build_bucket_summary,
+    build_knowledge_summary,
+    evaluate_knowledge_followthrough,
     evaluate_followthrough,
+    knowledge_categories,
     non_overlapping_scans,
     parse_log_scans,
     read_audit,
@@ -183,6 +188,77 @@ class PostMarketScoreAuditTests(unittest.TestCase):
         summary = build_bucket_summary(frame, minimum_samples=20)
         self.assertEqual(summary.iloc[0]["evidence"], "BUILDING")
         self.assertEqual(reason_category("Technical reward/risk is too low"), "REWARD_RISK")
+
+    def test_knowledge_audit_keeps_overlaps_and_stops_before_ambiguous_bar(self):
+        index = pd.date_range(
+            "2026-08-14 10:00", periods=4, freq="min", tz="Asia/Kolkata"
+        )
+        candles = pd.DataFrame(
+            {
+                "open": [100, 100, 100, 100],
+                "high": [108, 140, 110, 112],
+                "low": [99, 69, 98, 97],
+                "close": [106, 75, 105, 108],
+            },
+            index=index,
+        )
+        scan = {
+            "scan_slot_timestamp": index[0],
+            "scan_time": index[0].isoformat(),
+            "symbol": "NIFTY",
+            "action": "REJECT",
+            "direction": "BULLISH",
+            "knowledge_score": 71.4,
+            "selection_score": 63,
+            "blockers": "breadth failed",
+            "evidence": json.dumps(
+                {
+                    "breadth": {"passed": False},
+                    "option_chain": {"passed": False},
+                }
+            ),
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "VAMSI_KB_NIFTY_TARGET_POINTS": "30",
+                "VAMSI_KB_NIFTY_STOP_POINTS": "30",
+            },
+        ):
+            row = evaluate_knowledge_followthrough(scan, candles)
+
+        self.assertEqual(row["favorable_points_before_stop"], 8)
+        self.assertTrue(row["stop_hit"])
+        self.assertFalse(row["target_hit_before_stop"])
+        self.assertIn("SCORE 70-79", json.loads(row["categories_json"]))
+        self.assertIn("REJECT · CONSTITUENT BREADTH", json.loads(row["categories_json"]))
+        self.assertIn("REJECT · OPTION CHAIN", knowledge_categories(scan))
+
+    def test_knowledge_summary_has_three_index_rows_and_sample_counts(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "symbol": "NIFTY",
+                    "categories_json": json.dumps(["SCORE 70-79", "REJECT · OPTION CHAIN"]),
+                    "favorable_points_before_stop": 12,
+                    "target_hit_before_stop": False,
+                },
+                {
+                    "symbol": "NIFTY",
+                    "categories_json": json.dumps(["SCORE 70-79"]),
+                    "favorable_points_before_stop": 18,
+                    "target_hit_before_stop": False,
+                },
+            ]
+        )
+        summary = build_knowledge_summary(
+            frame, trading_date=pd.Timestamp("2026-08-14").date()
+        )
+        self.assertEqual([row["symbol"] for row in summary["rows"]], ["NIFTY", "BANKNIFTY", "SENSEX"])
+        nifty = summary["rows"][0]
+        score_cell = next(cell for cell in nifty["cells"] if cell["column"] == "SCORE 70-79")
+        self.assertEqual(score_cell["samples"], 2)
+        self.assertEqual(score_cell["averageFavorablePoints"], 15)
 
 
 if __name__ == "__main__":

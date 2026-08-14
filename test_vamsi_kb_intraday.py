@@ -135,6 +135,30 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
         self.assertEqual(prepared["stop_loss_price"], 134.4)
         self.assertEqual(prepared["entry_score"]["score_version"], kb.SCORE_VERSION)
 
+    def test_prepared_trade_uses_index_specific_bank_and_sensex_points(self):
+        current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
+        with patch.dict(
+            kb.os.environ,
+            {
+                "VAMSI_KB_BANKNIFTY_TARGET_POINTS": "60",
+                "VAMSI_KB_BANKNIFTY_STOP_POINTS": "60",
+                "VAMSI_KB_SENSEX_TARGET_POINTS": "80",
+                "VAMSI_KB_SENSEX_STOP_POINTS": "80",
+            },
+        ):
+            bank_candidate = qualified_candidate(current=current, symbol="BANKNIFTY")
+            bank_candidate["technicals"]["banknifty_breadth"] = bank_candidate["technicals"].pop("nifty_breadth")
+            bank = kb.prepare_candidate(
+                bank_candidate, kb.evaluate_knowledge_setup(bank_candidate, current)
+            )
+            sensex_candidate = qualified_candidate(current=current, symbol="SENSEX")
+            sensex_candidate["technicals"]["sensex_breadth"] = sensex_candidate["technicals"].pop("nifty_breadth")
+            sensex = kb.prepare_candidate(
+                sensex_candidate, kb.evaluate_knowledge_setup(sensex_candidate, current)
+            )
+        self.assertEqual((bank["target_points"], bank["stop_points"]), (60, 60))
+        self.assertEqual((sensex["target_points"], sensex["stop_points"]), (80, 80))
+
     def test_scan_evaluates_all_indices_and_executes_highest_qualified_score(self):
         candidates = {
             symbol: {
@@ -180,6 +204,7 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
             patch.object(kb.trade_bot, "load_env"),
             patch.object(kb.trade_bot, "trading_engine", return_value=kb.ENGINE),
             patch.object(kb, "_entry_window_ok", return_value=True),
+            patch.object(kb, "_observation_window_ok", return_value=True),
             patch.object(kb, "_read_scan_state", return_value={}),
             patch.object(kb, "atomic_write_json"),
             patch.object(kb.trade_bot, "read_state", return_value={}),
@@ -199,6 +224,31 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
         self.assertEqual(evaluate_mock.call_count, 3)
         self.assertEqual(result["symbol"], "SENSEX")
         self.assertEqual(execute.call_args.args[0]["symbol"], "SENSEX")
+
+    def test_daily_trade_limit_blocks_orders_but_not_evidence_scans(self):
+        with (
+            patch.object(kb.trade_bot, "load_env"),
+            patch.object(kb.trade_bot, "trading_engine", return_value=kb.ENGINE),
+            patch.object(kb, "_entry_window_ok", return_value=True),
+            patch.object(kb, "_observation_window_ok", return_value=True),
+            patch.object(kb, "_read_scan_state", return_value={}),
+            patch.object(kb, "atomic_write_json"),
+            patch.object(kb.trade_bot, "read_state", return_value={}),
+            patch.object(kb.trade_bot, "state_is_active", return_value=False),
+            patch.object(kb.trade_bot, "index_trade_count_today", return_value=1),
+            patch.object(
+                kb.trade_bot,
+                "evaluate_symbol_buy_or_sell",
+                return_value=None,
+            ) as evaluate,
+            patch.object(kb.trade_bot, "execute_selected_candidate") as execute,
+            patch.object(kb, "_record_scan"),
+        ):
+            result = kb.scan()
+
+        self.assertEqual(evaluate.call_count, 3)
+        self.assertEqual(result["action"], "NO_QUALIFIED_CANDIDATE")
+        execute.assert_not_called()
 
 
 if __name__ == "__main__":

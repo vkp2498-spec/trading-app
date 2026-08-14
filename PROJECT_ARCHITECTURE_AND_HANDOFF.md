@@ -28,8 +28,9 @@ The project is an experimental automated trading platform for Indian markets usi
   may operate beside his untracked manual delivery positions. Both accounts
   allow one account-wide live entry per day. Every completed-candle scan checks
   NIFTY, BANKNIFTY, and SENSEX; if multiple setups pass every hard gate, only
-  the highest continuous selection score is eligible for execution. Target and
-  hard stop currently default to 30 underlying-index points for each index.
+  the highest continuous selection score is eligible for execution. Fixed
+  target/hard-stop pairs are NIFTY 30/30, BANKNIFTY 60/60, and SENSEX 80/80
+  underlying-index points.
 - Staged protection locks 10% of the planned move after 40% progress, 25%
   after 60%, and 55% after 80%. Persistent five-minute thesis reversal remains
   enabled independently of the entry score.
@@ -80,6 +81,10 @@ flowchart TD
     MON --> TRAIL["Staged profit locks and thesis reversal"]
     STOP --> JOURNAL["Trade journal"]
     TRAIL --> JOURNAL
+    KB --> SCANS["Every overlapping 5M verdict ledger"]
+    SCANS --> AUDIT["16:00 IST favourable-points audit"]
+    AUDIT --> DASH
+    AUDIT --> API
     JOURNAL --> DASH["Streamlit dashboard"]
     JOURNAL --> API["FastAPI mobile API"]
     API --> IOS["iOS app"]
@@ -196,6 +201,11 @@ after each completed five-minute candle. Calling `trade_bot.py` without
 `--monitor` or `--squareoff` cannot fall through to the legacy Vamsi entry path
 while this engine is selected.
 
+The scanner continues generating read-only evidence after the account's one
+live entry has been used or while a bot position is open. That observation path
+cannot submit another order. It exists so every NIFTY/BANKNIFTY/SENSEX five-minute
+verdict through the completed 15:25 candle remains available for research.
+
 Current state slots include the Vamsi NIFTY/BANKNIFTY/SENSEX lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
 
 ## 7. Vamsi engine
@@ -213,31 +223,21 @@ broker-entry safety checks.
 
 - Option-chain direction and confidence.
 - 5-minute and 15-minute completed-candle trend and momentum.
-- 2-hour higher-timeframe context.
-- Classic pivots.
-- Bollinger upper/lower bands and middle-band moving average.
-- ATM or selected-option VWAP, slope, volume ratio, spread, and Greeks.
+- Qualified trend breakout/retest/pullback or confirmed Bollinger reversal.
+- Bought-option VWAP and volume confirmation.
+- ATM/near-ATM spread, quote quality, and delta range.
 - NIFTY constituent breadth, BANKNIFTY major-bank breadth, or SENSEX 30-stock breadth.
-- Futures price/OI behavior, basis, VIX, FII/DII context, PCR, and max pain.
-- Market regime and entry structure.
-- Reachable technical reward/risk and entry extension.
-- Portfolio risk, daily risk, position correlation, broker state, and monitor health.
+- Entry freshness/extension.
 
-The live Vamsi entry decision uses one versioned score, `VAMSI_UNIFIED_ENTRY_V1`. Its weights total 100: core option/technical alignment 25, multi-timeframe direction and entry structure 25, breadth 20, institutional context 10, market regime/expiry 10, and trade feasibility (15-minute target, reward/risk, and entry extension) 10. These market-strategy conditions no longer veto a setup separately; alignment earns points and conflict or weak evidence earns fewer points. The score is an evidence ranking, not a calibrated probability.
+The diagnostic knowledge score is the percentage of these independent families
+that passed. It is not a calibrated probability and it cannot authorize an
+entry: all families must pass. The older `VAMSI_UNIFIED_ENTRY_V1` score,
+adaptive score-band promotion, and paper-observation engine remain historical
+research only and are not scheduled.
 
-Liquidity/contract validity, broker reconciliation, monitor health, market hours, duplicate-position controls, capital/lot ceilings, broker protection, and portfolio risk remain hard execution safeguards. Post-fill technical validation is observation-only: it records revised reward/risk and target context but cannot flatten a filled position.
-
-When `VAMSI_ADAPTIVE_SCORE_ENABLED=true`, the 09:00 IST job analyzes only prior rows tagged with the current unified score version, separately for NIFTY and BANKNIFTY. It compares minimum-and-above rules with contiguous bounded ranges and saves the effective rule in `data/vamsi_adaptive_score_config.json`. Legacy weighted-score observations remain stored but are excluded because their scale is not comparable. Until at least 20 current-version observations exist across five trading days, or whenever today's calibration is missing/stale/invalid, the strict fallback is `score > VAMSI_UNIFIED_SCORE_FALLBACK` (default 55). Adaptive boundaries are inclusive.
-
-For a manually selected static score range, set `VAMSI_ADAPTIVE_SCORE_ENABLED=false`, use `VAMSI_UNIFIED_SCORE_FALLBACK` as the inclusive lower boundary, and set the optional `VAMSI_UNIFIED_SCORE_MAXIMUM` as the inclusive upper boundary. If the maximum is omitted, the legacy strict minimum-only rule remains in effect.
-
-For multiple disjoint static bands, set `VAMSI_UNIFIED_SCORE_RANGES` to comma-separated inclusive ranges such as `50-59,80-89`. An explicit multi-range setting takes precedence over adaptive calibration and over the fallback/maximum pair; scores in gaps between bands are rejected.
-
-The post-market audit stores up to 60 one-minute OHLC candles for every selected unified-score observation. Dashboard presentation consistently groups scores as 0-9, 10-19, through 90-100 so low-score paper observations remain visible. The adaptive engine retains its finer internal research cells independently of these display buckets. The 09:00 job first keeps the score-band exit report in `data/vamsi_adaptive_exit_shadow.json`, then builds `data/vamsi_adaptive_live_policy.json` across the dashboard's time and score cells. A cell needs at least 40 within-cell non-overlapping observations across ten trading days, chronological held-out positive conservative expectancy, held-out profit factor of at least 1.20, and three successful calibrations containing new evidence. Target/stop optimization resolves same-candle ambiguity as a stop and limits changes to 10% per calibration.
-
-The Time × Score Net P&L matrix on the main dashboard is intentionally today-only and has no historical date selector. Cumulative and historical results belong in the Analytics section.
-
-Before any cell completes promotion, the static 65-69 and 11:00-13:55 collection strategy remains active while scans across 09:15-15:25 populate every research cell. After first promotion, only `LIVE_ENABLED` cells may enter; the policy supplies that cell's score band and target/stop. The daily live-trade allowance is the number of distinct promoted time cells capped by `VAMSI_ADAPTIVE_MAX_LIVE_TRADES_CAP` (default two). A missing, stale, incompatible, or failed policy after first promotion suspends adaptive entries instead of returning to the static rule. The policy is generated from prior dates and remains immutable intraday.
+Broker reconciliation, monitor health, market hours, duplicate-position
+controls, capital/lot ceilings, one account-wide entry per day, and broker
+protection remain hard execution safeguards outside the evidence decision.
 
 ### 7.3 Contract selection
 
@@ -260,16 +260,34 @@ Before any cell completes promotion, the static 65-69 and 11:00-13:55 collection
   following expiry to reduce near-expiry distortion. Confirm the exact current
   selection in `strategy_core.py` before changing it.
 
-### 7.4 Default risk/exit shape in `.env.example`
+### 7.4 Current post-market evidence audit
+
+At 16:00 IST, `post_market_score_audit.py --knowledge-engine-all-scans`
+evaluates every overlapping five-minute knowledge-engine verdict. A scan is
+counted in its 10-point diagnostic score bucket and in every hard gate that it
+failed. For each expected bullish/bearish direction, the audit measures the
+maximum favourable underlying-index movement from the next tradable minute
+until the configured stop first touches or the session ends. A minute that
+touches both favourable and stop levels is treated conservatively as stop-first.
+
+The cumulative, idempotent ledger is
+`data/vamsi_kb_intraday/post_market_followthrough.csv`; the dashboard/mobile
+payload is `data/vamsi_kb_intraday/post_market_summary.json`. Dashboard and iOS
+show NIFTY, BANKNIFTY, and SENSEX rows with average favourable points and sample
+counts for each observed score/gate column. This is evidence for later gate
+review, not an automatic permission to relax gates.
+
+### 7.5 Default risk/exit shape
 
 The current documented defaults are:
 
 ```dotenv
 NIFTY_TARGET_POINTS=30
 NIFTY_STOP_POINTS=30
-BANKNIFTY_TARGET_POINTS=90
-BANKNIFTY_STOP_POINTS=90
-MIN_TECHNICAL_REWARD_RISK=0.8
+BANKNIFTY_TARGET_POINTS=60
+BANKNIFTY_STOP_POINTS=60
+SENSEX_TARGET_POINTS=80
+SENSEX_STOP_POINTS=80
 OPTION_DELTA_APPROXIMATION=0.50
 ```
 
@@ -289,9 +307,9 @@ PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT=25
 
 The trigger/lock values must satisfy the validation ordering enforced by the code. Invalid sequences intentionally stop the monitor rather than run with incoherent protection.
 
-The fresh evidence-collection profile permits one one-lot live NIFTY entry per day from 09:15 through 15:15 for a unified score from 80 through 89. Every other fully constructed NIFTY setup—including scores outside the live band and setups blocked from live entry by the daily limit or adaptive cell policy—is opened as an independent one-lot paper observation. Ten paper observations may be open simultaneously. Paper observations use the same target, stop, trailing protection, thesis-reversal, time-stop, and journaling paths as live trades, but do not consume live trade counts or invoke broker, daily-P&L, portfolio-risk, or correlation entry gates.
-
-Automatic promotion remains evidence gated: each time × score cell requires at least 40 independent episodes across 10 trading days, held-out validation, and three consecutive successful daily calibrations. Promotion chooses whether the cell may trade and its target/stop combination; the live cap remains one trade per day.
+Vamsi uses MAX capital and Ganesh uses one lot. Both retain one account-wide
+live entry per day. Subsequent scans continue as read-only evidence; they do
+not create simulated broker positions or bypass the live entry limit.
 
 Vamsi index-option positions also use an active five-minute thesis-reversal exit. After a five-minute grace period, each completed five-minute boundary combines four deterministic components: high-confidence opposite option-chain direction; simultaneous adverse underlying and bought-option VWAP behavior; opposite completed 5M structure; and opposite completed 15M structure. Three of four components must persist for two consecutive scans. A completed 15M close beyond the saved structural invalidation together with adverse underlying VWAP exits immediately. Entry score is deliberately excluded from this exit decision. While this mode is enabled it replaces the legacy tick-level structural exit and the option-chain-only sentiment exit; the 20-minute no-progress time stop and broker-protected premium stop remain active.
 
@@ -303,7 +321,7 @@ VAMSI_THESIS_REVERSAL_CONFIRMATION_SCANS=2
 VAMSI_THESIS_REVERSAL_SKIP_AFTER_TARGET_PROGRESS_PERCENT=70
 ```
 
-### 7.5 Capital and mobile profile
+### 7.6 Capital and mobile profile
 
 `OPTION_CAPITAL_PER_ENTRY` supports:
 
@@ -323,7 +341,7 @@ planned risk = abs(entry premium - stop premium) * actual quantity
 
 Never raise an account cap merely because a larger mobile profile was selected.
 
-### 7.6 Retired T20 experiment
+### 7.7 Retired T20 experiment
 
 The experimental T20 fallback lane has been removed from runtime code, configuration, state monitoring, dashboards, and tests. Historical journal rows remain readable as ordinary index-option history. Do not add its old environment variables back to AWS `.env` files.
 
@@ -497,23 +515,21 @@ sudo systemctl enable --now nifty-app
 
 Lightsail servers use UTC. IST is UTC+05:30.
 
-The established schedule is:
+The active managed schedule is:
 
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
-- Vamsi score, shadow-exit, and automatic live-policy calibration: 09:00 IST on weekdays, `30 3 * * 1-5` in UTC cron.
-- Vamsi entry checks: every 5 minutes beginning at 09:15 IST. Ganesh retains its internal 09:30 strategy start. The bot's internal market window prevents late entries.
+- Knowledge-engine scans: one minute after every completed five-minute candle from 09:20 through 15:25 IST.
 - Position monitor: launch just before 09:15 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
-- Before promotion, collection entries use 11:00-13:55 IST while scans cover 09:15-15:25. After promotion, each live-enabled adaptive cell controls its own permitted time window.
 - Forced square-off: 15:29 IST, `59 9 * * 1-5` in UTC cron.
-- Mobile profile default reset: around 15:30 IST when configured.
-- Post-market score audit: 15:45 IST on weekdays (`15 10 * * 1-5` in UTC cron); it stores a 15-minute summary plus the longer minute path used by shadow exit research.
+- All-scan post-market audit: 16:00 IST on weekdays (`30 10 * * 1-5` UTC).
 
 An example cron layout is:
 
 ```cron
-# Vamsi entry checks: 09:15 IST onward, every five minutes.
-45,50,55 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_entry_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
-*/5 4-9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_entry_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
+# Completed-five-minute knowledge scans.
+51,56 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/vamsi_kb_intraday.py --scan >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
+1-56/5 4-8 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/vamsi_kb_intraday.py --scan >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
+1,6,11,16,21,26,31,36,41,46,51,56 9 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/vamsi_kb_intraday.py --scan >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 
 # Start the monitor at 09:14 IST so it is healthy before the 09:15 entry scan.
 44-59 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/index_monitor_bot.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/trade_bot.py --monitor >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
@@ -525,11 +541,8 @@ An example cron layout is:
 # Request Upstox token approval at 07:30 IST.
 0 2 * * 1-5 cd /home/ubuntu/trading-app && /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/request_upstox_token.py >> /home/ubuntu/trading-app/logs/token_request.log 2>&1
 
-# Calibrate today's Vamsi score rule and non-executable shadow exits at 09:00 IST (03:30 UTC).
-30 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_score_calibration.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/adaptive_score_calibration.py >> /home/ubuntu/trading-app/logs/adaptive_score_calibration.log 2>&1
-
-# Store score follow-through and 60-minute shadow-exit paths at 15:45 IST (10:15 UTC).
-15 10 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/post_market_score_audit.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/post_market_score_audit.py >> /home/ubuntu/trading-app/logs/post_market_score_audit.log 2>&1
+# Audit all overlapping scans at 16:00 IST (10:30 UTC).
+30 10 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/post_market_score_audit.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/post_market_score_audit.py --knowledge-engine-all-scans >> /home/ubuntu/trading-app/logs/post_market_audit.log 2>&1
 ```
 
 The repeated cron launch of `--monitor` is a recovery mechanism: while the long-running process holds the lock, later launches exit. If it dies, a later cron invocation restarts it. Never write `- 4-9`; the minute field must be `*`.
@@ -585,7 +598,10 @@ Do not use `source .env` as the normal application loader. Unquoted values conta
 
 ### 13.1 Dashboard
 
-The Streamlit dashboard and iOS trading presentation are branded **Nifty Options Trading**. Their performance totals, calendar, weekday charts, trade sequences, score/time heat maps, expectancy, and post-market score review use NIFTY index-option trades only. Historical BANKNIFTY journal rows are preserved for audit purposes but are excluded from these displayed analytics.
+The simplified Streamlit dashboard and iOS trading presentation show today's
+P/L, cumulative P/L, completed trade count, P/L calendar, current scans, and the
+cumulative post-market evidence matrix. The evidence matrix is deliberately
+multi-index: NIFTY, BANKNIFTY, and SENSEX appear as separate rows.
 
 Restart after code changes that affect the dashboard:
 
@@ -731,6 +747,7 @@ Useful review tools:
 venv/bin/python check_pnl.py
 venv/bin/python trade_forensics.py --date YYYY-MM-DD --forward-candles 6 --post-exit-candles 6
 venv/bin/python post_market_review.py --date YYYY-MM-DD
+venv/bin/python post_market_score_audit.py --knowledge-engine-all-scans --date YYYY-MM-DD
 ```
 
 The forensic tools use completed OHLC candles. They cannot know tick order inside one candle. Maximum favorable/adverse excursion is hindsight diagnostic evidence, not proof that a live exit was wrong.
