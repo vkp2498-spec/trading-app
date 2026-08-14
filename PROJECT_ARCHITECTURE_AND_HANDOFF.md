@@ -849,7 +849,7 @@ Use the example for local paper/research defaults. Do not copy production creden
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -p 'test_*.py'
 ```
 
-At the time this handoff was last updated, the latest full suite had 268 passing tests. The number will change as tests are added.
+At the time this handoff was last updated, the latest full suite had 269 passing tests. The number will change as tests are added.
 
 ### 20.3 Run dashboard locally
 

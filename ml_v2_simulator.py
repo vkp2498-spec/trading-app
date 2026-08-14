@@ -323,6 +323,38 @@ def compare_rr_cutoffs(
     return pd.DataFrame(rows)
 
 
+def probability_rr_surface(
+    forecasts: pd.DataFrame,
+    base_assumptions: SimulationAssumptions,
+    probability_cutoffs=None,
+    rr_cutoffs=None,
+) -> pd.DataFrame:
+    """Net P&L and sample count for every probability/RR combination and side."""
+    probabilities = probability_cutoffs or tuple(np.round(np.arange(0.50, 0.91, 0.05), 2))
+    reward_risks = rr_cutoffs or (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0)
+    rows = []
+    for probability in probabilities:
+        for reward_risk in reward_risks:
+            assumptions = SimulationAssumptions(**{
+                **base_assumptions.__dict__,
+                "probability_cutoff": float(probability),
+                "rr_cutoff": None if float(reward_risk) == 0 else float(reward_risk),
+            })
+            trades = simulate_trades(forecasts, assumptions, rule="rr")
+            for direction in ("CALL", "PUT"):
+                side = trades[trades["direction"] == direction]
+                summary = summarize(side)
+                rows.append({
+                    "direction": direction,
+                    "probability_cutoff": float(probability),
+                    "rr_cutoff": float(reward_risk),
+                    "trades": summary["trades"],
+                    "net_pnl": summary["net_pnl"],
+                    "win_probability": summary["win_probability"],
+                })
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--refresh-data", action="store_true", help="Download and cache the latest history")

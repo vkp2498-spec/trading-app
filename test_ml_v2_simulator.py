@@ -5,6 +5,7 @@ import pandas as pd
 from ml_v2_simulator import (
     SimulationAssumptions,
     compare_rr_cutoffs,
+    probability_rr_surface,
     simulate_trades,
     split_samples,
     summarize,
@@ -57,6 +58,26 @@ class MlV2SimulatorTests(unittest.TestCase):
         self.assertEqual(summary["targets"], 1)
         self.assertEqual(summary["stops"], 1)
         self.assertEqual(summary["win_probability"], 0.5)
+
+    def test_probability_rr_surface_separates_call_and_put(self):
+        surface = probability_rr_surface(
+            self.forecasts(),
+            SimulationAssumptions(),
+            probability_cutoffs=(0.5, 0.9),
+            rr_cutoffs=(0.0, 1.5),
+        )
+        self.assertEqual(len(surface), 8)
+        self.assertEqual(set(surface["direction"]), {"CALL", "PUT"})
+        call_default = surface[
+            (surface["direction"] == "CALL")
+            & (surface["probability_cutoff"] == 0.5)
+            & (surface["rr_cutoff"] == 0.0)
+        ].iloc[0]
+        self.assertEqual(call_default["trades"], 2)
+        self.assertEqual(
+            surface[(surface["probability_cutoff"] == 0.9)]["trades"].sum(),
+            0,
+        )
 
     def test_fixed_train_and_test_windows_do_not_overlap(self):
         index = pd.date_range("2023-01-02", periods=520, freq="B", tz="Asia/Kolkata")

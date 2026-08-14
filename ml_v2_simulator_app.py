@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from ml_v2_simulator import (
@@ -19,6 +20,7 @@ from ml_v2_simulator import (
     fit_and_forecast,
     labeled_samples,
     load_history,
+    probability_rr_surface,
     simulate_trades,
     summarize,
 )
@@ -33,6 +35,42 @@ def money(value) -> str:
 
 def percent(value) -> str:
     return f"{float(value) * 100:.1f}%"
+
+
+def surface_figure(surface: pd.DataFrame, direction: str) -> go.Figure:
+    side = surface[surface["direction"] == direction]
+    pnl = side.pivot(index="rr_cutoff", columns="probability_cutoff", values="net_pnl")
+    counts = side.pivot(index="rr_cutoff", columns="probability_cutoff", values="trades")
+    z = pnl.to_numpy(dtype=float, copy=True)
+    z[counts.to_numpy(dtype=int) == 0] = np.nan
+    finite = np.abs(z[np.isfinite(z)])
+    scale = float(finite.max()) if finite.size else 1.0
+    figure = go.Figure(go.Surface(
+        x=pnl.columns.to_numpy(dtype=float) * 100,
+        y=pnl.index.to_numpy(dtype=float),
+        z=z,
+        customdata=counts.to_numpy(dtype=int),
+        colorscale="RdYlGn",
+        cmin=-scale,
+        cmax=scale,
+        colorbar={"title": "Net P&L"},
+        hovertemplate=(
+            "Probability > %{x:.0f}%<br>Min RR: %{y:.1f}<br>"
+            "Net P&L: ₹%{z:,.0f}<br>Trades: %{customdata}<extra></extra>"
+        ),
+    ))
+    figure.update_layout(
+        title=f"{direction} surface",
+        height=520,
+        margin={"l": 0, "r": 0, "t": 45, "b": 0},
+        scene={
+            "xaxis_title": "Probability cutoff (%)",
+            "yaxis_title": "Minimum predicted RR (0 = Any)",
+            "zaxis_title": "Net P&L (₹)",
+            "camera": {"eye": {"x": 1.45, "y": -1.55, "z": 1.15}},
+        },
+    )
+    return figure
 
 
 @st.cache_data(show_spinner=False)
@@ -147,8 +185,17 @@ comparison_tab, trades_tab, evidence_tab, assumptions_tab = st.tabs(
 
 with comparison_tab:
     comparison = compare_rr_cutoffs(forecasts, replace(assumptions, rr_cutoff=None))
+    surface = probability_rr_surface(forecasts, replace(assumptions, rr_cutoff=None))
     current_v2_trades = simulate_trades(forecasts, replace(assumptions, rr_cutoff=None), rule="ev", minimum_ev_r=0.10)
     current_v2 = summarize(current_v2_trades)
+    st.subheader("Probability × reward/risk × net P&L")
+    call_chart, put_chart = st.columns(2)
+    call_chart.plotly_chart(surface_figure(surface, "CALL"), use_container_width=True)
+    put_chart.plotly_chart(surface_figure(surface, "PUT"), use_container_width=True)
+    st.caption(
+        "Each surface uses the untouched six-month holdout. RR 0 means no RR cutoff; combinations with "
+        "zero trades are left blank. Hover to see the trade count behind each point."
+    )
     st.subheader("Raw reward/risk cutoffs")
     display = comparison[[
         "rr_cutoff", "trades", "calls", "puts", "targets", "stops",
