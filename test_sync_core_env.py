@@ -6,6 +6,7 @@ from scripts.sync_core_env import (
     BLOCK_END,
     BLOCK_START,
     CORE_VALUES,
+    deployment_role_overrides,
     normalized_lines,
     parse_instance_overrides,
 )
@@ -32,16 +33,16 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertIn("UPSTOX_ACCESS_TOKEN=keep-token", updated)
         self.assertIn("GANESH_API_KEY=also-keep-me", updated)
         self.assertNotIn("VAMSI_UNIFIED_SCORE_RANGES", updated)
-        self.assertIn("TRADING_ENGINE=ML_SHADOW_V1", updated)
+        self.assertIn("TRADING_ENGINE=VAMSI_KB_INTRADAY_V1", updated)
         self.assertIn("ENABLE_LIVE_TRADING=false", updated)
-        self.assertIn("ML_SHADOW_PAPER_ENABLED=true", updated)
-        self.assertIn("ML_SHADOW_MIN_PROBABILITY=0.50", updated)
-        self.assertIn("ML_SHADOW_MIN_REWARD_RISK=0.75", updated)
+        self.assertIn("ML_SHADOW_PAPER_ENABLED=false", updated)
+        self.assertIn("OPTION_CAPITAL_PER_ENTRY=1", updated)
+        self.assertIn("MAX_INDEX_TRADES_PER_DAY=1", updated)
+        self.assertIn("VAMSI_KB_TARGET_POINTS=30", updated)
+        self.assertIn("VAMSI_KB_STOP_POINTS=30", updated)
         self.assertIn("ML_SHADOW_LIVE_TRADING_ENABLED=false", updated)
         self.assertIn("ML_SHADOW_V2_LIVE_ENABLED=false", updated)
         self.assertIn("ML_SHADOW_FORECAST_ONLY=true", updated)
-        self.assertIn("ML_SHADOW_MIN_EXPECTED_VALUE_R=0.10", updated)
-        self.assertIn("ML_SHADOW_TRAINING_DAYS=504", updated)
         self.assertNotIn("T20_MODE_ENABLED", updated)
         self.assertNotIn("GANESH_MAX_TRADES", updated)
         self.assertEqual(updated.count(BLOCK_START), 1)
@@ -57,24 +58,34 @@ class SyncCoreEnvTests(unittest.TestCase):
 
     def test_instance_overrides_replace_selected_core_values(self):
         overrides = parse_instance_overrides(
-            "ML_SHADOW_MIN_PROBABILITY=0.75\n"
-            "ML_SHADOW_NIFTY_LOT_SIZE=50\n"
-            "DAILY_PNL_GUARDS_ENABLED=false\n"
-            "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true\n"
+            "VAMSI_KB_MIN_BREADTH_SCORE=25\n"
+            "MAX_CAPITAL_USE_PERCENT=90\n"
         )
         updated = "\n".join(normalized_lines("", overrides=overrides))
 
-        self.assertIn("ML_SHADOW_MIN_PROBABILITY=0.75", updated)
-        self.assertIn("ML_SHADOW_NIFTY_LOT_SIZE=50", updated)
-        self.assertIn("DAILY_PNL_GUARDS_ENABLED=false", updated)
-        self.assertIn(
-            "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS=true",
-            updated,
-        )
+        self.assertIn("VAMSI_KB_MIN_BREADTH_SCORE=25", updated)
+        self.assertIn("MAX_CAPITAL_USE_PERCENT=90", updated)
 
     def test_instance_overrides_reject_unknown_or_sensitive_keys(self):
         with self.assertRaises(ValueError):
             parse_instance_overrides("UPSTOX_ACCESS_TOKEN=do-not-store-here")
+
+    def test_live_roles_separate_vamsi_max_from_ganesh_one_lot(self):
+        vamsi = deployment_role_overrides("kb-live-max")
+        ganesh = deployment_role_overrides("kb-live-one-lot")
+
+        self.assertEqual(vamsi["ENABLE_LIVE_TRADING"], "true")
+        self.assertEqual(vamsi["OPTION_CAPITAL_PER_ENTRY"], "MAX")
+        self.assertEqual(vamsi["VAMSI_KB_FORCE_MAX_ALLOCATION"], "true")
+        self.assertEqual(
+            vamsi["ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS"], "false"
+        )
+        self.assertEqual(ganesh["ENABLE_LIVE_TRADING"], "true")
+        self.assertEqual(ganesh["OPTION_CAPITAL_PER_ENTRY"], "1")
+        self.assertEqual(ganesh["ACCOUNT_MAX_LOTS_PER_ENTRY"], "1")
+        self.assertEqual(
+            ganesh["ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS"], "true"
+        )
 
 
 if __name__ == "__main__":

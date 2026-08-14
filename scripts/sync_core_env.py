@@ -122,40 +122,89 @@ LEGACY_CORE_VALUES = {
     "VAMSI_ADAPTIVE_LIVE_STOP_GRID": "10,15,20,25,30,35,40,45",
 }
 
-# ML_SHADOW_V1 observes the completed 09:15-09:20 NIFTY candle, then predicts
-# the post-09:20 path through 13:15. Live GTT requires two matching switches.
+# The knowledge engine scans only completed five-minute candles.  Direction is
+# taken from the NIFTY underlying; option-chain, option VWAP/volume, breadth,
+# spread, and delta are independent mandatory confirmations.  The role switch
+# below is the only deployment code allowed to enable live order submission.
 CORE_VALUES = {
-    "TRADING_ENGINE": "ML_SHADOW_V1",
+    "TRADING_ENGINE": "VAMSI_KB_INTRADAY_V1",
     "ENABLE_LIVE_TRADING": "false",
     "TRADE_BANK_NIFTY": "false",
     "PAPER_OBSERVATION_MODE_ENABLED": "false",
-    "ML_SHADOW_PAPER_ENABLED": "true",
+    "DEFAULT_TRADING_PROFILE": "1_LOT",
+    "OPTION_CAPITAL_PER_ENTRY": "1",
+    "ACCOUNT_MAX_OPTION_CAPITAL": "0",
+    "ACCOUNT_MAX_LOTS_PER_ENTRY": "1",
+    "MAX_LOTS_PER_ENTRY": "1",
+    "MAX_CAPITAL_USE_PERCENT": "95",
+    "MAX_CAPITAL_RESERVE_RUPEES": "1000",
+    "NIFTY_TARGET_POINTS": "30",
+    "NIFTY_STOP_POINTS": "30",
+    "OPTION_DELTA_APPROXIMATION": "0.50",
+    "VAMSI_KB_TARGET_POINTS": "30",
+    "VAMSI_KB_STOP_POINTS": "30",
+    "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
+    "VAMSI_KB_FIRST_ENTRY_TIME": "09:20",
+    "VAMSI_KB_LAST_ENTRY_TIME": "15:15",
+    "VAMSI_KB_CANDLE_GRACE_SECONDS": "8",
+    "VAMSI_KB_MAX_CANDLE_AGE_MINUTES": "7",
+    "VAMSI_KB_MIN_BREADTH_COVERAGE": "30",
+    "VAMSI_KB_MIN_BREADTH_SCORE": "18",
+    "VAMSI_KB_ALLOW_NEUTRAL_CHAIN": "false",
+    "VAMSI_KB_MIN_OPTION_VOLUME_RATIO": "1.0",
+    "VAMSI_KB_MIN_OPTION_DELTA": "0.40",
+    "VAMSI_KB_MAX_OPTION_DELTA": "0.70",
+    "VAMSI_KB_MAX_OPTION_SPREAD_PERCENT": "2.0",
+    "VAMSI_KB_MAX_ENTRY_EXTENSION_PERCENT": "1.5",
+    "VAMSI_KB_BOLLINGER_REVERSAL_ENABLED": "true",
+    "MAX_OPTION_SPREAD_PERCENT": "2.0",
+    "MIN_OPTION_DELTA": "0.40",
+    "MAX_OPTION_DELTA": "0.70",
+    "OPTION_GREEKS_FILTER": "true",
+    "OPTION_DEPTH_FILTER": "false",
+    "COMPLETED_CANDLE_GRACE_SECONDS": "8",
+    "BROKER_RECONCILIATION_REQUIRED": "true",
+    "BROKER_PROTECTIVE_STOP_ENABLED": "true",
+    "REQUIRE_HEALTHY_POSITION_MONITOR": "true",
+    "POSITION_MONITOR_INTERVAL_SECONDS": "2",
+    "PROFIT_PROTECTION_ENABLED": "true",
+    "PROFIT_BOOKING_TARGET_PERCENT": "80",
+    "PROFIT_BOOKING_MODE": "runner",
+    "PROFIT_RUNNER_LOCK_PERCENT": "55",
+    "PROFIT_PROTECTION_STAGE_ONE_TRIGGER_PERCENT": "40",
+    "PROFIT_PROTECTION_STAGE_ONE_LOCK_PERCENT": "10",
+    "PROFIT_PROTECTION_STAGE_TWO_TRIGGER_PERCENT": "60",
+    "PROFIT_PROTECTION_STAGE_TWO_LOCK_PERCENT": "25",
+    "VAMSI_THESIS_REVERSAL_EXIT_ENABLED": "true",
+    "VAMSI_THESIS_REVERSAL_GRACE_MINUTES": "5",
+    "VAMSI_THESIS_REVERSAL_MIN_COMPONENTS": "3",
+    "VAMSI_THESIS_REVERSAL_CONFIRMATION_SCANS": "2",
+    "VAMSI_THESIS_REVERSAL_SKIP_AFTER_TARGET_PROGRESS_PERCENT": "70",
+    "STOP_AFTER_FIRST_PROFIT_OR_LOSS": "true",
+    "STOP_AFTER_FIRST_PROFIT": "true",
+    "STOP_AFTER_FIRST_LOSS": "true",
+    "AFTER_FIRST_OUTCOME_MODE": "stop",
+    "AFTER_FIRST_PROFIT_MODE": "stop",
+    "AFTER_FIRST_LOSS_MODE": "stop",
+    "MAX_INDEX_TRADES_PER_DAY": "1",
+    "ALLOW_SIMULTANEOUS_INDEX_POSITIONS": "false",
+    "DAILY_PNL_GUARDS_ENABLED": "false",
+    "DYNAMIC_CAPITAL_RISK_ENABLED": "false",
+    "DAILY_PROFIT_TARGET": "0",
+    "DAILY_MAX_LOSS": "0",
+    "MAX_OPEN_PORTFOLIO_RISK": "0",
+    "MAX_DAILY_INDEX_RISK": "0",
+    "INDEX_RISK_PER_TRADE": "0",
+    "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "false",
+    "ML_SHADOW_PAPER_ENABLED": "false",
     "ML_SHADOW_LIVE_TRADING_ENABLED": "false",
     "ML_SHADOW_V2_LIVE_ENABLED": "false",
     "ML_SHADOW_FORECAST_ONLY": "true",
-    "ML_SHADOW_TRAINING_DAYS": "504",
-    "ML_SHADOW_HISTORY_CALENDAR_DAYS": "800",
-    "ML_SHADOW_MIN_TRAINING_ROWS": "300",
-    "ML_SHADOW_MAX_MODEL_AGE_DAYS": "4",
-    "ML_SHADOW_EVENT_MOVE_PERCENT": "0.10",
-    "ML_SHADOW_MIN_PROBABILITY": "0.50",
-    "ML_SHADOW_MIN_REWARD_RISK": "0.75",
-    "ML_SHADOW_MIN_EXPECTED_VALUE_R": "0.10",
-    "ML_SHADOW_V2_FIRST_ENTRY_TIME": "09:17",
-    "ML_SHADOW_V2_LAST_ENTRY_TIME": "09:30",
-    "ML_SHADOW_FIRST_ENTRY_TIME": "09:21",
-    "ML_SHADOW_LAST_ENTRY_TIME": "09:25",
-    "ML_SHADOW_CANDLE_GRACE_SECONDS": "8",
-    "ML_SHADOW_MAX_OPTION_SPREAD_PERCENT": "5",
-    "ML_SHADOW_NIFTY_LOT_SIZE": "65",
-    "ML_SHADOW_TRAILING_GAP_FRACTION": "0.25",
-    "ML_SHADOW_QUOTE_MAX_AGE_SECONDS": "20",
-    "ML_SHADOW_MONITOR_INTERVAL_SECONDS": "2",
 }
 
 INSTANCE_OVERRIDE_KEYS = set(CORE_VALUES) | {
-    "DAILY_PNL_GUARDS_ENABLED",
-    "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS",
+    "MAX_CAPITAL_USE_PERCENT",
+    "MAX_CAPITAL_RESERVE_RUPEES",
 }
 
 DEPRECATED_KEYS = {
@@ -190,7 +239,9 @@ def is_deprecated(key):
     sensitive_terms = ("API", "TOKEN", "SECRET", "PASSWORD", "CLIENT", "WEBHOOK")
     if any(term in key.upper() for term in sensitive_terms):
         return False
-    return key in DEPRECATED_KEYS or key.startswith(("T20_", "GANESH_", "VAMSI_"))
+    return key in DEPRECATED_KEYS or key.startswith(
+        ("T20_", "GANESH_", "VAMSI_", "ML_SHADOW_")
+    )
 
 
 def active_state_files(app_dir):
@@ -220,6 +271,44 @@ def parse_instance_overrides(text):
             raise ValueError(f"Unsupported instance core override: {key}")
         overrides[key] = stripped.split("=", 1)[1].strip()
     return overrides
+
+
+def deployment_role_overrides(role):
+    if role not in {"kb-shadow", "kb-live-max", "kb-live-one-lot", "disabled"}:
+        raise ValueError(f"Unsupported deployment role: {role}")
+    live_role = role in {"kb-live-max", "kb-live-one-lot"}
+    values = {
+        "ENABLE_LIVE_TRADING": "true" if live_role else "false",
+        "ML_SHADOW_LIVE_TRADING_ENABLED": "false",
+        "ML_SHADOW_V2_LIVE_ENABLED": "false",
+        "ML_SHADOW_FORECAST_ONLY": "true",
+        "ML_SHADOW_PAPER_ENABLED": "false",
+    }
+    if role == "kb-live-max":
+        values.update(
+            {
+                "DEFAULT_TRADING_PROFILE": "MAX",
+                "OPTION_CAPITAL_PER_ENTRY": "MAX",
+                "ACCOUNT_MAX_LOTS_PER_ENTRY": "0",
+                "MAX_LOTS_PER_ENTRY": "0",
+                "VAMSI_KB_FORCE_MAX_ALLOCATION": "true",
+                "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "false",
+            }
+        )
+    elif role == "kb-live-one-lot":
+        values.update(
+            {
+                "DEFAULT_TRADING_PROFILE": "1_LOT",
+                "OPTION_CAPITAL_PER_ENTRY": "1",
+                "ACCOUNT_MAX_LOTS_PER_ENTRY": "1",
+                "MAX_LOTS_PER_ENTRY": "1",
+                "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
+                # This role is for Ganesh, who intentionally retains manual
+                # delivery positions. The bot manages only its own state.
+                "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "true",
+            }
+        )
+    return values
 
 
 def normalized_lines(existing, overrides=None):
@@ -287,8 +376,8 @@ def main():
     parser.add_argument("--refuse-active-state", action="store_true")
     parser.add_argument(
         "--role",
-        choices=("ml-shadow", "ml-live", "disabled"),
-        help="Force the instance paper role after reading optional local overrides.",
+        choices=("kb-shadow", "kb-live-max", "kb-live-one-lot", "disabled"),
+        help="Force the knowledge-engine instance role after local overrides.",
     )
     args = parser.parse_args()
 
@@ -300,14 +389,7 @@ def main():
         overrides_path.read_text() if overrides_path.exists() else ""
     )
     if args.role:
-        live_role = args.role == "ml-live"
-        overrides["ENABLE_LIVE_TRADING"] = "true" if live_role else "false"
-        overrides["ML_SHADOW_LIVE_TRADING_ENABLED"] = "true" if live_role else "false"
-        overrides["ML_SHADOW_V2_LIVE_ENABLED"] = "true" if live_role else "false"
-        overrides["ML_SHADOW_FORECAST_ONLY"] = "true"
-        overrides["ML_SHADOW_PAPER_ENABLED"] = (
-            "true" if args.role in {"ml-shadow", "ml-live"} else "false"
-        )
+        overrides.update(deployment_role_overrides(args.role))
     active = active_state_files(env_path.parent)
     if args.refuse_active_state and active:
         raise SystemExit(

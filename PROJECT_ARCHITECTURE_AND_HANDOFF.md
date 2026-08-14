@@ -14,17 +14,24 @@ Never add API keys, access tokens, webhook secrets, APNs private keys, Android k
 
 ## 2. Current project state
 
-The project is an experimental automated trading platform for Indian markets using Upstox. As of 2026-08-14, the only scheduled decision engine is `ML_SHADOW_V1`:
+The project is an experimental automated trading platform for Indian markets using Upstox. As of 2026-08-14, the only scheduled decision engine is `VAMSI_KB_INTRADAY_V1`:
 
 - A shared Python codebase deployed to three AWS Lightsail Ubuntu instances.
-- Vamsi runs the opening V2 model live with one lot per independently qualified direction, while post-opening V3 remains forecast-only for comparison.
-- Ganesh and Sastry have all managed trading schedules disabled.
-- V2 live execution requires `ENABLE_LIVE_TRADING=true`, `ML_SHADOW_LIVE_TRADING_ENABLED=true`, and `ML_SHADOW_V2_LIVE_ENABLED=true`. V3 is forced to shadow by `ML_SHADOW_FORECAST_ONLY=true`.
-- The former Vamsi/Ganesh engine remains in the repository only as historical rollback/reference code and is not scheduled.
-- Nightly point-in-time training uses about two years (504 sessions) of five-minute data through the previous trading day. The completed 09:15–09:20 candle is observable input; labels use only the subsequent path through 13:15.
-- V2 qualifies above 50% probability only when `probability × reward/risk − (1 − probability)` is at least `+0.10R`; the same proxy is recalculated using remaining reward/risk immediately before execution.
-- V3 predicts whether a fixed 0.10% directional barrier beats the opposite barrier, plus favorable and adverse post-09:20 excursions. Its qualified signals are recorded without opening broker or paper positions.
-- NIFTY percentage levels are converted to ATM option-premium trigger prices using live option delta. Paper execution mirrors target, stop, and step trailing behavior; live execution delegates all three legs to Upstox GTT.
+- Vamsi and Ganesh run the same deterministic NIFTY option-buying engine live;
+  Sastry has all managed trading schedules disabled.
+- Every entry requires completed 5M/15M structure, directional regime,
+  constituent breadth, medium/high option-chain agreement, bought-option
+  VWAP/volume, and executable ATM/near-ATM spread/delta quality. The displayed
+  knowledge score is diagnostic and cannot compensate for a failed gate.
+- Vamsi uses the maximum whole-lot quantity supported by 95% of available
+  option capital after a Rs 1,000 reserve. Ganesh is hard-capped at one lot and
+  may operate beside his untracked manual delivery positions. Both accounts
+  allow one live entry per day. Target and hard stop are both 30 NIFTY points.
+- Staged protection locks 10% of the planned move after 40% progress, 25%
+  after 60%, and 55% after 80%. Persistent five-minute thesis reversal remains
+  enabled independently of the entry score.
+- The V2/V3 ML engines and former unified-score Vamsi/Ganesh engine remain in
+  the repository as historical research/rollback code and are not scheduled.
 - A Streamlit web dashboard.
 - A FastAPI mobile backend used by iOS and Android clients.
 - Daily Upstox notifier-token automation through a webhook.
@@ -32,7 +39,9 @@ The project is an experimental automated trading platform for Indian markets usi
 - Post-market reviews, forensic analysis, score follow-through audits, and historical replay tools.
 - A safe utility for resetting dashboard/mobile tracking while preserving configuration and credentials.
 
-Historical research has not established a stable profitable edge. The current engine is evidence collection only; it must not be promoted to live trading from an attractive backtest or a small shadow sample.
+Historical research has not established a stable profitable edge. The current
+live deployment is an explicit high-risk user choice; operational safeguards
+do not establish or guarantee a profitable edge.
 
 ## 3. Source-of-truth order
 
@@ -51,21 +60,22 @@ The AWS `.env` files are deliberately not in Git, so account behavior can differ
 
 ```mermaid
 flowchart TD
-    CRON["Vamsi AWS cron"] --> TRAIN["Nightly prior-day training"]
-    CRON --> SCORE["V2 opening live forecast"]
-    CRON --> SHADOW["V3 post-opening shadow forecast"]
-    TRAIN --> MODEL["Separate V2 and V3 model artifacts"]
-    MODEL --> SCORE
-    MODEL --> SHADOW
-    SCORE --> RULE["Probability and positive EV proxy"]
-    RULE --> EXEC["One live lot per qualified side"]
-    EXEC --> PAPER["Paper target/stop/trailing simulation"]
-    EXEC --> GTT["Optional Upstox multi-leg GTT"]
-    MON["Post-opening monitor"] --> PAPER
-    PAPER --> JOURNAL["Paper trade journal"]
-    SCORE --> EVIDENCE["V2 opening evidence"]
-    SHADOW --> EVIDENCE3["V3 post-09:20 evidence"]
-
+    CRON["Vamsi/Ganesh five-minute cron"] --> KB["VAMSI_KB_INTRADAY_V1"]
+    STREAM["Upstox market streams"] --> KB
+    KB --> CANDLE["Completed 5M and 15M structure"]
+    KB --> BREADTH["NIFTY breadth"]
+    KB --> CHAIN["Option chain and contract quality"]
+    KB --> FLOW["Bought-option VWAP and volume"]
+    CANDLE --> ALL["All gates must pass"]
+    BREADTH --> ALL
+    CHAIN --> ALL
+    FLOW --> ALL
+    ALL --> EXEC["MAX whole-lot market buy"]
+    EXEC --> STOP["Broker protective stop"]
+    MON["Two-second position monitor"] --> STOP
+    MON --> TRAIL["Staged profit locks and thesis reversal"]
+    STOP --> JOURNAL["Trade journal"]
+    TRAIL --> JOURNAL
     JOURNAL --> DASH["Streamlit dashboard"]
     JOURNAL --> API["FastAPI mobile API"]
     API --> IOS["iOS app"]
@@ -76,16 +86,15 @@ flowchart TD
     NGINX --> WEBHOOK["token_webhook.py on port 9000"]
     WEBHOOK --> ENV["Atomic .env token update"]
 
-    STREAM["upstox_streams.py"] --> SCORE
     STREAM --> MON
-
-    DISABLED["Ganesh and Sastry"] --> OFF["Managed trading cron disabled"]
+    DISABLED["Sastry"] --> OFF["Managed trading cron disabled"]
 ```
 
 ## 5. Repository map
 
 ### Live trading and strategy
 
+- `vamsi_kb_intraday.py`: Active all-gates NIFTY option-buying scanner.
 - `ml_shadow_4h_v2_live.py`: Live opening V2 trainer/scanner with the `+0.10R` probability-adjusted payoff filter.
 - `ml_shadow_v1.py`: Post-opening V3 trainer/scanner, 09:15–09:20 observation features, forecast-only evidence, shared live-state monitoring, and 13:15 exits.
 - `trade_bot.py`: Main orchestration, entry dispatch, broker execution, persistent state, live monitor, exits, square-off, and shared safety controls.
@@ -157,7 +166,13 @@ Some legacy modules remain for historical compatibility or research. Their prese
 
 ## 6. Strategy engine selection
 
-Each AWS instance selects one entry engine:
+Each AWS instance selects one entry engine. The active production value is:
+
+```dotenv
+TRADING_ENGINE=VAMSI_KB_INTRADAY_V1
+```
+
+Historical rollback values include:
 
 ```dotenv
 TRADING_ENGINE=VAMSI
@@ -170,6 +185,11 @@ TRADING_ENGINE=GANESH
 ```
 
 Only the selected engine may create new entries. The monitor and square-off layers always inspect every known bot state slot. This is important: changing the selected engine must not orphan a position created by the other engine.
+
+The knowledge engine is launched by `vamsi_kb_intraday.py --scan`, one minute
+after each completed five-minute candle. Calling `trade_bot.py` without
+`--monitor` or `--squareoff` cannot fall through to the legacy Vamsi entry path
+while this engine is selected.
 
 Current state slots include the Vamsi NIFTY/BANKNIFTY lanes, legacy compatibility slots, and the Ganesh `GANESH_GAP_NIFTY` / `GANESH_GAP_BANKNIFTY` lanes.
 
@@ -799,10 +819,10 @@ run `scripts/deploy_three_aws.sh` from the development machine with three SSH
 aliases or `ubuntu@IP` values. It pulls all three first, refuses to alter `.env`
 or restart while any instance has active bot state, preserves account-specific
 keys/tokens, removes duplicate/deprecated strategy values, writes one canonical
-core block, creates a timestamped `.env` backup, generates calibration output,
-and restarts only installed long-running services. It leaves `1 Lot` as the
-daily default but permits a morning `MAX` mobile selection to size from available
-capital. The operation is idempotent.
+core block, creates a timestamped `.env` backup, and restarts only installed
+long-running services. The Vamsi deployment role forces MAX while the Ganesh
+role forces one lot, so stale mobile selections cannot change either profile.
+The operation is idempotent.
 
 ## 19. Verify effective engine and configuration
 
@@ -822,10 +842,11 @@ PY
 
 Expected account selections at this handoff:
 
-- Vamsi: `TRADING_ENGINE=VAMSI`.
-- Ganesh: `TRADING_ENGINE=GANESH`, `GANESH_GAP_MODE=FAITHFUL`, `GANESH_GAP_LIVE_TRADING=true`, `GANESH_LOTS_PER_ENTRY=1`.
-
-The Ganesh instance also needs `ENABLE_LIVE_TRADING=true` to place actual orders.
+- Vamsi: `TRADING_ENGINE=VAMSI_KB_INTRADAY_V1`, live enabled, MAX allocation.
+- Ganesh: `TRADING_ENGINE=VAMSI_KB_INTRADAY_V1`, live enabled, one-lot cap,
+  untracked manual-position overlap allowed.
+- Sastry: canonical core configuration with live disabled and managed trading
+  cron removed.
 
 ## 20. New MacBook Air setup
 

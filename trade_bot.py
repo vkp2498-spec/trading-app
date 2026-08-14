@@ -395,8 +395,10 @@ def configured_bool(env_key, default=False):
 
 def trading_engine():
     engine = str(os.getenv("TRADING_ENGINE", "VAMSI")).strip().upper()
-    if engine not in {"VAMSI", "GANESH"}:
-        raise RuntimeError("TRADING_ENGINE must be VAMSI or GANESH")
+    if engine not in {"VAMSI", "GANESH", "VAMSI_KB_INTRADAY_V1"}:
+        raise RuntimeError(
+            "TRADING_ENGINE must be VAMSI, GANESH, or VAMSI_KB_INTRADAY_V1"
+        )
     return engine
 
 
@@ -2510,7 +2512,16 @@ def option_capital_per_entry():
         "OPTION_CAPITAL_PER_ENTRY",
         str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
     ).strip()
-    raw_value = str(active_value("optionCapitalPerEntry", fallback)).strip()
+    if (
+        trading_engine() == "VAMSI_KB_INTRADAY_V1"
+        and configured_bool("VAMSI_KB_FORCE_MAX_ALLOCATION", True)
+    ):
+        # This strategy is intentionally account-compounding.  Do not allow a
+        # stale dashboard/mobile profile copied from an older deployment to
+        # silently turn MAX into one lot.
+        raw_value = "MAX"
+    else:
+        raw_value = str(active_value("optionCapitalPerEntry", fallback)).strip()
     account_cap = configured_non_negative_float("ACCOUNT_MAX_OPTION_CAPITAL", 0.0)
     if raw_value.upper() == "MAX" or to_float(raw_value, 0.0) < 0:
         if account_cap > 0:
@@ -6187,6 +6198,9 @@ def _execute_selected_candidate_locked(chosen):
     entry_score = chosen.get("entry_score") or {}
     trade_metadata = {
         **trade_context,
+        "strategy": chosen.get("strategy")
+        or (chosen.get("option_summary") or {}).get("strategy")
+        or "VAMSI",
         "planned_risk": round(planned_risk, 2),
         "score_cutoff_approved": bool(chosen.get("score_cutoff_approved")),
         "entry_minimum_score": to_float(chosen.get("entry_minimum_score")),
@@ -6205,6 +6219,7 @@ def _execute_selected_candidate_locked(chosen):
         "underlying_atr": structural.get("atr"),
         "market_regime": (chosen.get("technicals", {}).get("market_regime") or {}).get("regime"),
         "entry_structure": (chosen.get("technicals", {}).get("entry_structure") or {}).get("type"),
+        "knowledge_decision": chosen.get("knowledge_decision", {}),
     }
 
     live = (
@@ -7372,6 +7387,12 @@ def _legacy_run_stock_futures_fallback():
 
 
 def run_signal_check():
+    if trading_engine() == "VAMSI_KB_INTRADAY_V1":
+        log(
+            "VAMSI_KB_INTRADAY_V1 entries must run through "
+            "vamsi_kb_intraday.py --scan; legacy signal check skipped."
+        )
+        return
     live_entry_window = market_window_ok()
     paper_observation_window = bool(
         paper_observation_mode_enabled() and paper_observation_entry_window_ok()

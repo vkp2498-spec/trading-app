@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the canonical post-opening ML_SHADOW_V1 cron without disturbing other jobs."""
+"""Install the canonical VAMSI knowledge-engine cron without disturbing other jobs."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ MANAGED_COMMANDS = (
     "post_market_score_audit.py",
     "ml_shadow_v1.py",
     "ml_shadow_4h_v2_live.py",
+    "vamsi_kb_intraday.py",
 )
 
 
@@ -25,21 +26,16 @@ def canonical_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# AWS cron uses UTC. Train live V2 at 08:35 and shadow V3 at 08:45 IST.",
-        f"5 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_v2_train.lock {python} {root}/ml_shadow_4h_v2_live.py --train >> {log_dir}/ml_shadow_v2.log 2>&1",
-        f"15 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_train.lock {python} {root}/ml_shadow_v1.py --train >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# V2 live opening forecast retries at 09:17/09:22/09:27 IST.",
-        f"47,52,57 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_v2_scan.lock {python} {root}/ml_shadow_4h_v2_live.py --scan >> {log_dir}/ml_shadow_v2.log 2>&1",
-        "# V3 forecast-only retries after the completed 09:15-09:20 candle.",
-        f"51,53,55 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# A flock-protected monitor follows paper or live-GTT state through 13:15 IST.",
-        f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
-        f"* 4-6 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
-        f"0-46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# Cancel/flatten any remaining live GTT at 13:16 IST; resolve evidence at 13:18.",
-        f"46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_squareoff.lock {python} {root}/ml_shadow_v1.py --squareoff >> {log_dir}/ml_shadow_v1.log 2>&1",
-        f"47 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_v2_scan.lock {python} {root}/ml_shadow_4h_v2_live.py --scan >> {log_dir}/ml_shadow_v2.log 2>&1",
-        f"48 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
+        "# AWS cron uses UTC. Scan one minute after each completed 5M candle.",
+        f"51,56 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        f"1-56/5 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        f"1,6,11,16,21,26,31,36,41,46 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        "# One flock-protected monitor owns protection, staged trailing and exits.",
+        f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
+        f"* 4-9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
+        f"0 10 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
+        "# Final bot square-off is 15:29 IST.",
+        f"59 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_squareoff.lock {python} {root}/trade_bot.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
         BLOCK_END,
     ]
 
@@ -98,7 +94,7 @@ def main():
     print(
         "Managed NIFTY trading cron disabled"
         if args.disable
-        else "Canonical post-opening ML_SHADOW_V1 cron installed"
+        else "Canonical VAMSI_KB_INTRADAY_V1 cron installed"
     )
 
 
