@@ -29,8 +29,8 @@ TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 ANALYSIS_HISTORY_FILE = DATA_DIR / "analysis_history.csv"
 LOG_FILE = LOG_DIR / "trade_bot.log"
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
-ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_4h_v2" / "metadata.json"
-ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_4h_v2" / "predictions.csv"
+ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
+ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
@@ -2225,6 +2225,7 @@ def build_ml_shadow_status() -> dict:
             "candleTime": row.get("candle_time") or None,
             "modelTrainedThrough": row.get("model_trained_through") or None,
             "modelHash": row.get("model_hash") or None,
+            "sessionOpen": safe_float(row.get("session_open")),
             "underlyingOpen": safe_float(row.get("underlying_open")),
             "underlyingEntryPrice": safe_float(row.get("underlying_entry_price")),
             "callProbability": safe_float(row.get("call_probability")),
@@ -2309,7 +2310,7 @@ def build_ml_shadow_status() -> dict:
 
     paper_trades = []
     for trade in read_trade_history():
-        if not str(trade.get("strategy") or "").upper().startswith("ML_SHADOW_4H_PERCENT_V2"):
+        if not str(trade.get("strategy") or "").upper().startswith("ML_SHADOW_0920_PERCENT_V3"):
             continue
         normalized = dict(trade)
         if normalized.get("optionType") in {"CALL", "PUT"}:
@@ -2329,9 +2330,9 @@ def build_ml_shadow_status() -> dict:
             "minimumRewardRisk": safe_float(os.getenv("ML_SHADOW_MIN_REWARD_RISK"), 0.75),
             "eventMovePercent": safe_float(os.getenv("ML_SHADOW_EVENT_MOVE_PERCENT"), 0.10),
             "trailingGapFraction": safe_float(os.getenv("ML_SHADOW_TRAILING_GAP_FRACTION"), 0.25),
-            "firstEntryTime": os.getenv("ML_SHADOW_FIRST_ENTRY_TIME", "09:17"),
-            "lastEntryTime": os.getenv("ML_SHADOW_LAST_ENTRY_TIME", "09:30"),
-            "timeframe": "09:15–13:15 first 4H candle",
+            "firstEntryTime": os.getenv("ML_SHADOW_FIRST_ENTRY_TIME", "09:21"),
+            "lastEntryTime": os.getenv("ML_SHADOW_LAST_ENTRY_TIME", "09:25"),
+            "timeframe": "Observe 09:15–09:20; predict 09:20–13:15",
             "liveTradingEnabled": (
                 os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
                 and os.getenv("ML_SHADOW_LIVE_TRADING_ENABLED", "false").lower() == "true"

@@ -30,6 +30,21 @@ def daily_candles(rows=90, start=None):
     return pd.DataFrame(values, index=index)
 
 
+def five_minute_session(day=None):
+    day = day or (date.today() - timedelta(days=5)).isoformat()
+    index = pd.date_range(f"{day} 09:15", f"{day} 13:10", freq="5min", tz=ml.IST)
+    rows = []
+    price = 25000.0
+    for number, _timestamp in enumerate(index):
+        close = price + (4 if number % 3 else -2)
+        rows.append({
+            "open": price, "high": max(price, close) + 3,
+            "low": min(price, close) - 2, "close": close, "volume": 1000 + number,
+        })
+        price = close
+    return pd.DataFrame(rows, index=index)
+
+
 class MlShadowV1Tests(unittest.TestCase):
     def test_features_use_only_prior_candles_and_current_open(self):
         original = daily_candles()
@@ -97,8 +112,15 @@ class MlShadowV1Tests(unittest.TestCase):
         outcome = ml._direction_outcome("CALL", 1.0, 1.0, 0.2, 0.5, 0.5)
         self.assertEqual(outcome, ("STOP", -0.5))
 
+    def test_daily_sample_uses_0920_entry_and_post_entry_path(self):
+        frame = five_minute_session()
+        sample = ml.daily_samples_from_5minute(frame).iloc[0]
+        self.assertEqual(sample["entry_price"], frame.iloc[0]["close"])
+        self.assertEqual(sample["post_entry_high"], frame.iloc[1:]["high"].max())
+        self.assertEqual(sample["first5_close"], frame.iloc[0]["close"])
+
     def test_prediction_resolves_both_directions_in_percent(self):
-        frame = daily_candles(rows=1)
+        frame = five_minute_session()
         candle_time = frame.index[0].isoformat()
         with tempfile.TemporaryDirectory() as directory:
             prediction_path = Path(directory) / "predictions.csv"

@@ -35,6 +35,7 @@ DATA_NAMES = {
     "vamsi_adaptive_live_policy.json",
     "ml_shadow_v1/predictions.csv",
     "ml_shadow_4h_v2/predictions.csv",
+    "ml_shadow_0920_v3/predictions.csv",
 }
 
 DATA_PATTERNS = (

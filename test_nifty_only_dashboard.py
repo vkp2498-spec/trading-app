@@ -27,7 +27,7 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
                 "call_target_percent", "call_stop_percent", "call_reward_risk",
                 "put_target_percent", "put_stop_percent", "put_reward_risk",
                 "call_action", "call_reason", "put_action", "put_reason",
-                "overall_action", "execution_mode", "underlying_open",
+                "overall_action", "execution_mode", "session_open", "underlying_open",
                 "underlying_entry_price", "future_up_percent", "future_down_percent",
                 "call_outcome", "call_realized_percent", "put_outcome",
                 "put_realized_percent", "resolved_at",
@@ -51,6 +51,7 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
                     "put_reason": "probability below threshold",
                     "overall_action": "PAPER_ENTRY",
                     "execution_mode": "PAPER",
+                    "session_open": "24980",
                     "underlying_open": "24995",
                     "underlying_entry_price": "25000",
                     "future_up_percent": "0.15",
@@ -63,7 +64,7 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
                 })
 
             paper_trade = {
-                "strategy": "ML_SHADOW_4H_PERCENT_V2_PAPER",
+                "strategy": "ML_SHADOW_0920_PERCENT_V3_PAPER",
                 "optionType": "CALL",
                 "direction": "BULLISH",
             }
@@ -76,6 +77,7 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
         self.assertEqual(forecast["callAction"], "PAPER_ENTRY")
         self.assertEqual(forecast["callProbability"], 0.62)
         self.assertEqual(forecast["callTargetPercent"], 0.12)
+        self.assertEqual(forecast["sessionOpen"], 24980.0)
         self.assertEqual(status["resolvedForecastCount"], 1)
         self.assertEqual(status["paperTrades"][0]["direction"], "CALL")
 

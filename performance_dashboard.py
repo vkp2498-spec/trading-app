@@ -2580,10 +2580,10 @@ def render_analytics_tab(performance_payload):
     )
 
     ml_status = build_ml_shadow_status()
-    st.markdown("### First-4H ML Evidence")
+    st.markdown("### Post-opening ML Evidence")
     st.caption(
-        "One daily NIFTY forecast for the 09:15–13:15 candle. CALL and PUT are "
-        "evaluated independently in percentage terms."
+        "The model observes the completed 09:15–09:20 NIFTY candle, then forecasts "
+        "CALL and PUT independently for the path through 13:15."
     )
     ml_columns = st.columns(4)
     ml_columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
@@ -2645,9 +2645,9 @@ def render_analytics_tab(performance_payload):
     render_edge_matrix(performance_payload.get("edgeAnalytics") or {})
 
 
-st.markdown('<div class="dash-title">ML First-4H Shadow</div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-title">ML Post-opening Forecast</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="dash-subtitle">One NIFTY forecast each day for the 09:15–13:15 candle</div>',
+    '<div class="dash-subtitle">Observe 09:15–09:20, then forecast the path through 13:15</div>',
     unsafe_allow_html=True,
 )
 
@@ -2669,7 +2669,7 @@ with overview_tab:
     columns = st.columns(4)
     columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
     columns[1].metric("Trained through", ml_status.get("trainedThrough") or "—")
-    columns[2].metric("Training first candles", int(ml_status.get("trainingRows") or 0))
+    columns[2].metric("Training sessions", int(ml_status.get("trainingRows") or 0))
     columns[3].metric("Training days", int(ml_status.get("trainingDays") or 0))
 
     rule_columns = st.columns(4)
@@ -2699,7 +2699,7 @@ with overview_tab:
     if ml_positions:
         st.dataframe(pd.DataFrame(ml_positions), use_container_width=True, hide_index=True)
     else:
-        st.success("No ML position is open. The next decision is made just after 09:15 IST.")
+        st.success("No ML position is open. The next decision is made after the 09:15–09:20 candle closes.")
 
     st.markdown("### Honest validation snapshot")
     validation_columns = st.columns(4)
@@ -2718,18 +2718,18 @@ with overview_tab:
     )
 
 with forecasts_tab:
-    st.markdown("### Daily first-candle forecasts")
+    st.markdown("### Daily post-opening forecasts")
     st.caption(
-        "Targets and stops are percentages of the NIFTY opening price. Both sides can "
-        "qualify; outcomes use the first four-hour candle only."
+        "Targets and stops are percentages of the NIFTY level at 09:20. Both sides can "
+        "qualify independently; outcomes use only the path from 09:20 through 13:15."
     )
     forecasts = pd.DataFrame(ml_status.get("recentForecasts") or [])
     if forecasts.empty:
-        st.info("The first forecast will appear shortly after the 09:15 opening print.")
+        st.info("The forecast will appear after the 09:15–09:20 candle is complete.")
     else:
         visible = [
             column for column in (
-                "candleTime", "underlyingOpen", "callProbability",
+                "candleTime", "sessionOpen", "underlyingOpen", "underlyingEntryPrice", "callProbability",
                 "callTargetPercent", "callStopPercent", "callRewardRisk", "callAction",
                 "putProbability", "putTargetPercent", "putStopPercent", "putRewardRisk",
                 "putAction", "overallAction", "executionMode", "futureUpPercent",
@@ -2781,7 +2781,7 @@ with paper_tab:
     st.markdown("### Completed ML paper trades")
     paper_trades = pd.DataFrame(ml_status.get("paperTrades") or [])
     if paper_trades.empty:
-        st.info("No first-4H ML paper trade has closed yet.")
+        st.info("No post-opening ML paper trade has closed yet.")
     else:
         visible = [
             column for column in (

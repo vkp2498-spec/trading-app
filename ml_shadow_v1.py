@@ -1,11 +1,10 @@
-"""ML Shadow: leakage-safe first-four-hour NIFTY model.
+"""ML Shadow: leakage-safe post-opening NIFTY model.
 
-One sample is created per trading day from the 09:15-13:15 NIFTY candle.
-The live forecast is made just after the open using prior-day features and
-today's opening price only. CALL and PUT are independent questions, so either,
-neither, or both can qualify. Paper execution is the default. Live execution
-requires two explicit switches and uses an Upstox multi-leg GTT with target,
-stop loss, and broker-managed trailing stop loss.
+One sample is created per trading day. The completed 09:15-09:20 candle is the
+observation, the 09:20 close is the model entry reference, and labels use only
+the subsequent path through 13:15. CALL and PUT are independent questions, so
+either, neither, or both can qualify. Paper execution is the default. Live
+execution requires two explicit switches and uses an Upstox multi-leg GTT.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ from upstox_streams import read_market_cache, read_stream_instruments, write_str
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "ml_shadow_4h_v2"
+DATA_DIR = BASE_DIR / "data" / "ml_shadow_0920_v3"
 MODEL_FILE = DATA_DIR / "model.joblib"
 METADATA_FILE = DATA_DIR / "metadata.json"
 PREDICTIONS_FILE = DATA_DIR / "predictions.csv"
@@ -51,9 +50,9 @@ STATE_FILES = {
     "CALL": BASE_DIR / "trade_state_ML_SHADOW_CALL.json",
     "PUT": BASE_DIR / "trade_state_ML_SHADOW_PUT.json",
 }
-LOG_PREFIX = "ML_SHADOW_4H_V2"
+LOG_PREFIX = "ML_SHADOW_0920_V3"
 ENGINE = "ML_SHADOW_V1"
-MODEL_VERSION = "ML_SHADOW_4H_PERCENT_V2"
+MODEL_VERSION = "ML_SHADOW_0920_PERCENT_V3"
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
 GTT_PLACE_URL = "https://api.upstox.com/v3/order/gtt/place"
 GTT_DETAILS_URL = "https://api.upstox.com/v3/order/gtt"
@@ -69,6 +68,12 @@ FEATURE_COLUMNS = [
     "previous_down_percent",
     "previous_close_location",
     "opening_gap_percent",
+    "first5_return_percent",
+    "first5_range_percent",
+    "first5_close_location",
+    "first5_upper_wick_percent",
+    "first5_lower_wick_percent",
+    "first5_volume_ratio_20",
     "previous_volume_ratio_20",
     "trend_5_percent",
     "trend_20_percent",
@@ -102,6 +107,7 @@ PREDICTION_COLUMNS = [
     "candle_time",
     "model_trained_through",
     "model_hash",
+    "session_open",
     "underlying_open",
     "underlying_entry_price",
     "call_probability",
@@ -173,7 +179,7 @@ def _as_ist(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def first_candle_per_day(candles: pd.DataFrame) -> pd.DataFrame:
-    """Return exactly the first 4-hour candle from each session."""
+    """Return the single daily model sample from each session."""
     frame = _as_ist(candles)
     if frame.empty:
         return frame
@@ -182,12 +188,85 @@ def first_candle_per_day(candles: pd.DataFrame) -> pd.DataFrame:
     return frame.groupby(frame.index.date, sort=True).head(1).copy()
 
 
+def _barrier_wins(path: pd.DataFrame, entry: float, move_percent: float) -> tuple[int, int]:
+    """Conservatively label which fixed barrier is reached first after 09:20."""
+    call_target = entry * (1 + move_percent / 100)
+    call_stop = entry * (1 - move_percent / 100)
+    put_target = call_stop
+    put_stop = call_target
+    call_result = None
+    put_result = None
+    for _timestamp, candle in path.iterrows():
+        high = float(candle["high"])
+        low = float(candle["low"])
+        if call_result is None:
+            hit_target = high >= call_target
+            hit_stop = low <= call_stop
+            if hit_target or hit_stop:
+                call_result = 0 if hit_stop else 1
+        if put_result is None:
+            hit_target = low <= put_target
+            hit_stop = high >= put_stop
+            if hit_target or hit_stop:
+                put_result = 0 if hit_stop else 1
+        if call_result is not None and put_result is not None:
+            break
+    return int(call_result or 0), int(put_result or 0)
+
+
+def daily_samples_from_5minute(candles: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate one leakage-safe 09:20-entry training sample per session."""
+    frame = _as_ist(candles)
+    if frame.empty:
+        return frame
+    threshold = max(configured_float("ML_SHADOW_EVENT_MOVE_PERCENT", 0.10), 0.01)
+    rows = []
+    for _day, group in frame.groupby(frame.index.date, sort=True):
+        times = group.index.time
+        session = group[(times >= clock_time(9, 15)) & (times < clock_time(13, 15))]
+        if session.empty:
+            continue
+        first = session.iloc[0]
+        first_time = session.index[0]
+        if first_time.time() != clock_time(9, 15):
+            continue
+        post = session[session.index.time >= clock_time(9, 20)]
+        if post.empty:
+            continue
+        entry = float(first["close"])
+        if entry <= 0:
+            continue
+        call_label, put_label = _barrier_wins(post, entry, threshold)
+        rows.append({
+            "timestamp": first_time,
+            "open": float(first["open"]),
+            "high": float(session["high"].max()),
+            "low": float(session["low"].min()),
+            "close": float(session.iloc[-1]["close"]),
+            "volume": float(session.get("volume", pd.Series(dtype=float)).sum()),
+            "first5_open": float(first["open"]),
+            "first5_high": float(first["high"]),
+            "first5_low": float(first["low"]),
+            "first5_close": entry,
+            "first5_volume": float(first.get("volume") or 0),
+            "entry_price": entry,
+            "post_entry_high": float(post["high"].max()),
+            "post_entry_low": float(post["low"].min()),
+            "post_entry_close": float(post.iloc[-1]["close"]),
+            "call_label": call_label,
+            "put_label": put_label,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return _as_ist(pd.DataFrame(rows).set_index("timestamp"))
+
+
 def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator / denominator.replace(0, np.nan)
 
 
 def build_feature_frame(candles: pd.DataFrame) -> pd.DataFrame:
-    """Build one daily feature row without using that day's high/low/close."""
+    """Build daily features using prior sessions plus today's completed first 5M."""
     frame = first_candle_per_day(candles)
     if frame.empty:
         return frame
@@ -220,6 +299,39 @@ def build_feature_frame(candles: pd.DataFrame) -> pd.DataFrame:
     result["previous_down_percent"] = down_percent.shift(1)
     result["previous_close_location"] = close_location.shift(1)
     result["opening_gap_percent"] = _safe_divide(open_price - close.shift(1), close.shift(1)) * 100
+    first5_open = pd.to_numeric(
+        frame.get("first5_open", frame["open"]), errors="coerce"
+    )
+    first5_high = pd.to_numeric(
+        frame.get("first5_high", frame["open"]), errors="coerce"
+    )
+    first5_low = pd.to_numeric(
+        frame.get("first5_low", frame["open"]), errors="coerce"
+    )
+    first5_close = pd.to_numeric(
+        frame.get("first5_close", frame["open"]), errors="coerce"
+    )
+    first5_volume = pd.to_numeric(
+        frame.get("first5_volume", pd.Series(0.0, index=frame.index)), errors="coerce"
+    ).fillna(0.0)
+    first5_range = first5_high - first5_low
+    result["first5_return_percent"] = _safe_divide(
+        first5_close - first5_open, first5_open
+    ) * 100
+    result["first5_range_percent"] = _safe_divide(first5_range, first5_open) * 100
+    result["first5_close_location"] = _safe_divide(first5_close - first5_low, first5_range)
+    result["first5_upper_wick_percent"] = _safe_divide(
+        first5_high - pd.concat([first5_open, first5_close], axis=1).max(axis=1),
+        first5_open,
+    ) * 100
+    result["first5_lower_wick_percent"] = _safe_divide(
+        pd.concat([first5_open, first5_close], axis=1).min(axis=1) - first5_low,
+        first5_open,
+    ) * 100
+    first5_volume_average = first5_volume.rolling(20, min_periods=5).mean().shift(1)
+    result["first5_volume_ratio_20"] = _safe_divide(
+        first5_volume, first5_volume_average
+    ).fillna(1.0)
     volume_average = volume.rolling(20, min_periods=5).mean().shift(1)
     result["previous_volume_ratio_20"] = _safe_divide(volume.shift(1), volume_average).fillna(1.0)
     result["trend_5_percent"] = (_safe_divide(close.shift(1), close.shift(6)) - 1) * 100
@@ -243,7 +355,7 @@ def add_forward_labels(
     horizon_candles: int = 1,
     minimum_move: float | None = None,
 ) -> pd.DataFrame:
-    """Attach same-first-candle percentage excursions as independent labels."""
+    """Attach post-09:20 percentage excursions and barrier-first labels."""
     del horizon_candles
     threshold = (
         configured_float("ML_SHADOW_EVENT_MOVE_PERCENT", 0.10)
@@ -251,14 +363,15 @@ def add_forward_labels(
         else float(minimum_move)
     )
     labeled = features.copy()
-    labeled["future_up_percent"] = (
-        _safe_divide(labeled["high"] - labeled["open"], labeled["open"]) * 100
-    ).clip(lower=0)
-    labeled["future_down_percent"] = (
-        _safe_divide(labeled["open"] - labeled["low"], labeled["open"]) * 100
-    ).clip(lower=0)
-    labeled["call_label"] = (labeled["future_up_percent"] >= threshold).astype(int)
-    labeled["put_label"] = (labeled["future_down_percent"] >= threshold).astype(int)
+    entry = pd.to_numeric(labeled.get("entry_price", labeled["open"]), errors="coerce")
+    post_high = pd.to_numeric(labeled.get("post_entry_high", labeled["high"]), errors="coerce")
+    post_low = pd.to_numeric(labeled.get("post_entry_low", labeled["low"]), errors="coerce")
+    labeled["future_up_percent"] = (_safe_divide(post_high - entry, entry) * 100).clip(lower=0)
+    labeled["future_down_percent"] = (_safe_divide(entry - post_low, entry) * 100).clip(lower=0)
+    if "call_label" not in labeled:
+        labeled["call_label"] = (labeled["future_up_percent"] >= threshold).astype(int)
+    if "put_label" not in labeled:
+        labeled["put_label"] = (labeled["future_down_percent"] >= threshold).astype(int)
     return labeled
 
 
@@ -327,11 +440,13 @@ def fetch_training_candles() -> pd.DataFrame:
     while cursor <= end:
         chunk_start = max(start, cursor)
         chunk_end = min(end, cursor.replace(day=monthrange(cursor.year, cursor.month)[1]))
-        frame = source.candles(NIFTY_KEY, "4hour", chunk_start, chunk_end, expired=False)
+        frame = source.candles(NIFTY_KEY, "5minute", chunk_start, chunk_end, expired=False)
         if not frame.empty:
             frames.append(frame)
         cursor = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
-    candles = first_candle_per_day(pd.concat(frames).sort_index() if frames else pd.DataFrame())
+    candles = daily_samples_from_5minute(
+        pd.concat(frames).sort_index() if frames else pd.DataFrame()
+    )
     available = sorted(set(candles.index.date))
     if len(available) > trading_days:
         candles = candles[candles.index.date >= available[-trading_days]]
@@ -370,7 +485,7 @@ def train() -> dict:
             "generated_at": now_ist().isoformat(),
         }
         atomic_write_json(METADATA_FILE, metadata, sort_keys=True)
-        raise RuntimeError(f"Need {minimum_rows} first-candle rows; found {len(usable)}")
+        raise RuntimeError(f"Need {minimum_rows} post-09:20 rows; found {len(usable)}")
     for label in ("call_label", "put_label"):
         if usable[label].nunique() < 2:
             raise RuntimeError(f"{label} requires both classes; adjust ML_SHADOW_EVENT_MOVE_PERCENT")
@@ -432,14 +547,14 @@ def train() -> dict:
         "put_stop": _regressor(sk, 0.75).fit(X, usable["future_up_percent"]),
         "event_move_percent": event_move,
         "trained_through": max(candles.index.date).isoformat(),
-        "history_tail": first_candle_per_day(candles).tail(90),
+        "history_tail": candles.tail(90),
     }
     sk["joblib"].dump(artifact, MODEL_FILE)
     model_hash = hashlib.sha256(MODEL_FILE.read_bytes()).hexdigest()[:16]
     metadata = {
         "version": MODEL_VERSION,
         "status": "READY_SHADOW",
-        "timeframe": "FIRST_4H",
+        "timeframe": "FIRST5_OBSERVATION_TO_1315",
         "generated_at": now_ist().isoformat(),
         "trained_through": artifact["trained_through"],
         "training_rows": int(len(usable)),
@@ -452,7 +567,7 @@ def train() -> dict:
     }
     atomic_write_json(METADATA_FILE, metadata, sort_keys=True)
     log(
-        f"trained first-4H percent model through {artifact['trained_through']}; "
+        f"trained 09:20-entry percent model through {artifact['trained_through']}; "
         f"rows={len(usable)} validation_accuracy={metrics['accuracy']}"
     )
     return metadata
@@ -465,7 +580,7 @@ def load_artifact():
     artifact = sk["joblib"].load(MODEL_FILE)
     metadata = json.loads(METADATA_FILE.read_text())
     if artifact.get("version") != MODEL_VERSION or metadata.get("status") != "READY_SHADOW":
-        raise RuntimeError("First-4H ML model is not READY_SHADOW")
+        raise RuntimeError("09:20-entry ML model is not READY_SHADOW")
     if artifact.get("trained_through") >= now_ist().date().isoformat():
         raise RuntimeError("ML model includes the current live day")
     trained_date = date.fromisoformat(str(artifact["trained_through"]))
@@ -475,29 +590,63 @@ def load_artifact():
     return artifact, metadata
 
 
-def fetch_today_open() -> tuple[pd.Timestamp, float, float]:
-    candles = _as_ist(fetch_v3_intraday_minutes(NIFTY_KEY, minutes=1))
+def fetch_today_observation() -> tuple[pd.Timestamp, dict, float]:
+    candles = _as_ist(fetch_v3_intraday_minutes(NIFTY_KEY, minutes=5))
     candles = completed_candles(
         candles,
-        1,
+        5,
         current_time=now_ist(),
         grace_seconds=max(configured_float("ML_SHADOW_CANDLE_GRACE_SECONDS", 8), 5),
     )
     today = candles[candles.index.date == now_ist().date()]
     if today.empty:
-        raise RuntimeError("The first completed NIFTY minute is not available")
-    opening = float(today.iloc[0]["open"])
+        raise RuntimeError("The completed 09:15-09:20 NIFTY candle is not available")
+    first = today.iloc[0]
+    if today.index[0].time() != clock_time(9, 15):
+        raise RuntimeError("The 09:15 NIFTY candle is missing")
+    observation = {
+        "open": float(first["open"]),
+        "high": float(first["high"]),
+        "low": float(first["low"]),
+        "close": float(first["close"]),
+        "volume": float(first.get("volume") or 0),
+    }
     current_quote = read_market_cache(NIFTY_KEY) or {}
     current_price = float(current_quote.get("ltp") or today.iloc[-1]["close"])
     candle_time = pd.Timestamp.combine(now_ist().date(), clock_time(9, 15)).tz_localize(IST)
-    return candle_time, opening, current_price
+    return candle_time, observation, current_price
+
+
+def fetch_today_open() -> tuple[pd.Timestamp, float, float]:
+    """Compatibility helper returning session open and current NIFTY price."""
+    candle_time, observation, current_price = fetch_today_observation()
+    return candle_time, observation["open"], current_price
 
 
 def score_latest(artifact, metadata, live_data=None) -> dict:
-    candle_time, opening, current_price = live_data or fetch_today_open()
+    candle_time, observation, current_price = live_data or fetch_today_observation()
+    if not isinstance(observation, dict):
+        observation = {
+            "open": float(observation), "high": float(observation),
+            "low": float(observation), "close": float(observation), "volume": 0.0,
+        }
+    session_open = float(observation["open"])
+    model_entry = float(observation["close"])
     history = first_candle_per_day(artifact["history_tail"])
     synthetic = pd.DataFrame(
-        [{"open": opening, "high": opening, "low": opening, "close": opening, "volume": 0.0}],
+        [{
+            "open": session_open,
+            "high": float(observation["high"]),
+            "low": float(observation["low"]),
+            "close": model_entry,
+            "volume": float(observation.get("volume") or 0),
+            "first5_open": session_open,
+            "first5_high": float(observation["high"]),
+            "first5_low": float(observation["low"]),
+            "first5_close": model_entry,
+            "first5_volume": float(observation.get("volume") or 0),
+            "entry_price": model_entry,
+        }],
         index=pd.DatetimeIndex([candle_time]),
     )
     features = build_feature_frame(pd.concat([history, synthetic]).sort_index())
@@ -515,7 +664,8 @@ def score_latest(artifact, metadata, live_data=None) -> dict:
         "candle_time": candle_time.isoformat(),
         "model_trained_through": artifact["trained_through"],
         "model_hash": metadata["model_hash"],
-        "underlying_open": opening,
+        "session_open": session_open,
+        "underlying_open": model_entry,
         "underlying_entry_price": current_price,
         "call_probability": call_probability,
         "call_target_percent": call_target,
@@ -629,8 +779,8 @@ def _direction_outcome(
 def resolve_prediction_outcomes(candles: pd.DataFrame) -> int:
     if not PREDICTIONS_FILE.exists() or candles.empty:
         return 0
-    first = first_candle_per_day(candles)
-    by_date = {timestamp.date(): row for timestamp, row in first.iterrows()}
+    samples = daily_samples_from_5minute(candles)
+    by_date = {timestamp.date(): row for timestamp, row in samples.iterrows()}
     changed = 0
     lock_path = PREDICTIONS_FILE.with_suffix(PREDICTIONS_FILE.suffix + ".lock")
     with file_lock(lock_path):
@@ -642,12 +792,12 @@ def resolve_prediction_outcomes(candles: pd.DataFrame) -> int:
             try:
                 candle_date = pd.Timestamp(row["candle_time"]).date()
                 candle = by_date[candle_date]
-                opening = float(candle["open"])
+                opening = float(candle["entry_price"])
             except (KeyError, TypeError, ValueError):
                 continue
-            up = max((float(candle["high"]) - opening) / opening * 100, 0)
-            down = max((opening - float(candle["low"])) / opening * 100, 0)
-            close_change = (float(candle["close"]) - opening) / opening * 100
+            up = max((float(candle["post_entry_high"]) - opening) / opening * 100, 0)
+            down = max((opening - float(candle["post_entry_low"])) / opening * 100, 0)
+            close_change = (float(candle["post_entry_close"]) - opening) / opening * 100
             row["future_up_percent"] = round(up, 4)
             row["future_down_percent"] = round(down, 4)
             for direction, prefix in (("CALL", "call"), ("PUT", "put")):
@@ -679,8 +829,8 @@ def fetch_resolution_candles() -> pd.DataFrame:
     end = now_ist().date()
     start = end - timedelta(days=10)
     source = UpstoxBacktestData(DATA_DIR / "history_cache", progress=log, pause_seconds=0.1)
-    historical = source.candles(NIFTY_KEY, "4hour", start, end - timedelta(days=1), expired=False)
-    intraday = source.candles(NIFTY_KEY, "4hour", end, end, expired=False)
+    historical = source.candles(NIFTY_KEY, "5minute", start, end - timedelta(days=1), expired=False)
+    intraday = source.candles(NIFTY_KEY, "5minute", end, end, expired=False)
     valid = [frame for frame in (historical, intraday) if not frame.empty]
     return pd.concat(valid).sort_index() if valid else pd.DataFrame()
 
@@ -935,7 +1085,7 @@ def monitor_paper_direction(direction: str, state: dict, force_squareoff: bool =
     trailed_stop = _round_tick(original_stop + favorable_steps * trailing_gap)
     state["stop_loss_price"] = trailed_stop
     if force_squareoff or now_ist() >= datetime.fromisoformat(state["expires_at"]):
-        close_paper_position(direction, state, _round_tick(option_ltp), "FIRST_4H_CLOSE")
+        close_paper_position(direction, state, _round_tick(option_ltp), "POST_OPENING_WINDOW_CLOSE")
         return True
     if option_ltp <= trailed_stop:
         close_paper_position(direction, state, _round_tick(option_ltp), "TRAILING_STOP")
@@ -981,7 +1131,7 @@ def squareoff_live_direction(direction: str, state: dict) -> bool:
     )
     if position is None:
         write_state(direction, {})
-        log(f"LIVE {direction} GTT has no open broker quantity at first-4H close")
+        log(f"LIVE {direction} GTT has no open broker quantity at 13:15 close")
         return True
     quantity = abs(int(float(position.get("quantity") or 0)))
     payload = {
@@ -1000,11 +1150,11 @@ def squareoff_live_direction(direction: str, state: dict) -> bool:
         "market_protection": -1,
     }
     response = requests.post(ORDER_PLACE_URL, headers=_auth_headers(), json=payload, timeout=20)
-    result = _response_json(response, "first-4H square-off")
+    result = _response_json(response, "13:15 square-off")
     state["status"] = "SQUAREOFF_SENT"
     state["squareoff_response"] = result
     write_state(direction, state)
-    log(f"LIVE {direction} first-4H square-off sent for qty={quantity}")
+    log(f"LIVE {direction} 13:15 square-off sent for qty={quantity}")
     return True
 
 
@@ -1052,19 +1202,19 @@ def scan() -> dict:
         raise RuntimeError("Both ENABLE_LIVE_TRADING and ML_SHADOW_LIVE_TRADING_ENABLED must match")
 
     current_minutes = now_ist().hour * 60 + now_ist().minute
-    first_entry = _configured_minutes("ML_SHADOW_FIRST_ENTRY_TIME", "09:17")
-    last_entry = _configured_minutes("ML_SHADOW_LAST_ENTRY_TIME", "09:30")
+    first_entry = _configured_minutes("ML_SHADOW_FIRST_ENTRY_TIME", "09:21")
+    last_entry = _configured_minutes("ML_SHADOW_LAST_ENTRY_TIME", "09:25")
     if current_minutes >= 13 * 60 + 16:
         resolved = resolve_prediction_outcomes(fetch_resolution_candles())
-        log(f"first-4H resolution pass; resolved={resolved}")
+        log(f"post-09:20 resolution pass; resolved={resolved}")
         return {"overall_action": "RESOLVE_ONLY", "resolved": resolved}
     if not first_entry <= current_minutes <= last_entry:
-        raise RuntimeError("Outside first-4H forecast entry window")
+        raise RuntimeError("Outside post-opening forecast entry window")
 
     artifact, metadata = load_artifact()
     prediction = score_latest(artifact, metadata)
     if prediction_already_recorded(prediction["candle_time"]):
-        log(f"first-4H forecast for {prediction['candle_time']} already recorded")
+        log(f"09:20-entry forecast for {prediction['candle_time']} already recorded")
         return {"overall_action": "DUPLICATE", **prediction}
     decisions = choose_actions(prediction)
     actions = []
@@ -1098,7 +1248,7 @@ def scan() -> dict:
     })
     append_prediction(prediction)
     log(
-        f"first4h={prediction['candle_time']} call={prediction['call_probability']:.3f}/"
+        f"post0920={prediction['candle_time']} call={prediction['call_probability']:.3f}/"
         f"rr{prediction['call_reward_risk']:.2f}/{prediction['call_action']} "
         f"put={prediction['put_probability']:.3f}/rr{prediction['put_reward_risk']:.2f}/"
         f"{prediction['put_action']} mode={mode}"
@@ -1116,7 +1266,7 @@ def monitor_loop() -> None:
         except Exception as error:
             log(f"monitor error: {error}")
         time.sleep(interval)
-    log("first-4H monitor stopped")
+    log("post-09:20 monitor stopped")
 
 
 def main() -> None:

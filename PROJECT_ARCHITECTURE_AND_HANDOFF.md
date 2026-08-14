@@ -1,6 +1,6 @@
 # Hare Krishna Trading Bot: Architecture and Project Handoff
 
-Last updated: 2026-08-13 IST
+Last updated: 2026-08-14 IST
 Repository: `git@github.com:vkp2498-spec/trading-app.git`  
 Primary branch: `main`
 
@@ -14,15 +14,15 @@ Never add API keys, access tokens, webhook secrets, APNs private keys, Android k
 
 ## 2. Current project state
 
-The project is an experimental automated trading platform for Indian markets using Upstox. As of 2026-08-13, the only scheduled decision engine is `ML_SHADOW_V1`:
+The project is an experimental automated trading platform for Indian markets using Upstox. As of 2026-08-14, the only scheduled decision engine is `ML_SHADOW_V1`:
 
 - A shared Python codebase deployed to three AWS Lightsail Ubuntu instances.
-- Vamsi runs the first-4H `ML_SHADOW_V1` with one lot per independently qualified direction. Paper remains available; live GTT requires two matching switches.
+- Vamsi runs the post-opening `ML_SHADOW_V1` with one lot per independently qualified direction. Paper remains available; live GTT requires two matching switches.
 - Ganesh and Sastry have all managed trading schedules disabled.
 - `ML_SHADOW_V1` defaults to paper. Live execution requires both `ENABLE_LIVE_TRADING=true` and `ML_SHADOW_LIVE_TRADING_ENABLED=true` and uses an Upstox multi-leg GTT.
 - The former Vamsi/Ganesh engine remains in the repository only as historical rollback/reference code and is not scheduled.
-- Nightly point-in-time training uses about two years (504 sessions) through the previous trading day. Only each day's first 09:15–13:15 four-hour candle is a sample; the second candle is ignored.
-- The once-daily opening forecast predicts CALL and PUT event probabilities, favorable percentage excursion, and adverse percentage excursion independently. Either, neither, or both sides may qualify above 50% probability and 0.75 reward/risk.
+- Nightly point-in-time training uses about two years (504 sessions) of five-minute data through the previous trading day. The completed 09:15–09:20 candle is observable input; labels use only the subsequent path through 13:15.
+- The once-daily 09:20 forecast predicts whether a fixed 0.10% directional barrier beats the opposite barrier, plus favorable and adverse post-09:20 percentage excursions. Either, neither, or both sides may qualify above 50% probability and 0.75 reward/risk.
 - NIFTY percentage levels are converted to ATM option-premium trigger prices using live option delta. Paper execution mirrors target, stop, and step trailing behavior; live execution delegates all three legs to Upstox GTT.
 - A Streamlit web dashboard.
 - A FastAPI mobile backend used by iOS and Android clients.
@@ -51,16 +51,16 @@ The AWS `.env` files are deliberately not in Git, so account behavior can differ
 ```mermaid
 flowchart TD
     CRON["Vamsi AWS cron"] --> TRAIN["Nightly prior-day training"]
-    CRON --> SCORE["Once-daily opening forecast"]
+    CRON --> SCORE["Once-daily post-opening forecast"]
     TRAIN --> MODEL["Calibrated direction and quantile excursion models"]
     MODEL --> SCORE
     SCORE --> RULE["Independent CALL/PUT probability and reward/risk rule"]
     RULE --> EXEC["One lot per qualified side"]
     EXEC --> PAPER["Paper target/stop/trailing simulation"]
     EXEC --> GTT["Optional Upstox multi-leg GTT"]
-    MON["First-4H monitor"] --> PAPER
+    MON["Post-opening monitor"] --> PAPER
     PAPER --> JOURNAL["Paper trade journal"]
-    SCORE --> EVIDENCE["First-candle percentage evidence"]
+    SCORE --> EVIDENCE["Post-09:20 percentage evidence"]
 
     JOURNAL --> DASH["Streamlit dashboard"]
     JOURNAL --> API["FastAPI mobile API"]
@@ -82,7 +82,7 @@ flowchart TD
 
 ### Live trading and strategy
 
-- `ml_shadow_v1.py`: Active first-4H NIFTY engine, leakage-safe two-year training, independent CALL/PUT scoring, percentage evidence, paper simulation, optional live GTT, monitoring, and 13:15 exits.
+- `ml_shadow_v1.py`: Active post-opening NIFTY engine, leakage-safe two-year training, 09:15–09:20 observation features, independent CALL/PUT scoring, percentage evidence, paper simulation, optional live GTT, monitoring, and 13:15 exits.
 - `trade_bot.py`: Main orchestration, entry dispatch, broker execution, persistent state, live monitor, exits, square-off, and shared safety controls.
 - `strategy_core.py`: Upstox option-chain access, expiry selection, option recommendations, and directional signal construction.
 - `market_technicals.py`: 5-minute, 15-minute, and 2-hour technical analysis, pivots, Bollinger Bands, moving averages, momentum, and option-premium level conversion.

@@ -122,8 +122,8 @@ LEGACY_CORE_VALUES = {
     "VAMSI_ADAPTIVE_LIVE_STOP_GRID": "10,15,20,25,30,35,40,45",
 }
 
-# ML_SHADOW_V1 is a first-four-hour NIFTY percentage model. Paper is the safe
-# default; live GTT execution requires two matching switches.
+# ML_SHADOW_V1 observes the completed 09:15-09:20 NIFTY candle, then predicts
+# the post-09:20 path through 13:15. Live GTT requires two matching switches.
 CORE_VALUES = {
     "TRADING_ENGINE": "ML_SHADOW_V1",
     "ENABLE_LIVE_TRADING": "false",
@@ -138,8 +138,8 @@ CORE_VALUES = {
     "ML_SHADOW_EVENT_MOVE_PERCENT": "0.10",
     "ML_SHADOW_MIN_PROBABILITY": "0.50",
     "ML_SHADOW_MIN_REWARD_RISK": "0.75",
-    "ML_SHADOW_FIRST_ENTRY_TIME": "09:17",
-    "ML_SHADOW_LAST_ENTRY_TIME": "09:30",
+    "ML_SHADOW_FIRST_ENTRY_TIME": "09:21",
+    "ML_SHADOW_LAST_ENTRY_TIME": "09:25",
     "ML_SHADOW_CANDLE_GRACE_SECONDS": "8",
     "ML_SHADOW_MAX_OPTION_SPREAD_PERCENT": "5",
     "ML_SHADOW_NIFTY_LOT_SIZE": "65",

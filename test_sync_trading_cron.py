@@ -23,7 +23,7 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertEqual(updated.count(BLOCK_START), 1)
         self.assertEqual(updated.count(BLOCK_END), 1)
         self.assertIn("15 3 * * 1-5", updated)
-        self.assertIn("47,52,57 3 * * 1-5", updated)
+        self.assertIn("51,53,55 3 * * 1-5", updated)
         self.assertIn("ml_shadow_v1.py --scan", updated)
         self.assertIn("46 7 * * 1-5", updated)
         self.assertIn("48 7 * * 1-5", updated)
