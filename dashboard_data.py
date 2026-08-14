@@ -31,6 +31,8 @@ LOG_FILE = LOG_DIR / "trade_bot.log"
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
 ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
 ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
+ML_SHADOW_V2_METADATA_FILE = DATA_DIR / "ml_shadow_4h_v2" / "metadata.json"
+ML_SHADOW_V2_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_4h_v2" / "predictions.csv"
 STOCK_SCANNER_STATUS_FILE = DATA_DIR / "stock_scanner_status.json"
 
 SYMBOLS = ["NIFTY", "BANKNIFTY"]
@@ -2336,6 +2338,7 @@ def build_ml_shadow_status() -> dict:
             "liveTradingEnabled": (
                 os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
                 and os.getenv("ML_SHADOW_LIVE_TRADING_ENABLED", "false").lower() == "true"
+                and os.getenv("ML_SHADOW_FORECAST_ONLY", "true").lower() != "true"
             ),
         },
         "forecastCount": len(rows),
@@ -2364,6 +2367,51 @@ def build_ml_shadow_status() -> dict:
         "timeBuckets": direction_buckets,
         "recentForecasts": typed_rows[-30:][::-1],
         "paperTrades": paper_trades,
+    }
+
+
+def build_ml_shadow_v2_status() -> dict:
+    metadata = read_json_file(ML_SHADOW_V2_METADATA_FILE, {})
+    rows = []
+    if ML_SHADOW_V2_PREDICTIONS_FILE.exists():
+        try:
+            with ML_SHADOW_V2_PREDICTIONS_FILE.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except (OSError, ValueError):
+            rows = []
+    recent = []
+    for index, row in enumerate(rows[-30:][::-1]):
+        recent.append({
+            "id": f"{row.get('candle_time', '')}-v2-{index}",
+            "scanTime": row.get("scan_time") or None,
+            "candleTime": row.get("candle_time") or None,
+            "callProbability": safe_float(row.get("call_probability")),
+            "callRewardRisk": safe_float(row.get("call_reward_risk")),
+            "callExpectedValueR": safe_float(row.get("call_expected_value_r"), None),
+            "callAction": row.get("call_action") or "NO_TRADE",
+            "putProbability": safe_float(row.get("put_probability")),
+            "putRewardRisk": safe_float(row.get("put_reward_risk")),
+            "putExpectedValueR": safe_float(row.get("put_expected_value_r"), None),
+            "putAction": row.get("put_action") or "NO_TRADE",
+            "overallAction": row.get("overall_action") or "NO_TRADE",
+            "resolvedAt": row.get("resolved_at") or None,
+        })
+    return {
+        "status": metadata.get("status", "NOT_TRAINED"),
+        "trainedThrough": metadata.get("trained_through"),
+        "trainingRows": safe_int(metadata.get("training_rows")),
+        "validation": metadata.get("validation") or {},
+        "minimumProbability": safe_float(os.getenv("ML_SHADOW_MIN_PROBABILITY"), 0.50),
+        "minimumExpectedValueR": safe_float(
+            os.getenv("ML_SHADOW_MIN_EXPECTED_VALUE_R"), 0.10
+        ),
+        "liveTradingEnabled": (
+            os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+            and os.getenv("ML_SHADOW_LIVE_TRADING_ENABLED", "false").lower() == "true"
+            and os.getenv("ML_SHADOW_V2_LIVE_ENABLED", "false").lower() == "true"
+        ),
+        "forecastCount": len(rows),
+        "recentForecasts": recent,
     }
 
 def build_health_snapshot() -> dict:
@@ -2438,6 +2486,7 @@ def build_health_snapshot() -> dict:
         "lastRuns": latest_analyses,
         "todayScans": build_today_scans(),
         "mlShadow": build_ml_shadow_status(),
+        "mlShadowV2": build_ml_shadow_v2_status(),
         "performance": trade_performance,
         "live": live_positions,
         "upstoxAccount": {

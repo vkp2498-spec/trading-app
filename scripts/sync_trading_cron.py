@@ -15,6 +15,7 @@ MANAGED_COMMANDS = (
     "adaptive_score_calibration.py",
     "post_market_score_audit.py",
     "ml_shadow_v1.py",
+    "ml_shadow_4h_v2_live.py",
 )
 
 
@@ -24,9 +25,12 @@ def canonical_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# AWS cron uses UTC. Train at 08:45 IST using data through the prior day.",
+        "# AWS cron uses UTC. Train live V2 at 08:35 and shadow V3 at 08:45 IST.",
+        f"5 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_v2_train.lock {python} {root}/ml_shadow_4h_v2_live.py --train >> {log_dir}/ml_shadow_v2.log 2>&1",
         f"15 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_train.lock {python} {root}/ml_shadow_v1.py --train >> {log_dir}/ml_shadow_v1.log 2>&1",
-        "# Observe the completed 09:15-09:20 candle; forecast with retries at 09:21/09:23/09:25 IST.",
+        "# V2 live opening forecast retries at 09:17/09:22/09:27 IST.",
+        f"47,52,57 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_v2_scan.lock {python} {root}/ml_shadow_4h_v2_live.py --scan >> {log_dir}/ml_shadow_v2.log 2>&1",
+        "# V3 forecast-only retries after the completed 09:15-09:20 candle.",
         f"51,53,55 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
         "# A flock-protected monitor follows paper or live-GTT state through 13:15 IST.",
         f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
@@ -34,6 +38,7 @@ def canonical_block(app_dir: Path) -> list[str]:
         f"0-46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_monitor.lock {python} {root}/ml_shadow_v1.py --monitor >> {log_dir}/ml_shadow_v1.log 2>&1",
         "# Cancel/flatten any remaining live GTT at 13:16 IST; resolve evidence at 13:18.",
         f"46 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_squareoff.lock {python} {root}/ml_shadow_v1.py --squareoff >> {log_dir}/ml_shadow_v1.log 2>&1",
+        f"47 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_v2_scan.lock {python} {root}/ml_shadow_4h_v2_live.py --scan >> {log_dir}/ml_shadow_v2.log 2>&1",
         f"48 7 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/ml_shadow_scan.lock {python} {root}/ml_shadow_v1.py --scan >> {log_dir}/ml_shadow_v1.log 2>&1",
         BLOCK_END,
     ]

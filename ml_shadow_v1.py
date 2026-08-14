@@ -886,12 +886,26 @@ def option_levels(prediction: dict, decision: dict, option: dict) -> dict:
     if stop_points <= 0:
         raise RuntimeError(f"{decision['direction']} predicted underlying stop was already crossed")
     execution_reward_risk = target_points / stop_points
-    minimum_rr = configured_float("ML_SHADOW_MIN_REWARD_RISK", 0.75)
+    minimum_rr = float(
+        prediction.get(
+            "minimum_execution_reward_risk",
+            configured_float("ML_SHADOW_MIN_REWARD_RISK", 0.75),
+        )
+    )
     if execution_reward_risk < minimum_rr:
         raise RuntimeError(
             f"{decision['direction']} remaining reward/risk {execution_reward_risk:.2f} "
             f"is below {minimum_rr:.2f}"
         )
+    if prediction.get("minimum_expected_value_r") is not None:
+        probability = float(decision["probability"])
+        execution_ev = probability * execution_reward_risk - (1 - probability)
+        minimum_ev = float(prediction["minimum_expected_value_r"])
+        if execution_ev < minimum_ev:
+            raise RuntimeError(
+                f"{decision['direction']} remaining EV proxy {execution_ev:+.3f}R "
+                f"is below {minimum_ev:+.2f}R"
+            )
     target_distance = max(target_points * delta, 0.05)
     stop_distance = min(max(stop_points * delta, 0.05), max(entry - 0.05, 0.05))
     target = _round_tick(entry + target_distance)
@@ -913,6 +927,7 @@ def option_levels(prediction: dict, decision: dict, option: dict) -> dict:
 
 def _base_state(prediction: dict, decision: dict, option: dict, levels: dict, mode: str) -> dict:
     direction = decision["direction"]
+    model_version = str(prediction.get("model_version") or MODEL_VERSION)
     expires = datetime.combine(now_ist().date(), clock_time(13, 15), tzinfo=IST)
     return {
         "date": now_ist().date().isoformat(),
@@ -920,7 +935,7 @@ def _base_state(prediction: dict, decision: dict, option: dict, levels: dict, mo
         "underlying_symbol": "NIFTY",
         "state_slot": f"ML_SHADOW_{direction}",
         "instrument_class": "INDEX_OPTION",
-        "strategy": f"{MODEL_VERSION}_{mode}",
+        "strategy": f"{model_version}_{mode}",
         "paper_trade": mode == "PAPER",
         "execution_mode": mode,
         "status": "POSITION_OPEN" if mode == "PAPER" else "GTT_SUBMITTING",
@@ -935,7 +950,7 @@ def _base_state(prediction: dict, decision: dict, option: dict, levels: dict, mo
         "ml_direction": direction,
         "score": round(decision["probability"] * 100, 2),
         "weighted_score": round(decision["probability"] * 100, 2),
-        "entry_score_version": MODEL_VERSION,
+        "entry_score_version": model_version,
         "entry_price": option["entry_price"],
         "target_price": levels["target_price"],
         "planned_target_price": levels["target_price"],
@@ -954,6 +969,7 @@ def _base_state(prediction: dict, decision: dict, option: dict, levels: dict, mo
         "option_stop_percent": levels["option_stop_percent"],
         "ml_probability": round(decision["probability"], 6),
         "ml_reward_risk": round(decision["reward_risk"], 4),
+        "ml_expected_value_r": round(float(decision.get("expected_value_r") or 0), 4),
         "execution_reward_risk": levels["execution_reward_risk"],
         "ml_model_hash": prediction["model_hash"],
         "ml_model_trained_through": prediction["model_trained_through"],
@@ -1195,10 +1211,11 @@ def scan() -> dict:
     migrate_legacy_state()
     if os.getenv("TRADING_ENGINE", "").strip().upper() != ENGINE:
         raise RuntimeError(f"TRADING_ENGINE must be {ENGINE}")
-    mode = "LIVE_GTT" if live_enabled() else "PAPER"
+    forecast_only = configured_bool("ML_SHADOW_FORECAST_ONLY", False)
+    mode = "SHADOW" if forecast_only else "LIVE_GTT" if live_enabled() else "PAPER"
     if mode == "PAPER" and not configured_bool("ML_SHADOW_PAPER_ENABLED", True):
         raise RuntimeError("Paper mode is disabled and both live switches are not enabled")
-    if configured_bool("ML_SHADOW_LIVE_TRADING_ENABLED", False) != configured_bool("ENABLE_LIVE_TRADING", False):
+    if not forecast_only and configured_bool("ML_SHADOW_LIVE_TRADING_ENABLED", False) != configured_bool("ENABLE_LIVE_TRADING", False):
         raise RuntimeError("Both ENABLE_LIVE_TRADING and ML_SHADOW_LIVE_TRADING_ENABLED must match")
 
     current_minutes = now_ist().hour * 60 + now_ist().minute
@@ -1223,7 +1240,10 @@ def scan() -> dict:
         action = "NO_TRADE"
         reason = decision["reason"]
         if decision["qualified"]:
-            if read_state(direction).get("instrument_key"):
+            if forecast_only:
+                action = "SHADOW_SIGNAL"
+                reason = "V3 forecast-only signal; no broker or paper position opened"
+            elif read_state(direction).get("instrument_key"):
                 reason = f"{direction} lane already has active state"
             else:
                 try:
@@ -1240,7 +1260,10 @@ def scan() -> dict:
         prediction[f"{prefix}_action"] = action
         prediction[f"{prefix}_reason"] = reason
         actions.append(action)
-    entries = [action for action in actions if action in {"PAPER_ENTRY", "LIVE_GTT"}]
+    entries = [
+        action for action in actions
+        if action in {"PAPER_ENTRY", "LIVE_GTT", "SHADOW_SIGNAL"}
+    ]
     prediction.update({
         "scan_time": now_ist().isoformat(),
         "execution_mode": mode,

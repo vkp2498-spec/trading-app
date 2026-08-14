@@ -147,6 +147,7 @@ class MlShadowV1Tests(unittest.TestCase):
             "TRADING_ENGINE": "ML_SHADOW_V1",
             "ENABLE_LIVE_TRADING": "true",
             "ML_SHADOW_LIVE_TRADING_ENABLED": "false",
+            "ML_SHADOW_FORECAST_ONLY": "false",
         }, clear=False):
             with self.assertRaisesRegex(RuntimeError, "must match"):
                 ml.scan()

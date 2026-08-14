@@ -40,6 +40,7 @@ from strategy_core import now_ist
 from dashboard_data import build_live_positions as api_build_live_positions
 from dashboard_data import build_trade_performance as api_build_trade_performance
 from dashboard_data import build_ml_shadow_status
+from dashboard_data import build_ml_shadow_v2_status
 from dashboard_data import dashboard_index_trades
 from dashboard_data import edge_time_bucket
 from dashboard_data import entry_minutes
@@ -2645,27 +2646,51 @@ def render_analytics_tab(performance_payload):
     render_edge_matrix(performance_payload.get("edgeAnalytics") or {})
 
 
-st.markdown('<div class="dash-title">ML Post-opening Forecast</div>', unsafe_allow_html=True)
+st.markdown('<div class="dash-title">ML V2 Live + V3 Shadow</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="dash-subtitle">Observe 09:15–09:20, then forecast the path through 13:15</div>',
+    '<div class="dash-subtitle">V2 trades only positive probability-adjusted payoff; V3 remains forecast-only</div>',
     unsafe_allow_html=True,
 )
 
 ml_status = build_ml_shadow_status()
+v2_status = build_ml_shadow_v2_status()
 overview_tab, forecasts_tab, evidence_tab, paper_tab = st.tabs(
     ["Overview", "Forecasts", "Evidence", "Paper Trades"]
 )
 
 with overview_tab:
+    st.markdown("### Live V2 opening model")
+    if v2_status.get("liveTradingEnabled"):
+        st.warning("V2 LIVE GTT is enabled for one lot per qualified direction.")
+    v2_columns = st.columns(4)
+    v2_columns[0].metric("V2 status", v2_status.get("status") or "NOT_TRAINED")
+    v2_columns[1].metric("Trained through", v2_status.get("trainedThrough") or "—")
+    v2_columns[2].metric(
+        "Minimum probability",
+        f"{float(v2_status.get('minimumProbability') or 0) * 100:.0f}%",
+    )
+    v2_columns[3].metric(
+        "Minimum EV proxy",
+        f"{float(v2_status.get('minimumExpectedValueR') or 0):+.2f}R",
+    )
+    v2_forecasts = pd.DataFrame(v2_status.get("recentForecasts") or [])
+    if not v2_forecasts.empty:
+        visible = [
+            column for column in (
+                "candleTime", "callProbability", "callRewardRisk",
+                "callExpectedValueR", "callAction", "putProbability",
+                "putRewardRisk", "putExpectedValueR", "putAction",
+            ) if column in v2_forecasts.columns
+        ]
+        st.dataframe(v2_forecasts[visible], use_container_width=True, hide_index=True)
+
+    st.markdown("### V3 post-opening shadow model")
     configuration = ml_status.get("configuration") or {}
     validation = ml_status.get("validation") or {}
     if configuration.get("liveTradingEnabled"):
         st.error("LIVE GTT MODE is enabled. Qualified CALL/PUT sides can reach Upstox.")
     else:
-        st.info(
-            "Paper mode is active. CALL and PUT qualify independently when probability "
-            "is above 50% and predicted reward/risk is at least 0.75."
-        )
+        st.info("V3 is forecast-only. It records qualified signals without opening positions.")
     columns = st.columns(4)
     columns[0].metric("Model", ml_status.get("status") or "NOT_TRAINED")
     columns[1].metric("Trained through", ml_status.get("trainedThrough") or "—")

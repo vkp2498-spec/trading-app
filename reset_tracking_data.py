@@ -95,6 +95,7 @@ def reset_candidates(new_account: bool = False) -> list[Path]:
     candidates.append(DATA_DIR / "watch_states")
     candidates.append(LOG_DIR / "trade_bot.log")
     candidates.append(LOG_DIR / "ml_shadow_v1.log")
+    candidates.append(LOG_DIR / "ml_shadow_v2.log")
     return sorted({path for path in candidates if path.exists()}, key=lambda path: str(path))
 
 

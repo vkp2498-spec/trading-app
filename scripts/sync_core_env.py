@@ -131,6 +131,8 @@ CORE_VALUES = {
     "PAPER_OBSERVATION_MODE_ENABLED": "false",
     "ML_SHADOW_PAPER_ENABLED": "true",
     "ML_SHADOW_LIVE_TRADING_ENABLED": "false",
+    "ML_SHADOW_V2_LIVE_ENABLED": "false",
+    "ML_SHADOW_FORECAST_ONLY": "true",
     "ML_SHADOW_TRAINING_DAYS": "504",
     "ML_SHADOW_HISTORY_CALENDAR_DAYS": "800",
     "ML_SHADOW_MIN_TRAINING_ROWS": "300",
@@ -138,6 +140,9 @@ CORE_VALUES = {
     "ML_SHADOW_EVENT_MOVE_PERCENT": "0.10",
     "ML_SHADOW_MIN_PROBABILITY": "0.50",
     "ML_SHADOW_MIN_REWARD_RISK": "0.75",
+    "ML_SHADOW_MIN_EXPECTED_VALUE_R": "0.10",
+    "ML_SHADOW_V2_FIRST_ENTRY_TIME": "09:17",
+    "ML_SHADOW_V2_LAST_ENTRY_TIME": "09:30",
     "ML_SHADOW_FIRST_ENTRY_TIME": "09:21",
     "ML_SHADOW_LAST_ENTRY_TIME": "09:25",
     "ML_SHADOW_CANDLE_GRACE_SECONDS": "8",
@@ -298,6 +303,8 @@ def main():
         live_role = args.role == "ml-live"
         overrides["ENABLE_LIVE_TRADING"] = "true" if live_role else "false"
         overrides["ML_SHADOW_LIVE_TRADING_ENABLED"] = "true" if live_role else "false"
+        overrides["ML_SHADOW_V2_LIVE_ENABLED"] = "true" if live_role else "false"
+        overrides["ML_SHADOW_FORECAST_ONLY"] = "true"
         overrides["ML_SHADOW_PAPER_ENABLED"] = (
             "true" if args.role in {"ml-shadow", "ml-live"} else "false"
         )
