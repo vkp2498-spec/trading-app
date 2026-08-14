@@ -38,6 +38,10 @@ MODEL_VERSION = "ML_SHADOW_4H_PERCENT_V2"
 LOG_PREFIX = "ML_SHADOW_4H_V2_LIVE"
 NIFTY_KEY = execution.NIFTY_KEY
 
+# Shared order-management helpers log through the execution module. Keep those
+# lines attributed to V2 when this wrapper invokes them.
+execution.LOG_PREFIX = LOG_PREFIX
+
 FEATURE_COLUMNS = [
     "previous_return_percent", "previous_range_percent", "previous_body_percent",
     "previous_up_percent", "previous_down_percent", "previous_close_location",
