@@ -783,7 +783,7 @@ def build_post_market_review() -> dict:
         "rows": [
             {"symbol": "NIFTY", "targetPoints": 30, "stopPoints": 30, "cells": []},
             {"symbol": "BANKNIFTY", "targetPoints": 60, "stopPoints": 60, "cells": []},
-            {"symbol": "SENSEX", "targetPoints": 80, "stopPoints": 80, "cells": []},
+            {"symbol": "SENSEX", "targetPoints": 40, "stopPoints": 40, "cells": []},
         ],
         "method": "Every overlapping five-minute scan is evaluated until stop or session end.",
     }

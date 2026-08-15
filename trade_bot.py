@@ -208,7 +208,7 @@ DEFAULT_CAUTIOUS_STOP_PERCENT = 5.0
 DEFAULT_INDEX_EXIT_POINTS = {
     "NIFTY": {"target": 30.0, "stop": 30.0},
     "BANKNIFTY": {"target": 60.0, "stop": 60.0},
-    "SENSEX": {"target": 80.0, "stop": 80.0},
+    "SENSEX": {"target": 40.0, "stop": 40.0},
 }
 DEFAULT_OPTION_DELTA_APPROXIMATION = 0.50
 DEFAULT_MIN_TECHNICAL_REWARD_RISK = 0.8

@@ -3043,6 +3043,7 @@ class TradeControlTests(unittest.TestCase):
             extreme_nifty = trade_bot.score_based_exit_settings("NIFTY", 90)
             standard_bank = trade_bot.score_based_exit_settings("BANKNIFTY", 75)
             extreme_bank = trade_bot.score_based_exit_settings("BANKNIFTY", 95)
+            standard_sensex = trade_bot.score_based_exit_settings("SENSEX", 75)
 
         self.assertEqual(
             (standard_nifty["target_points"], standard_nifty["stop_points"]),
@@ -3059,6 +3060,10 @@ class TradeControlTests(unittest.TestCase):
         self.assertEqual(
             (extreme_bank["target_points"], extreme_bank["stop_points"]),
             (60, 60),
+        )
+        self.assertEqual(
+            (standard_sensex["target_points"], standard_sensex["stop_points"]),
+            (40, 40),
         )
 
     def test_max_capital_uses_available_funds_and_rounds_down(self):

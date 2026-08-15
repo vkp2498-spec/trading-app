@@ -29,7 +29,7 @@ The project is an experimental automated trading platform for Indian markets usi
   allow one account-wide live entry per day. Every completed-candle scan checks
   NIFTY, BANKNIFTY, and SENSEX; if multiple setups pass every hard gate, only
   the highest continuous selection score is eligible for execution. Fixed
-  target/hard-stop pairs are NIFTY 30/30, BANKNIFTY 60/60, and SENSEX 80/80
+  target/hard-stop pairs are NIFTY 30/30, BANKNIFTY 60/60, and SENSEX 40/40
   underlying-index points.
 - Staged protection locks 10% of the planned move after 40% progress, 25%
   after 60%, and 55% after 80%. Persistent five-minute thesis reversal remains
@@ -286,8 +286,8 @@ NIFTY_TARGET_POINTS=30
 NIFTY_STOP_POINTS=30
 BANKNIFTY_TARGET_POINTS=60
 BANKNIFTY_STOP_POINTS=60
-SENSEX_TARGET_POINTS=80
-SENSEX_STOP_POINTS=80
+SENSEX_TARGET_POINTS=40
+SENSEX_STOP_POINTS=40
 OPTION_DELTA_APPROXIMATION=0.50
 ```
 

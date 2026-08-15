@@ -142,8 +142,8 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
             {
                 "VAMSI_KB_BANKNIFTY_TARGET_POINTS": "60",
                 "VAMSI_KB_BANKNIFTY_STOP_POINTS": "60",
-                "VAMSI_KB_SENSEX_TARGET_POINTS": "80",
-                "VAMSI_KB_SENSEX_STOP_POINTS": "80",
+                "VAMSI_KB_SENSEX_TARGET_POINTS": "40",
+                "VAMSI_KB_SENSEX_STOP_POINTS": "40",
             },
         ):
             bank_candidate = qualified_candidate(current=current, symbol="BANKNIFTY")
@@ -157,7 +157,7 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
                 sensex_candidate, kb.evaluate_knowledge_setup(sensex_candidate, current)
             )
         self.assertEqual((bank["target_points"], bank["stop_points"]), (60, 60))
-        self.assertEqual((sensex["target_points"], sensex["stop_points"]), (80, 80))
+        self.assertEqual((sensex["target_points"], sensex["stop_points"]), (40, 40))
 
     def test_scan_evaluates_all_indices_and_executes_highest_qualified_score(self):
         candidates = {

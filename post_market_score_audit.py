@@ -32,7 +32,7 @@ KNOWLEDGE_STATUS_FILE = DATA_DIR / "vamsi_kb_intraday" / "post_market_status.jso
 KNOWLEDGE_EXIT_DEFAULTS = {
     "NIFTY": {"target": 30.0, "stop": 30.0},
     "BANKNIFTY": {"target": 60.0, "stop": 60.0},
-    "SENSEX": {"target": 80.0, "stop": 80.0},
+    "SENSEX": {"target": 40.0, "stop": 40.0},
 }
 KNOWLEDGE_AUDIT_COLUMNS = [
     "observation_id",
