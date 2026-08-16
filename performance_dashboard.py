@@ -19,6 +19,11 @@ from strategy_core import now_ist
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ICON = BASE_DIR / "assets" / "vamsi_icon_v2.jpg"
+INDEX_COLUMNS = (
+    ("NIFTY", "nifty"),
+    ("BANKNIFTY", "bankNifty"),
+    ("SENSEX", "sensex"),
+)
 
 st.set_page_config(
     page_title="Index Options Trading",
@@ -52,24 +57,29 @@ st.markdown(
     .day-number { color: #64748b; font-size: .7rem; font-weight: 750; }
     .day-pnl { color: #0b2343; font-size: .88rem; font-weight: 850; margin-top: 12px; }
     .day-trades { color: #738197; font-size: .65rem; margin-top: 3px; }
-    .scan-card { background: #fff; border: 1px solid #dde5ef; border-radius: 11px; margin-bottom: 9px; padding: 14px 16px; }
-    .scan-head { align-items: center; display: flex; gap: 10px; justify-content: space-between; }
-    .scan-time { color: #0b2343; font-size: .9rem; font-weight: 800; }
-    .scan-badge { background: #e8eef6; border-radius: 999px; color: #334b69; font-size: .66rem; font-weight: 850; padding: 5px 9px; }
-    .scan-badge.entered { background: #dff5e8; color: #13723e; }
-    .scan-detail { color: #64748b; font-size: .78rem; margin-top: 8px; }
-    .scan-meta { color: #334b69; font-size: .72rem; font-weight: 700; margin-top: 7px; }
-    .review-wrap { overflow-x: auto; padding-bottom: 7px; }
-    .review-table { border-collapse: separate; border-spacing: 0; min-width: 100%; }
-    .review-table th, .review-table td { background: #fff; border-bottom: 1px solid #dde5ef; border-right: 1px solid #dde5ef; padding: 11px 12px; text-align: center; white-space: nowrap; }
-    .review-table th { background: #eef3f8; color: #52657d; font-size: .68rem; font-weight: 850; }
-    .review-table th:first-child, .review-table td:first-child { border-left: 1px solid #dde5ef; position: sticky; left: 0; text-align: left; z-index: 1; }
-    .review-table td:first-child { color: #0b2343; font-weight: 850; }
-    .review-value { color: #0b2343; font-size: .84rem; font-weight: 850; }
-    .review-samples { color: #738197; font-size: .62rem; margin-top: 2px; }
+    .matrix-wrap { overflow-x: auto; padding: 2px 0 8px; }
+    .matrix-table { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; min-width: 780px; }
+    .matrix-table th, .matrix-table td { background: #fff; border-bottom: 1px solid #dde5ef; border-right: 1px solid #dde5ef; padding: 13px 14px; text-align: left; vertical-align: top; }
+    .matrix-table th { background: #0b2343; color: #fff; font-size: .76rem; font-weight: 850; }
+    .matrix-table th:first-child, .matrix-table td:first-child { border-left: 1px solid #dde5ef; position: sticky; left: 0; width: 142px; z-index: 2; }
+    .matrix-table th:first-child { background: #0b2343; }
+    .matrix-table td:first-child { background: #eef3f8; color: #0b2343; font-size: .76rem; font-weight: 850; }
+    .matrix-table tr:first-child th:first-child { border-top-left-radius: 8px; }
+    .matrix-table tr:first-child th:last-child { border-top-right-radius: 8px; }
+    .matrix-table tbody tr:last-child td:first-child { border-bottom-left-radius: 8px; }
+    .matrix-table tbody tr:last-child td:last-child { border-bottom-right-radius: 8px; }
+    .matrix-value { color: #0b2343; font-size: .92rem; font-weight: 850; }
+    .matrix-detail { color: #64748b; font-size: .68rem; line-height: 1.35; margin-top: 4px; white-space: normal; }
+    .matrix-badge { background: #e8eef6; border-radius: 999px; color: #334b69; display: inline-block; font-size: .62rem; font-weight: 850; padding: 4px 8px; }
+    .matrix-badge.entered { background: #dff5e8; color: #13723e; }
+    .matrix-badge.unavailable { background: #f0f2f5; color: #7a8799; }
+    .symbol-note { color: #cbd8e8; display: block; font-size: .6rem; font-weight: 700; margin-top: 2px; }
     @media (max-width: 720px) {
         .summary-grid { grid-template-columns: 1fr; }
         .page-title { font-size: 1.75rem; }
+        .matrix-table { min-width: 680px; }
+        .matrix-table th, .matrix-table td { padding: 11px 10px; }
+        .matrix-table th:first-child, .matrix-table td:first-child { width: 112px; }
     }
     </style>
     """,
@@ -86,6 +96,10 @@ def money(value) -> str:
 def value_class(value) -> str:
     amount = float(value or 0)
     return "positive" if amount > 0 else "negative" if amount < 0 else ""
+
+
+def percent(value) -> str:
+    return f"{float(value or 0):,.1f}%"
 
 
 def summary_card(label: str, value: str, detail: str = "", css_class: str = "") -> str:
@@ -160,53 +174,99 @@ def render_pnl_calendar(days: list[dict]) -> None:
     )
 
 
-def render_scans(scans: list[dict]) -> None:
-    symbol_keys = (
-        ("NIFTY", "nifty"),
-        ("BANKNIFTY", "bankNifty"),
-        ("SENSEX", "sensex"),
+def render_index_performance(today: dict, cumulative: dict) -> None:
+    today_stats = today.get("symbolStats") or {}
+    cumulative_stats = cumulative.get("symbolStats") or {}
+    rows = (
+        ("Today’s P/L", lambda symbol: money((today_stats.get(symbol) or {}).get("netPnL")), "money", today_stats),
+        ("Today’s Trades", lambda symbol: f"{int((today_stats.get(symbol) or {}).get('trades') or 0):,}", "", today_stats),
+        ("Today’s Win Rate", lambda symbol: percent((today_stats.get(symbol) or {}).get("winRate")), "", today_stats),
+        ("Cumulative P/L", lambda symbol: money((cumulative_stats.get(symbol) or {}).get("netPnL")), "money", cumulative_stats),
+        ("Total Trades", lambda symbol: f"{int((cumulative_stats.get(symbol) or {}).get('trades') or 0):,}", "", cumulative_stats),
+        ("Cumulative Win Rate", lambda symbol: percent((cumulative_stats.get(symbol) or {}).get("winRate")), "", cumulative_stats),
+        ("Average Win", lambda symbol: money((cumulative_stats.get(symbol) or {}).get("averageProfit")), "money", cumulative_stats),
+        ("Average Loss", lambda symbol: money(-abs(float((cumulative_stats.get(symbol) or {}).get("averageLoss") or 0))), "loss", cumulative_stats),
     )
-    visible = [
-        (row, symbol, row.get(key))
-        for row in scans or []
-        for symbol, key in symbol_keys
-        if row.get(key)
-    ]
-    if not visible:
+    header = "".join(f"<th>{html.escape(symbol)}</th>" for symbol, _key in INDEX_COLUMNS)
+    body = []
+    for label, formatter, value_type, source in rows:
+        cells = []
+        for symbol, _key in INDEX_COLUMNS:
+            stats = source.get(symbol) or {}
+            raw = (
+                stats.get("netPnL")
+                if "P/L" in label
+                else -abs(float(stats.get("averageLoss") or 0))
+                if value_type == "loss"
+                else stats.get("averageProfit")
+                if label == "Average Win"
+                else 0
+            )
+            css_class = value_class(raw) if value_type in {"money", "loss"} else ""
+            cells.append(
+                f'<td><div class="matrix-value {css_class}">'
+                f"{html.escape(formatter(symbol))}</div></td>"
+            )
+        body.append(f"<tr><td>{html.escape(label)}</td>{''.join(cells)}</tr>")
+    st.markdown(
+        '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Metric</th>'
+        + header
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_scans(scans: list[dict]) -> None:
+    if not any(row.get(key) for row in scans or [] for _symbol, key in INDEX_COLUMNS):
         st.info("Today’s completed five-minute scans will appear here.")
         return
-    for row, symbol, decision in visible:
+    header = "".join(f"<th>{html.escape(symbol)}</th>" for symbol, _key in INDEX_COLUMNS)
+    body = []
+    for row in scans or []:
         try:
             timestamp = datetime.fromisoformat(str(row.get("timestamp") or ""))
             time_text = timestamp.strftime("%I:%M %p").lstrip("0")
         except ValueError:
             time_text = "—"
-        status = str(decision.get("decision") or "SCANNED")
-        badge_class = "entered" if status in {"ENTERED", "SELECTED"} else ""
-        metadata = [
-            symbol,
-            str(decision.get("direction") or "").title(),
-            str(decision.get("setup") or "").title(),
-        ]
-        score = decision.get("score")
-        if score is not None:
-            metadata.append(f"Knowledge {float(score):.1f}")
-        selection = decision.get("selectionScore")
-        if selection is not None:
-            metadata.append(f"Rank {float(selection):.1f}")
-        instrument = decision.get("instrument")
-        if instrument:
-            metadata.append(str(instrument))
-        metadata = [item for item in metadata if item]
-        st.markdown(
-            '<div class="scan-card">'
-            f'<div class="scan-head"><div class="scan-time">{html.escape(time_text)}</div>'
-            f'<div class="scan-badge {badge_class}">{html.escape(status)}</div></div>'
-            f'<div class="scan-detail">{html.escape(str(decision.get("reason") or "Scan completed"))}</div>'
-            f'<div class="scan-meta">{html.escape(" · ".join(metadata))}</div>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        cells = []
+        for _symbol, key in INDEX_COLUMNS:
+            decision = row.get(key)
+            if not decision:
+                cells.append('<td><span class="matrix-badge unavailable">NO DATA</span></td>')
+                continue
+            status = str(decision.get("decision") or "SCANNED")
+            badge_class = "entered" if status in {"ENTERED", "SELECTED"} else ""
+            details = []
+            score = decision.get("score")
+            if score is not None:
+                details.append(f"Score {float(score):.1f}")
+            direction = str(decision.get("direction") or "").title()
+            setup = str(decision.get("setup") or "").title()
+            if direction:
+                details.append(direction)
+            if setup:
+                details.append(setup)
+            reason = str(decision.get("reason") or "Scan completed")
+            instrument = str(decision.get("instrument") or "")
+            cells.append(
+                "<td>"
+                f'<span class="matrix-badge {badge_class}">{html.escape(status)}</span>'
+                f'<div class="matrix-value" style="margin-top:7px">{html.escape(" · ".join(details) or "Scanned")}</div>'
+                f'<div class="matrix-detail">{html.escape(reason)}</div>'
+                + (f'<div class="matrix-detail">{html.escape(instrument)}</div>' if instrument else "")
+                + "</td>"
+            )
+        body.append(f"<tr><td>{html.escape(time_text)}</td>{''.join(cells)}</tr>")
+    st.markdown(
+        '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Time</th>'
+        + header
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_post_market_review(review: dict) -> None:
@@ -215,37 +275,47 @@ def render_post_market_review(review: dict) -> None:
     if not columns:
         st.info(str(review.get("message") or "Post-market evidence will appear after the 4 PM audit."))
         return
-    header = "".join(f"<th>{html.escape(str(column))}</th>" for column in columns)
+    by_symbol = {
+        str(row.get("symbol") or "").upper(): row
+        for row in rows
+    }
+    header_cells = []
+    for symbol, _key in INDEX_COLUMNS:
+        row = by_symbol.get(symbol) or {}
+        target = float(row.get("targetPoints") or 0)
+        stop = float(row.get("stopPoints") or 0)
+        header_cells.append(
+            f"<th>{html.escape(symbol)}"
+            f'<span class="symbol-note">T/S {target:g}/{stop:g}</span></th>'
+        )
     body = []
-    for row in rows:
-        by_column = {
-            str(cell.get("column")): cell
-            for cell in row.get("cells") or []
-        }
+    for column in columns:
         cells = []
-        for column in columns:
+        for symbol, _key in INDEX_COLUMNS:
+            symbol_row = by_symbol.get(symbol) or {}
+            by_column = {
+                str(cell.get("column")): cell
+                for cell in symbol_row.get("cells") or []
+            }
             cell = by_column.get(str(column)) or {}
             average = cell.get("averageFavorablePoints")
             samples = int(cell.get("samples") or 0)
             value = "—" if average is None else f"{float(average):,.1f} pts"
             cells.append(
                 "<td>"
-                f'<div class="review-value">{html.escape(value)}</div>'
-                f'<div class="review-samples">{samples} scan{"s" if samples != 1 else ""}</div>'
+                f'<div class="matrix-value">{html.escape(value)}</div>'
+                f'<div class="matrix-detail">{samples} scan{"s" if samples != 1 else ""}</div>'
                 "</td>"
             )
-        symbol = str(row.get("symbol") or "—")
-        target = float(row.get("targetPoints") or 0)
-        stop = float(row.get("stopPoints") or 0)
         body.append(
             "<tr>"
-            f"<td>{html.escape(symbol)}<div class=\"review-samples\">T/S {target:g}/{stop:g}</div></td>"
+            f"<td>{html.escape(str(column))}</td>"
             + "".join(cells)
             + "</tr>"
         )
     st.markdown(
-        '<div class="review-wrap"><table class="review-table"><thead><tr><th>Index</th>'
-        + header
+        '<div class="matrix-wrap"><table class="matrix-table"><thead><tr><th>Score Bucket</th>'
+        + "".join(header_cells)
         + "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table></div>",
@@ -282,6 +352,13 @@ st.markdown(
     + "</div>",
     unsafe_allow_html=True,
 )
+
+st.markdown('<div class="section-title">Index Overview</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-subtitle">Today and cumulative results by index</div>',
+    unsafe_allow_html=True,
+)
+render_index_performance(today, cumulative)
 
 st.markdown('<div class="section-title">P/L Calendar</div>', unsafe_allow_html=True)
 st.markdown('<div class="section-subtitle">Daily completed-trade results</div>', unsafe_allow_html=True)
