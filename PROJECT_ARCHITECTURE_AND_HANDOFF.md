@@ -293,6 +293,15 @@ one account-wide live trade; those later verdicts remain shadow evidence for
 the next post-market audit. If qualified candidates are effectively tied,
 selection priority is NIFTY, then BANKNIFTY, then SENSEX.
 
+While isolated evidence is still building, `ONE_GATE_EXPLORATION` may select
+one gate from the broader dashboard gate cohort only when it has at least 10
+observations, a 55% target-before-stop rate, average favourable movement at
+least equal to the configured target, and at least +2 expected underlying
+points under the target/stop approximation. This mode is deliberately labelled
+separately from `ONE_GATE_ADAPTIVE`; the live candidate must still pass the
+selected gate's bounded soft condition and every other gate. As sole-failed-gate
+evidence matures, the stricter adaptive selection takes precedence.
+
 ### 7.5 Default risk/exit shape
 
 The current documented defaults are:

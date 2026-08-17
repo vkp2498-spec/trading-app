@@ -141,6 +141,33 @@ def _eligible(stats: dict, target: float) -> bool:
     )
 
 
+def _exploration_eligible(stats: dict, target: float) -> bool:
+    if str(os.getenv("VAMSI_KB_PLAN_EXPLORATION_ENABLED", "true")).lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    return bool(
+        stats["samples"]
+        >= _configured_int("VAMSI_KB_PLAN_EXPLORATION_MIN_SAMPLES", 10)
+        and stats["tradingDays"]
+        >= _configured_int("VAMSI_KB_PLAN_EXPLORATION_MIN_TRADING_DAYS", 1)
+        and (stats["targetHitRate"] or 0)
+        >= _configured_float("VAMSI_KB_PLAN_EXPLORATION_MIN_TARGET_HIT_RATE", 55)
+        and (stats["averageFavorablePoints"] or 0)
+        >= target
+        * _configured_float(
+            "VAMSI_KB_PLAN_EXPLORATION_MIN_FAVORABLE_TARGET_RATIO", 1.0
+        )
+        and (stats["expectedIndexPoints"] or 0)
+        >= _configured_float(
+            "VAMSI_KB_PLAN_EXPLORATION_MIN_EXPECTED_INDEX_POINTS", 2
+        )
+    )
+
+
 def _prepare_frame(path: Path, plan_date: date) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
@@ -191,6 +218,11 @@ def _isolated_gate_rows(frame: pd.DataFrame, gate: str) -> pd.DataFrame:
     return frame[frame["categories"].map(isolated)]
 
 
+def _all_gate_rows(frame: pd.DataFrame, gate: str) -> pd.DataFrame:
+    wanted = GATE_CATEGORIES[gate]
+    return frame[frame["categories"].map(lambda categories: wanted in categories)]
+
+
 def build_daily_plan(plan_date=None, audit_file=AUDIT_FILE) -> dict:
     plan_date = plan_date or trade_bot.now_ist().date()
     if isinstance(plan_date, str):
@@ -206,31 +238,74 @@ def build_daily_plan(plan_date=None, audit_file=AUDIT_FILE) -> dict:
         symbol_frame = frame[frame["symbol"] == symbol] if not frame.empty else frame
         candidates = []
         for gate in RELAXABLE_GATES:
-            stats = _weighted_stats(
+            isolated_stats = _weighted_stats(
                 _isolated_gate_rows(symbol_frame, gate), target, stop, plan_date
+            )
+            dashboard_stats = _weighted_stats(
+                _all_gate_rows(symbol_frame, gate), target, stop, plan_date
             )
             candidates.append(
                 {
                     "gate": gate,
-                    "eligible": _eligible(stats, target),
-                    **stats,
+                    "adaptiveEligible": _eligible(isolated_stats, target),
+                    "explorationEligible": _exploration_eligible(
+                        dashboard_stats, target
+                    ),
+                    "isolatedEvidence": isolated_stats,
+                    "dashboardEvidence": dashboard_stats,
                 }
             )
-        qualified = [item for item in candidates if item["eligible"]]
-        qualified.sort(
+        adaptive = [item for item in candidates if item["adaptiveEligible"]]
+        adaptive.sort(
             key=lambda item: (
-                item["expectedIndexPoints"],
-                item["targetHitRate"],
-                item["samples"],
+                item["isolatedEvidence"]["expectedIndexPoints"],
+                item["isolatedEvidence"]["targetHitRate"],
+                item["isolatedEvidence"]["samples"],
                 -RELAXABLE_GATES.index(item["gate"]),
             ),
             reverse=True,
         )
-        selected = qualified[:1]
+        exploration = [
+            item
+            for item in candidates
+            if item["explorationEligible"] and not item["adaptiveEligible"]
+        ]
+        exploration.sort(
+            key=lambda item: (
+                item["dashboardEvidence"]["expectedIndexPoints"],
+                item["dashboardEvidence"]["targetHitRate"],
+                item["dashboardEvidence"]["samples"],
+                -RELAXABLE_GATES.index(item["gate"]),
+            ),
+            reverse=True,
+        )
+        if adaptive:
+            chosen = adaptive[0]
+            mode = "ONE_GATE_ADAPTIVE"
+            selected = [
+                {
+                    "gate": chosen["gate"],
+                    "source": "ISOLATED_SINGLE_GATE_EVIDENCE",
+                    **chosen["isolatedEvidence"],
+                }
+            ]
+        elif exploration:
+            chosen = exploration[0]
+            mode = "ONE_GATE_EXPLORATION"
+            selected = [
+                {
+                    "gate": chosen["gate"],
+                    "source": "DASHBOARD_GATE_EVIDENCE_BUILDING",
+                    **chosen["dashboardEvidence"],
+                }
+            ]
+        else:
+            mode = "STRICT"
+            selected = []
         relaxed = [item["gate"] for item in selected]
         symbol_plans[symbol] = {
             "priority": PRIORITY[symbol],
-            "mode": "ONE_GATE_ADAPTIVE" if relaxed else "STRICT",
+            "mode": mode,
             "eligibleScoreBuckets": ["80-89", "90-100"] if relaxed else ["90-100"],
             "relaxedGates": relaxed,
             "maximumRelaxedFailuresPerCandidate": 1 if relaxed else 0,
@@ -249,8 +324,10 @@ def build_daily_plan(plan_date=None, audit_file=AUDIT_FILE) -> dict:
         "indexPriority": list(SYMBOLS),
         "symbols": symbol_plans,
         "policy": (
-            "One evidence gate per index may change daily. Completed historical days "
-            "only; contract quality, entry freshness, data health and execution/risk "
+            "One evidence gate per index may change daily. ONE_GATE_EXPLORATION "
+            "uses broader dashboard evidence while isolated evidence is building; "
+            "ONE_GATE_ADAPTIVE requires sole-failed-gate evidence. Completed historical "
+            "days only; contract quality, entry freshness, data health and execution/risk "
             "controls remain hard gates. The plan is frozen for its planDate."
         ),
     }

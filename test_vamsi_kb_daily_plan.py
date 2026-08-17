@@ -83,9 +83,42 @@ class VamsiKnowledgeDailyPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "audit.csv"
             pd.DataFrame(rows).to_csv(path, index=False)
-            plan = planner.build_daily_plan(date(2026, 8, 18), path)
+            with patch.dict(
+                planner.os.environ,
+                {"VAMSI_KB_PLAN_EXPLORATION_ENABLED": "false"},
+            ):
+                plan = planner.build_daily_plan(date(2026, 8, 18), path)
 
         self.assertEqual(plan["symbols"]["NIFTY"]["mode"], "STRICT")
+
+    def test_uses_dashboard_evidence_for_bounded_early_exploration(self):
+        rows = [
+            {
+                "trading_date": "2026-08-17",
+                "symbol": "BANKNIFTY",
+                "categories_json": json.dumps(
+                    ["SCORE 80-89", "REJECT · CONSTITUENT BREADTH"]
+                ),
+                "favorable_points_before_stop": 90,
+                "adverse_points_before_stop": 25,
+                "target_hit_before_stop": index < 6,
+                "stop_hit": index >= 6,
+            }
+            for index in range(10)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.csv"
+            pd.DataFrame(rows).to_csv(path, index=False)
+            plan = planner.build_daily_plan(date(2026, 8, 18), path)
+
+        bank = plan["symbols"]["BANKNIFTY"]
+        self.assertEqual(bank["mode"], "ONE_GATE_EXPLORATION")
+        self.assertEqual(bank["relaxedGates"], ["breadth"])
+        self.assertEqual(bank["maximumRelaxedFailuresPerCandidate"], 1)
+        self.assertEqual(
+            bank["selectedEvidence"][0]["source"],
+            "DASHBOARD_GATE_EVIDENCE_BUILDING",
+        )
 
 
 if __name__ == "__main__":
