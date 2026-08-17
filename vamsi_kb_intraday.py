@@ -20,6 +20,8 @@ from pathlib import Path
 
 from safe_storage import atomic_write_json, file_lock, locked_append_csv
 import trade_bot
+from dashboard_score_buckets import dashboard_score_bucket
+from vamsi_kb_daily_plan import load_daily_plan
 
 
 ENGINE = "VAMSI_KB_INTRADAY_V1"
@@ -44,9 +46,29 @@ SCAN_COLUMNS = [
     "target_price",
     "stop_loss_price",
     "quantity",
+    "plan_version",
+    "plan_mode",
+    "planned_relaxed_gates",
+    "relaxed_gates_applied",
     "blockers",
     "evidence",
 ]
+GATE_FAILURE_MESSAGES = {
+    "setup": "no qualified trend breakout/retest/pullback or confirmed Bollinger reversal",
+    "completed_candles": "fresh completed 5M and 15M direction are not aligned",
+    "breadth": "{symbol} constituent breadth does not confirm direction",
+    "option_chain": "option-chain direction is not a medium/high confirmation",
+    "option_flow": "bought option premium lacks VWAP and volume confirmation",
+    "contract_quality": "ATM/near-ATM contract spread, delta or quote quality failed",
+    "entry_freshness": "option premium is already extended beyond the completed candle",
+}
+ADAPTIVELY_RELAXABLE_GATES = {
+    "setup",
+    "completed_candles",
+    "breadth",
+    "option_chain",
+    "option_flow",
+}
 
 
 def log(message: str) -> None:
@@ -122,7 +144,46 @@ def _candle_is_fresh(five: dict, current=None) -> bool:
     return candle.date() == current.date() and 4.5 <= age <= maximum_age
 
 
-def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
+def _soft_gate_passes(name: str, evidence: dict, direction: str) -> bool:
+    """Return the bounded soft form of an evidence gate selected pre-market."""
+    item = evidence.get(name) or {}
+    opposite = _opposite(direction)
+    if name == "setup":
+        return bool(
+            item.get("regime_direction") == direction
+            and item.get("regime") in {"TREND", "VOLATILITY_EXPANSION"}
+        )
+    if name == "completed_candles":
+        five_bias = str(item.get("five_bias") or "NEUTRAL").upper()
+        fifteen_bias = str(item.get("fifteen_bias") or "NEUTRAL").upper()
+        return bool(
+            item.get("fresh")
+            and direction in {five_bias, fifteen_bias}
+            and opposite not in {five_bias, fifteen_bias}
+        )
+    if name == "breadth":
+        bias = str(item.get("bias") or "NEUTRAL").upper()
+        oriented = _number(item.get("oriented_score"))
+        return bool(
+            item.get("coverage", 0) >= item.get("minimum_coverage", 0)
+            and bias != opposite
+            and oriented >= 0
+        )
+    if name == "option_chain":
+        return str(item.get("bias") or "").upper() == "NEUTRAL"
+    if name == "option_flow":
+        return bool(
+            str(item.get("bias") or "NEUTRAL").upper() != "BEARISH"
+            and _number(item.get("close")) > 0
+            and _number(item.get("vwap")) > 0
+            and _number(item.get("close")) >= _number(item.get("vwap"))
+            and _number(item.get("volume_ratio"))
+            >= _number(item.get("minimum_volume"), 1.0) * 0.60
+        )
+    return False
+
+
+def evaluate_knowledge_setup(candidate: dict, current=None, daily_plan=None) -> dict:
     """Apply all option-buying gates without using the legacy unified score."""
     current = current or trade_bot.now_ist()
     candidate = candidate or {}
@@ -199,6 +260,7 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
     )
     evidence["completed_candles"] = {
         "passed": candle_passed,
+        "fresh": _candle_is_fresh(five, current),
         "five_bias": five.get("bias"),
         "five_confidence": five.get("confidence"),
         "fifteen_bias": fifteen.get("bias"),
@@ -233,6 +295,7 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
         "bias": breadth.get("bias"),
         "confidence": breadth.get("confidence"),
         "score": breadth_score,
+        "oriented_score": oriented_breadth,
         "coverage": breadth.get("coverage"),
         "minimum_coverage": minimum_coverage,
     }
@@ -277,6 +340,7 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
         "close": flow_close,
         "vwap": flow_vwap,
         "volume_ratio": volume_ratio,
+        "minimum_volume": minimum_volume,
     }
     if not flow_passed:
         blockers.append("bought option premium lacks VWAP and volume confirmation")
@@ -318,15 +382,58 @@ def evaluate_knowledge_setup(candidate: dict, current=None) -> dict:
 
     passed_count = sum(bool(item.get("passed")) for item in evidence.values())
     score = round(passed_count / max(len(evidence), 1) * 100, 1)
+    score_bucket = dashboard_score_bucket(score)
+    plan = daily_plan if isinstance(daily_plan, dict) else {}
+    planned_relaxations = {
+        str(item)
+        for item in plan.get("relaxedGates", [])
+        if str(item) in ADAPTIVELY_RELAXABLE_GATES
+    }
+    eligible_buckets = {
+        str(item) for item in plan.get("eligibleScoreBuckets", ["90-100"])
+    }
+    maximum_relaxed = int(plan.get("maximumRelaxedFailuresPerCandidate", 0) or 0)
+    relaxed_applied = []
+    effective_failures = []
+    for name, item in evidence.items():
+        effective_passed = bool(item.get("passed"))
+        if (
+            not effective_passed
+            and name in planned_relaxations
+            and len(relaxed_applied) < maximum_relaxed
+            and _soft_gate_passes(name, evidence, direction)
+        ):
+            effective_passed = True
+            relaxed_applied.append(name)
+        item["effective_passed"] = effective_passed
+        item["relaxed_by_daily_plan"] = name in relaxed_applied
+        if not effective_passed:
+            effective_failures.append(name)
+
+    blockers = [] if direction in {"BULLISH", "BEARISH"} else [
+        "direction is not bullish or bearish"
+    ]
+    blockers.extend(
+        GATE_FAILURE_MESSAGES[name].format(symbol=symbol)
+        for name in effective_failures
+    )
+    if score_bucket not in eligible_buckets:
+        blockers.append(
+            f"daily plan excludes diagnostic score bucket {score_bucket}"
+        )
     return {
         "allowed": not blockers,
         "direction": direction,
         "setup": evidence["setup"]["type"],
         "score": score,
+        "score_bucket": score_bucket,
         "score_version": SCORE_VERSION,
         "score_is_probability": False,
         "blockers": blockers,
         "evidence": evidence,
+        "daily_plan_mode": plan.get("mode", "STRICT"),
+        "planned_relaxed_gates": sorted(planned_relaxations),
+        "relaxed_gates_applied": relaxed_applied,
     }
 
 
@@ -447,6 +554,14 @@ def _record_scan(
             "target_price": candidate.get("target_price") or "",
             "stop_loss_price": candidate.get("stop_loss_price") or "",
             "quantity": quantity if quantity is not None else "",
+            "plan_version": decision.get("plan_version") or "",
+            "plan_mode": decision.get("daily_plan_mode") or "",
+            "planned_relaxed_gates": ",".join(
+                decision.get("planned_relaxed_gates") or []
+            ),
+            "relaxed_gates_applied": ",".join(
+                decision.get("relaxed_gates_applied") or []
+            ),
             "blockers": " | ".join(decision.get("blockers") or []),
             "evidence": json.dumps(decision.get("evidence") or {}, sort_keys=True),
         },
@@ -476,6 +591,19 @@ def scan() -> dict:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     slot = completed_scan_slot()
+    daily_plan = (
+        load_daily_plan()
+        if _configured_bool("VAMSI_KB_DAILY_PLAN_ENABLED", True)
+        else None
+    )
+    if daily_plan:
+        choices = ", ".join(
+            f"{symbol}={','.join((daily_plan.get('symbols', {}).get(symbol) or {}).get('relaxedGates', [])) or 'strict'}"
+            for symbol in INDEX_SYMBOLS
+        )
+        log(f"daily plan {daily_plan['planDate']}: {choices}")
+    else:
+        log("no valid plan for today; strict all-gates fallback is active")
     with file_lock(SCAN_LOCK_FILE):
         state = _read_scan_state()
         if state.get("date") == trade_bot.now_ist().date().isoformat() and state.get(
@@ -543,7 +671,9 @@ def scan() -> dict:
                 log(f"{symbol} no complete option-buying candidate was available")
                 continue
 
-            decision = evaluate_knowledge_setup(candidate)
+            symbol_plan = (daily_plan or {}).get("symbols", {}).get(symbol) or {}
+            decision = evaluate_knowledge_setup(candidate, daily_plan=symbol_plan)
+            decision["plan_version"] = (daily_plan or {}).get("version", "STRICT_FALLBACK")
             decision["selection_score"] = selection_score(candidate)
             if not decision["allowed"]:
                 _record_scan(slot, symbol, "REJECT", decision, candidate)
@@ -587,12 +717,21 @@ def scan() -> dict:
                 "outcomes": outcomes,
             }
 
+        best_selection_score = max(item[2]["selection_score"] for item in qualified)
+        tie_tolerance = max(
+            _configured_float("VAMSI_KB_PRIORITY_TIE_SCORE_TOLERANCE", 0.5), 0.0
+        )
+        tied = [
+            item
+            for item in qualified
+            if best_selection_score - item[2]["selection_score"] <= tie_tolerance
+        ]
         symbol, candidate, decision = max(
-            qualified,
+            tied,
             key=lambda item: (
+                -INDEX_SYMBOLS.index(item[0]),
                 item[2]["selection_score"],
                 float(item[1].get("contract_selection_rank") or 0),
-                -INDEX_SYMBOLS.index(item[0]),
             ),
         )
         for other_symbol, other_candidate, other_decision in qualified:
@@ -635,6 +774,8 @@ def scan() -> dict:
             f"{symbol} {decision['direction']} {decision['setup']} selected from "
             f"{len(qualified)} qualified index setup(s); "
             f"knowledge={decision['score']:.1f} rank={decision['selection_score']:.1f} "
+            f"plan={decision.get('daily_plan_mode', 'STRICT')} "
+            f"relaxed={','.join(decision.get('relaxed_gates_applied') or []) or 'none'} "
             f"qty={quantity} target/stop={prepared['target_points']:.0f}/"
             f"{prepared['stop_points']:.0f} {symbol} points"
         )

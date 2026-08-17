@@ -23,6 +23,8 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertEqual(updated.count(BLOCK_START), 1)
         self.assertEqual(updated.count(BLOCK_END), 1)
         self.assertIn("51,56 3 * * 1-5", updated)
+        self.assertIn("0 3 * * 1-5", updated)
+        self.assertIn("vamsi_kb_daily_plan.py --generate", updated)
         self.assertIn("1-56/5 4-8 * * 1-5", updated)
         self.assertIn("vamsi_kb_intraday.py --scan", updated)
         self.assertIn("trade_bot.py --monitor", updated)

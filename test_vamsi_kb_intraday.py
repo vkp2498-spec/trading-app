@@ -116,6 +116,44 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertFalse(result["evidence"]["option_chain"]["passed"])
 
+    def test_daily_plan_can_soften_only_its_selected_neutral_chain_gate(self):
+        current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
+        candidate = qualified_candidate(current=current)
+        candidate["option_summary"]["chain_bias"] = "NEUTRAL"
+        plan = {
+            "mode": "ONE_GATE_ADAPTIVE",
+            "eligibleScoreBuckets": ["80-89", "90-100"],
+            "relaxedGates": ["option_chain"],
+            "maximumRelaxedFailuresPerCandidate": 1,
+        }
+        result = kb.evaluate_knowledge_setup(candidate, current, daily_plan=plan)
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["score_bucket"], "80-89")
+        self.assertEqual(result["relaxed_gates_applied"], ["option_chain"])
+        self.assertFalse(result["evidence"]["option_chain"]["passed"])
+        self.assertTrue(result["evidence"]["option_chain"]["effective_passed"])
+
+        candidate["option_summary"]["chain_bias"] = "BEARISH"
+        opposite = kb.evaluate_knowledge_setup(candidate, current, daily_plan=plan)
+        self.assertFalse(opposite["allowed"])
+        self.assertEqual(opposite["relaxed_gates_applied"], [])
+
+    def test_daily_plan_never_softens_contract_quality(self):
+        current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
+        candidate = qualified_candidate(current=current)
+        candidate["option_summary"]["option_market_quality"]["spread_percent"] = 9
+        plan = {
+            "mode": "ONE_GATE_ADAPTIVE",
+            "eligibleScoreBuckets": ["80-89", "90-100"],
+            "relaxedGates": ["contract_quality"],
+            "maximumRelaxedFailuresPerCandidate": 1,
+        }
+        result = kb.evaluate_knowledge_setup(candidate, current, daily_plan=plan)
+
+        self.assertFalse(result["allowed"])
+        self.assertNotIn("contract_quality", result["planned_relaxed_gates"])
+
     def test_contract_quality_requires_live_delta_and_tight_spread(self):
         current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
         candidate = qualified_candidate(current=current)
@@ -180,7 +218,7 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
         def evaluate(symbol, **_kwargs):
             return candidates[symbol]
 
-        def decision(candidate, current=None):
+        def decision(candidate, current=None, daily_plan=None):
             return {
                 "allowed": True,
                 "direction": "BULLISH",
@@ -206,6 +244,7 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
             patch.object(kb, "_entry_window_ok", return_value=True),
             patch.object(kb, "_observation_window_ok", return_value=True),
             patch.object(kb, "_read_scan_state", return_value={}),
+            patch.object(kb, "load_daily_plan", return_value=None),
             patch.object(kb, "atomic_write_json"),
             patch.object(kb.trade_bot, "read_state", return_value={}),
             patch.object(kb.trade_bot, "state_is_active", return_value=False),
@@ -232,6 +271,7 @@ class VamsiKnowledgeEngineTests(unittest.TestCase):
             patch.object(kb, "_entry_window_ok", return_value=True),
             patch.object(kb, "_observation_window_ok", return_value=True),
             patch.object(kb, "_read_scan_state", return_value={}),
+            patch.object(kb, "load_daily_plan", return_value=None),
             patch.object(kb, "atomic_write_json"),
             patch.object(kb.trade_bot, "read_state", return_value={}),
             patch.object(kb.trade_bot, "state_is_active", return_value=False),

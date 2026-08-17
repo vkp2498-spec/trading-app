@@ -230,10 +230,17 @@ broker-entry safety checks.
 - Entry freshness/extension.
 
 The diagnostic knowledge score is the percentage of these independent families
-that passed. It is not a calibrated probability and it cannot authorize an
-entry: all families must pass. The older `VAMSI_UNIFIED_ENTRY_V1` score,
-adaptive score-band promotion, and paper-observation engine remain historical
-research only and are not scheduled.
+that passed. It is not a calibrated probability. At 08:30 IST,
+`vamsi_kb_daily_plan.py --generate` uses only completed prior-day audit rows to
+freeze that session's plan. The strict 90-100 bucket always remains eligible.
+For each index, the plan may additionally enable the 80-89 bucket by selecting
+at most one historically supported evidence gate for a bounded soft check. The
+selected gate can change daily as the rolling, recency-weighted evidence
+changes. Multiple-gate failures remain rejected. Spread/delta/quote quality,
+entry freshness, data health, broker reconciliation, capital and risk controls
+can never be relaxed by this plan. The older `VAMSI_UNIFIED_ENTRY_V1` adaptive
+score-band promotion and paper-observation engine remain historical research
+only and are not scheduled.
 
 Broker reconciliation, monitor health, market hours, duplicate-position
 controls, capital/lot ceilings, one account-wide entry per day, and broker
@@ -276,6 +283,15 @@ payload is `data/vamsi_kb_intraday/post_market_summary.json`. Dashboard and iOS
 show NIFTY, BANKNIFTY, and SENSEX rows with average favourable points and sample
 counts for each observed score/gate column. This is evidence for later gate
 review, not an automatic permission to relax gates.
+
+The pre-market planner considers only observations where the candidate gate was
+the sole failed research gate. Promotion requires the configured minimum sample
+count, distinct trading days, target-hit rate, favourable movement and positive
+conservative target/stop expectancy. If no gate qualifies, that index is strict
+for the entire day. NIFTY, BANKNIFTY and SENSEX are all still scanned after the
+one account-wide live trade; those later verdicts remain shadow evidence for
+the next post-market audit. If qualified candidates are effectively tied,
+selection priority is NIFTY, then BANKNIFTY, then SENSEX.
 
 ### 7.5 Default risk/exit shape
 
@@ -518,6 +534,7 @@ Lightsail servers use UTC. IST is UTC+05:30.
 The active managed schedule is:
 
 - Daily Upstox token request: 07:30 IST on weekdays, `0 2 * * 1-5` in UTC cron.
+- Frozen daily knowledge plan: 08:30 IST on weekdays, `0 3 * * 1-5` in UTC cron.
 - Knowledge-engine scans: one minute after every completed five-minute candle from 09:20 through 15:25 IST.
 - Position monitor: launch just before 09:15 IST and keep its internal loop alive. `flock` prevents overlapping monitor processes.
 - Forced square-off: 15:29 IST, `59 9 * * 1-5` in UTC cron.
@@ -526,6 +543,9 @@ The active managed schedule is:
 An example cron layout is:
 
 ```cron
+# Freeze the plan from completed prior-day evidence at 08:30 IST.
+0 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_kb_daily_plan.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/vamsi_kb_daily_plan.py --generate >> /home/ubuntu/trading-app/logs/daily_plan.log 2>&1
+
 # Completed-five-minute knowledge scans.
 51,56 3 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/vamsi_kb_intraday.py --scan >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1
 1-56/5 4-8 * * 1-5 cd /home/ubuntu/trading-app && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock /home/ubuntu/trading-app/venv/bin/python /home/ubuntu/trading-app/vamsi_kb_intraday.py --scan >> /home/ubuntu/trading-app/logs/trade_bot.log 2>&1

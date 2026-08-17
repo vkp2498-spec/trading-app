@@ -14,6 +14,7 @@ MANAGED_COMMANDS = (
     "trade_bot.py",
     "adaptive_score_calibration.py",
     "post_market_score_audit.py",
+    "vamsi_kb_daily_plan.py",
     "ml_shadow_v1.py",
     "ml_shadow_4h_v2_live.py",
     "vamsi_kb_intraday.py",
@@ -26,6 +27,8 @@ def canonical_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
+        "# Freeze the evidence-based plan at 08:30 IST using prior completed days.",
+        f"0 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_daily_plan.lock {python} {root}/vamsi_kb_daily_plan.py --generate >> {log_dir}/daily_plan.log 2>&1",
         "# AWS cron uses UTC. Scan one minute after each completed 5M candle.",
         f"51,56 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
         f"1-56/5 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_kb_scan.lock {python} {root}/vamsi_kb_intraday.py --scan >> {log_dir}/trade_bot.log 2>&1",
