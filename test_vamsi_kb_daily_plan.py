@@ -11,6 +11,25 @@ import vamsi_kb_daily_plan as planner
 
 
 class VamsiKnowledgeDailyPlanTests(unittest.TestCase):
+    def test_weekly_manual_plan_defaults_to_nifty_50_59_and_paper_only_other_indices(self):
+        with patch.dict(planner.os.environ, {}, clear=True):
+            plan = planner.build_weekly_manual_plan()
+
+        nifty = plan["symbols"]["NIFTY"]
+        self.assertEqual(plan["version"], planner.WEEKLY_MANUAL_VERSION)
+        self.assertEqual(nifty["eligibleScoreBuckets"], ["50-59"])
+        self.assertEqual(
+            nifty["relaxedGates"],
+            ["setup", "completed_candles", "breadth", "option_flow"],
+        )
+        self.assertEqual(nifty["maximumRelaxedFailuresPerCandidate"], 4)
+        self.assertEqual(
+            plan["symbols"]["BANKNIFTY"]["mode"],
+            "WEEKLY_MANUAL_PAPER_ONLY",
+        )
+        self.assertEqual(plan["symbols"]["BANKNIFTY"]["eligibleScoreBuckets"], [])
+        self.assertEqual(plan["symbols"]["SENSEX"]["eligibleScoreBuckets"], [])
+
     def test_selects_one_gate_from_prior_completed_days(self):
         rows = []
         for index in range(6):

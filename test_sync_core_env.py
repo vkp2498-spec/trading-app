@@ -50,7 +50,15 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertIn("VAMSI_KB_SENSEX_STOP_POINTS=40", updated)
         self.assertIn("VAMSI_KB_BANKNIFTY_MIN_BREADTH_COVERAGE=3", updated)
         self.assertIn("VAMSI_KB_SENSEX_MIN_BREADTH_COVERAGE=20", updated)
-        self.assertIn("VAMSI_KB_DAILY_PLAN_ENABLED=true", updated)
+        self.assertIn("VAMSI_KB_WEEKLY_MANUAL_PLAN_ENABLED=true", updated)
+        self.assertIn("VAMSI_KB_NIFTY_LIVE_SCORE_BUCKETS=50-59", updated)
+        self.assertIn(
+            "VAMSI_KB_NIFTY_LIVE_RELAXED_GATES=setup,completed_candles,breadth,option_flow",
+            updated,
+        )
+        self.assertIn("VAMSI_KB_BANKNIFTY_LIVE_SCORE_BUCKETS=", updated)
+        self.assertIn("VAMSI_KB_SENSEX_LIVE_SCORE_BUCKETS=", updated)
+        self.assertIn("VAMSI_KB_DAILY_PLAN_ENABLED=false", updated)
         self.assertIn("VAMSI_KB_PLAN_MIN_TRADING_DAYS=2", updated)
         self.assertIn("VAMSI_KB_PLAN_EXPLORATION_ENABLED=true", updated)
         self.assertIn("CONCISE_TRADE_LOGS=true", updated)

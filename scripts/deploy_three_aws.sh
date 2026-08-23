@@ -14,7 +14,7 @@ if [[ "$#" -ne 3 ]]; then
 fi
 
 hosts=("$1" "$2" "$3")
-roles=("kb-live-max" "kb-live-one-lot" "disabled")
+roles=("kb-live-max" "kb-live-one-lot" "kb-live-one-lot")
 remote_app_dir="${REMOTE_APP_DIR:-/home/ubuntu/trading-app}"
 ssh_options=(-o BatchMode=yes -o ConnectTimeout=15)
 if [[ -n "${SSH_IDENTITY_FILE:-}" ]]; then
@@ -55,4 +55,4 @@ for index in "${!hosts[@]}"; do
     "set -e; cd $remote_dir_quoted && (pkill -f '[t]rade_bot.py --monitor' || true) && (pkill -f '[m]l_shadow_v1.py --monitor' || true) && venv/bin/pip install -r requirements.txt && ${reset_command}venv/bin/python scripts/sync_core_env.py --env-file .env --role $role --refuse-active-state && $role_command && for service in nifty-app hk-mobile-api upstox-streams upstox-token-webhook; do if systemctl list-unit-files \"\${service}.service\" --no-legend 2>/dev/null | grep -q \"\${service}.service\"; then sudo systemctl restart \"\${service}\"; fi; done"
 done
 
-echo "Deployment complete: Vamsi=MAX live; Ganesh=one-lot live; Sastry disabled."
+echo "Deployment complete: Vamsi=MAX live; Ganesh=one-lot live; Sastry=one-lot live."

@@ -21,7 +21,7 @@ from pathlib import Path
 from safe_storage import atomic_write_json, file_lock, locked_append_csv
 import trade_bot
 from dashboard_score_buckets import dashboard_score_bucket
-from vamsi_kb_daily_plan import load_daily_plan
+from vamsi_kb_daily_plan import build_weekly_manual_plan, load_daily_plan
 
 
 ENGINE = "VAMSI_KB_INTRADAY_V1"
@@ -591,17 +591,28 @@ def scan() -> dict:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     slot = completed_scan_slot()
-    daily_plan = (
-        load_daily_plan()
-        if _configured_bool("VAMSI_KB_DAILY_PLAN_ENABLED", True)
-        else None
-    )
+    if _configured_bool("VAMSI_KB_WEEKLY_MANUAL_PLAN_ENABLED", False):
+        daily_plan = build_weekly_manual_plan()
+    elif _configured_bool("VAMSI_KB_DAILY_PLAN_ENABLED", True):
+        daily_plan = load_daily_plan()
+    else:
+        daily_plan = None
     if daily_plan:
-        choices = ", ".join(
-            f"{symbol}={','.join((daily_plan.get('symbols', {}).get(symbol) or {}).get('relaxedGates', [])) or 'strict'}"
-            for symbol in INDEX_SYMBOLS
-        )
-        log(f"daily plan {daily_plan['planDate']}: {choices}")
+        choices = []
+        for symbol in INDEX_SYMBOLS:
+            symbol_plan = (daily_plan.get("symbols", {}).get(symbol) or {})
+            buckets = symbol_plan.get("eligibleScoreBuckets") or []
+            relaxed = symbol_plan.get("relaxedGates") or []
+            choices.append(
+                f"{symbol}="
+                + (
+                    f"scores {','.join(buckets)} relax {','.join(relaxed) or 'none'}"
+                    if buckets
+                    else "scan-only"
+                )
+            )
+        label = daily_plan.get("reviewLabel") or daily_plan.get("planDate")
+        log(f"entry plan {label}: " + "; ".join(choices))
     else:
         log("no valid plan for today; strict all-gates fallback is active")
     with file_lock(SCAN_LOCK_FILE):

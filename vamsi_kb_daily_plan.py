@@ -22,6 +22,7 @@ import trade_bot
 
 
 VERSION = "VAMSI_KB_DAILY_PLAN_V1"
+WEEKLY_MANUAL_VERSION = "VAMSI_KB_WEEKLY_MANUAL_PLAN_V1"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "vamsi_kb_intraday"
 AUDIT_FILE = DATA_DIR / "post_market_followthrough.csv"
@@ -48,6 +49,89 @@ DEFAULT_POINTS = {
     "BANKNIFTY": (60.0, 60.0),
     "SENSEX": (40.0, 40.0),
 }
+
+
+def _configured_csv(name: str, default: str = "") -> list[str]:
+    return [
+        item.strip()
+        for item in str(os.getenv(name, default)).split(",")
+        if item.strip()
+    ]
+
+
+def build_weekly_manual_plan(current=None) -> dict:
+    """Build the operator-reviewed entry plan directly from non-secret env values.
+
+    Unlike the adaptive plan file, this configuration remains unchanged until
+    the operator updates the env during the weekly review.  Empty score buckets
+    deliberately keep an index in scan/audit mode without allowing live entry.
+    """
+    current = current or trade_bot.now_ist()
+    allowed_buckets = {
+        "0-9", "10-19", "20-29", "30-39", "40-49",
+        "50-59", "60-69", "70-79", "80-89", "90-100",
+    }
+    symbols = {}
+    for symbol in SYMBOLS:
+        score_buckets = _configured_csv(
+            f"VAMSI_KB_{symbol}_LIVE_SCORE_BUCKETS",
+            "50-59" if symbol == "NIFTY" else "",
+        )
+        invalid_buckets = set(score_buckets) - allowed_buckets
+        if invalid_buckets:
+            raise RuntimeError(
+                f"Invalid {symbol} weekly score buckets: "
+                + ", ".join(sorted(invalid_buckets))
+            )
+        relaxed_gates = _configured_csv(
+            f"VAMSI_KB_{symbol}_LIVE_RELAXED_GATES",
+            "setup,completed_candles,breadth,option_flow"
+            if symbol == "NIFTY"
+            else "",
+        )
+        invalid_gates = set(relaxed_gates) - set(RELAXABLE_GATES)
+        if invalid_gates:
+            raise RuntimeError(
+                f"Invalid {symbol} weekly relaxed gates: "
+                + ", ".join(sorted(invalid_gates))
+            )
+        maximum_relaxed = max(
+            _configured_int(
+                f"VAMSI_KB_{symbol}_MAX_RELAXED_FAILURES",
+                len(relaxed_gates),
+            ),
+            0,
+        )
+        maximum_relaxed = min(maximum_relaxed, len(relaxed_gates))
+        target, stop = _points(symbol)
+        symbols[symbol] = {
+            "priority": PRIORITY[symbol],
+            "mode": "WEEKLY_MANUAL_LIVE" if score_buckets else "WEEKLY_MANUAL_PAPER_ONLY",
+            "eligibleScoreBuckets": score_buckets,
+            "relaxedGates": relaxed_gates,
+            "maximumRelaxedFailuresPerCandidate": maximum_relaxed,
+            "targetPoints": target,
+            "stopPoints": stop,
+            "selectedEvidence": [],
+            "gateRanking": [],
+        }
+    return {
+        "version": WEEKLY_MANUAL_VERSION,
+        "planDate": current.date().isoformat(),
+        "generatedAt": current.isoformat(),
+        "trainingThrough": "",
+        "lookbackDays": 0,
+        "reviewLabel": os.getenv(
+            "VAMSI_KB_WEEKLY_PLAN_LABEL", "MANUAL_NIFTY_50_59_V1"
+        ),
+        "indexPriority": list(SYMBOLS),
+        "symbols": symbols,
+        "policy": (
+            "Operator-reviewed weekly entry plan. Empty score buckets are paper/audit only. "
+            "Contract quality, entry freshness, data health, broker execution and account-risk "
+            "controls cannot be relaxed by this plan."
+        ),
+    }
 
 
 def _configured_int(name: str, default: int) -> int:

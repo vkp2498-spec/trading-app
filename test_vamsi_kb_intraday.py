@@ -71,6 +71,49 @@ def qualified_candidate(direction="BULLISH", current=None, symbol="NIFTY"):
 
 
 class VamsiKnowledgeEngineTests(unittest.TestCase):
+    def test_weekly_manual_nifty_rule_relaxes_selected_research_gates_only(self):
+        current = datetime(2026, 8, 24, 11, 6, tzinfo=IST)
+        candidate = qualified_candidate(current=current)
+        candidate["technicals"]["entry_structure"]["qualified"] = False
+        candidate["technicals"]["five_min"]["bias"] = "NEUTRAL"
+        candidate["technicals"]["nifty_breadth"].update(
+            {"bias": "NEUTRAL", "score": 0}
+        )
+        with patch.dict(kb.os.environ, {}, clear=True):
+            plan = kb.build_weekly_manual_plan(current)["symbols"]["NIFTY"]
+            result = kb.evaluate_knowledge_setup(
+                candidate, current, daily_plan=plan
+            )
+
+        self.assertEqual(result["score_bucket"], "50-59")
+        self.assertTrue(result["allowed"])
+        self.assertEqual(
+            result["relaxed_gates_applied"],
+            ["setup", "completed_candles", "breadth"],
+        )
+        self.assertTrue(result["evidence"]["option_chain"]["effective_passed"])
+        self.assertTrue(result["evidence"]["contract_quality"]["effective_passed"])
+        self.assertTrue(result["evidence"]["entry_freshness"]["effective_passed"])
+
+        candidate["option_summary"]["chain_bias"] = "BEARISH"
+        rejected = kb.evaluate_knowledge_setup(candidate, current, daily_plan=plan)
+        self.assertFalse(rejected["allowed"])
+        self.assertFalse(rejected["evidence"]["option_chain"]["effective_passed"])
+
+    def test_weekly_manual_bank_and_sensex_remain_scan_only(self):
+        current = datetime(2026, 8, 24, 11, 6, tzinfo=IST)
+        with patch.dict(kb.os.environ, {}, clear=True):
+            plan = kb.build_weekly_manual_plan(current)
+        for symbol in ("BANKNIFTY", "SENSEX"):
+            candidate = qualified_candidate(current=current, symbol=symbol)
+            source = candidate["technicals"].pop("nifty_breadth")
+            candidate["technicals"][f"{symbol.lower()}_breadth"] = source
+            result = kb.evaluate_knowledge_setup(
+                candidate, current, daily_plan=plan["symbols"][symbol]
+            )
+            self.assertFalse(result["allowed"])
+            self.assertIn("excludes diagnostic score bucket", " ".join(result["blockers"]))
+
     def test_all_independent_families_are_required(self):
         current = datetime(2026, 8, 14, 11, 6, tzinfo=IST)
         result = kb.evaluate_knowledge_setup(qualified_candidate(current=current), current)
