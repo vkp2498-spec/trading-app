@@ -32,6 +32,9 @@ VAMSI_KB_SCAN_FILE = DATA_DIR / "vamsi_kb_intraday" / "scans.csv"
 VAMSI_KB_POST_MARKET_SUMMARY_FILE = (
     DATA_DIR / "vamsi_kb_intraday" / "post_market_summary.json"
 )
+VAMSI_KB_DAILY_PLAN_FILE = (
+    DATA_DIR / "vamsi_kb_intraday" / "daily_trade_plan.json"
+)
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
 ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
 ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
@@ -789,6 +792,116 @@ def build_post_market_review() -> dict:
     }
     payload = read_json_file(VAMSI_KB_POST_MARKET_SUMMARY_FILE, defaults)
     return payload if isinstance(payload, dict) else defaults
+
+
+def build_strategy_plan() -> dict:
+    """Return the non-secret live entry plan for dashboard and mobile clients."""
+    weekly_manual = str(
+        os.getenv("VAMSI_KB_WEEKLY_MANUAL_PLAN_ENABLED", "true")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+    if not weekly_manual:
+        adaptive = read_json_file(VAMSI_KB_DAILY_PLAN_FILE, {})
+        if isinstance(adaptive, dict) and adaptive.get("symbols"):
+            return adaptive
+
+    defaults = {
+        "NIFTY": {
+            "scoreBuckets": "50-59",
+            "relaxedGates": "setup,completed_candles,breadth,option_flow",
+            "targetPoints": 30.0,
+            "stopPoints": 30.0,
+        },
+        "BANKNIFTY": {
+            "scoreBuckets": "",
+            "relaxedGates": "",
+            "targetPoints": 60.0,
+            "stopPoints": 60.0,
+        },
+        "SENSEX": {
+            "scoreBuckets": "",
+            "relaxedGates": "",
+            "targetPoints": 40.0,
+            "stopPoints": 40.0,
+        },
+    }
+    symbols = {}
+    for priority, symbol in enumerate(SYMBOLS, start=1):
+        values = defaults[symbol]
+        score_buckets = [
+            item.strip()
+            for item in os.getenv(
+                f"VAMSI_KB_{symbol}_LIVE_SCORE_BUCKETS",
+                values["scoreBuckets"],
+            ).split(",")
+            if item.strip()
+        ]
+        relaxed_gates = [
+            item.strip()
+            for item in os.getenv(
+                f"VAMSI_KB_{symbol}_LIVE_RELAXED_GATES",
+                values["relaxedGates"],
+            ).split(",")
+            if item.strip()
+        ]
+        try:
+            maximum_relaxed = int(
+                float(
+                    os.getenv(
+                        f"VAMSI_KB_{symbol}_MAX_RELAXED_FAILURES",
+                        len(relaxed_gates),
+                    )
+                )
+            )
+        except (TypeError, ValueError):
+            maximum_relaxed = len(relaxed_gates)
+
+        def configured_points(kind: str) -> float:
+            default = values[f"{kind.lower()}Points"]
+            raw = os.getenv(
+                f"VAMSI_KB_{symbol}_{kind.upper()}_POINTS",
+                os.getenv(f"VAMSI_KB_{kind.upper()}_POINTS", str(default)),
+            )
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+
+        symbols[symbol] = {
+            "priority": priority,
+            "mode": (
+                "WEEKLY_MANUAL_LIVE"
+                if score_buckets
+                else "WEEKLY_MANUAL_PAPER_ONLY"
+            ),
+            "eligibleScoreBuckets": score_buckets,
+            "relaxedGates": relaxed_gates,
+            "maximumRelaxedFailuresPerCandidate": max(
+                0, min(maximum_relaxed, len(relaxed_gates))
+            ),
+            "targetPoints": configured_points("target"),
+            "stopPoints": configured_points("stop"),
+            "selectedEvidence": [],
+            "gateRanking": [],
+        }
+
+    return {
+        "version": "VAMSI_KB_WEEKLY_MANUAL_PLAN_V1",
+        "planDate": datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat(),
+        "generatedAt": None,
+        "trainingThrough": "",
+        "lookbackDays": 0,
+        "reviewLabel": os.getenv(
+            "VAMSI_KB_WEEKLY_PLAN_LABEL", "MANUAL_NIFTY_50_59_V1"
+        ),
+        "indexPriority": list(SYMBOLS),
+        "symbols": symbols,
+        "policy": (
+            "Operator-reviewed weekly entry plan. Empty score buckets are scan-only. "
+            "Contract quality, entry freshness, data health, broker execution and "
+            "account-risk controls remain hard safeguards."
+        ),
+    }
 
 
 def empty_trade_performance() -> dict:
@@ -2588,6 +2701,7 @@ def build_health_snapshot() -> dict:
         "lastRuns": latest_analyses,
         "todayScans": build_today_scans(),
         "postMarketReview": build_post_market_review(),
+        "strategyPlan": build_strategy_plan(),
         "mlShadow": build_ml_shadow_status(),
         "mlShadowV2": build_ml_shadow_v2_status(),
         "performance": trade_performance,
