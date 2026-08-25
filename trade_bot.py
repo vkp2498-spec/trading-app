@@ -406,9 +406,15 @@ def configured_bool(env_key, default=False):
 
 def trading_engine():
     engine = str(os.getenv("TRADING_ENGINE", "VAMSI")).strip().upper()
-    if engine not in {"VAMSI", "GANESH", "VAMSI_KB_INTRADAY_V1"}:
+    if engine not in {
+        "VAMSI",
+        "GANESH",
+        "VAMSI_KB_INTRADAY_V1",
+        "VAMSI_OPENING_PULSE_V1",
+    }:
         raise RuntimeError(
-            "TRADING_ENGINE must be VAMSI, GANESH, or VAMSI_KB_INTRADAY_V1"
+            "TRADING_ENGINE must be VAMSI, GANESH, VAMSI_KB_INTRADAY_V1, "
+            "or VAMSI_OPENING_PULSE_V1"
         )
     return engine
 
@@ -2528,7 +2534,7 @@ def option_capital_per_entry():
         "OPTION_CAPITAL_PER_ENTRY",
         str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
     ).strip()
-    if (
+    if trading_engine() == "VAMSI_OPENING_PULSE_V1" or (
         trading_engine() == "VAMSI_KB_INTRADAY_V1"
         and configured_bool("VAMSI_KB_FORCE_MAX_ALLOCATION", True)
     ):

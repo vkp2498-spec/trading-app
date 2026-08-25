@@ -18,6 +18,8 @@ MANAGED_COMMANDS = (
     "ml_shadow_v1.py",
     "ml_shadow_4h_v2_live.py",
     "vamsi_kb_intraday.py",
+    "vamsi_opening_pulse.py",
+    "sync_upstox_today_trades.py",
 )
 
 
@@ -45,7 +47,28 @@ def canonical_block(app_dir: Path) -> list[str]:
     ]
 
 
-def normalized_crontab(existing: str, app_dir: Path, enabled: bool = True) -> str:
+def opening_pulse_block(app_dir: Path) -> list[str]:
+    root = str(app_dir)
+    python = f"{root}/venv/bin/python"
+    log_dir = f"{root}/logs"
+    return [
+        BLOCK_START,
+        "# One mandatory NIFTY opening-pulse decision at 09:20 IST.",
+        f"50 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_opening_pulse.lock {python} {root}/vamsi_opening_pulse.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        "# Cancel the GTT and market-square-off any remaining position at 15:00 IST.",
+        f"30 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_opening_pulse_squareoff.lock {python} {root}/vamsi_opening_pulse.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
+        "# Reconcile the completed broker result into dashboard history at 15:05 IST.",
+        f"35 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/upstox_trade_sync.lock {python} {root}/sync_upstox_today_trades.py >> {log_dir}/upstox_trade_sync.log 2>&1",
+        BLOCK_END,
+    ]
+
+
+def normalized_crontab(
+    existing: str,
+    app_dir: Path,
+    enabled: bool = True,
+    mode: str = "knowledge",
+) -> str:
     retained = []
     inside_managed_block = False
     for line in existing.splitlines():
@@ -66,7 +89,11 @@ def normalized_crontab(existing: str, app_dir: Path, enabled: bool = True) -> st
     if retained and enabled:
         retained.append("")
     if enabled:
-        retained.extend(canonical_block(app_dir))
+        retained.extend(
+            opening_pulse_block(app_dir)
+            if mode == "opening-pulse"
+            else canonical_block(app_dir)
+        )
     return "\n".join(retained) + ("\n" if retained else "")
 
 
@@ -88,9 +115,20 @@ def main():
         action="store_true",
         help="Remove all managed trading jobs while preserving unrelated cron entries.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("knowledge", "opening-pulse"),
+        default="knowledge",
+        help="Install the selected production schedule.",
+    )
     args = parser.parse_args()
     app_dir = Path(args.app_dir).expanduser().resolve()
-    updated = normalized_crontab(read_crontab(), app_dir, enabled=not args.disable)
+    updated = normalized_crontab(
+        read_crontab(),
+        app_dir,
+        enabled=not args.disable,
+        mode=args.mode,
+    )
     if args.dry_run:
         print(updated, end="")
         return
@@ -99,7 +137,11 @@ def main():
     print(
         "Managed NIFTY trading cron disabled"
         if args.disable
-        else "Canonical VAMSI_KB_INTRADAY_V1 cron installed"
+        else (
+            "VAMSI_OPENING_PULSE_V1 cron installed"
+            if args.mode == "opening-pulse"
+            else "Canonical VAMSI_KB_INTRADAY_V1 cron installed"
+        )
     )
 
 

@@ -154,6 +154,14 @@ CORE_VALUES = {
     "VAMSI_KB_BANKNIFTY_STOP_POINTS": "60",
     "VAMSI_KB_SENSEX_TARGET_POINTS": "40",
     "VAMSI_KB_SENSEX_STOP_POINTS": "40",
+    "VAMSI_OPENING_PULSE_LIVE_ENABLED": "false",
+    "VAMSI_OPENING_PULSE_FIRST_ENTRY_TIME": "09:20",
+    "VAMSI_OPENING_PULSE_LAST_ENTRY_TIME": "09:22",
+    "VAMSI_OPENING_PULSE_SQUAREOFF_TIME": "15:00",
+    "VAMSI_OPENING_PULSE_MIN_REWARD_RISK": "0.80",
+    "VAMSI_OPENING_PULSE_MAX_REWARD_RISK": "1.25",
+    "VAMSI_OPENING_PULSE_MIN_LEVEL_DISTANCE_POINTS": "5",
+    "VAMSI_OPENING_PULSE_FALLBACK_DISTANCE_POINTS": "30",
     "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
     "VAMSI_KB_FIRST_ENTRY_TIME": "09:20",
     "VAMSI_KB_LAST_ENTRY_TIME": "15:15",
@@ -316,11 +324,20 @@ def parse_instance_overrides(text):
 
 
 def deployment_role_overrides(role):
-    if role not in {"kb-shadow", "kb-live-max", "kb-live-one-lot", "disabled"}:
+    if role not in {
+        "kb-shadow",
+        "kb-live-max",
+        "kb-live-one-lot",
+        "opening-pulse-live-max",
+        "disabled",
+    }:
         raise ValueError(f"Unsupported deployment role: {role}")
-    live_role = role in {"kb-live-max", "kb-live-one-lot"}
+    live_role = role in {
+        "kb-live-max", "kb-live-one-lot", "opening-pulse-live-max"
+    }
     values = {
         "ENABLE_LIVE_TRADING": "true" if live_role else "false",
+        "VAMSI_OPENING_PULSE_LIVE_ENABLED": "false",
         "ML_SHADOW_LIVE_TRADING_ENABLED": "false",
         "ML_SHADOW_V2_LIVE_ENABLED": "false",
         "ML_SHADOW_FORECAST_ONLY": "true",
@@ -334,6 +351,23 @@ def deployment_role_overrides(role):
                 "ACCOUNT_MAX_LOTS_PER_ENTRY": "0",
                 "MAX_LOTS_PER_ENTRY": "0",
                 "VAMSI_KB_FORCE_MAX_ALLOCATION": "true",
+                "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "false",
+            }
+        )
+    elif role == "opening-pulse-live-max":
+        values.update(
+            {
+                "TRADING_ENGINE": "VAMSI_OPENING_PULSE_V1",
+                "VAMSI_OPENING_PULSE_LIVE_ENABLED": "true",
+                "TRADE_BANK_NIFTY": "false",
+                "TRADE_SENSEX": "false",
+                "PAPER_OBSERVATION_MODE_ENABLED": "false",
+                "DEFAULT_TRADING_PROFILE": "MAX",
+                "OPTION_CAPITAL_PER_ENTRY": "MAX",
+                "ACCOUNT_MAX_OPTION_CAPITAL": "0",
+                "ACCOUNT_MAX_LOTS_PER_ENTRY": "0",
+                "MAX_LOTS_PER_ENTRY": "0",
+                "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
                 "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "false",
             }
         )
@@ -418,7 +452,13 @@ def main():
     parser.add_argument("--refuse-active-state", action="store_true")
     parser.add_argument(
         "--role",
-        choices=("kb-shadow", "kb-live-max", "kb-live-one-lot", "disabled"),
+        choices=(
+            "kb-shadow",
+            "kb-live-max",
+            "kb-live-one-lot",
+            "opening-pulse-live-max",
+            "disabled",
+        ),
         help="Force the knowledge-engine instance role after local overrides.",
     )
     args = parser.parse_args()

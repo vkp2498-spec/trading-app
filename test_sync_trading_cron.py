@@ -51,6 +51,22 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertNotIn("trade_bot.py", updated)
         self.assertNotIn("ml_shadow_v1.py", updated)
 
+    def test_opening_pulse_schedule_has_only_one_entry_and_1500_squareoff(self):
+        updated = normalized_crontab(
+            "0 2 * * 1-5 /usr/local/bin/token-request",
+            Path("/home/ubuntu/trading-app"),
+            mode="opening-pulse",
+        )
+
+        self.assertIn("50 3 * * 1-5", updated)
+        self.assertIn("vamsi_opening_pulse.py --scan", updated)
+        self.assertIn("30 9 * * 1-5", updated)
+        self.assertIn("vamsi_opening_pulse.py --squareoff", updated)
+        self.assertIn("35 9 * * 1-5", updated)
+        self.assertIn("sync_upstox_today_trades.py", updated)
+        self.assertNotIn("vamsi_kb_intraday.py", updated)
+        self.assertNotIn("trade_bot.py --monitor", updated)
+
 
 if __name__ == "__main__":
     unittest.main()
