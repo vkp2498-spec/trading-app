@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot 09:20 NIFTY opening-pulse GTT strategy for Vamsi.
+"""One-shot 09:20 SENSEX opening-pulse GTT strategy for Vamsi.
 
 The completed 09:15-09:20 market path always resolves to BULLISH or BEARISH.
 There are no score, breadth, option-flow, regime, or structure entry gates.
@@ -25,12 +25,16 @@ from strategy_core import (
     fetch_upstox_option_chain,
     get_expiries_from_upstox,
     now_ist,
+    option_chain_signal,
+    option_chain_target_stoploss,
+    option_contract_quality,
 )
 
 
 ENGINE = "VAMSI_OPENING_PULSE_V1"
-NIFTY_STATE_SLOT = "NIFTY"
-NIFTY_KEY = "NSE_INDEX|Nifty 50"
+TRADE_SYMBOL = "SENSEX"
+STATE_SLOT = "SENSEX"
+UNDERLYING_KEY = "BSE_INDEX|SENSEX"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "vamsi_opening_pulse"
 CLAIM_FILE = DATA_DIR / "daily_entry_claim.json"
@@ -79,53 +83,70 @@ def sign(value: float) -> int:
     return 1 if value > 0 else -1 if value < 0 else 0
 
 
-def opening_pulse(snapshot: dict) -> dict:
-    """Always resolve the completed opening path to CALL or PUT."""
-    five = snapshot.get("latest_completed_5m") or {}
+def opening_pulse(snapshot: dict, option_context: dict | None = None) -> dict:
+    """Resolve the developing 09:15 15M structure plus derivatives evidence."""
+    option_context = option_context or {}
+    opening = snapshot.get("opening_15m") or {}
+    previous = snapshot.get("previous_completed_15m") or {}
     spot = float(snapshot["spot"])
     today_open = float(snapshot["today_open"])
     previous_close = float(snapshot["previous_close"])
-    five_open = float(five.get("open") or today_open)
-    five_close = float(five.get("close") or spot)
-    pivots = snapshot.get("pivots") or {}
-    bands = snapshot.get("bollinger") or {}
+    opening_open = float(opening.get("open") or today_open)
+    opening_close = float(opening.get("close") or spot)
+    opening_high = float(opening.get("high") or max(opening_open, opening_close))
+    opening_low = float(opening.get("low") or min(opening_open, opening_close))
+    previous_open = float(previous.get("open") or previous_close)
+    previous_15m_close = float(previous.get("close") or previous_close)
+    bands = snapshot.get("bollinger_15m") or {}
     components = {
-        "opening_5m_body": {
-            "points": five_close - five_open,
-            "weight": 3,
+        "developing_opening_15m_body": {
+            "points": opening_close - opening_open,
+            "weight": 4,
         },
         "session_move": {
             "points": spot - today_open,
+            "weight": 2,
+        },
+        "opening_15m_range_position": {
+            "points": opening_close - ((opening_high + opening_low) / 2.0),
+            "weight": 1,
+        },
+        "previous_completed_15m_body": {
+            "points": previous_15m_close - previous_open,
             "weight": 2,
         },
         "overnight_gap": {
             "points": today_open - previous_close,
             "weight": 1,
         },
-        "previous_close_position": {
-            "points": spot - previous_close,
-            "weight": 1,
-        },
-        "pivot_position": {
-            "points": spot - float(pivots.get("P") or spot),
-            "weight": 1,
-        },
-        "bollinger_middle_position": {
+        "fifteen_minute_band_position": {
             "points": spot - float(bands.get("middle") or spot),
             "weight": 1,
         },
     }
     vote = sum(sign(item["points"]) * item["weight"] for item in components.values())
+    chain_score = int(option_context.get("chain_score") or 0)
+    vote += max(min(chain_score, 4), -4)
+    call_depth = float(
+        (option_context.get("call_quality") or {}).get("depth_ratio") or 0
+    )
+    put_depth = float(
+        (option_context.get("put_quality") or {}).get("depth_ratio") or 0
+    )
+    depth_difference = call_depth - put_depth
+    depth_vote = sign(depth_difference) * 2 if abs(depth_difference) >= 0.10 else 0
+    vote += depth_vote
     if vote == 0:
         tie_breakers = (
-            five_close - five_open,
+            opening_close - opening_open,
             spot - today_open,
+            chain_score,
+            depth_difference,
             spot - previous_close,
-            spot - float(pivots.get("P") or spot),
         )
         vote = next((sign(value) for value in tie_breakers if sign(value)), 1)
     direction = "BULLISH" if vote > 0 else "BEARISH"
-    maximum_vote = sum(item["weight"] for item in components.values())
+    maximum_vote = sum(item["weight"] for item in components.values()) + 6
     return {
         "direction": direction,
         "option_direction": "CALL" if direction == "BULLISH" else "PUT",
@@ -138,20 +159,37 @@ def opening_pulse(snapshot: dict) -> dict:
             }
             for name, item in components.items()
         },
+        "option_chain": {
+            "direction": option_context.get("chain_direction", "NEUTRAL"),
+            "confidence": option_context.get("chain_confidence", "LOW"),
+            "score": chain_score,
+            "vote": max(min(chain_score, 4), -4),
+        },
+        "market_depth": {
+            "call_depth_ratio": round(call_depth, 4),
+            "put_depth_ratio": round(put_depth, 4),
+            "difference": round(depth_difference, 4),
+            "vote": depth_vote,
+        },
     }
 
 
-def named_levels(snapshot: dict) -> list[dict]:
-    pivots = snapshot.get("pivots") or {}
-    bands = snapshot.get("bollinger") or {}
+def named_levels(snapshot: dict, option_context: dict | None = None) -> list[dict]:
+    option_context = option_context or {}
+    bands = snapshot.get("bollinger_15m") or {}
+    opening = snapshot.get("opening_15m") or {}
+    swing = snapshot.get("recent_15m_swing") or {}
+    chain_levels = option_context.get("chain_levels") or {}
     raw = [
-        ("R1", pivots.get("R1")),
-        ("R2", pivots.get("R2")),
-        ("S1", pivots.get("S1")),
-        ("S2", pivots.get("S2")),
-        ("BB_MIDDLE", bands.get("middle")),
-        ("BB_UPPER", bands.get("upper")),
-        ("BB_LOWER", bands.get("lower")),
+        ("OPENING_15M_HIGH", opening.get("high")),
+        ("OPENING_15M_LOW", opening.get("low")),
+        ("15M_SWING_HIGH", swing.get("high")),
+        ("15M_SWING_LOW", swing.get("low")),
+        ("15M_BB_MIDDLE", bands.get("middle")),
+        ("15M_BB_UPPER", bands.get("upper")),
+        ("15M_BB_LOWER", bands.get("lower")),
+        ("OPTION_RESISTANCE", chain_levels.get("resistance")),
+        ("OPTION_SUPPORT", chain_levels.get("support")),
     ]
     return [
         {"name": name, "level": round(float(value), 2)}
@@ -243,22 +281,50 @@ def balanced_level_pair(
     }
 
 
-def select_atm_option(option_direction: str) -> dict:
-    option_type = "CE" if option_direction == "CALL" else "PE"
-    expiry = choose_expiry("NIFTY", get_expiries_from_upstox("NIFTY"))
-    atm, _nearby, _chain = fetch_upstox_option_chain(
-        "NIFTY",
-        nearby=1,
+def sensex_option_context() -> dict:
+    """Fetch SENSEX ATM chain, OI signal and top-of-book depth once."""
+    expiry = choose_expiry(TRADE_SYMBOL, get_expiries_from_upstox(TRADE_SYMBOL))
+    atm, nearby, _chain = fetch_upstox_option_chain(
+        TRADE_SYMBOL,
+        nearby=5,
         expiry_role="execution",
         expiry=expiry,
     )
     if atm.empty:
-        raise RuntimeError("NIFTY ATM option chain is unavailable")
+        raise RuntimeError(f"{TRADE_SYMBOL} ATM option chain is unavailable")
     row = atm.iloc[0].to_dict()
+    chain_direction, chain_confidence, chain_score, chain_reasons = (
+        option_chain_signal(row)
+    )
+    chain_levels = option_chain_target_stoploss(
+        nearby,
+        float(row.get("strike") or 0),
+        chain_direction if chain_direction != "NEUTRAL" else "BULLISH",
+    )
+    return {
+        "expiry": str(expiry),
+        "atm": row,
+        "chain_direction": chain_direction,
+        "chain_confidence": chain_confidence,
+        "chain_score": int(chain_score),
+        "chain_reasons": chain_reasons,
+        "chain_levels": chain_levels,
+        "call_quality": option_contract_quality(row, "CE"),
+        "put_quality": option_contract_quality(row, "PE"),
+    }
+
+
+def select_atm_option(
+    option_direction: str, option_context: dict | None = None
+) -> dict:
+    option_type = "CE" if option_direction == "CALL" else "PE"
+    option_context = option_context or sensex_option_context()
+    expiry = option_context["expiry"]
+    row = option_context["atm"]
     prefix = option_type
     strike = float(row.get("strike") or 0)
     instrument = trade_bot.find_index_option_instrument(
-        "NIFTY", expiry, strike, option_type
+        TRADE_SYMBOL, expiry, strike, option_type
     )
     instrument_key = str(
         row.get(f"{prefix}_instrument_key")
@@ -269,13 +335,15 @@ def select_atm_option(option_direction: str) -> dict:
     ask = float(row.get(f"{prefix}_ask_price") or 0)
     bid = float(row.get(f"{prefix}_bid_price") or 0)
     if not instrument_key or max(ask, ltp, bid) <= 0:
-        raise RuntimeError(f"ATM NIFTY {option_type} has no executable quote")
+        raise RuntimeError(
+            f"ATM {TRADE_SYMBOL} {option_type} has no executable quote"
+        )
     return {
         "instrument_key": instrument_key,
         "trading_symbol": instrument.get("trading_symbol") or (
-            f"NIFTY {int(strike)} {option_type} {expiry}"
+            f"{TRADE_SYMBOL} {int(strike)} {option_type} {expiry}"
         ),
-        "underlying_symbol": "NIFTY",
+        "underlying_symbol": TRADE_SYMBOL,
         "option_type": option_type,
         "strike": strike,
         "expiry": str(expiry),
@@ -285,13 +353,62 @@ def select_atm_option(option_direction: str) -> dict:
     }
 
 
-def option_price_levels(option: dict, level_pair: dict) -> dict:
+def option_price_levels(
+    option: dict,
+    level_pair: dict,
+    option_context: dict | None = None,
+) -> dict:
+    """Translate index levels without ever risking nearly all option premium.
+
+    Named index levels remain reference ceilings.  The submitted option target
+    and stop use the smaller converted distance and are capped at a configured
+    percentage of entry premium, keeping the actual option payoff one-to-one.
+    """
     entry = float(option["entry_price"])
     delta = float(option["delta"])
-    target_distance = max(float(level_pair["target_distance"]) * delta, 0.05)
-    stop_distance = max(float(level_pair["stop_distance"]) * delta, 0.05)
-    target = round_tick(entry + target_distance)
-    stop = round_tick(max(entry - stop_distance, 0.05))
+    raw_target_distance = max(
+        float(level_pair["target_distance"]) * delta, 0.05
+    )
+    raw_stop_distance = max(
+        float(level_pair["stop_distance"]) * delta, 0.05
+    )
+    maximum_loss_percent = configured_float(
+        "VAMSI_OPENING_PULSE_MAX_OPTION_LOSS_PERCENT", 25.0
+    )
+    if not 1.0 <= maximum_loss_percent <= 50.0:
+        raise RuntimeError(
+            "VAMSI_OPENING_PULSE_MAX_OPTION_LOSS_PERCENT must be between 1 and 50"
+        )
+    option_context = option_context or {}
+    quality_key = (
+        "call_quality"
+        if str(option.get("option_type") or "CE").upper() == "CE"
+        else "put_quality"
+    )
+    quality = option_context.get(quality_key) or {}
+    depth_ratio = quality.get("depth_ratio")
+    spread_percent = quality.get("spread_percent")
+    depth_factor = (
+        1.0 if depth_ratio is not None and depth_ratio >= 0.20
+        else 0.60 if depth_ratio is not None and depth_ratio <= -0.20
+        else 0.80
+    )
+    spread_factor = 0.80 if spread_percent is not None and spread_percent > 2.0 else 1.0
+    effective_loss_percent = max(
+        min(maximum_loss_percent * depth_factor * spread_factor, maximum_loss_percent),
+        10.0,
+    )
+    maximum_risk_distance = entry * effective_loss_percent / 100.0
+    balanced_distance = max(
+        min(raw_target_distance, raw_stop_distance, maximum_risk_distance),
+        0.05,
+    )
+    target = round_tick(entry + balanced_distance)
+    stop = round_tick(entry - balanced_distance)
+    if target <= entry or stop <= 0 or stop >= entry:
+        raise RuntimeError(
+            f"Unsafe option levels: entry={entry} target={target} stop={stop}"
+        )
     return {
         "target_price": target,
         "stop_loss_price": stop,
@@ -299,6 +416,15 @@ def option_price_levels(option: dict, level_pair: dict) -> dict:
         "stop_option_points": round(entry - stop, 2),
         "option_reward_risk": round(
             (target - entry) / max(entry - stop, 0.05), 3
+        ),
+        "raw_target_option_points": round(raw_target_distance, 2),
+        "raw_stop_option_points": round(raw_stop_distance, 2),
+        "maximum_option_loss_percent": maximum_loss_percent,
+        "effective_option_loss_percent": round(effective_loss_percent, 2),
+        "selected_option_depth_ratio": depth_ratio,
+        "selected_option_spread_percent": spread_percent,
+        "premium_risk_capped": balanced_distance + 1e-9 < min(
+            raw_target_distance, raw_stop_distance
         ),
     }
 
@@ -392,9 +518,9 @@ def _state(
     direction = pulse["direction"]
     return {
         "date": now_ist().date().isoformat(),
-        "symbol": "NIFTY",
-        "underlying_symbol": "NIFTY",
-        "underlying_instrument_key": NIFTY_KEY,
+        "symbol": TRADE_SYMBOL,
+        "underlying_symbol": TRADE_SYMBOL,
+        "underlying_instrument_key": UNDERLYING_KEY,
         "instrument_class": "INDEX_OPTION",
         "strategy": ENGINE,
         "status": "GTT_SUBMITTING",
@@ -428,6 +554,13 @@ def _state(
         "underlying_reward_risk": level_pair["reward_risk"],
         "option_delta_used": option["delta"],
         "option_reward_risk": option_levels["option_reward_risk"],
+        "maximum_option_loss_percent": option_levels[
+            "maximum_option_loss_percent"
+        ],
+        "effective_option_loss_percent": option_levels[
+            "effective_option_loss_percent"
+        ],
+        "premium_risk_capped": option_levels["premium_risk_capped"],
         "max_allocation_capital": usable_capital,
         "pulse": pulse,
         "profit_protection_enabled_for_trade": False,
@@ -469,19 +602,22 @@ def scan() -> dict:
             }
         )
 
-        existing = trade_bot.read_state(NIFTY_STATE_SLOT)
+        existing = trade_bot.read_state(STATE_SLOT)
         if trade_bot.state_is_active(existing):
             message = "an earlier bot position state is still active"
             write_claim({"date": today, "status": "OPERATIONAL_ERROR", "reason": message})
             raise RuntimeError(message)
 
         try:
-            snapshot = trade_bot.ganesh_gap_market_snapshot("NIFTY", current_time=current)
-            pulse = opening_pulse(snapshot)
+            snapshot = trade_bot.ganesh_gap_market_snapshot(
+                TRADE_SYMBOL, current_time=current
+            )
+            option_context = sensex_option_context()
+            pulse = opening_pulse(snapshot, option_context)
             pair = balanced_level_pair(
                 pulse["direction"],
                 float(snapshot["spot"]),
-                named_levels(snapshot),
+                named_levels(snapshot, option_context),
                 minimum_ratio=configured_float(
                     "VAMSI_OPENING_PULSE_MIN_REWARD_RISK", 0.80
                 ),
@@ -495,13 +631,15 @@ def scan() -> dict:
                     "VAMSI_OPENING_PULSE_FALLBACK_DISTANCE_POINTS", 30.0
                 ),
             )
-            option = select_atm_option(pulse["option_direction"])
-            prices = option_price_levels(option, pair)
+            option = select_atm_option(pulse["option_direction"], option_context)
+            prices = option_price_levels(option, pair, option_context)
             quantity, usable = max_allocation_quantity(option)
             if quantity < int(option["lot_size"]):
-                raise RuntimeError("available option capital cannot buy one whole NIFTY lot")
+                raise RuntimeError(
+                    f"available option capital cannot buy one whole {TRADE_SYMBOL} lot"
+                )
             state = _state(snapshot, pulse, pair, option, prices, quantity, usable)
-            trade_bot.write_state(NIFTY_STATE_SLOT, state)
+            trade_bot.write_state(STATE_SLOT, state)
             payload = gtt_payload(option, prices, quantity)
             response = requests.post(
                 GTT_PLACE_URL,
@@ -520,8 +658,8 @@ def scan() -> dict:
                     "gtt_payload": payload,
                 }
             )
-            trade_bot.write_state(NIFTY_STATE_SLOT, state)
-            trade_bot.increment_trade_count("NIFTY")
+            trade_bot.write_state(STATE_SLOT, state)
+            trade_bot.increment_trade_count(TRADE_SYMBOL)
             trade_bot.send_apple_trade_entered_alert(state)
             write_claim(
                 {
@@ -540,16 +678,21 @@ def scan() -> dict:
                 f"target={prices['target_price']} ({pair['target_name']} "
                 f"{pair['target_level']}) stop={prices['stop_loss_price']} "
                 f"({pair['stop_name']} {pair['stop_level']}) "
-                f"underlying_rr={pair['reward_risk']:.2f} GTT={identifiers[0]} "
+                f"underlying_rr={pair['reward_risk']:.2f} "
+                f"chain={pulse['option_chain']['direction']}/"
+                f"{pulse['option_chain']['score']:+d} "
+                f"depth_vote={pulse['market_depth']['vote']:+d} "
+                f"premium_risk={prices['effective_option_loss_percent']:.1f}% "
+                f"GTT={identifiers[0]} "
                 "trailing=OFF"
             )
             return {"action": "LIVE_GTT", **state}
         except Exception as error:
-            state = trade_bot.read_state(NIFTY_STATE_SLOT)
+            state = trade_bot.read_state(STATE_SLOT)
             if state.get("strategy") == ENGINE:
                 state["status"] = "GTT_SUBMISSION_UNKNOWN"
                 state["submission_error"] = str(error)
-                trade_bot.write_state(NIFTY_STATE_SLOT, state)
+                trade_bot.write_state(STATE_SLOT, state)
             write_claim(
                 {
                     "date": today,
@@ -583,7 +726,7 @@ def cancel_gtt(gtt_order_id: str) -> None:
 
 def squareoff() -> dict:
     trade_bot.load_env()
-    state = trade_bot.read_state(NIFTY_STATE_SLOT)
+    state = trade_bot.read_state(STATE_SLOT)
     if state.get("strategy") != ENGINE or not state.get("instrument_key"):
         log("15:00 square-off: no opening-pulse state")
         return {"action": "NO_POSITION"}
@@ -593,14 +736,14 @@ def squareoff() -> dict:
         try:
             cancel_gtt(gtt_order_id)
             state["gtt_cancelled_at"] = now_ist().isoformat()
-            trade_bot.write_state(NIFTY_STATE_SLOT, state)
+            trade_bot.write_state(STATE_SLOT, state)
         except Exception as error:
             position = trade_bot.find_matching_position_for_side(
                 state["instrument_key"], "BUY", force=True
             )
             if position:
                 state["squareoff_error"] = str(error)
-                trade_bot.write_state(NIFTY_STATE_SLOT, state)
+                trade_bot.write_state(STATE_SLOT, state)
                 log(f"CRITICAL 15:00 square-off blocked: {error}")
                 raise
             log(f"GTT cancel returned after broker position had closed: {error}")
@@ -609,7 +752,7 @@ def squareoff() -> dict:
         state["instrument_key"], "BUY", force=True
     )
     if not position:
-        trade_bot.clear_state(NIFTY_STATE_SLOT)
+        trade_bot.clear_state(STATE_SLOT)
         write_claim(
             {
                 **read_claim(),
@@ -627,19 +770,19 @@ def squareoff() -> dict:
     }
     state["status"] = "EXIT_PENDING"
     state["exit_reason"] = "TIME_SQUAREOFF_1500"
-    trade_bot.write_state(NIFTY_STATE_SLOT, state)
+    trade_bot.write_state(STATE_SLOT, state)
     result, payload = trade_bot.place_market_order(
         instrument, "SELL", quantity, product="I"
     )
     order_id = (result.get("data") or {}).get("order_id")
     if not order_id:
         state["status"] = "POSITION_OPEN"
-        trade_bot.write_state(NIFTY_STATE_SLOT, state)
+        trade_bot.write_state(STATE_SLOT, state)
         raise RuntimeError(f"15:00 SELL returned no order_id: {result}")
     details = trade_bot.wait_for_order_complete(order_id)
     if trade_bot.order_is_complete(details):
         row = trade_bot.complete_exit(
-            NIFTY_STATE_SLOT,
+            STATE_SLOT,
             state,
             details,
             trade_bot.position_ltp(position),
@@ -658,7 +801,7 @@ def squareoff() -> dict:
         return {"action": "SQUAREOFF_COMPLETE", "quantity": quantity}
     state["exit_order_id"] = order_id
     state["exit_fallback_price"] = trade_bot.position_ltp(position)
-    trade_bot.write_state(NIFTY_STATE_SLOT, state)
+    trade_bot.write_state(STATE_SLOT, state)
     raise RuntimeError(
         f"15:00 SELL is not complete: order_id={order_id} "
         f"status={trade_bot.order_status(details)}"

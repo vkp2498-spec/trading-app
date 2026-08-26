@@ -109,14 +109,14 @@ class SyncCoreEnvTests(unittest.TestCase):
             ganesh["ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS"], "true"
         )
 
-    def test_opening_pulse_role_is_live_nifty_only_and_max(self):
+    def test_opening_pulse_role_is_live_sensex_only_and_max(self):
         values = deployment_role_overrides("opening-pulse-live-max")
 
         self.assertEqual(values["TRADING_ENGINE"], "VAMSI_OPENING_PULSE_V1")
         self.assertEqual(values["ENABLE_LIVE_TRADING"], "true")
         self.assertEqual(values["VAMSI_OPENING_PULSE_LIVE_ENABLED"], "true")
         self.assertEqual(values["TRADE_BANK_NIFTY"], "false")
-        self.assertEqual(values["TRADE_SENSEX"], "false")
+        self.assertEqual(values["TRADE_SENSEX"], "true")
         self.assertEqual(values["OPTION_CAPITAL_PER_ENTRY"], "MAX")
         self.assertEqual(values["ACCOUNT_MAX_LOTS_PER_ENTRY"], "0")
 

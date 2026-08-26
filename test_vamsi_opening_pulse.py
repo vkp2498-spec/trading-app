@@ -23,6 +23,18 @@ def snapshot(
             "open": five_open,
             "close": five_close,
         },
+        "opening_15m": {
+            "open": five_open,
+            "high": max(five_open, five_close) + 10,
+            "low": min(five_open, five_close) - 10,
+            "close": five_close,
+        },
+        "previous_completed_15m": {
+            "open": previous_close - 10,
+            "high": previous_close + 10,
+            "low": previous_close - 20,
+            "close": previous_close,
+        },
         "pivots": {
             "P": 22070,
             "R1": 22170,
@@ -35,6 +47,12 @@ def snapshot(
             "upper": 22200,
             "lower": 21980,
         },
+        "bollinger_15m": {
+            "middle": 22090,
+            "upper": 22200,
+            "lower": 21980,
+        },
+        "recent_15m_swing": {"high": 22200, "low": 21980},
     }
 
 
@@ -60,6 +78,28 @@ class OpeningPulseTests(unittest.TestCase):
         self.assertEqual(result["direction"], "BEARISH")
         self.assertEqual(result["option_direction"], "PUT")
         self.assertLess(result["vote"], 0)
+
+    def test_option_chain_and_depth_participate_in_pulse(self):
+        result = pulse.opening_pulse(
+            snapshot(
+                spot=22000,
+                today_open=22000,
+                previous_close=22000,
+                five_open=22000,
+                five_close=22000,
+            ),
+            {
+                "chain_direction": "BEARISH",
+                "chain_confidence": "HIGH",
+                "chain_score": -4,
+                "call_quality": {"depth_ratio": -0.5},
+                "put_quality": {"depth_ratio": 0.5},
+            },
+        )
+
+        self.assertEqual(result["direction"], "BEARISH")
+        self.assertEqual(result["option_chain"]["vote"], -4)
+        self.assertEqual(result["market_depth"]["vote"], -2)
 
     def test_perfect_tie_still_resolves_to_a_trade_direction(self):
         tied = snapshot(
@@ -127,12 +167,29 @@ class OpeningPulseTests(unittest.TestCase):
         stop = next(rule for rule in payload["rules"] if rule["strategy"] == "STOPLOSS")
         self.assertNotIn("trailing_gap", stop)
 
+    def test_option_levels_are_balanced_and_cap_premium_loss(self):
+        with patch.dict(
+            pulse.os.environ,
+            {"VAMSI_OPENING_PULSE_MAX_OPTION_LOSS_PERCENT": "25"},
+            clear=False,
+        ):
+            result = pulse.option_price_levels(
+                {"entry_price": 100.0, "delta": 0.5},
+                {"target_distance": 150.0, "stop_distance": 200.0},
+            )
+
+        self.assertEqual(result["target_price"], 120.0)
+        self.assertEqual(result["stop_loss_price"], 80.0)
+        self.assertEqual(result["option_reward_risk"], 1.0)
+        self.assertEqual(result["effective_option_loss_percent"], 20.0)
+        self.assertTrue(result["premium_risk_capped"])
+
     def test_scan_places_one_max_allocation_gtt_without_strategy_gates(self):
         fixed_now = datetime(2026, 8, 26, 9, 20, 5, tzinfo=ZoneInfo("Asia/Kolkata"))
         option = {
-            "instrument_key": "NSE_FO|123",
-            "trading_symbol": "NIFTY26AUG22100CE",
-            "underlying_symbol": "NIFTY",
+            "instrument_key": "BSE_FO|123",
+            "trading_symbol": "SENSEX26AUG80000CE",
+            "underlying_symbol": "SENSEX",
             "option_type": "CE",
             "strike": 22100,
             "expiry": "2026-08-26",
@@ -176,6 +233,19 @@ class OpeningPulseTests(unittest.TestCase):
             pulse.trade_bot, "state_is_active", return_value=False
         ), patch.object(
             pulse.trade_bot, "ganesh_gap_market_snapshot", return_value=snapshot()
+        ) as snapshot_fetch, patch.object(
+            pulse,
+            "sensex_option_context",
+            return_value={
+                "expiry": "2026-08-26",
+                "atm": {},
+                "chain_direction": "BULLISH",
+                "chain_confidence": "MEDIUM",
+                "chain_score": 2,
+                "chain_levels": {"support": 22000, "resistance": 22200},
+                "call_quality": {"depth_ratio": 0.3, "spread_percent": 1.0},
+                "put_quality": {"depth_ratio": -0.3, "spread_percent": 1.0},
+            },
         ), patch.object(
             pulse, "select_atm_option", return_value=option
         ), patch.object(
@@ -191,9 +261,13 @@ class OpeningPulseTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "LIVE_GTT")
         self.assertEqual(saved_state["status"], "GTT_ACTIVE")
+        self.assertEqual(saved_state["symbol"], "SENSEX")
         self.assertEqual(saved_state["quantity"], 650)
         self.assertFalse(saved_state["trailing_stop_active"])
-        increment.assert_called_once_with("NIFTY")
+        increment.assert_called_once_with("SENSEX")
+        snapshot_fetch.assert_called_once_with(
+            "SENSEX", current_time=fixed_now
+        )
         submitted = post.call_args.kwargs["json"]
         self.assertEqual(submitted["quantity"], 650)
         self.assertNotIn("trailing_gap", str(submitted))

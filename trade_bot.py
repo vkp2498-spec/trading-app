@@ -861,8 +861,8 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
         current_time = symbol
         symbol = "NIFTY"
     symbol = str(symbol).strip().upper()
-    if symbol not in GANESH_GAP_STATE_BY_SYMBOL:
-        raise ValueError(f"Unsupported Ganesh gap symbol: {symbol}")
+    if symbol not in UNDERLYING_INDEX_KEYS:
+        raise ValueError(f"Unsupported index snapshot symbol: {symbol}")
     current_time = current_time or now_ist()
     instrument_key = UNDERLYING_INDEX_KEYS[symbol]
     intraday = _frame_in_ist(fetch_v3_intraday_minutes(instrument_key, minutes=1))
@@ -885,6 +885,14 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
         "low": float(previous_day["low"].min()),
         "close": float(previous_day.iloc[-1]["close"]),
     }
+
+    completed_15m = history_15[
+        history_15.index + pd.Timedelta(minutes=15) <= pd.Timestamp(current_time)
+    ]
+    previous_completed_15m = (
+        completed_15m.iloc[-1].to_dict() if not completed_15m.empty else {}
+    )
+    recent_completed_15m = completed_15m.tail(20)
 
     maximum_age = configured_positive_float("GANESH_DATA_MAX_AGE_SECONDS", 120.0)
     stream_spot, stream_age = _latest_stream_ltp(instrument_key, maximum_age)
@@ -920,6 +928,20 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
     )
     if not bands:
         raise RuntimeError("Insufficient two-hour candles for Bollinger Bands")
+    fifteen_minute_closes = [
+        float(value)
+        for value in recent_completed_15m.get(
+            "close", pd.Series(dtype=float)
+        ).dropna()
+    ]
+    fifteen_minute_closes.append(spot)
+    bands_15m = bollinger_bands(
+        fifteen_minute_closes,
+        period=min(max(len(fifteen_minute_closes), 2), 20),
+        standard_deviations=configured_positive_float("GANESH_BB_STDDEV", 2.0),
+    )
+    if not bands_15m:
+        raise RuntimeError("Insufficient 15-minute candles for Bollinger Bands")
     recent_volumes = [
         float(value)
         for value in prior_2h.get("volume", pd.Series(dtype=float)).dropna().tail(20)
@@ -943,6 +965,29 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
         configured_non_negative_float("GANESH_COLOUR_NEUTRAL_BUFFER_POINTS", 0.0),
     )
     session_open = pd.Timestamp(current_time.replace(hour=9, minute=15, second=0, microsecond=0))
+    opening_15m_end = session_open + pd.Timedelta(minutes=15)
+    opening_15m_rows = today_rows[
+        (today_rows.index >= session_open) & (today_rows.index < opening_15m_end)
+    ]
+    opening_15m_live = pd.Timestamp(current_time) < opening_15m_end
+    opening_15m_close = (
+        spot if opening_15m_live else float(opening_15m_rows.iloc[-1]["close"])
+    )
+    opening_15m_high = float(opening_15m_rows["high"].max())
+    opening_15m_low = float(opening_15m_rows["low"].min())
+    if opening_15m_live:
+        opening_15m_high = max(opening_15m_high, spot)
+        opening_15m_low = min(opening_15m_low, spot)
+    opening_15m = {
+        "complete": not opening_15m_live,
+        "start": session_open.isoformat(),
+        "end": opening_15m_end.isoformat(),
+        "observed_through": pd.Timestamp(current_time).isoformat(),
+        "open": round(float(opening_15m_rows.iloc[0]["open"]), 2),
+        "high": round(opening_15m_high, 2),
+        "low": round(opening_15m_low, 2),
+        "close": round(opening_15m_close, 2),
+    }
     opening_minutes = max(to_int(os.getenv("GANESH_OPENING_RANGE_MINUTES"), 15), 5)
     opening_end = session_open + pd.Timedelta(minutes=opening_minutes)
     opening_range = (
@@ -975,6 +1020,17 @@ def ganesh_gap_market_snapshot(symbol="NIFTY", current_time=None):
         "candle_low": round(active_low, 2),
         "candle_colour": colour,
         "bollinger": bands,
+        "bollinger_15m": bands_15m,
+        "opening_15m": opening_15m,
+        "previous_completed_15m": {
+            key: round(float(previous_completed_15m[key]), 2)
+            for key in ("open", "high", "low", "close")
+            if previous_completed_15m.get(key) is not None
+        },
+        "recent_15m_swing": {
+            "high": round(float(recent_completed_15m["high"].tail(8).max()), 2),
+            "low": round(float(recent_completed_15m["low"].tail(8).min()), 2),
+        },
         "pivots": pivots,
         "active_volume": round(active_volume, 2),
         "volume_average_20": round(average_volume, 2),
