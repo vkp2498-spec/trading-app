@@ -35,6 +35,10 @@ VAMSI_KB_POST_MARKET_SUMMARY_FILE = (
 VAMSI_KB_DAILY_PLAN_FILE = (
     DATA_DIR / "vamsi_kb_intraday" / "daily_trade_plan.json"
 )
+OPENING_PULSE_CLAIM_FILE = (
+    DATA_DIR / "vamsi_opening_pulse" / "daily_entry_claim.json"
+)
+OPENING_PULSE_ENGINE = "VAMSI_OPENING_PULSE_V1"
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
 ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
 ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
@@ -1969,6 +1973,23 @@ def build_trade_performance(analytics_mode: str = "real") -> dict:
     normalized["analyticsMode"] = analytics_mode.upper()
     return raw
 
+
+def build_opening_pulse_performance() -> dict:
+    """Actual P/L for SENSEX trades created by the 09:20 pulse engine only."""
+    today_text = datetime.now(IST).strftime("%Y-%m-%d")
+    trades = [
+        trade
+        for trade in selective_index_trades(read_trade_history())
+        if not is_paper_trade(trade)
+        and normalized_underlying(trade) == "SENSEX"
+        and str(trade.get("strategy") or "").upper() == OPENING_PULSE_ENGINE
+    ]
+    payload = _build_trade_performance_payload(trades, today_text)
+    payload["analyticsMode"] = "REAL"
+    payload["symbol"] = "SENSEX"
+    payload["strategy"] = OPENING_PULSE_ENGINE
+    return payload
+
 def state_file(symbol: str) -> Path:
     return BASE_DIR / f"trade_state_{symbol}.json"
 
@@ -1987,6 +2008,135 @@ def read_json_file(
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return default
+
+
+def _opening_pulse_component(pulse: dict, name: str) -> dict:
+    item = (pulse.get("components") or {}).get(name) or {}
+    return {
+        "name": name,
+        "points": safe_float(item.get("points"), None),
+        "vote": safe_int(item.get("vote")),
+    }
+
+
+def build_opening_pulse_summary() -> dict:
+    """Return a compact, dashboard-safe view of today's SENSEX decision."""
+    now = datetime.now(IST)
+    today = now.date().isoformat()
+    claim = read_json_file(OPENING_PULSE_CLAIM_FILE, {})
+    state = read_json_file(state_file("SENSEX"), {})
+    if (
+        state.get("date") != today
+        or state.get("strategy") != OPENING_PULSE_ENGINE
+    ):
+        state = {}
+    if claim.get("date") != today:
+        claim = {}
+
+    stored = claim.get("dashboard") if isinstance(claim.get("dashboard"), dict) else {}
+    source = {**stored, **state}
+    pulse = source.get("pulse") if isinstance(source.get("pulse"), dict) else {}
+    option_chain = pulse.get("option_chain") if isinstance(pulse.get("option_chain"), dict) else {}
+    depth = pulse.get("market_depth") if isinstance(pulse.get("market_depth"), dict) else {}
+
+    status = str(state.get("status") or claim.get("status") or "").upper()
+    if not status:
+        minute = now.hour * 60 + now.minute
+        status = "SCHEDULED" if minute < 9 * 60 + 20 else "NO DECISION"
+
+    option_type = str(source.get("option_type") or "").upper()
+    option_direction = (
+        "CALL" if option_type == "CE"
+        else "PUT" if option_type == "PE"
+        else str(claim.get("option_direction") or "")
+    )
+    direction = str(source.get("direction") or claim.get("direction") or "")
+    if not option_direction and direction:
+        option_direction = "CALL" if direction == "BULLISH" else "PUT"
+
+    trade = next(
+        (
+            row
+            for row in reversed(read_trade_history())
+            if row.get("tradeDate") == today
+            and normalized_underlying(row) == "SENSEX"
+            and str(row.get("strategy") or "").upper() == OPENING_PULSE_ENGINE
+        ),
+        None,
+    )
+    result = None
+    if trade:
+        result = {
+            "pnl": safe_float(trade.get("grossPnL")),
+            "exitPrice": safe_float(trade.get("exitPrice")),
+            "exitReason": trade.get("exitReason") or "CLOSED",
+            "exitTime": trade.get("exitTime") or None,
+        }
+
+    components = [
+        _opening_pulse_component(pulse, name)
+        for name in (
+            "developing_opening_15m_body",
+            "opening_15m_range_position",
+            "previous_completed_15m_body",
+            "fifteen_minute_band_position",
+            "session_move",
+            "overnight_gap",
+        )
+    ]
+    components = [item for item in components if item.get("points") is not None]
+
+    return {
+        "engine": OPENING_PULSE_ENGINE,
+        "symbol": "SENSEX",
+        "entryTime": "09:20 IST",
+        "squareoffTime": "15:00 IST",
+        "tradeDate": today,
+        "status": status,
+        "hasDecision": bool(direction or option_direction),
+        "direction": direction or None,
+        "optionDirection": option_direction or None,
+        "pulseVote": safe_int(pulse.get("vote")) if pulse else None,
+        "pulseStrength": safe_float(pulse.get("strength"), None),
+        "tradingSymbol": source.get("trading_symbol") or claim.get("trading_symbol") or None,
+        "quantity": safe_int(source.get("quantity") or claim.get("quantity")),
+        "entryPrice": safe_float(source.get("entry_price"), None),
+        "targetPrice": safe_float(source.get("target_price"), None),
+        "stopLossPrice": safe_float(source.get("stop_loss_price"), None),
+        "targetReference": source.get("underlying_target_name") or None,
+        "targetReferencePrice": safe_float(source.get("underlying_target_price"), None),
+        "stopReference": source.get("underlying_stop_name") or None,
+        "stopReferencePrice": safe_float(source.get("underlying_stop_price"), None),
+        "optionRewardRisk": safe_float(source.get("option_reward_risk"), None),
+        "maximumOptionLossPercent": safe_float(source.get("maximum_option_loss_percent"), None),
+        "effectiveOptionLossPercent": safe_float(source.get("effective_option_loss_percent"), None),
+        "premiumRiskCapped": bool(source.get("premium_risk_capped", False)),
+        "chain": {
+            "direction": option_chain.get("direction") or "NEUTRAL",
+            "confidence": option_chain.get("confidence") or "LOW",
+            "score": safe_int(option_chain.get("score")),
+            "vote": safe_int(option_chain.get("vote")),
+        },
+        "depth": {
+            "callRatio": safe_float(depth.get("call_depth_ratio"), None),
+            "putRatio": safe_float(depth.get("put_depth_ratio"), None),
+            "difference": safe_float(depth.get("difference"), None),
+            "vote": safe_int(depth.get("vote")),
+        },
+        "fifteenMinuteComponents": components,
+        "gttOrderId": source.get("gtt_order_id") or claim.get("gtt_order_id") or None,
+        "createdAt": source.get("created_at") or claim.get("submitted_at") or claim.get("claimed_at") or None,
+        "result": result,
+        "message": (
+            claim.get("reason")
+            if status in {"OPERATIONAL_ERROR", "ERROR"}
+            else "SENSEX opening pulse is scheduled for 09:20 IST."
+            if status == "SCHEDULED"
+            else "Waiting for the 09:20 SENSEX pulse decision."
+            if status == "NO DECISION"
+            else None
+        ),
+    }
 
 
 def upstox_headers():
@@ -2702,6 +2852,8 @@ def build_health_snapshot() -> dict:
         "todayScans": build_today_scans(),
         "postMarketReview": build_post_market_review(),
         "strategyPlan": build_strategy_plan(),
+        "openingPulse": build_opening_pulse_summary(),
+        "openingPulsePerformance": build_opening_pulse_performance(),
         "mlShadow": build_ml_shadow_status(),
         "mlShadowV2": build_ml_shadow_v2_status(),
         "performance": trade_performance,

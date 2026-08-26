@@ -573,6 +573,32 @@ def _state(
     }
 
 
+def dashboard_claim(state: dict) -> dict:
+    """Persist only dashboard fields needed after the live state is cleared."""
+    keys = (
+        "strategy",
+        "direction",
+        "option_type",
+        "trading_symbol",
+        "quantity",
+        "entry_price",
+        "target_price",
+        "stop_loss_price",
+        "underlying_target_name",
+        "underlying_target_price",
+        "underlying_stop_name",
+        "underlying_stop_price",
+        "option_reward_risk",
+        "maximum_option_loss_percent",
+        "effective_option_loss_percent",
+        "premium_risk_capped",
+        "pulse",
+        "gtt_order_id",
+        "created_at",
+    )
+    return {key: state.get(key) for key in keys}
+
+
 def scan() -> dict:
     trade_bot.load_env()
     if trade_bot.trading_engine() != ENGINE:
@@ -670,6 +696,7 @@ def scan() -> dict:
                     "trading_symbol": option["trading_symbol"],
                     "quantity": quantity,
                     "submitted_at": now_ist().isoformat(),
+                    "dashboard": dashboard_claim(state),
                 }
             )
             log(

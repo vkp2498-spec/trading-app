@@ -167,6 +167,21 @@ class OpeningPulseTests(unittest.TestCase):
         stop = next(rule for rule in payload["rules"] if rule["strategy"] == "STOPLOSS")
         self.assertNotIn("trailing_gap", stop)
 
+    def test_dashboard_claim_excludes_broker_payload_and_keeps_evidence(self):
+        value = pulse.dashboard_claim(
+            {
+                "strategy": pulse.ENGINE,
+                "trading_symbol": "SENSEX 77500 CE",
+                "pulse": {"vote": 5},
+                "gtt_payload": {"should": "not persist"},
+                "instrument_key": "BSE_FO|secret-adjacent-internal-key",
+            }
+        )
+
+        self.assertEqual(value["pulse"], {"vote": 5})
+        self.assertNotIn("gtt_payload", value)
+        self.assertNotIn("instrument_key", value)
+
     def test_option_levels_are_balanced_and_cap_premium_loss(self):
         with patch.dict(
             pulse.os.environ,

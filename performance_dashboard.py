@@ -1,4 +1,4 @@
-"""Minimal index-options dashboard: headline P/L, calendar and scans."""
+"""Minimal SENSEX 09:20 opening-pulse dashboard."""
 
 from __future__ import annotations
 
@@ -10,9 +10,8 @@ from pathlib import Path
 import streamlit as st
 
 from dashboard_data import (
-    build_post_market_review,
-    build_today_scans,
-    build_trade_performance,
+    build_opening_pulse_performance,
+    build_opening_pulse_summary,
 )
 from strategy_core import now_ist
 
@@ -26,7 +25,7 @@ INDEX_COLUMNS = (
 )
 
 st.set_page_config(
-    page_title="Index Options Trading",
+    page_title="SENSEX Opening Pulse",
     page_icon=str(APP_ICON) if APP_ICON.exists() else "📈",
     layout="wide",
 )
@@ -74,12 +73,28 @@ st.markdown(
     .matrix-badge.entered { background: #dff5e8; color: #13723e; }
     .matrix-badge.unavailable { background: #f0f2f5; color: #7a8799; }
     .symbol-note { color: #cbd8e8; display: block; font-size: .6rem; font-weight: 700; margin-top: 2px; }
+    .pulse-card { background: linear-gradient(135deg, #0b2343, #143d67); border-radius: 18px; color: #fff; padding: 24px; box-shadow: 0 12px 30px rgba(11,35,67,.18); }
+    .pulse-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
+    .pulse-symbol { color: #9fb8d4; font-size: .7rem; font-weight: 850; letter-spacing: .1em; }
+    .pulse-direction { font-size: 1.8rem; font-weight: 900; margin-top: 5px; }
+    .pulse-contract { color: #d7e5f4; font-size: .84rem; margin-top: 5px; }
+    .pulse-status { background: rgba(255,255,255,.12); border-radius: 999px; font-size: .68rem; font-weight: 850; padding: 7px 11px; white-space: nowrap; }
+    .pulse-levels { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 20px; }
+    .pulse-level { background: rgba(255,255,255,.08); border-radius: 11px; padding: 11px; }
+    .pulse-level-label { color: #9fb8d4; font-size: .61rem; font-weight: 800; text-transform: uppercase; }
+    .pulse-level-value { font-size: .96rem; font-weight: 850; margin-top: 4px; }
+    .evidence-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .evidence-card { background: #fff; border: 1px solid #dde5ef; border-radius: 14px; padding: 17px; }
+    .evidence-title { color: #64748b; font-size: .69rem; font-weight: 850; text-transform: uppercase; }
+    .evidence-value { color: #0b2343; font-size: 1.15rem; font-weight: 850; margin-top: 7px; }
+    .evidence-detail { color: #64748b; font-size: .71rem; margin-top: 5px; }
     @media (max-width: 720px) {
         .summary-grid { grid-template-columns: 1fr; }
         .page-title { font-size: 1.75rem; }
         .matrix-table { min-width: 680px; }
         .matrix-table th, .matrix-table td { padding: 11px 10px; }
         .matrix-table th:first-child, .matrix-table td:first-child { width: 112px; }
+        .pulse-levels, .evidence-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     </style>
     """,
@@ -327,7 +342,123 @@ def render_post_market_review(review: dict) -> None:
     )
 
 
-performance = build_trade_performance(analytics_mode="real")
+def number(value, suffix: str = "") -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):,.2f}{suffix}"
+
+
+def render_opening_pulse(pulse: dict) -> None:
+    status = str(pulse.get("status") or "NO DECISION").replace("_", " ")
+    direction = pulse.get("direction") or "Waiting"
+    option_direction = pulse.get("optionDirection") or ""
+    headline = f"{direction} · {option_direction}" if option_direction else str(direction)
+    contract = pulse.get("tradingSymbol") or pulse.get("message") or "Decision scheduled at 09:20 IST"
+    levels = (
+        ("Entry", number(pulse.get("entryPrice"))),
+        ("Target", number(pulse.get("targetPrice"))),
+        ("Stop", number(pulse.get("stopLossPrice"))),
+        ("Quantity", f"{int(pulse.get('quantity') or 0):,}" if pulse.get("quantity") else "—"),
+    )
+    level_html = "".join(
+        '<div class="pulse-level">'
+        f'<div class="pulse-level-label">{html.escape(label)}</div>'
+        f'<div class="pulse-level-value">{html.escape(value)}</div>'
+        "</div>"
+        for label, value in levels
+    )
+    st.markdown(
+        '<div class="pulse-card"><div class="pulse-top"><div>'
+        '<div class="pulse-symbol">SENSEX · 09:20 OPENING PULSE</div>'
+        f'<div class="pulse-direction">{html.escape(headline)}</div>'
+        f'<div class="pulse-contract">{html.escape(str(contract))}</div>'
+        '</div>'
+        f'<div class="pulse-status">{html.escape(status)}</div>'
+        '</div><div class="pulse-levels">'
+        + level_html
+        + "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    chain = pulse.get("chain") or {}
+    depth = pulse.get("depth") or {}
+    risk = pulse.get("effectiveOptionLossPercent")
+    evidence = (
+        (
+            "15-minute pulse",
+            f"Vote {int(pulse.get('pulseVote') or 0):+d}" if pulse.get("pulseVote") is not None else "Waiting",
+            f"Strength {number(pulse.get('pulseStrength'), '%')}",
+        ),
+        (
+            "Option chain",
+            str(chain.get("direction") or "NEUTRAL"),
+            f"{chain.get('confidence') or 'LOW'} confidence · score {int(chain.get('score') or 0):+d}",
+        ),
+        (
+            "Market depth & risk",
+            f"Vote {int(depth.get('vote') or 0):+d}",
+            f"Premium risk {number(risk, '%')} · option R:R {number(pulse.get('optionRewardRisk'))}",
+        ),
+    )
+    st.markdown(
+        '<div class="evidence-grid">'
+        + "".join(
+            '<div class="evidence-card">'
+            f'<div class="evidence-title">{html.escape(title)}</div>'
+            f'<div class="evidence-value">{html.escape(value)}</div>'
+            f'<div class="evidence-detail">{html.escape(detail)}</div>'
+            '</div>'
+            for title, value, detail in evidence
+        )
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    components = pulse.get("fifteenMinuteComponents") or []
+    if components:
+        labels = {
+            "developing_opening_15m_body": "Opening 15M body",
+            "opening_15m_range_position": "Opening range position",
+            "previous_completed_15m_body": "Previous 15M body",
+            "fifteen_minute_band_position": "15M band position",
+            "session_move": "Session move",
+            "overnight_gap": "Overnight gap",
+        }
+        st.dataframe(
+            [
+                {
+                    "15-minute evidence": labels.get(item.get("name"), item.get("name")),
+                    "Points": item.get("points"),
+                    "Vote": item.get("vote"),
+                }
+                for item in components
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def render_recent_trades(trades: list[dict]) -> None:
+    if not trades:
+        st.info("Completed SENSEX opening-pulse trades will appear here.")
+        return
+    st.dataframe(
+        [
+            {
+                "Date": trade.get("tradeDate") or "—",
+                "Contract": trade.get("tradingSymbol") or "—",
+                "Exit": str(trade.get("exitReason") or "CLOSED").replace("_", " "),
+                "P/L": money(trade.get("grossPnL")),
+            }
+            for trade in trades[:10]
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+performance = build_opening_pulse_performance()
+pulse = build_opening_pulse_summary()
 today = performance.get("today") or {}
 cumulative = performance.get("cumulative") or {}
 today_pnl = float(today.get("netPnL", today.get("closedPnL", 0)) or 0)
@@ -335,9 +466,9 @@ cumulative_pnl = float(cumulative.get("netPnL", cumulative.get("totalPnL", 0)) o
 today_trades = int(today.get("closedTrades", 0) or 0)
 total_trades = int(cumulative.get("totalTrades", 0) or 0)
 
-st.markdown('<div class="page-title">Index Options Trading</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-title">SENSEX Opening Pulse</div>', unsafe_allow_html=True)
 st.markdown(
-    f'<div class="page-subtitle">Updated {now_ist().strftime("%d %b %Y · %I:%M:%S %p")} IST</div>',
+    f'<div class="page-subtitle">One decision at 09:20 · fixed GTT target/stop · 15:00 square-off · updated {now_ist().strftime("%d %b %Y · %I:%M:%S %p")} IST</div>',
     unsafe_allow_html=True,
 )
 
@@ -348,29 +479,19 @@ st.markdown(
     '<div class="summary-grid">'
     + summary_card("Today’s P/L", money(today_pnl), f"{today_trades} trade{'s' if today_trades != 1 else ''} today", value_class(today_pnl))
     + summary_card("Cumulative P/L", money(cumulative_pnl), "Recorded live bot trades", value_class(cumulative_pnl))
-    + summary_card("Number of Trades", f"{total_trades:,}", "Cumulative completed trades")
+    + summary_card("Total Trades", f"{total_trades:,}", "SENSEX opening-pulse trades")
     + "</div>",
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="section-title">Index Overview</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="section-subtitle">Today and cumulative results by index</div>',
-    unsafe_allow_html=True,
-)
-render_index_performance(today, cumulative)
+st.markdown('<div class="section-title">Today’s 09:20 Decision</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-subtitle">15-minute structure, option-chain positioning and market depth</div>', unsafe_allow_html=True)
+render_opening_pulse(pulse)
 
 st.markdown('<div class="section-title">P/L Calendar</div>', unsafe_allow_html=True)
 st.markdown('<div class="section-subtitle">Daily completed-trade results</div>', unsafe_allow_html=True)
 render_pnl_calendar(performance.get("pnlCalendar") or [])
 
-st.markdown('<div class="section-title">Today’s Scans</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-subtitle">Latest completed five-minute scan first</div>', unsafe_allow_html=True)
-render_scans(build_today_scans())
-
-st.markdown('<div class="section-title">Post-Market Review</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="section-subtitle">Average favourable index points before the configured stop, accumulated from every overlapping five-minute scan</div>',
-    unsafe_allow_html=True,
-)
-render_post_market_review(build_post_market_review())
+st.markdown('<div class="section-title">Recent Trades</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-subtitle">Latest completed SENSEX opening-pulse exits</div>', unsafe_allow_html=True)
+render_recent_trades(performance.get("recentTrades") or [])
