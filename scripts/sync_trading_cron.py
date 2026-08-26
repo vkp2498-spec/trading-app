@@ -53,7 +53,7 @@ def opening_pulse_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# One mandatory NIFTY opening-pulse decision at 09:20 IST.",
+        "# One mandatory SENSEX opening-pulse decision at 09:20 IST.",
         f"50 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_opening_pulse.lock {python} {root}/vamsi_opening_pulse.py --scan >> {log_dir}/trade_bot.log 2>&1",
         "# Cancel the GTT and market-square-off any remaining position at 15:00 IST.",
         f"30 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_opening_pulse_squareoff.lock {python} {root}/vamsi_opening_pulse.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
