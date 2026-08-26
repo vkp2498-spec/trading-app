@@ -9,6 +9,36 @@ import dashboard_data
 
 
 class OpeningPulseDashboardTests(unittest.TestCase):
+    def test_same_day_retired_nifty_claim_is_not_shown_as_sensex(self):
+        today = datetime.now(dashboard_data.IST).date().isoformat()
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claim_file = root / "claim.json"
+            state_file = root / "sensex.json"
+            history_file = root / "trades.csv"
+            claim_file.write_text(
+                json.dumps(
+                    {
+                        "date": today,
+                        "status": "GTT_ACTIVE",
+                        "direction": "BEARISH",
+                        "trading_symbol": "NIFTY 24300 PE",
+                    }
+                )
+            )
+
+            with patch.object(
+                dashboard_data, "OPENING_PULSE_CLAIM_FILE", claim_file
+            ), patch.object(
+                dashboard_data, "TRADE_HISTORY_FILE", history_file
+            ), patch.object(
+                dashboard_data, "state_file", return_value=state_file
+            ):
+                result = dashboard_data.build_opening_pulse_summary()
+
+        self.assertFalse(result["hasDecision"])
+        self.assertIsNone(result["tradingSymbol"])
+
     def test_performance_excludes_retired_indices_and_engines(self):
         today = datetime.now(dashboard_data.IST).date().isoformat()
         base = {

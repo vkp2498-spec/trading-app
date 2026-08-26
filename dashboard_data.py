@@ -2033,6 +2033,20 @@ def build_opening_pulse_summary() -> dict:
     if claim.get("date") != today:
         claim = {}
 
+    claim_dashboard = (
+        claim.get("dashboard")
+        if isinstance(claim.get("dashboard"), dict)
+        else {}
+    )
+    claim_contract = str(
+        claim_dashboard.get("trading_symbol")
+        or claim.get("trading_symbol")
+        or ""
+    ).upper()
+    if claim_contract and "SENSEX" not in claim_contract:
+        # Ignore a same-day claim created by the retired NIFTY version.
+        claim = {}
+
     stored = claim.get("dashboard") if isinstance(claim.get("dashboard"), dict) else {}
     source = {**stored, **state}
     pulse = source.get("pulse") if isinstance(source.get("pulse"), dict) else {}
