@@ -67,6 +67,21 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertNotIn("vamsi_kb_intraday.py", updated)
         self.assertNotIn("trade_bot.py --monitor", updated)
 
+    def test_nifty_option_buy_schedule_scans_completed_candles_and_exits_at_1500(self):
+        updated = normalized_crontab(
+            "0 2 * * 1-5 /usr/local/bin/token-request",
+            Path("/home/ubuntu/trading-app"),
+            mode="nifty-option-buy",
+        )
+
+        self.assertIn("vamsi_nifty_option_buy.py --scan", updated)
+        self.assertIn("1-56/5 4-8 * * 1-5", updated)
+        self.assertIn("trade_bot.py --monitor", updated)
+        self.assertIn("30 9 * * 1-5", updated)
+        self.assertIn("trade_bot.py --squareoff", updated)
+        self.assertNotIn("vamsi_opening_pulse.py", updated)
+        self.assertNotIn("vamsi_kb_intraday.py", updated)
+
 
 if __name__ == "__main__":
     unittest.main()

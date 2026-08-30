@@ -1,4 +1,5 @@
 import json
+import csv
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -144,6 +145,90 @@ class OpeningPulseDashboardTests(unittest.TestCase):
         self.assertEqual(result["chain"]["score"], 2)
         self.assertEqual(result["depth"]["vote"], 2)
         self.assertEqual(result["fifteenMinuteComponents"][0]["vote"], 4)
+
+    def test_nifty_option_buy_summary_uses_latest_weighted_scan(self):
+        today = datetime.now(dashboard_data.IST).date().isoformat()
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scan_file = root / "scans.csv"
+            state_path = root / "nifty.json"
+            history_file = root / "trades.csv"
+            with scan_file.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=(
+                        "scan_time", "action", "direction", "signed_score",
+                        "contract", "entry_price", "underlying_target",
+                        "underlying_stop", "reward_risk", "blockers", "components",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "scan_time": f"{today}T10:01:00+05:30",
+                        "action": "REJECT",
+                        "direction": "BULLISH",
+                        "signed_score": "70",
+                        "contract": "NIFTY ATM CE",
+                        "entry_price": "150",
+                        "underlying_target": "25100",
+                        "underlying_stop": "25020",
+                        "reward_risk": "1.6",
+                        "blockers": "volume too low",
+                        "components": json.dumps(
+                            {
+                                "15_min_trend": {
+                                    "earned": 25,
+                                    "weight": 25,
+                                    "detail": "BULLISH",
+                                }
+                            }
+                        ),
+                    }
+                )
+
+            with patch.object(
+                dashboard_data, "NIFTY_OPTION_BUY_SCAN_FILE", scan_file
+            ), patch.object(
+                dashboard_data, "TRADE_HISTORY_FILE", history_file
+            ), patch.object(
+                dashboard_data, "state_file", return_value=state_path
+            ):
+                result = dashboard_data.build_nifty_option_buy_summary()
+
+        self.assertEqual(result["symbol"], "NIFTY")
+        self.assertEqual(result["optionDirection"], "CALL")
+        self.assertEqual(result["pulseStrength"], 70.0)
+        self.assertEqual(result["status"], "REJECT")
+        self.assertEqual(result["blockers"], ["volume too low"])
+        self.assertEqual(result["fifteenMinuteComponents"][0]["earned"], 25.0)
+
+    def test_nifty_option_buy_performance_excludes_other_strategies(self):
+        today = datetime.now(dashboard_data.IST).date().isoformat()
+        base = {
+            "tradeDate": today,
+            "symbol": "NIFTY",
+            "underlyingSymbol": "NIFTY",
+            "instrumentClass": "INDEX_OPTION",
+            "paperTrade": False,
+            "grossPnL": 250.0,
+            "exitTime": f"{today}T11:00:00+05:30",
+            "entryTime": f"{today}T10:00:00+05:30",
+            "tradingSymbol": "NIFTY ATM CE",
+            "optionType": "CALL",
+            "entryPrice": 100.0,
+            "quantity": 65,
+        }
+        rows = [
+            {**base, "strategy": dashboard_data.NIFTY_OPTION_BUY_ENGINE},
+            {**base, "strategy": dashboard_data.OPENING_PULSE_ENGINE},
+        ]
+
+        with patch.object(dashboard_data, "read_trade_history", return_value=rows):
+            result = dashboard_data.build_nifty_option_buy_performance()
+
+        self.assertEqual(result["cumulative"]["totalTrades"], 1)
+        self.assertEqual(result["symbol"], "NIFTY")
 
 
 if __name__ == "__main__":

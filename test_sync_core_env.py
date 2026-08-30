@@ -120,6 +120,18 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertEqual(values["OPTION_CAPITAL_PER_ENTRY"], "MAX")
         self.assertEqual(values["ACCOUNT_MAX_LOTS_PER_ENTRY"], "0")
 
+    def test_nifty_option_buy_role_is_live_nifty_only_max_and_one_trade(self):
+        values = deployment_role_overrides("nifty-option-buy-live-max")
+
+        self.assertEqual(values["TRADING_ENGINE"], "VAMSI_NIFTY_OPTION_BUY_V1")
+        self.assertEqual(values["ENABLE_LIVE_TRADING"], "true")
+        self.assertEqual(values["VAMSI_OPENING_PULSE_LIVE_ENABLED"], "false")
+        self.assertEqual(values["TRADE_BANK_NIFTY"], "false")
+        self.assertEqual(values["TRADE_SENSEX"], "false")
+        self.assertEqual(values["OPTION_CAPITAL_PER_ENTRY"], "MAX")
+        self.assertEqual(values["ACCOUNT_MAX_LOTS_PER_ENTRY"], "0")
+        self.assertEqual(values["MAX_INDEX_TRADES_PER_DAY"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

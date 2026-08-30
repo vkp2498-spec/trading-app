@@ -163,6 +163,20 @@ CORE_VALUES = {
     "VAMSI_OPENING_PULSE_MIN_LEVEL_DISTANCE_POINTS": "5",
     "VAMSI_OPENING_PULSE_FALLBACK_DISTANCE_POINTS": "30",
     "VAMSI_OPENING_PULSE_MAX_OPTION_LOSS_PERCENT": "25",
+    "NIFTY_OPTION_BUY_FIRST_ENTRY_TIME": "09:30",
+    "NIFTY_OPTION_BUY_LAST_ENTRY_TIME": "14:30",
+    "NIFTY_OPTION_BUY_MIN_SCORE": "60",
+    "NIFTY_OPTION_BUY_MIN_VOLUME_RATIO": "1.5",
+    "NIFTY_OPTION_BUY_MIN_ATR_PERCENT": "0.04",
+    "NIFTY_OPTION_BUY_MIN_STOP_ATR": "0.5",
+    "NIFTY_OPTION_BUY_MAX_STOP_ATR": "1.0",
+    "NIFTY_OPTION_BUY_MIN_REWARD_RISK": "1.5",
+    "NIFTY_OPTION_BUY_MIN_DELTA": "0.45",
+    "NIFTY_OPTION_BUY_MAX_DELTA": "0.65",
+    "NIFTY_OPTION_BUY_MAX_SPREAD_PERCENT": "2.0",
+    "NIFTY_OPTION_BUY_MAX_IV": "35",
+    "NIFTY_OPTION_BUY_EXPIRY_DAY_MIN_SCORE": "70",
+    "NIFTY_OPTION_BUY_EXPIRY_DAY_LAST_ENTRY_TIME": "13:00",
     "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
     "VAMSI_KB_FIRST_ENTRY_TIME": "09:20",
     "VAMSI_KB_LAST_ENTRY_TIME": "15:15",
@@ -330,11 +344,13 @@ def deployment_role_overrides(role):
         "kb-live-max",
         "kb-live-one-lot",
         "opening-pulse-live-max",
+        "nifty-option-buy-live-max",
         "disabled",
     }:
         raise ValueError(f"Unsupported deployment role: {role}")
     live_role = role in {
-        "kb-live-max", "kb-live-one-lot", "opening-pulse-live-max"
+        "kb-live-max", "kb-live-one-lot", "opening-pulse-live-max",
+        "nifty-option-buy-live-max",
     }
     values = {
         "ENABLE_LIVE_TRADING": "true" if live_role else "false",
@@ -370,6 +386,29 @@ def deployment_role_overrides(role):
                 "MAX_LOTS_PER_ENTRY": "0",
                 "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
                 "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "false",
+            }
+        )
+    elif role == "nifty-option-buy-live-max":
+        values.update(
+            {
+                "TRADING_ENGINE": "VAMSI_NIFTY_OPTION_BUY_V1",
+                "VAMSI_OPENING_PULSE_LIVE_ENABLED": "false",
+                "TRADE_BANK_NIFTY": "false",
+                "TRADE_SENSEX": "false",
+                "PAPER_OBSERVATION_MODE_ENABLED": "false",
+                "DEFAULT_TRADING_PROFILE": "MAX",
+                "OPTION_CAPITAL_PER_ENTRY": "MAX",
+                "ACCOUNT_MAX_OPTION_CAPITAL": "0",
+                "ACCOUNT_MAX_LOTS_PER_ENTRY": "0",
+                "MAX_LOTS_PER_ENTRY": "0",
+                "MAX_INDEX_TRADES_PER_DAY": "1",
+                "MAX_DAILY_INDEX_RISK": "0",
+                "INDEX_RISK_PER_TRADE": "0",
+                "VAMSI_KB_FORCE_MAX_ALLOCATION": "false",
+                "ALLOW_BOT_WITH_UNTRACKED_DERIVATIVE_POSITIONS": "false",
+                "AFTER_FIRST_OUTCOME_MODE": "stop",
+                "AFTER_FIRST_PROFIT_MODE": "stop",
+                "AFTER_FIRST_LOSS_MODE": "stop",
             }
         )
     elif role == "kb-live-one-lot":
@@ -415,7 +454,7 @@ def normalized_lines(existing, overrides=None):
             "",
             BLOCK_START,
             "# Account-specific API keys, access tokens, and notification secrets above are preserved.",
-            "# The active knowledge engine ranks qualified NIFTY, BANKNIFTY and SENSEX setups.",
+            "# The deployment role below selects the active deterministic option-buying engine.",
             *[f"{key}={value}" for key, value in values.items()],
             BLOCK_END,
             "",
@@ -458,6 +497,7 @@ def main():
             "kb-live-max",
             "kb-live-one-lot",
             "opening-pulse-live-max",
+            "nifty-option-buy-live-max",
             "disabled",
         ),
         help="Force the knowledge-engine instance role after local overrides.",

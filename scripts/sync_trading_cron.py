@@ -19,6 +19,7 @@ MANAGED_COMMANDS = (
     "ml_shadow_4h_v2_live.py",
     "vamsi_kb_intraday.py",
     "vamsi_opening_pulse.py",
+    "vamsi_nifty_option_buy.py",
     "sync_upstox_today_trades.py",
 )
 
@@ -63,6 +64,24 @@ def opening_pulse_block(app_dir: Path) -> list[str]:
     ]
 
 
+def nifty_option_buy_block(app_dir: Path) -> list[str]:
+    root = str(app_dir)
+    python = f"{root}/venv/bin/python"
+    log_dir = f"{root}/logs"
+    return [
+        BLOCK_START,
+        "# Selective NIFTY option buyer: scan after each completed 5M candle.",
+        f"1-56/5 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        "# One monitor owns the broker stop, target, time stop, reversal exit and trailing.",
+        f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
+        f"* 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
+        "# Close any remaining bot position at 15:00 IST.",
+        f"30 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_squareoff.lock {python} {root}/trade_bot.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
+        f"35 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/upstox_trade_sync.lock {python} {root}/sync_upstox_today_trades.py >> {log_dir}/upstox_trade_sync.log 2>&1",
+        BLOCK_END,
+    ]
+
+
 def normalized_crontab(
     existing: str,
     app_dir: Path,
@@ -92,6 +111,8 @@ def normalized_crontab(
         retained.extend(
             opening_pulse_block(app_dir)
             if mode == "opening-pulse"
+            else nifty_option_buy_block(app_dir)
+            if mode == "nifty-option-buy"
             else canonical_block(app_dir)
         )
     return "\n".join(retained) + ("\n" if retained else "")
@@ -117,7 +138,7 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=("knowledge", "opening-pulse"),
+        choices=("knowledge", "opening-pulse", "nifty-option-buy"),
         default="knowledge",
         help="Install the selected production schedule.",
     )
@@ -140,6 +161,8 @@ def main():
         else (
             "VAMSI_OPENING_PULSE_V1 cron installed"
             if args.mode == "opening-pulse"
+            else "VAMSI_NIFTY_OPTION_BUY_V1 cron installed"
+            if args.mode == "nifty-option-buy"
             else "Canonical VAMSI_KB_INTRADAY_V1 cron installed"
         )
     )

@@ -39,6 +39,8 @@ OPENING_PULSE_CLAIM_FILE = (
     DATA_DIR / "vamsi_opening_pulse" / "daily_entry_claim.json"
 )
 OPENING_PULSE_ENGINE = "VAMSI_OPENING_PULSE_V1"
+NIFTY_OPTION_BUY_SCAN_FILE = DATA_DIR / "vamsi_nifty_option_buy" / "scans.csv"
+NIFTY_OPTION_BUY_ENGINE = "VAMSI_NIFTY_OPTION_BUY_V1"
 ML_SHADOW_LOG_FILE = LOG_DIR / "ml_shadow_v1.log"
 ML_SHADOW_METADATA_FILE = DATA_DIR / "ml_shadow_0920_v3" / "metadata.json"
 ML_SHADOW_PREDICTIONS_FILE = DATA_DIR / "ml_shadow_0920_v3" / "predictions.csv"
@@ -2153,6 +2155,166 @@ def build_opening_pulse_summary() -> dict:
     }
 
 
+def build_nifty_option_buy_performance() -> dict:
+    """Actual P/L created by the selective NIFTY option-buying engine."""
+    today_text = datetime.now(IST).strftime("%Y-%m-%d")
+    trades = [
+        trade
+        for trade in selective_index_trades(read_trade_history())
+        if not is_paper_trade(trade)
+        and normalized_underlying(trade) == "NIFTY"
+        and str(trade.get("strategy") or "").upper() == NIFTY_OPTION_BUY_ENGINE
+    ]
+    payload = _build_trade_performance_payload(trades, today_text)
+    payload["analyticsMode"] = "REAL"
+    payload["symbol"] = "NIFTY"
+    payload["strategy"] = NIFTY_OPTION_BUY_ENGINE
+    return payload
+
+
+def _latest_nifty_option_buy_scan(today: str) -> dict:
+    if not NIFTY_OPTION_BUY_SCAN_FILE.exists():
+        return {}
+    latest = {}
+    try:
+        with NIFTY_OPTION_BUY_SCAN_FILE.open("r", newline="", errors="ignore") as handle:
+            for row in csv.DictReader(handle):
+                if str(row.get("scan_time") or "").startswith(today):
+                    latest = row
+    except OSError:
+        return {}
+    return latest
+
+
+def build_nifty_option_buy_summary() -> dict:
+    """Compact current scan/position view for dashboard and mobile clients."""
+    now = datetime.now(IST)
+    today = now.date().isoformat()
+    scan = _latest_nifty_option_buy_scan(today)
+    state = read_json_file(state_file("NIFTY"), {})
+    if state.get("date") != today or state.get("strategy") != NIFTY_OPTION_BUY_ENGINE:
+        state = {}
+
+    try:
+        raw_components = json.loads(scan.get("components") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_components = {}
+    components = [
+        {
+            "name": name,
+            "earned": safe_float(item.get("earned"), 0),
+            "weight": safe_float(item.get("weight"), 0),
+            "detail": item.get("detail"),
+        }
+        for name, item in raw_components.items()
+        if isinstance(item, dict)
+    ]
+
+    decision = state.get("knowledge_decision") or {}
+    plan = decision.get("plan") or {}
+    status = str(state.get("status") or scan.get("action") or "").upper()
+    if not status:
+        minute = now.hour * 60 + now.minute
+        status = "SCHEDULED" if minute < 9 * 60 + 30 else "NO SCAN"
+    direction = str(state.get("direction") or scan.get("direction") or "").upper()
+    score = safe_float(
+        state.get("weighted_score"),
+        safe_float(scan.get("signed_score"), None),
+    )
+    option_direction = (
+        "CALL" if direction == "BULLISH"
+        else "PUT" if direction == "BEARISH"
+        else None
+    )
+    blockers = [
+        item.strip()
+        for item in str(scan.get("blockers") or "").split("|")
+        if item.strip()
+    ]
+
+    trade = next(
+        (
+            row
+            for row in reversed(read_trade_history())
+            if row.get("tradeDate") == today
+            and normalized_underlying(row) == "NIFTY"
+            and str(row.get("strategy") or "").upper() == NIFTY_OPTION_BUY_ENGINE
+        ),
+        None,
+    )
+    result = None
+    if trade:
+        result = {
+            "pnl": safe_float(trade.get("grossPnL")),
+            "exitPrice": safe_float(trade.get("exitPrice")),
+            "exitReason": trade.get("exitReason") or "CLOSED",
+            "exitTime": trade.get("exitTime") or None,
+        }
+
+    magnitude = abs(score) if score is not None else None
+    return {
+        "engine": NIFTY_OPTION_BUY_ENGINE,
+        "symbol": "NIFTY",
+        "entryTime": "09:30–14:30 IST",
+        "squareoffTime": "15:00 IST",
+        "tradeDate": today,
+        "status": status,
+        "hasDecision": bool(direction),
+        "direction": direction or None,
+        "optionDirection": option_direction,
+        "pulseVote": round(score) if score is not None else None,
+        "pulseStrength": magnitude,
+        "tradingSymbol": state.get("trading_symbol") or scan.get("contract") or None,
+        "quantity": safe_int(state.get("quantity")),
+        "entryPrice": safe_float(
+            state.get("entry_price"), safe_float(scan.get("entry_price"), None)
+        ),
+        "targetPrice": safe_float(state.get("target_price"), None),
+        "stopLossPrice": safe_float(state.get("stop_loss_price"), None),
+        "targetReference": plan.get("target_name") or None,
+        "targetReferencePrice": safe_float(
+            plan.get("target"), safe_float(scan.get("underlying_target"), None)
+        ),
+        "stopReference": (
+            plan.get("stop_name")
+            or state.get("underlying_structural_reference")
+            or None
+        ),
+        "stopReferencePrice": safe_float(
+            plan.get("stop"), safe_float(scan.get("underlying_stop"), None)
+        ),
+        "optionRewardRisk": safe_float(
+            plan.get("reward_risk"), safe_float(scan.get("reward_risk"), None)
+        ),
+        "maximumOptionLossPercent": None,
+        "effectiveOptionLossPercent": None,
+        "premiumRiskCapped": False,
+        "chain": {
+            "direction": "CONFIRMATION",
+            "confidence": "SCORE INPUT",
+            "score": None,
+            "vote": None,
+        },
+        "depth": {
+            "callRatio": None,
+            "putRatio": None,
+            "difference": None,
+            "vote": None,
+        },
+        "fifteenMinuteComponents": components,
+        "gttOrderId": None,
+        "createdAt": state.get("created_at") or scan.get("scan_time") or None,
+        "result": result,
+        "blockers": blockers,
+        "message": (
+            "Waiting for the first completed 15-minute candle and 09:31 scan."
+            if status in {"SCHEDULED", "NO SCAN"}
+            else "; ".join(blockers[:3]) if blockers
+            else None
+        ),
+    }
+
+
 def upstox_headers():
     token = os.getenv("UPSTOX_ACCESS_TOKEN")
 
@@ -2866,8 +3028,9 @@ def build_health_snapshot() -> dict:
         "todayScans": build_today_scans(),
         "postMarketReview": build_post_market_review(),
         "strategyPlan": build_strategy_plan(),
-        "openingPulse": build_opening_pulse_summary(),
-        "openingPulsePerformance": build_opening_pulse_performance(),
+        # Keep the mobile payload keys stable while the active strategy evolves.
+        "openingPulse": build_nifty_option_buy_summary(),
+        "openingPulsePerformance": build_nifty_option_buy_performance(),
         "mlShadow": build_ml_shadow_status(),
         "mlShadowV2": build_ml_shadow_v2_status(),
         "performance": trade_performance,

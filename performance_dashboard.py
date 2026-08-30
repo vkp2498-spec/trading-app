@@ -1,4 +1,4 @@
-"""Minimal SENSEX 09:20 opening-pulse dashboard."""
+"""Minimal selective NIFTY option-buying dashboard."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from pathlib import Path
 import streamlit as st
 
 from dashboard_data import (
-    build_opening_pulse_performance,
-    build_opening_pulse_summary,
+    build_nifty_option_buy_performance,
+    build_nifty_option_buy_summary,
 )
 from strategy_core import now_ist
 
@@ -25,7 +25,7 @@ INDEX_COLUMNS = (
 )
 
 st.set_page_config(
-    page_title="SENSEX Opening Pulse",
+    page_title="NIFTY Option Buying",
     page_icon=str(APP_ICON) if APP_ICON.exists() else "📈",
     layout="wide",
 )
@@ -353,7 +353,7 @@ def render_opening_pulse(pulse: dict) -> None:
     direction = pulse.get("direction") or "Waiting"
     option_direction = pulse.get("optionDirection") or ""
     headline = f"{direction} · {option_direction}" if option_direction else str(direction)
-    contract = pulse.get("tradingSymbol") or pulse.get("message") or "Decision scheduled at 09:20 IST"
+    contract = pulse.get("tradingSymbol") or pulse.get("message") or "Waiting for the next completed-candle scan"
     levels = (
         ("Entry", number(pulse.get("entryPrice"))),
         ("Target", number(pulse.get("targetPrice"))),
@@ -369,7 +369,7 @@ def render_opening_pulse(pulse: dict) -> None:
     )
     st.markdown(
         '<div class="pulse-card"><div class="pulse-top"><div>'
-        '<div class="pulse-symbol">SENSEX · 09:20 OPENING PULSE</div>'
+        '<div class="pulse-symbol">NIFTY · SELECTIVE CE/PE</div>'
         f'<div class="pulse-direction">{html.escape(headline)}</div>'
         f'<div class="pulse-contract">{html.escape(str(contract))}</div>'
         '</div>'
@@ -380,24 +380,22 @@ def render_opening_pulse(pulse: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    chain = pulse.get("chain") or {}
-    depth = pulse.get("depth") or {}
-    risk = pulse.get("effectiveOptionLossPercent")
+    blockers = pulse.get("blockers") or []
     evidence = (
         (
-            "15-minute pulse",
-            f"Vote {int(pulse.get('pulseVote') or 0):+d}" if pulse.get("pulseVote") is not None else "Waiting",
-            f"Strength {number(pulse.get('pulseStrength'), '%')}",
+            "Weighted alignment",
+            f"Score {number(pulse.get('pulseStrength'), '/100')}",
+            "15M + 5M + VWAP + levels + volume + breadth + chain",
         ),
         (
-            "Option chain",
-            str(chain.get("direction") or "NEUTRAL"),
-            f"{chain.get('confidence') or 'LOW'} confidence · score {int(chain.get('score') or 0):+d}",
+            "Underlying plan",
+            f"R:R {number(pulse.get('optionRewardRisk'))}",
+            f"Target {number(pulse.get('targetReferencePrice'))} · stop {number(pulse.get('stopReferencePrice'))}",
         ),
         (
-            "Market depth & risk",
-            f"Vote {int(depth.get('vote') or 0):+d}",
-            f"Premium risk {number(risk, '%')} · option R:R {number(pulse.get('optionRewardRisk'))}",
+            "Decision",
+            str(pulse.get("status") or "WAITING").replace("_", " "),
+            "; ".join(blockers[:2]) if blockers else "All mandatory filters passed or awaiting scan",
         ),
     )
     st.markdown(
@@ -417,19 +415,21 @@ def render_opening_pulse(pulse: dict) -> None:
     components = pulse.get("fifteenMinuteComponents") or []
     if components:
         labels = {
-            "developing_opening_15m_body": "Opening 15M body",
-            "opening_15m_range_position": "Opening range position",
-            "previous_completed_15m_body": "Previous 15M body",
-            "fifteen_minute_band_position": "15M band position",
-            "session_move": "Session move",
-            "overnight_gap": "Overnight gap",
+            "15_min_trend": "15-minute trend",
+            "5_min_structure": "5-minute structure",
+            "vwap": "VWAP",
+            "key_levels": "Key levels",
+            "volume": "Volume",
+            "breadth": "NIFTY breadth",
+            "option_chain": "Option chain",
         }
         st.dataframe(
             [
                 {
-                    "15-minute evidence": labels.get(item.get("name"), item.get("name")),
-                    "Points": item.get("points"),
-                    "Vote": item.get("vote"),
+                    "Decision factor": labels.get(item.get("name"), item.get("name")),
+                    "Earned": item.get("earned"),
+                    "Maximum": item.get("weight"),
+                    "Reading": item.get("detail"),
                 }
                 for item in components
             ],
@@ -440,7 +440,7 @@ def render_opening_pulse(pulse: dict) -> None:
 
 def render_recent_trades(trades: list[dict]) -> None:
     if not trades:
-        st.info("Completed SENSEX opening-pulse trades will appear here.")
+        st.info("Completed NIFTY option-buying trades will appear here.")
         return
     st.dataframe(
         [
@@ -457,8 +457,8 @@ def render_recent_trades(trades: list[dict]) -> None:
     )
 
 
-performance = build_opening_pulse_performance()
-pulse = build_opening_pulse_summary()
+performance = build_nifty_option_buy_performance()
+pulse = build_nifty_option_buy_summary()
 today = performance.get("today") or {}
 cumulative = performance.get("cumulative") or {}
 today_pnl = float(today.get("netPnL", today.get("closedPnL", 0)) or 0)
@@ -466,9 +466,9 @@ cumulative_pnl = float(cumulative.get("netPnL", cumulative.get("totalPnL", 0)) o
 today_trades = int(today.get("closedTrades", 0) or 0)
 total_trades = int(cumulative.get("totalTrades", 0) or 0)
 
-st.markdown('<div class="page-title">SENSEX Opening Pulse</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-title">NIFTY Option Buying</div>', unsafe_allow_html=True)
 st.markdown(
-    f'<div class="page-subtitle">One decision at 09:20 · fixed GTT target/stop · 15:00 square-off · updated {now_ist().strftime("%d %b %Y · %I:%M:%S %p")} IST</div>',
+    f'<div class="page-subtitle">Completed-candle scans · selective CE/PE · underlying target and ATR stop · 15:00 square-off · updated {now_ist().strftime("%d %b %Y · %I:%M:%S %p")} IST</div>',
     unsafe_allow_html=True,
 )
 
@@ -479,13 +479,13 @@ st.markdown(
     '<div class="summary-grid">'
     + summary_card("Today’s P/L", money(today_pnl), f"{today_trades} trade{'s' if today_trades != 1 else ''} today", value_class(today_pnl))
     + summary_card("Cumulative P/L", money(cumulative_pnl), "Recorded live bot trades", value_class(cumulative_pnl))
-    + summary_card("Total Trades", f"{total_trades:,}", "SENSEX opening-pulse trades")
+    + summary_card("Total Trades", f"{total_trades:,}", "Selective NIFTY option trades")
     + "</div>",
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="section-title">Today’s 09:20 Decision</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-subtitle">15-minute structure, option-chain positioning and market depth</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Latest Decision</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-subtitle">15-minute direction, 5-minute entry, VWAP, levels, volume, breadth and option-chain confirmation</div>', unsafe_allow_html=True)
 render_opening_pulse(pulse)
 
 st.markdown('<div class="section-title">P/L Calendar</div>', unsafe_allow_html=True)
@@ -493,5 +493,5 @@ st.markdown('<div class="section-subtitle">Daily completed-trade results</div>',
 render_pnl_calendar(performance.get("pnlCalendar") or [])
 
 st.markdown('<div class="section-title">Recent Trades</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-subtitle">Latest completed SENSEX opening-pulse exits</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-subtitle">Latest completed NIFTY option-buying exits</div>', unsafe_allow_html=True)
 render_recent_trades(performance.get("recentTrades") or [])

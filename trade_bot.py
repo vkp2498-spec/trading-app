@@ -4741,6 +4741,46 @@ def apply_trailing_stop(symbol, state, ltp):
             min(to_float(state.get("lowest_ltp"), entry), current_ltp), 2
         )
 
+    if state.get("strategy") == "VAMSI_NIFTY_OPTION_BUY_V1":
+        original_stop = to_float(
+            state.get("original_stop_loss_price") or state.get("stop_loss_price")
+        )
+        initial_risk = entry - original_stop if not is_short else original_stop - entry
+        favorable_move = entry - current_ltp if is_short else current_ltp - entry
+        favorable_r = favorable_move / initial_risk if initial_risk > 0 else 0.0
+        current_stop = to_float(state.get("stop_loss_price"))
+        current_stage = int(to_float(state.get("profit_protection_stage"), 0) or 0)
+        new_stage = current_stage
+        proposed_stop = current_stop
+        if favorable_r >= 1.5 and current_stage < 2:
+            new_stage = 2
+            proposed_stop = (
+                entry - initial_risk * 0.5 if is_short else entry + initial_risk * 0.5
+            )
+        elif favorable_r >= 1.0 and current_stage < 1:
+            new_stage = 1
+            proposed_stop = entry
+        improved_stop = (
+            min(current_stop, proposed_stop)
+            if is_short else max(current_stop, proposed_stop)
+        )
+        if new_stage != current_stage:
+            state["stop_loss_price"] = round(improved_stop, 2)
+            state["profit_protection_stage"] = new_stage
+            state.setdefault("profit_protection_activated_at", now_ist().isoformat())
+            state["trailing_stop_active"] = True
+            state["trailing_stop_reason"] = (
+                f"risk stage {new_stage}: favorable={favorable_r:.2f}R"
+            )
+            state["favorable_r_multiple"] = round(favorable_r, 3)
+            write_state(symbol, state)
+            log(
+                f"{symbol} risk-based protection activated: stage={new_stage} "
+                f"favorable={favorable_r:.2f}R ltp={current_ltp} "
+                f"stop={state['stop_loss_price']}"
+            )
+        return state
+
     settings = profit_protection_settings()
     if not settings["enabled"]:
         return state
