@@ -75,6 +75,14 @@ def candidate(direction="BULLISH", *, target=120.0, volume_ratio=1.6):
 
 
 class NiftyOptionBuyTests(unittest.TestCase):
+    def test_engine_is_accepted_by_central_runtime_validator(self):
+        with patch.dict(
+            strategy.trade_bot.os.environ,
+            {"TRADING_ENGINE": strategy.ENGINE},
+            clear=False,
+        ):
+            self.assertEqual(strategy.trade_bot.trading_engine(), strategy.ENGINE)
+
     def test_full_alignment_earns_one_hundred_points(self):
         result = strategy.weighted_signal(candidate())
 

@@ -411,10 +411,11 @@ def trading_engine():
         "GANESH",
         "VAMSI_KB_INTRADAY_V1",
         "VAMSI_OPENING_PULSE_V1",
+        "VAMSI_NIFTY_OPTION_BUY_V1",
     }:
         raise RuntimeError(
             "TRADING_ENGINE must be VAMSI, GANESH, VAMSI_KB_INTRADAY_V1, "
-            "or VAMSI_OPENING_PULSE_V1"
+            "VAMSI_OPENING_PULSE_V1, or VAMSI_NIFTY_OPTION_BUY_V1"
         )
     return engine
 
