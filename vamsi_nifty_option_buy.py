@@ -443,6 +443,13 @@ def record_scan(slot: str, action: str, decision=None, candidate=None) -> None:
     )
 
 
+def live_entry_block_reason() -> str:
+    """Block overlapping capital use while allowing unlimited sequential entries."""
+    if trade_bot.state_is_active(trade_bot.read_state(STATE_SLOT)):
+        return "NIFTY bot position is already active"
+    return trade_bot.daily_index_entry_block_reason(SYMBOL) or ""
+
+
 def scan() -> dict:
     trade_bot.load_env()
     if trade_bot.trading_engine() != ENGINE:
@@ -464,13 +471,7 @@ def scan() -> dict:
             sort_keys=True,
         )
 
-        entry_block = ""
-        if trade_bot.state_is_active(trade_bot.read_state(STATE_SLOT)):
-            entry_block = "NIFTY bot position is already active"
-        elif trade_bot.index_trade_count_today() >= 1:
-            entry_block = "one account-wide index trade already used today"
-        else:
-            entry_block = trade_bot.daily_index_entry_block_reason(SYMBOL) or ""
+        entry_block = live_entry_block_reason()
 
         try:
             candidate = trade_bot.evaluate_symbol_buy_or_sell(

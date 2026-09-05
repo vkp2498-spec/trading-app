@@ -120,7 +120,7 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertEqual(values["OPTION_CAPITAL_PER_ENTRY"], "MAX")
         self.assertEqual(values["ACCOUNT_MAX_LOTS_PER_ENTRY"], "0")
 
-    def test_nifty_option_buy_role_is_live_nifty_only_max_and_one_trade(self):
+    def test_nifty_option_buy_role_is_live_nifty_only_max_and_unlimited(self):
         values = deployment_role_overrides("nifty-option-buy-live-max")
 
         self.assertEqual(values["TRADING_ENGINE"], "VAMSI_NIFTY_OPTION_BUY_V1")
@@ -130,7 +130,13 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertEqual(values["TRADE_SENSEX"], "false")
         self.assertEqual(values["OPTION_CAPITAL_PER_ENTRY"], "MAX")
         self.assertEqual(values["ACCOUNT_MAX_LOTS_PER_ENTRY"], "0")
-        self.assertEqual(values["MAX_INDEX_TRADES_PER_DAY"], "1")
+        self.assertEqual(values["MAX_INDEX_TRADES_PER_DAY"], "0")
+        self.assertEqual(values["STOP_AFTER_FIRST_PROFIT_OR_LOSS"], "false")
+        self.assertEqual(values["STOP_AFTER_FIRST_PROFIT"], "false")
+        self.assertEqual(values["STOP_AFTER_FIRST_LOSS"], "false")
+        self.assertEqual(values["MAX_CONSECUTIVE_LOSSES"], "0")
+        self.assertEqual(values["LOSS_REENTRY_MODE"], "off")
+        self.assertEqual(values["REQUIRE_SIGNAL_RESET_FOR_SAME_INDEX_REENTRY"], "false")
 
 
 if __name__ == "__main__":

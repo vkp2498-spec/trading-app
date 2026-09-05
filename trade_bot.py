@@ -2591,7 +2591,10 @@ def option_capital_per_entry():
         "OPTION_CAPITAL_PER_ENTRY",
         str(DEFAULT_OPTION_CAPITAL_PER_ENTRY),
     ).strip()
-    if trading_engine() == "VAMSI_OPENING_PULSE_V1" or (
+    if trading_engine() in {
+        "VAMSI_OPENING_PULSE_V1",
+        "VAMSI_NIFTY_OPTION_BUY_V1",
+    } or (
         trading_engine() == "VAMSI_KB_INTRADAY_V1"
         and configured_bool("VAMSI_KB_FORCE_MAX_ALLOCATION", True)
     ):

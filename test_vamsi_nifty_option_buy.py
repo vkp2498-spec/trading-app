@@ -83,6 +83,47 @@ class NiftyOptionBuyTests(unittest.TestCase):
         ):
             self.assertEqual(strategy.trade_bot.trading_engine(), strategy.ENGINE)
 
+    def test_strategy_forces_max_capital_even_if_saved_profile_is_one_lot(self):
+        environment = {
+            "TRADING_ENGINE": strategy.ENGINE,
+            "OPTION_CAPITAL_PER_ENTRY": "1",
+            "ACCOUNT_MAX_OPTION_CAPITAL": "0",
+        }
+        with patch.dict(strategy.trade_bot.os.environ, environment, clear=False), patch.object(
+            strategy.trade_bot,
+            "active_value",
+            return_value=1,
+        ):
+            self.assertEqual(strategy.trade_bot.option_capital_per_entry(), "MAX")
+
+    def test_prior_daily_trades_do_not_block_a_new_sequential_opportunity(self):
+        with patch.object(strategy.trade_bot, "read_state", return_value={}), patch.object(
+            strategy.trade_bot,
+            "state_is_active",
+            return_value=False,
+        ), patch.object(
+            strategy.trade_bot,
+            "daily_index_entry_block_reason",
+            return_value="",
+        ), patch.object(
+            strategy.trade_bot,
+            "index_trade_count_today",
+            return_value=99,
+        ) as trade_count:
+            self.assertEqual(strategy.live_entry_block_reason(), "")
+            trade_count.assert_not_called()
+
+    def test_active_position_still_blocks_overlapping_max_allocation(self):
+        with patch.object(strategy.trade_bot, "read_state", return_value={"status": "POSITION_OPEN"}), patch.object(
+            strategy.trade_bot,
+            "state_is_active",
+            return_value=True,
+        ):
+            self.assertEqual(
+                strategy.live_entry_block_reason(),
+                "NIFTY bot position is already active",
+            )
+
     def test_full_alignment_earns_one_hundred_points(self):
         result = strategy.weighted_signal(candidate())
 
