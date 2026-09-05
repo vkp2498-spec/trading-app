@@ -352,6 +352,131 @@ class TradeControlTests(unittest.TestCase):
             [atm],
         )
 
+    def test_v1_nifty_contract_ladder_uses_next_atm_then_next_itm(self):
+        recommendation = {
+            "symbol": "NIFTY",
+            "analysis_expiry": "2026-09-08",
+            "execution_expiry": "2026-09-15",
+            "analysis_atm": {"strike": 25000, "expiry": "2026-09-08"},
+            "atm": {"strike": 25000, "expiry": "2026-09-15"},
+            "nearby_contracts": [
+                {"strike": 24950, "expiry": "2026-09-15"},
+                {"strike": 25000, "expiry": "2026-09-15"},
+                {"strike": 25050, "expiry": "2026-09-15"},
+            ],
+            "analysis_nearby_contracts": [
+                {"strike": 24950, "expiry": "2026-09-08"},
+                {"strike": 25000, "expiry": "2026-09-08"},
+                {"strike": 25050, "expiry": "2026-09-08"},
+            ],
+        }
+        monday = datetime(2026, 9, 7, 10, 0)
+        with patch.object(
+            trade_bot, "trading_engine", return_value="VAMSI_NIFTY_OPTION_BUY_V1"
+        ):
+            call_rows = trade_bot.index_contract_rows(
+                recommendation, "BULLISH", current=monday
+            )
+            put_rows = trade_bot.index_contract_rows(
+                recommendation, "BEARISH", current=monday
+            )
+
+        self.assertEqual(
+            [(row["_contract_selection_role"], row["strike"]) for row in call_rows],
+            [("NEXT_EXPIRY_ATM", 25000), ("NEXT_EXPIRY_ITM", 24950)],
+        )
+        self.assertEqual(put_rows[1]["strike"], 25050)
+
+    def test_v1_nifty_contract_ladder_adds_same_expiry_itm_only_early_on_expiry(self):
+        recommendation = {
+            "symbol": "NIFTY",
+            "analysis_expiry": "2026-09-08",
+            "execution_expiry": "2026-09-15",
+            "analysis_atm": {"strike": 25000, "expiry": "2026-09-08"},
+            "atm": {"strike": 25000, "expiry": "2026-09-15"},
+            "nearby_contracts": [
+                {"strike": 24950, "expiry": "2026-09-15"},
+                {"strike": 25000, "expiry": "2026-09-15"},
+            ],
+            "analysis_nearby_contracts": [
+                {"strike": 24950, "expiry": "2026-09-08"},
+                {"strike": 25000, "expiry": "2026-09-08"},
+            ],
+        }
+        with patch.object(
+            trade_bot, "trading_engine", return_value="VAMSI_NIFTY_OPTION_BUY_V1"
+        ):
+            early = trade_bot.index_contract_rows(
+                recommendation, "BULLISH", current=datetime(2026, 9, 8, 11, 0)
+            )
+            late = trade_bot.index_contract_rows(
+                recommendation, "BULLISH", current=datetime(2026, 9, 8, 11, 31)
+            )
+
+        self.assertEqual(early[-1]["_contract_selection_role"], "SAME_EXPIRY_ITM")
+        self.assertEqual(early[-1]["strike"], 24950)
+        self.assertNotIn(
+            "SAME_EXPIRY_ITM",
+            [row["_contract_selection_role"] for row in late],
+        )
+
+    def test_v1_contract_selection_respects_ladder_before_score(self):
+        atm = {
+            "allowed": True,
+            "entry_score": {"score": 60},
+            "contract_selection_rank": 1,
+            "option_summary": {"contract_selection_tier": 0},
+            "transaction_type": "BUY",
+        }
+        itm = {
+            "allowed": True,
+            "entry_score": {"score": 100},
+            "contract_selection_rank": 10,
+            "option_summary": {"contract_selection_tier": 1},
+            "transaction_type": "BUY",
+        }
+        with patch.object(
+            trade_bot, "trading_engine", return_value="VAMSI_NIFTY_OPTION_BUY_V1"
+        ):
+            self.assertIs(trade_bot.select_trade_candidate([itm, atm]), atm)
+
+    def test_v1_contract_limits_match_each_ladder_tier(self):
+        self.assertEqual(
+            trade_bot.nifty_option_buy_contract_limits("NEXT_EXPIRY_ATM"),
+            {
+                "minimum_delta": 0.45,
+                "maximum_delta": 0.65,
+                "maximum_spread_percent": 2.0,
+            },
+        )
+        self.assertEqual(
+            trade_bot.nifty_option_buy_contract_limits("NEXT_EXPIRY_ITM")[
+                "minimum_delta"
+            ],
+            0.55,
+        )
+        same_expiry = trade_bot.nifty_option_buy_contract_limits("SAME_EXPIRY_ITM")
+        self.assertEqual(same_expiry["maximum_delta"], 0.75)
+        self.assertEqual(same_expiry["maximum_spread_percent"], 1.0)
+
+    def test_v1_stale_stream_quote_is_ignored(self):
+        with patch.object(
+            trade_bot,
+            "read_market_cache",
+            return_value={"ltp": 100, "received_at": 900},
+        ), patch.object(trade_bot.time_module, "time", return_value=1000):
+            self.assertEqual(trade_bot.recent_option_stream_quote("NSE_FO|1"), {})
+
+        with patch.object(
+            trade_bot,
+            "read_market_cache",
+            return_value={"ltp": 101, "received_at": 995},
+        ), patch.object(trade_bot.time_module, "time", return_value=1000):
+            self.assertEqual(
+                trade_bot.recent_option_stream_quote("NSE_FO|1")["ltp"],
+                101,
+            )
+
     def test_candidate_scores_near_expiry_flow_but_checks_execution_flow(self):
         rec = {
             "symbol": "NIFTY",

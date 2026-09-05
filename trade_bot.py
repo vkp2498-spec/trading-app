@@ -3187,13 +3187,85 @@ def find_index_option_instrument(symbol, expiry_text, strike, option_type):
     return sorted(matches, key=lambda x: x.get("lot_size", 0))[0]
 
 
-def index_contract_rows(recommendation, direction):
-    """Return ATM and nearest one-strike-ITM rows for execution comparison."""
+def _nearest_itm_contract(rows, atm_strike, expiry, direction):
+    """Return the closest one-strike ITM row for a directional option BUY."""
+    candidates = [
+        dict(row)
+        for row in rows or []
+        if isinstance(row, dict) and str(row.get("expiry") or "") == str(expiry or "")
+    ]
+    if direction == "BULLISH":
+        eligible = [row for row in candidates if 0 < to_float(row.get("strike")) < atm_strike]
+        return max(eligible, key=lambda row: to_float(row.get("strike")), default=None)
+    eligible = [row for row in candidates if to_float(row.get("strike")) > atm_strike]
+    return min(eligible, key=lambda row: to_float(row.get("strike")), default=None)
+
+
+def _contract_ladder_row(row, role, tier):
+    result = dict(row)
+    result["_contract_selection_role"] = role
+    result["_contract_selection_tier"] = int(tier)
+    return result
+
+
+def _same_expiry_itm_allowed(recommendation, current=None):
+    """Permit the aggressive expiry-day fallback only in its early window."""
+    if not configured_bool("NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_ENABLED", True):
+        return False
+    current = current or now_ist()
+    try:
+        analysis_expiry = parse_expiry(recommendation.get("analysis_expiry"))
+        execution_expiry = parse_expiry(recommendation.get("execution_expiry"))
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    cutoff = configured_clock(
+        "NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_LAST_ENTRY_TIME",
+        "11:30",
+    )
+    return bool(
+        analysis_expiry == current.date()
+        and execution_expiry != analysis_expiry
+        and current.time() <= cutoff
+    )
+
+
+def index_contract_rows(recommendation, direction, current=None):
+    """Return ordered execution contracts, including the V1 NIFTY ladder."""
     atm = dict(recommendation.get("atm") or {})
     if not atm:
         return []
-    # NIFTY signal evidence comes from the nearest expiry, but execution uses
-    # the next-expiry ATM contract exactly.
+    if (
+        recommendation.get("symbol") == "NIFTY"
+        and trading_engine() == "VAMSI_NIFTY_OPTION_BUY_V1"
+    ):
+        execution_expiry = atm.get("expiry")
+        atm_strike = to_float(atm.get("strike"))
+        rows = [_contract_ladder_row(atm, "NEXT_EXPIRY_ATM", 0)]
+        if configured_bool("NIFTY_OPTION_BUY_ITM_FALLBACK_ENABLED", True):
+            execution_itm = _nearest_itm_contract(
+                recommendation.get("nearby_contracts") or [],
+                atm_strike,
+                execution_expiry,
+                direction,
+            )
+            if execution_itm:
+                rows.append(
+                    _contract_ladder_row(execution_itm, "NEXT_EXPIRY_ITM", 1)
+                )
+        if _same_expiry_itm_allowed(recommendation, current=current):
+            analysis_atm = dict(recommendation.get("analysis_atm") or {})
+            same_expiry_itm = _nearest_itm_contract(
+                recommendation.get("analysis_nearby_contracts") or [],
+                to_float(analysis_atm.get("strike")),
+                analysis_atm.get("expiry"),
+                direction,
+            )
+            if same_expiry_itm:
+                rows.append(
+                    _contract_ladder_row(same_expiry_itm, "SAME_EXPIRY_ITM", 2)
+                )
+        return rows
+    # Other NIFTY engines retain their exact ATM execution contract.
     if recommendation.get("symbol") == "NIFTY":
         return [atm]
     if not configured_bool("INDEX_CONTRACT_SELECTION_ENABLED", True):
@@ -3211,6 +3283,64 @@ def index_contract_rows(recommendation, direction):
     if itm and to_float(itm.get("strike")) != atm_strike:
         rows.append(itm)
     return rows
+
+
+def nifty_option_buy_contract_limits(contract_role):
+    """Return the V1 delta/spread limits for one contract-ladder tier."""
+    role = str(contract_role or "NEXT_EXPIRY_ATM").upper()
+    if role == "NEXT_EXPIRY_ITM":
+        return {
+            "minimum_delta": configured_non_negative_float(
+                "NIFTY_OPTION_BUY_NEXT_ITM_MIN_DELTA", 0.55
+            ),
+            "maximum_delta": configured_non_negative_float(
+                "NIFTY_OPTION_BUY_NEXT_ITM_MAX_DELTA", 0.70
+            ),
+            "maximum_spread_percent": configured_positive_float(
+                "NIFTY_OPTION_BUY_MAX_SPREAD_PERCENT", 2.0
+            ),
+        }
+    if role == "SAME_EXPIRY_ITM":
+        return {
+            "minimum_delta": configured_non_negative_float(
+                "NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_MIN_DELTA", 0.60
+            ),
+            "maximum_delta": configured_non_negative_float(
+                "NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_MAX_DELTA", 0.75
+            ),
+            "maximum_spread_percent": configured_positive_float(
+                "NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_MAX_SPREAD_PERCENT", 1.0
+            ),
+        }
+    return {
+        "minimum_delta": configured_non_negative_float(
+            "NIFTY_OPTION_BUY_MIN_DELTA", 0.45
+        ),
+        "maximum_delta": configured_non_negative_float(
+            "NIFTY_OPTION_BUY_MAX_DELTA", 0.65
+        ),
+        "maximum_spread_percent": configured_positive_float(
+            "NIFTY_OPTION_BUY_MAX_SPREAD_PERCENT", 2.0
+        ),
+    }
+
+
+def recent_option_stream_quote(instrument_key):
+    """Ignore a stale stream quote so the freshly fetched chain remains authoritative."""
+    quote = read_market_cache(instrument_key) or {}
+    received_at = to_float(quote.get("received_at"), 0)
+    maximum_age = configured_positive_float(
+        "NIFTY_OPTION_BUY_STREAM_QUOTE_MAX_AGE_SECONDS", 15.0
+    )
+    age = time_module.time() - received_at if received_at > 0 else None
+    if age is None or age < 0 or age > maximum_age:
+        if quote:
+            verbose_log(
+                f"NIFTY option stream quote ignored as stale: instrument={instrument_key} "
+                f"age={age if age is not None else 'unknown'}"
+            )
+        return {}
+    return quote
 
 
 def ganesh_gap_occupied_contract_keys(force=False):
@@ -5378,11 +5508,30 @@ def build_trade_candidate(
         analysis_atm["strike"],
         option_type,
     )
-    stream_quote = read_market_cache(instrument.get("instrument_key"))
+    contract_role = str(
+        atm.get("_contract_selection_role") or "DEFAULT"
+    ).upper()
+    contract_tier = to_int(atm.get("_contract_selection_tier"), 99)
+    if trading_engine() == "VAMSI_NIFTY_OPTION_BUY_V1" and symbol == "NIFTY":
+        stream_quote = recent_option_stream_quote(instrument.get("instrument_key"))
+    else:
+        stream_quote = read_market_cache(instrument.get("instrument_key"))
     option_quality = option_contract_quality(atm, option_type, stream_quote)
     option_quality["instrument_key"] = instrument.get("instrument_key")
-    option_quality["max_spread_percent"] = to_float(
-        os.getenv("MAX_OPTION_SPREAD_PERCENT"), 2.5
+    option_quality["contract_role"] = contract_role
+    option_quality["contract_tier"] = contract_tier
+    v1_contract = bool(
+        trading_engine() == "VAMSI_NIFTY_OPTION_BUY_V1"
+        and symbol == "NIFTY"
+        and contract_role != "DEFAULT"
+    )
+    contract_limits = (
+        nifty_option_buy_contract_limits(contract_role) if v1_contract else {}
+    )
+    option_quality["max_spread_percent"] = (
+        contract_limits["maximum_spread_percent"]
+        if v1_contract
+        else to_float(os.getenv("MAX_OPTION_SPREAD_PERCENT"), 2.5)
     )
     option_quality["depth_filter_enabled"] = os.getenv(
         "OPTION_DEPTH_FILTER", "false"
@@ -5390,8 +5539,18 @@ def build_trade_candidate(
     option_quality["greeks_filter_enabled"] = os.getenv(
         "OPTION_GREEKS_FILTER", "true"
     ).lower() == "true"
-    min_delta = to_float(os.getenv("MIN_OPTION_DELTA"), 0.20)
-    max_delta = to_float(os.getenv("MAX_OPTION_DELTA"), 0.80)
+    min_delta = (
+        contract_limits["minimum_delta"]
+        if v1_contract
+        else to_float(os.getenv("MIN_OPTION_DELTA"), 0.20)
+    )
+    max_delta = (
+        contract_limits["maximum_delta"]
+        if v1_contract
+        else to_float(os.getenv("MAX_OPTION_DELTA"), 0.80)
+    )
+    option_quality["minimum_delta"] = min_delta
+    option_quality["maximum_delta"] = max_delta
     option_quality["entry_allowed"] = True
     quality_reasons = []
     if option_quality.get("spread_percent") is not None and option_quality["spread_percent"] > option_quality["max_spread_percent"]:
@@ -5405,6 +5564,30 @@ def build_trade_candidate(
             option_quality["entry_allowed"] = False
             quality_reasons.append(
                 f"delta {option_quality['delta']:.3f} outside {min_delta:.2f}-{max_delta:.2f}"
+            )
+    if v1_contract and option_quality.get("delta") is None:
+        option_quality["entry_allowed"] = False
+        quality_reasons.append("fresh option delta is unavailable")
+    if v1_contract:
+        maximum_iv = configured_positive_float("NIFTY_OPTION_BUY_MAX_IV", 35.0)
+        option_quality["maximum_iv"] = maximum_iv
+        if (
+            option_quality.get("iv") is not None
+            and to_float(option_quality.get("iv")) > maximum_iv
+        ):
+            option_quality["entry_allowed"] = False
+            quality_reasons.append(
+                f"IV {to_float(option_quality.get('iv')):.2f} exceeds {maximum_iv:.2f}"
+            )
+    if contract_role == "SAME_EXPIRY_ITM":
+        lot_size = max(to_int(instrument.get("lot_size"), 0), 1)
+        if (
+            to_float(option_quality.get("bid_qty"), 0) < lot_size
+            or to_float(option_quality.get("ask_qty"), 0) < lot_size
+        ):
+            option_quality["entry_allowed"] = False
+            quality_reasons.append(
+                "same-expiry ITM top-of-book depth is below one complete lot"
             )
     if option_quality.get("depth_filter_enabled") and option_quality.get("depth_bias") not in {"NEUTRAL", direction}:
         option_quality["entry_allowed"] = False
@@ -5519,6 +5702,8 @@ def build_trade_candidate(
         "trading_symbol": instrument["trading_symbol"],
         "option_chain_trend": option_trend,
         "option_market_quality": option_quality,
+        "contract_selection_role": contract_role,
+        "contract_selection_tier": contract_tier,
         "strategy": rec.get("strategy", "TREND_FOLLOWING"),
     }
     weighted = weighted_alignment_score(option_summary, technicals, option_trend)
@@ -5839,14 +6024,21 @@ def select_trade_candidate(candidates, allow_sell=True):
         and candidate.get("allowed")
         and candidate.get("transaction_type") == "BUY"
     ]
-    return max(
-        qualified,
-        key=lambda item: (
-            candidate_weighted_score(item),
-            float(item.get("contract_selection_rank") or 0),
-        ),
-        default=None,
-    )
+    return max(qualified, key=trade_candidate_selection_key, default=None)
+
+
+def trade_candidate_selection_key(candidate):
+    """Prefer the first valid V1 contract tier before comparing quality ranks."""
+    score = candidate_weighted_score(candidate)
+    rank = float(candidate.get("contract_selection_rank") or 0)
+    summary = candidate.get("option_summary") or {}
+    tier = summary.get("contract_selection_tier")
+    if (
+        trading_engine() == "VAMSI_NIFTY_OPTION_BUY_V1"
+        and tier is not None
+    ):
+        return (-to_int(tier, 99), score, rank)
+    return (0, score, rank)
 
 
 def evaluate_symbol_buy_or_sell(
@@ -6159,10 +6351,7 @@ def evaluate_symbol_buy_or_sell(
                 and candidate.get("paper_observation_eligible")
                 and candidate.get("transaction_type") == "BUY"
             ),
-            key=lambda item: (
-                candidate_weighted_score(item),
-                float(item.get("contract_selection_rank") or 0),
-            ),
+            key=trade_candidate_selection_key,
             default=None,
         )
     else:

@@ -305,9 +305,18 @@ def evaluate_candidate(candidate: dict, current=None) -> dict:
 
     delta = abs(number(quality.get("delta")))
     spread = quality.get("spread_percent")
-    minimum_delta = configured_float("NIFTY_OPTION_BUY_MIN_DELTA", 0.45)
-    maximum_delta = configured_float("NIFTY_OPTION_BUY_MAX_DELTA", 0.65)
-    maximum_spread = configured_float("NIFTY_OPTION_BUY_MAX_SPREAD_PERCENT", 2.0)
+    minimum_delta = number(
+        quality.get("minimum_delta"),
+        configured_float("NIFTY_OPTION_BUY_MIN_DELTA", 0.45),
+    )
+    maximum_delta = number(
+        quality.get("maximum_delta"),
+        configured_float("NIFTY_OPTION_BUY_MAX_DELTA", 0.65),
+    )
+    maximum_spread = number(
+        quality.get("max_spread_percent"),
+        configured_float("NIFTY_OPTION_BUY_MAX_SPREAD_PERCENT", 2.0),
+    )
     if not minimum_delta <= delta <= maximum_delta:
         blockers.append(
             f"option delta {delta:.3f} is outside {minimum_delta:.2f}-{maximum_delta:.2f}"
@@ -318,6 +327,13 @@ def evaluate_candidate(candidate: dict, current=None) -> dict:
         blockers.append("option quote is not executable")
     if quality.get("entry_allowed") is False:
         blockers.append("option contract quality rejected execution")
+    if str(quality.get("contract_role") or "").upper() == "SAME_EXPIRY_ITM":
+        lot_size = max(int(number((candidate.get("instrument") or {}).get("lot_size"), 1)), 1)
+        if (
+            number(quality.get("bid_qty")) < lot_size
+            or number(quality.get("ask_qty")) < lot_size
+        ):
+            blockers.append("same-expiry ITM depth is below one complete lot")
     expected_option_type = "CE" if direction == "BULLISH" else "PE"
     actual_option_type = str(
         (candidate.get("option_summary") or {}).get("option_type") or ""

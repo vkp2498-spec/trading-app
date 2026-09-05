@@ -137,6 +137,14 @@ class SyncCoreEnvTests(unittest.TestCase):
         self.assertEqual(values["MAX_CONSECUTIVE_LOSSES"], "0")
         self.assertEqual(values["LOSS_REENTRY_MODE"], "off")
         self.assertEqual(values["REQUIRE_SIGNAL_RESET_FOR_SAME_INDEX_REENTRY"], "false")
+        self.assertEqual(CORE_VALUES["NIFTY_OPTION_BUY_ITM_FALLBACK_ENABLED"], "true")
+        self.assertEqual(CORE_VALUES["NIFTY_OPTION_BUY_NEXT_ITM_MIN_DELTA"], "0.55")
+        self.assertEqual(CORE_VALUES["NIFTY_OPTION_BUY_NEXT_ITM_MAX_DELTA"], "0.70")
+        self.assertEqual(CORE_VALUES["NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_ENABLED"], "true")
+        self.assertEqual(
+            CORE_VALUES["NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_LAST_ENTRY_TIME"],
+            "11:30",
+        )
 
 
 if __name__ == "__main__":
