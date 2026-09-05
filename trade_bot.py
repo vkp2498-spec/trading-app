@@ -1688,6 +1688,8 @@ def reentry_block_reason(symbol, direction):
         return ""
 
     if guard.get("mode") == "signal_reset":
+        if not require_signal_reset_for_same_index_reentry():
+            return ""
         if not guard.get("reset_seen"):
             return (
                 f"same-index second trade blocked after {guard.get('exit_reason')} at "
@@ -6573,13 +6575,14 @@ def _execute_selected_candidate_locked(chosen):
             )
         )
         if not portfolio_decision.get("allowed"):
+            chosen["execution_rejection_reason"] = portfolio_decision.get("reason")
             log_scan_decision(
                 symbol,
                 candidate_weighted_score(chosen),
                 "reject",
                 score_version=candidate_score_version(chosen),
             )
-            verbose_log(
+            log(
                 f"{symbol} portfolio gate rejected entry: "
                 f"{portfolio_decision.get('reason')}"
             )

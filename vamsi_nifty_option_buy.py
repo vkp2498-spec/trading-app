@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 
 import trade_bot
+import market_technicals
+from institutional_flow import nearest_index_future
 from safe_storage import atomic_write_json, file_lock, locked_append_csv
 
 
@@ -124,6 +126,7 @@ def weighted_signal(candidate: dict) -> dict:
             "weight": 15.0,
             "earned": 15.0 if _aligned(five.get("vwap_bias"), direction) else 0.0,
             "detail": five.get("vwap_bias") or "UNAVAILABLE",
+            "source": five.get("participation_source") or "UNDERLYING",
         },
         "key_levels": {
             "weight": 15.0,
@@ -137,6 +140,7 @@ def weighted_signal(candidate: dict) -> dict:
             >= configured_float("NIFTY_OPTION_BUY_MIN_VOLUME_RATIO", 1.5)
             else 0.0,
             "detail": number(five.get("volume_ratio")),
+            "source": five.get("participation_source") or "UNDERLYING",
         },
         "breadth": {
             "weight": 10.0,
@@ -171,7 +175,7 @@ def weighted_signal(candidate: dict) -> dict:
     )
     return {
         "direction": direction,
-        "option_direction": "CALL" if direction == "BULLISH" else "PUT",
+        "option_direction": "CALL" if direction == "BULLISH" else "PUT" if direction == "BEARISH" else "NONE",
         "score": signed,
         "magnitude": magnitude,
         "components": components,
@@ -201,8 +205,8 @@ def underlying_trade_plan(candidate: dict) -> dict:
             (fifteen.get("recent_swing_high"), "15M swing high"),
             (five.get("upper_band"), "5M upper band"),
             (fifteen.get("upper_band"), "15M upper band"),
-            (five.get("target"), "5M target"),
-            (fifteen.get("target"), "15M target"),
+            (None if five.get("target_is_fallback") else five.get("target"), "5M target"),
+            (None if fifteen.get("target_is_fallback") else fifteen.get("target"), "15M target"),
         ]
         valid_stops = [(number(v), n) for v, n in stop_candidates if 0 < number(v) < entry]
         valid_targets = [(number(v), n) for v, n in target_candidates if number(v) > entry]
@@ -223,8 +227,8 @@ def underlying_trade_plan(candidate: dict) -> dict:
             (fifteen.get("recent_swing_low"), "15M swing low"),
             (five.get("lower_band"), "5M lower band"),
             (fifteen.get("lower_band"), "15M lower band"),
-            (five.get("target"), "5M target"),
-            (fifteen.get("target"), "15M target"),
+            (None if five.get("target_is_fallback") else five.get("target"), "5M target"),
+            (None if fifteen.get("target_is_fallback") else fifteen.get("target"), "15M target"),
         ]
         valid_stops = [(number(v), n) for v, n in stop_candidates if number(v) > entry]
         valid_targets = [(number(v), n) for v, n in target_candidates if 0 < number(v) < entry]
@@ -254,7 +258,10 @@ def underlying_trade_plan(candidate: dict) -> dict:
         "reason": (
             "underlying target and structure/ATR stop qualify"
             if reward_risk >= minimum_rr
-            else f"underlying reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}"
+            else (
+                f"underlying reward/risk {reward_risk:.2f} is below {minimum_rr:.2f}; "
+                f"nearest target {target_name}={target:.2f}, reward={reward:.2f}, risk={risk:.2f}"
+            )
         ),
         "entry": round(entry, 2),
         "target": round(target, 2),
@@ -269,7 +276,7 @@ def underlying_trade_plan(candidate: dict) -> dict:
     }
 
 
-def evaluate_candidate(candidate: dict, current=None) -> dict:
+def evaluate_candidate(candidate: dict, current=None, *, check_contract=True) -> dict:
     current = current or trade_bot.now_ist()
     signal = weighted_signal(candidate)
     direction = signal["direction"]
@@ -303,20 +310,23 @@ def evaluate_candidate(candidate: dict, current=None) -> dict:
             f"realised volatility {atr_percent:.3f}% is below {minimum_atr_percent:.3f}%"
         )
 
+    blockers.extend(technicals.get("data_blockers") or [])
+    if not plan.get("allowed"):
+        blockers.append(plan.get("reason") or "underlying target/stop plan failed")
+    market_result = {
+        **signal, "allowed": not blockers, "blockers": blockers,
+        "plan": plan, "regime": regime, "option_quality": quality,
+        "five_minute": five, "fifteen_minute": fifteen,
+    }
+    if not check_contract:
+        return market_result
+
     delta = abs(number(quality.get("delta")))
     spread = quality.get("spread_percent")
-    minimum_delta = number(
-        quality.get("minimum_delta"),
-        configured_float("NIFTY_OPTION_BUY_MIN_DELTA", 0.45),
-    )
-    maximum_delta = number(
-        quality.get("maximum_delta"),
-        configured_float("NIFTY_OPTION_BUY_MAX_DELTA", 0.65),
-    )
-    maximum_spread = number(
-        quality.get("max_spread_percent"),
-        configured_float("NIFTY_OPTION_BUY_MAX_SPREAD_PERCENT", 2.0),
-    )
+    limits = trade_bot.nifty_option_buy_contract_limits(quality.get("contract_role"))
+    minimum_delta = limits["minimum_delta"]
+    maximum_delta = limits["maximum_delta"]
+    maximum_spread = limits["maximum_spread_percent"]
     if not minimum_delta <= delta <= maximum_delta:
         blockers.append(
             f"option delta {delta:.3f} is outside {minimum_delta:.2f}-{maximum_delta:.2f}"
@@ -328,6 +338,11 @@ def evaluate_candidate(candidate: dict, current=None) -> dict:
     if quality.get("entry_allowed") is False:
         blockers.append("option contract quality rejected execution")
     if str(quality.get("contract_role") or "").upper() == "SAME_EXPIRY_ITM":
+        cutoff = trade_bot.configured_clock(
+            "NIFTY_OPTION_BUY_SAME_EXPIRY_ITM_LAST_ENTRY_TIME", "11:30"
+        )
+        if current.time() > cutoff:
+            blockers.append("same-expiry ITM entry window ended at 11:30")
         lot_size = max(int(number((candidate.get("instrument") or {}).get("lot_size"), 1)), 1)
         if (
             number(quality.get("bid_qty")) < lot_size
@@ -345,9 +360,6 @@ def evaluate_candidate(candidate: dict, current=None) -> dict:
     maximum_iv = configured_float("NIFTY_OPTION_BUY_MAX_IV", 35.0)
     if quality.get("iv") is not None and number(quality.get("iv")) > maximum_iv:
         blockers.append(f"option IV {number(quality.get('iv')):.2f} exceeds {maximum_iv:.2f}")
-
-    if not plan.get("allowed"):
-        blockers.append(plan.get("reason") or "underlying target/stop plan failed")
 
     days_to_expiry = int(number(regime.get("days_to_expiry"), 99))
     expiry_cutoff = trade_bot.configured_clock(
@@ -437,6 +449,18 @@ def record_scan(slot: str, action: str, decision=None, candidate=None) -> None:
     instrument = candidate.get("instrument") or {}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     locked_append_csv(
+        DATA_DIR / "decision_details.csv",
+        ("scan_time", "scan_slot", "action", "details"),
+        {
+            "scan_time": trade_bot.now_ist().isoformat(), "scan_slot": slot,
+            "action": action,
+            "details": json.dumps({
+                "decision": decision,
+                "participation": (candidate.get("technicals") or {}).get("participation"),
+            }, default=str, sort_keys=True),
+        },
+    )
+    locked_append_csv(
         SCAN_FILE,
         SCAN_COLUMNS,
         {
@@ -457,6 +481,204 @@ def record_scan(slot: str, action: str, decision=None, candidate=None) -> None:
             "components": json.dumps(decision.get("components") or {}, sort_keys=True),
         },
     )
+
+
+def candle_data_problem(analysis, minutes, current):
+    """Validate a completed same-session candle, using its end time for age."""
+    try:
+        start = datetime.fromisoformat(str(analysis.get("candle_time")))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=current.tzinfo)
+        age = (current - start).total_seconds() - minutes * 60
+        if start.date() != current.date() or age < 0 or age > minutes * 60 + 90:
+            return f"{minutes}M candle is stale or incomplete"
+        if number(analysis.get("close")) <= 0:
+            return f"{minutes}M close is unavailable"
+    except (TypeError, ValueError):
+        return f"{minutes}M candle timestamp is unavailable"
+    return ""
+
+
+def add_futures_participation(technicals, current):
+    """Use traded futures for volume/VWAP, projecting VWAP into spot units."""
+    future = nearest_index_future(SYMBOL)
+    key = future["instrument_key"]
+    history = market_technicals.fetch_v3_historical_minutes(key, minutes=5, lookback_days=5)
+    intraday = market_technicals.fetch_v3_intraday_minutes(key, minutes=5)
+    frame = market_technicals.completed_candles(
+        market_technicals.merge_candles(history, intraday), 5,
+        grace_seconds=configured_float("COMPLETED_CANDLE_GRACE_SECONDS", 8),
+    )
+    futures = market_technicals.analyze_latest(frame, "5M")
+    problem = candle_data_problem(futures, 5, current)
+    spot = technicals["five_min"]
+    if problem or futures.get("candle_time") != spot.get("candle_time"):
+        raise ValueError(problem or "futures and spot candles are not time-aligned")
+    if (
+        number(futures.get("volume")) <= 0
+        or number(futures.get("volume_ma20")) <= 0
+        or number(futures.get("vwap")) <= 0
+    ):
+        raise ValueError("futures volume or session VWAP is unavailable")
+    basis = number(futures["close"]) - number(spot["close"])
+    spot.update({
+        "vwap": round(number(futures["vwap"]) - basis, 2),
+        "vwap_bias": futures["vwap_bias"],
+        "volume_ratio": futures["volume_ratio"],
+        "participation_source": "NIFTY_FUTURES",
+    })
+    technicals["participation"] = {
+        **future, "candle_time": futures["candle_time"],
+        "futures_close": futures["close"], "futures_vwap": futures["vwap"],
+        "futures_volume": futures["volume"], "volume_ratio": futures["volume_ratio"],
+        "basis": round(basis, 2), "spot_equivalent_vwap": spot["vwap"],
+    }
+
+
+def market_candidate(recommendation, technicals, current):
+    """Let completed 15M price structure choose direction; chain earns five points."""
+    direction = (technicals.get("fifteen_min") or {}).get("bias") or "NEUTRAL"
+    value = {
+        "symbol": SYMBOL, "direction": direction, "transaction_type": "BUY",
+        "technicals": deepcopy(technicals),
+        "option_summary": {
+            "chain_bias": recommendation.get("direction"),
+            "chain_confidence": recommendation.get("confidence"),
+            "option_type": "CE" if direction == "BULLISH" else "PE",
+        },
+    }
+    t = value["technicals"]
+    t["entry_structure"] = trade_bot.entry_structure_for_direction(
+        t, direction, retest_buffer_atr=configured_float("ENTRY_RETEST_BUFFER_ATR", 0.25)
+    )
+    t["market_regime"] = trade_bot.classify_market_regime(
+        t, compression_width_percent=configured_float("REGIME_COMPRESSION_BB_WIDTH_PERCENT", 0.18),
+        extreme_atr_percent=configured_float("NIFTY_REGIME_EXTREME_ATR_PERCENT", 0.35),
+    )
+    return value
+
+
+def contract_candidate(base, row, current):
+    value = deepcopy(base)
+    option_type = value["option_summary"]["option_type"]
+    instrument = trade_bot.find_index_option_instrument(
+        SYMBOL, row["expiry"], row["strike"], option_type
+    )
+    # All contract fields come from the same fresh REST chain snapshot. A stream
+    # receipt timestamp alone cannot establish that its Greeks are current.
+    quality = trade_bot.option_contract_quality(row, option_type)
+    quality["contract_role"] = row["_contract_selection_role"]
+    quality["entry_allowed"] = True
+    quote_problems = []
+    fatal_problems = []
+    bid, ask = number(quality.get("bid_price")), number(quality.get("ask_price"))
+    if bid <= 0 or ask < bid or number(quality.get("ltp")) <= 0:
+        quote_problems.append("positive uncrossed bid/ask and LTP required")
+    if min(number(quality.get("bid_qty")), number(quality.get("ask_qty"))) <= 0:
+        quote_problems.append("two-sided option depth is unavailable")
+    try:
+        stamp = datetime.fromisoformat(str(row.get("timestamp")))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=current.tzinfo)
+        age = (current - stamp).total_seconds()
+        if not 0 <= age <= 30:
+            fatal_problems.append("option-chain snapshot is stale")
+    except (TypeError, ValueError):
+        fatal_problems.append("option-chain timestamp is unavailable")
+    delta = number(quality.get("delta"))
+    signed_delta = delta if option_type == "CE" else -delta
+    if not 0 < signed_delta <= 1 or number(quality.get("iv")) <= 0:
+        fatal_problems.append("option Greeks are missing or invalid")
+    quote_problems.extend(fatal_problems)
+    quality["data_problems"] = quote_problems
+    quality["fatal_data_problems"] = fatal_problems
+    quality["entry_allowed"] = not quote_problems
+    value.update(instrument=instrument, entry_price=ask)
+    value["option_summary"].update({
+        "strike": row["strike"], "expiry": row["expiry"],
+        "trading_symbol": instrument["trading_symbol"],
+        "option_market_quality": quality,
+        "contract_selection_role": row["_contract_selection_role"],
+    })
+    value["technicals"]["market_regime"]["days_to_expiry"] = (
+        trade_bot.parse_expiry(row["expiry"]) - current.date()
+    ).days
+    return value
+
+
+def select_complete_contract(base, recommendation, current):
+    """Apply every final gate before choosing a tier; refresh bad data once."""
+    attempts = []
+    rows = trade_bot.index_contract_rows(recommendation, base["direction"], current=current)
+    selected = base
+    decision = evaluate_candidate(base, current, check_contract=False)
+    if not decision["allowed"]:
+        return base, decision
+    for row in rows:
+        try:
+            current = trade_bot.now_ist()
+            selected = contract_candidate(base, row, current)
+            if selected["option_summary"]["option_market_quality"]["data_problems"]:
+                atm, nearby, _ = trade_bot.fetch_upstox_option_chain(
+                    SYMBOL, nearby=5, expiry=row["expiry"]
+                )
+                refreshed = atm.iloc[0].to_dict()
+                if row["_contract_selection_role"] != "NEXT_EXPIRY_ATM":
+                    refreshed = trade_bot._nearest_itm_contract(
+                        nearby.to_dict("records"), number(refreshed["strike"]),
+                        row["expiry"], base["direction"],
+                    )
+                if not refreshed:
+                    raise ValueError("one-strike ITM unavailable after refresh")
+                row = trade_bot._contract_ladder_row(
+                    refreshed, row["_contract_selection_role"], row["_contract_selection_tier"]
+                )
+                current = trade_bot.now_ist()
+                selected = contract_candidate(base, row, current)
+            quality = selected["option_summary"]["option_market_quality"]
+            decision = evaluate_candidate(selected, current)
+            attempts.append({
+                "role": row["_contract_selection_role"], "strike": row["strike"],
+                "expiry": row["expiry"], "blockers": decision["blockers"] + quality["data_problems"],
+            })
+            if decision["allowed"]:
+                decision["contract_attempts"] = attempts
+                return selected, decision
+            if quality["fatal_data_problems"]:
+                # Missing data must not send the account into a riskier expiry.
+                decision["blockers"].extend(quality["data_problems"])
+                break
+        except Exception as error:
+            decision = evaluate_candidate(base, current, check_contract=False)
+            decision.update(allowed=False, blockers=[f"contract data unavailable: {error}"])
+            attempts.append({"role": row["_contract_selection_role"], "blockers": decision["blockers"]})
+            break
+    decision["allowed"] = False
+    decision["contract_attempts"] = attempts
+    decision["blockers"] = [
+        f"{attempt['role']}: {'; '.join(attempt['blockers'])}" for attempt in attempts
+    ] or ["no execution contracts available"]
+    return selected, decision
+
+
+def collect_candidate(current):
+    recommendation = trade_bot.get_index_recommendation(SYMBOL)
+    trade_bot.record_option_chain_snapshot(SYMBOL, recommendation)
+    trade_bot.ensure_instruments_file()
+    technicals = trade_bot.get_technical_analysis(SYMBOL)
+    technicals["data_blockers"] = [
+        problem for name, minutes in (("five_min", 5), ("fifteen_min", 15))
+        if (problem := candle_data_problem(technicals.get(name) or {}, minutes, current))
+    ]
+    try:
+        add_futures_participation(technicals, current)
+    except Exception as error:
+        technicals["data_blockers"].append(f"NIFTY futures participation unavailable: {error}")
+    technicals["nifty_breadth"] = trade_bot.get_nifty_breadth(
+        trade_bot.INSTRUMENT_CACHE, trade_bot.upstox_request
+    )
+    base = market_candidate(recommendation, technicals, current)
+    return select_complete_contract(base, recommendation, trade_bot.now_ist())
 
 
 def live_entry_block_reason() -> str:
@@ -490,12 +712,7 @@ def scan() -> dict:
         entry_block = live_entry_block_reason()
 
         try:
-            candidate = trade_bot.evaluate_symbol_buy_or_sell(
-                SYMBOL,
-                allow_option_sell=False,
-                include_rejected=True,
-                paper_observation=True,
-            )
+            candidate, decision = collect_candidate(current)
         except Exception as error:
             decision = {"allowed": False, "blockers": [f"market scan unavailable: {error}"]}
             record_scan(slot, "ERROR", decision)
@@ -506,7 +723,8 @@ def scan() -> dict:
             log("no complete NIFTY CE/PE candidate was available")
             return {"action": "NO_CANDIDATE", "scan_slot": slot}
 
-        decision = evaluate_candidate(candidate, current=current)
+        entry_block = entry_block or trade_bot.reentry_block_reason(SYMBOL, candidate["direction"])
+
         if not decision["allowed"]:
             record_scan(slot, "REJECT", decision, candidate)
             log(
@@ -532,10 +750,13 @@ def scan() -> dict:
             f"{decision['option_direction']} selected score={decision['score']:+.1f} "
             f"underlying={plan['entry']:.2f} target={plan['target']:.2f} "
             f"stop={plan['stop']:.2f} rr={plan['reward_risk']:.2f} "
-            f"contract={(prepared.get('instrument') or {}).get('trading_symbol')} MAX"
+            f"contract={(prepared.get('instrument') or {}).get('trading_symbol')} "
+            f"tier={decision['option_quality'].get('contract_role')} MAX"
         )
         placed = trade_bot.execute_selected_candidate(prepared)
         action = "LIVE_ENTRY" if placed else "EXECUTION_REJECT"
+        if not placed:
+            decision["blockers"] = [prepared.get("execution_rejection_reason") or "execution declined; see sizing/broker log"]
         record_scan(slot, action, decision, prepared)
         return {"action": action, "scan_slot": slot, **decision}
 

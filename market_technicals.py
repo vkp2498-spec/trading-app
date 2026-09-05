@@ -611,6 +611,10 @@ def analyze_latest(df, timeframe):
         "upper_band": round(upper, 2),
         "lower_band": round(lower, 2),
         "target": target,
+        "target_is_fallback": bool(
+            (bias == "BULLISH" and not bullish_targets)
+            or (bias == "BEARISH" and not bearish_targets)
+        ),
         "stop_loss": stop_loss,
         "reasons": reasons,
         "prev_close": round(prev_close, 2),
