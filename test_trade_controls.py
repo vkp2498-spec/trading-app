@@ -347,10 +347,11 @@ class TradeControlTests(unittest.TestCase):
                 {"strike": 24350, "expiry": "2026-08-11"},
             ],
         }
-        self.assertEqual(
-            trade_bot.index_contract_rows(recommendation, "BULLISH"),
-            [atm],
-        )
+        with patch.object(trade_bot, "trading_engine", return_value="VAMSI"):
+            self.assertEqual(
+                trade_bot.index_contract_rows(recommendation, "BULLISH"),
+                [atm],
+            )
 
     def test_v1_nifty_contract_ladder_uses_next_atm_then_next_itm(self):
         recommendation = {
