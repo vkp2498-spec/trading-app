@@ -197,7 +197,9 @@ def underlying_trade_plan(candidate: dict) -> dict:
     fifteen = technicals.get("fifteen_min") or {}
     entry = number(five.get("close"))
     atr = number(five.get("atr14"))
-    if direction not in {"BULLISH", "BEARISH"} or entry <= 0 or atr <= 0:
+    if direction not in {"BULLISH", "BEARISH"}:
+        return {"allowed": False, "reason": "no directional target/stop plan for a neutral signal"}
+    if entry <= 0 or atr <= 0:
         return {"allowed": False, "reason": "underlying close or 5M ATR is unavailable"}
 
     if direction == "BULLISH":

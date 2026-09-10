@@ -48,8 +48,12 @@ def record_closed_trade(state, exit_price, exit_reason):
         else exit_price - entry_price
     )
     gross_pnl = round(pnl_per_unit * qty, 2)
-    highest_ltp = float(state.get("highest_ltp") or entry_price)
-    lowest_ltp = float(state.get("lowest_ltp") or entry_price)
+    # The actual entry/exit fills are observations too, even if a broker stop
+    # filled between monitor polls. These remain observed, not tick-complete MFE/MAE.
+    highest_ltp = max(float(state.get("highest_ltp") or entry_price), entry_price, exit_price)
+    lowest_ltp = min(float(state.get("lowest_ltp") or entry_price), entry_price, exit_price)
+    if exit_reason == "STOP_LOSS" and gross_pnl > 0 and int(state.get("profit_protection_stage") or 0) > 0:
+        exit_reason = "TRAILING_STOP"
     if transaction_type == "SELL":
         favorable = max(entry_price - lowest_ltp, 0.0)
         adverse = max(highest_ltp - entry_price, 0.0)

@@ -3798,7 +3798,7 @@ def complete_exit(symbol, state, order_details, fallback_price, exit_reason, res
     send_apple_closed_trade_alert(journal_row)
     log(
         f"{symbol} bought {journal_row.get('entry_price')} closed {journal_row.get('exit_price')} "
-        f"pnl {journal_row.get('gross_pnl')} reason {exit_reason}"
+        f"pnl {journal_row.get('gross_pnl')} reason {journal_row.get('exit_reason')}"
     )
     clear_state(symbol)
     return journal_row
@@ -4861,6 +4861,7 @@ def apply_trailing_stop(symbol, state, ltp):
     current_ltp = to_float(ltp)
     if not entry or not current_ltp:
         return state
+    previous_extrema = (state.get("highest_ltp"), state.get("lowest_ltp"))
     is_short = str(state.get("entry_transaction_type") or "BUY").upper() == "SELL"
     if is_short:
         state["lowest_ltp"] = round(
@@ -4915,6 +4916,10 @@ def apply_trailing_stop(symbol, state, ltp):
                 f"favorable={favorable_r:.2f}R ltp={current_ltp} "
                 f"stop={state['stop_loss_price']}"
             )
+        elif previous_extrema != (state.get("highest_ltp"), state.get("lowest_ltp")):
+            # REST-only monitoring must retain excursions even when no profit
+            # lock fires and no stream ticks cause the caller to persist state.
+            write_state(symbol, state)
         return state
 
     settings = profit_protection_settings()

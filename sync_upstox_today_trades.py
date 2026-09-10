@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 from collections import defaultdict
 from datetime import datetime
@@ -16,7 +17,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-from safe_storage import file_lock
+from safe_storage import atomic_write_json, file_lock
 from trade_history_schema import COLUMNS
 
 
@@ -27,6 +28,7 @@ TRADE_HISTORY_FILE = DATA_DIR / "trade_history.csv"
 IST = ZoneInfo("Asia/Kolkata")
 UPSTOX_TRADE_PNL_URL = "https://api.upstox.com/v2/trade/profit-loss/data"
 SYNC_REASON = "UPSTOX_SYNC_ADJUSTMENT"
+SYNC_STATUS_FILE = DATA_DIR / "upstox_pnl_sync_status.json"
 
 def load_env() -> None:
     if not ENV_FILE.exists():
@@ -91,9 +93,14 @@ def fetch_upstox_rows(day: datetime) -> list[dict]:
     except ValueError as error:
         raise RuntimeError("Upstox returned invalid JSON") from error
 
+    if payload.get("status") != "success":
+        raise RuntimeError("Upstox did not confirm a successful P&L response")
     rows = payload.get("data", [])
     if not isinstance(rows, list):
         raise RuntimeError("Upstox returned an unexpected P&L response")
+    page_size = (payload.get("metadata") or {}).get("page", {}).get("page_size") or params["page_size"]
+    if len(rows) >= int(page_size):
+        raise RuntimeError("P&L response may be paginated; refusing to reconcile a partial report")
     return [row for row in rows if isinstance(row, dict)]
 
 
@@ -124,10 +131,17 @@ def fetch_upstox_rows_from_positions() -> list[dict]:
 
 
 def row_pnl(row: dict) -> float:
-    for key in ["pnl", "day_pnl", "unrealised", "unrealized_pnl", "profit_and_loss"]:
+    for key in ["pnl", "day_pnl", "profit_and_loss"]:
         if row.get(key) is not None:
-            return round(safe_float(row.get(key)), 2)
-    return round(safe_float(row.get("sell_amount")) - safe_float(row.get("buy_amount")), 2)
+            result = float(row[key])
+            break
+    else:
+        if row.get("sell_amount") is None or row.get("buy_amount") is None:
+            raise ValueError("Broker row has no realized P&L or buy/sell amounts")
+        result = float(row["sell_amount"]) - float(row["buy_amount"])
+    if not math.isfinite(result):
+        raise ValueError("Broker P&L is not finite")
+    return round(result, 2)
 
 
 def row_symbol(row: dict) -> str:
@@ -225,18 +239,36 @@ def adjustment_row(day: datetime, symbol: str, option: str, pnl: float) -> dict:
     }
 
 
+def sync_status(day, status, reason, dry_run=False):
+    print(f"Reconciliation {status}: {reason}")
+    if not dry_run:
+        atomic_write_json(SYNC_STATUS_FILE, {
+            "date": day.strftime("%Y-%m-%d"), "status": status,
+            "reason": reason, "updated_at": datetime.now(IST).isoformat(),
+        })
+
+
 def sync(day: datetime, dry_run: bool = False, show_rows: bool = False) -> None:
+    # Capture before the broker request. An exit arriving during that request
+    # must not be negated by an older broker snapshot.
+    trade_rows, fieldnames = read_trade_history()
     source = "profit-loss"
     try:
         upstox_rows = fetch_upstox_rows(day)
     except RuntimeError as error:
         if "403" not in str(error) and "1010" not in str(error):
+            sync_status(day, "PENDING", "Broker P&L request failed; history preserved", dry_run)
             raise
+        if day.date() != datetime.now(IST).date():
+            sync_status(day, "PENDING", "Historical P&L unavailable; today's positions cannot reconcile another date", dry_run)
+            return
         print(f"Profit-loss endpoint blocked; falling back to positions endpoint. Detail: {error}")
         upstox_rows = fetch_upstox_rows_from_positions()
         source = "positions"
-    trade_rows, fieldnames = read_trade_history()
     day_text = day.strftime("%Y-%m-%d")
+    if not upstox_rows:
+        sync_status(day, "PENDING", "Broker returned no rows; existing trade history preserved", dry_run)
+        return
 
     clean_rows = [
         row
@@ -245,14 +277,43 @@ def sync(day: datetime, dry_run: bool = False, show_rows: bool = False) -> None:
     ]
 
     logged = defaultdict(float)
+    logged_quantity = defaultdict(float)
     for row in clean_rows:
         if row.get("trade_date") != day_text:
             continue
+        if "PAPER" in str(row.get("strategy") or "").upper() or str(row.get("paper_trade") or "").lower() == "true":
+            continue
         logged[trade_key_from_log(row)] += safe_float(row.get("gross_pnl"))
+        logged_quantity[trade_key_from_log(row)] += abs(safe_float(row.get("quantity")))
 
     upstox = defaultdict(float)
-    for row in upstox_rows:
-        upstox[(row_symbol(row), row_option_type(row))] += row_pnl(row)
+    broker_quantity = defaultdict(float)
+    try:
+        for row in upstox_rows:
+            if source == "positions":
+                # Never reconcile unrealized/open position P&L into closed trades.
+                if row.get("quantity") is None or float(row["quantity"]) != 0:
+                    raise ValueError("Open or incomplete broker position; wait until closed")
+                realized = row.get("realised", row.get("realized"))
+                if realized is None:
+                    raise ValueError("Closed position has no realized P&L")
+                pnl = row_pnl({"pnl": realized})
+            else:
+                pnl = row_pnl(row)
+                quantity = float(row.get("quantity") or 0)
+                if not math.isfinite(quantity) or quantity <= 0:
+                    raise ValueError("Broker report has no valid closed trade quantity")
+                broker_quantity[(row_symbol(row), row_option_type(row))] += quantity
+            upstox[(row_symbol(row), row_option_type(row))] += pnl
+    except (TypeError, ValueError) as error:
+        sync_status(day, "PENDING", str(error), dry_run)
+        return
+    if set(logged) - set(upstox):
+        sync_status(day, "PENDING", "Broker response is missing logged trade groups; history preserved", dry_run)
+        return
+    if source == "profit-loss" and any(broker_quantity[key] < quantity for key, quantity in logged_quantity.items()):
+        sync_status(day, "PENDING", "Broker report does not yet cover all logged trade quantities", dry_run)
+        return
 
     adjustments = []
     for key in sorted(set(logged) | set(upstox)):
@@ -283,11 +344,15 @@ def sync(day: datetime, dry_run: bool = False, show_rows: bool = False) -> None:
         # Re-read while holding the lock so a monitor exit cannot be overwritten
         # by a concurrent reconciliation rewrite.
         current_rows, current_fields = read_trade_history()
+        if current_rows != trade_rows:
+            sync_status(day, "PENDING", "Trade history changed during broker request; retry with a fresh snapshot", dry_run)
+            return
         retained = [
             row for row in current_rows
             if not (row.get("trade_date") == day_text and row.get("exit_reason") == SYNC_REASON)
         ]
         write_trade_history(retained + adjustments, current_fields)
+    sync_status(day, "COMPLETE", f"Reconciled {len(upstox_rows)} broker rows", dry_run)
     print(f"Wrote {len(adjustments)} adjustment rows to {TRADE_HISTORY_FILE}")
     print(f"Backup: {backup}")
 
