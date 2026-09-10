@@ -683,6 +683,10 @@ def get_technical_analysis(symbol):
         "two_hour": analyze_latest(df_2h, "2H"),
         "fifteen_min": analyze_latest(df_15, "15M"),
         "five_min": analyze_latest(df_5, "5M"),
+        "recent_fifteen_min_candles": [
+            {"timestamp": stamp.isoformat(), **{k: float(row[k]) for k in ("open", "high", "low", "close")}}
+            for stamp, row in df_15.tail(8).iterrows()
+        ],
     }
 
 

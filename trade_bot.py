@@ -6665,6 +6665,12 @@ def _execute_selected_candidate_locked(chosen):
         if not live:
             log(f"{symbol} DRY RUN ONLY: would {transaction_type} configured quantity.")
             return True
+        if chosen.get("strategy") == "VAMSI_NIFTY_OPTION_BUY_V1":
+            import llm_trade_judge
+            if llm_trade_judge.enabled() and not llm_trade_judge.approval_valid(chosen):
+                chosen["execution_rejection_reason"] = "fresh matching LLM PASS is required before entry"
+                log(f"{symbol} {chosen['execution_rejection_reason']}")
+                return False
         result, payload = place_market_order(instrument, transaction_type, quantity)
         order_id = result.get("data", {}).get("order_id")
         if not order_id:

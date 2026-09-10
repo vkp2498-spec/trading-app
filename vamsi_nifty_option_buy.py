@@ -16,12 +16,14 @@ import csv
 import json
 import math
 import os
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import trade_bot
 import market_technicals
+import llm_trade_judge
 from institutional_flow import nearest_index_future
 from safe_storage import atomic_write_json, file_lock, locked_append_csv
 
@@ -697,6 +699,51 @@ def live_entry_block_reason() -> str:
     return trade_bot.daily_index_entry_block_reason(SYMBOL) or ""
 
 
+def judge_entry(candidate, decision):
+    """Veto-only judge outside the position monitor/entry lock; refresh after PASS."""
+    current = trade_bot.now_ist()
+    evidence = llm_trade_judge.snapshot(candidate, decision, current)
+    review = llm_trade_judge.review(evidence)
+    decision["llm_judge"] = review
+    locked_append_csv(DATA_DIR / "llm_judge.csv", ("time", "evidence", "review"), {
+        "time": current.isoformat(), "evidence": json.dumps(evidence), "review": json.dumps(review),
+    })
+    if review["verdict"] != "PASS":
+        return candidate, decision, f"LLM {review['verdict']}: {review['reason']}"
+    try:
+        # Never switch strikes/expiry after the model approves a specific contract.
+        summary = candidate["option_summary"]
+        atm, nearby, _ = trade_bot.fetch_upstox_option_chain(SYMBOL, nearby=5, expiry=summary["expiry"])
+        rows = nearby.to_dict("records") + atm.to_dict("records")
+        row = next(r for r in rows if number(r.get("strike")) == number(summary["strike"]))
+        row = trade_bot._contract_ladder_row(row, summary["contract_selection_role"], 0)
+        refreshed_at = trade_bot.now_ist()
+        if not entry_window_ok(refreshed_at) or time.time() - review["started_at_epoch"] > 40:
+            raise ValueError("entry window/review freshness expired")
+        refreshed = contract_candidate(candidate, row, refreshed_at)
+        if refreshed["instrument"]["instrument_key"] != candidate["instrument"]["instrument_key"]:
+            raise ValueError("approved instrument changed")
+        fresh_decision = evaluate_candidate(refreshed, refreshed_at)
+        if not fresh_decision["allowed"]:
+            return refreshed, {**fresh_decision, "llm_judge": review}, "post-judge safety check: " + "; ".join(fresh_decision["blockers"])
+        old_ask, new_ask = number(candidate["entry_price"]), number(refreshed["entry_price"])
+        spot = number(row.get("spot"))
+        plan = fresh_decision["plan"]
+        sign = 1 if candidate["direction"] == "BULLISH" else -1
+        reward, risk = sign * (plan["target"] - spot), sign * (spot - plan["stop"])
+        if (spot <= 0 or old_ask <= 0 or abs(new_ask / old_ask - 1) > 0.02
+                or abs(spot - plan["entry"]) > 0.25 * plan["atr"]
+                or risk <= 0 or reward / risk < configured_float("NIFTY_OPTION_BUY_MIN_REWARD_RISK", 1.5)):
+            raise ValueError("price moved materially or reward/risk no longer qualifies")
+        # Keep approved absolute underlying target/stop, rebase distances to the
+        # refreshed underlying entry instead of using the pre-review candle close.
+        plan.update(entry=spot, target_points=round(reward, 2), stop_points=round(risk, 2), reward_risk=round(reward / risk, 3))
+        fresh_decision["llm_judge"] = review
+        return refreshed, fresh_decision, ""
+    except Exception:
+        return candidate, decision, "post-judge quote refresh/freshness check failed; entry skipped"
+
+
 def scan() -> dict:
     trade_bot.load_env()
     if trade_bot.trading_engine() != ENGINE:
@@ -753,7 +800,16 @@ def scan() -> dict:
                 **observed,
             }
 
+        if llm_trade_judge.enabled():
+            candidate, decision, judge_block = judge_entry(candidate, decision)
+            if judge_block:
+                decision.update(allowed=False, blockers=[judge_block])
+                record_scan(slot, "LLM_REJECT", decision, candidate)
+                log(judge_block)
+                return {"action": "LLM_REJECT", "scan_slot": slot, **decision}
         prepared = prepare_candidate(candidate, decision)
+        if llm_trade_judge.enabled():
+            prepared["llm_judge"] = {**decision["llm_judge"], "binding": llm_trade_judge.binding(prepared)}
         record_scan(slot, "ENTRY_SELECTED", decision, prepared)
         plan = decision["plan"]
         log(
