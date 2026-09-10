@@ -49,11 +49,15 @@ def snapshot(candidate, decision, current):
     # Explicit allowlists exclude credentials, account IDs, allocation and total score.
     return {
         "as_of": current.isoformat(), "symbol": "NIFTY", "direction": candidate["direction"],
+        "units": {"candles_and_plan": "NIFTY underlying index points, not option premium",
+                  "option_bid_ask": "option premium rupees per unit",
+                  "breadth_coverage": "number of constituents observed out of 50, not percent",
+                  "breadth_score": "signed breadth indicator from -100 to 100, not probability"},
         "five_minute": selected(t.get("five_min") or {}, candle_fields),
         "fifteen_minute": selected(t.get("fifteen_min") or {}, candle_fields),
         "recent_fifteen_minute_candles": [selected(r, "timestamp open high low close") for r in t.get("recent_fifteen_min_candles", [])[-8:]],
         "structure": selected(t.get("entry_structure") or {}, "type reference"),
-        "breadth": selected(t.get("nifty_breadth") or {}, "bias score coverage"),
+        "breadth": selected(t.get("nifty_breadth") or {}, "bias score coverage advances declines"),
         "participation": selected(t.get("participation") or {}, "futures_volume futures_vwap volume_ratio basis spot_equivalent_vwap candle_time"),
         "chain": selected(summary, "chain_bias chain_confidence option_type expiry strike"),
         "option": selected(decision.get("option_quality") or {}, "contract_role bid_price ask_price bid_qty ask_qty delta iv spread_percent depth_ratio"),
