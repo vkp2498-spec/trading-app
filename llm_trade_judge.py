@@ -19,15 +19,16 @@ news, probabilities, missing candles, levels or option Greeks. PASS means no
 material concern found, not a promise of profit. VETO requires a specific
 material concern. ABSTAIN when evidence is insufficient or ambiguous. Do not
 reject solely because no news or unavailable nonessential Greek was supplied.
-Return one verdict and a concise reason with exact dotted field names from the
-input supporting it. Never change direction, contract, size, target or stop.
+Return one verdict, a concise reason of at most 600 characters, and 1 to 8 exact
+dotted field names from the input supporting it. Never change direction,
+contract, size, target or stop.
 """
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
         "verdict": {"type": "string", "enum": ["PASS", "VETO", "ABSTAIN"]},
-        "reason": {"type": "string"},
-        "evidence_fields": {"type": "array", "items": {"type": "string"}},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 600},
+        "evidence_fields": {"type": "array", "minItems": 1, "maxItems": 8, "items": {"type": "string"}},
     },
     "required": ["verdict", "reason", "evidence_fields"],
 }
