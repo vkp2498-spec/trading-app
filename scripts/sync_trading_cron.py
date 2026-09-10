@@ -70,14 +70,16 @@ def nifty_option_buy_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# Selective NIFTY option buyer: scan after each completed 5M candle.",
-        f"1-56/5 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        "# UTC: completed 15M scans at 09:31, 09:46, ... 14:46 IST (22 per day).",
+        f"1,16,31,46 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        f"1,16 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
         "# One monitor owns the broker stop, target, time stop, reversal exit and trailing.",
         f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
         f"* 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
-        "# Close any remaining bot position at 15:00 IST.",
-        f"30 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_squareoff.lock {python} {root}/trade_bot.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
-        f"35 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/upstox_trade_sync.lock {python} {root}/sync_upstox_today_trades.py >> {log_dir}/upstox_trade_sync.log 2>&1",
+        f"* 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
+        "# Close any remaining bot position at 15:25 IST; reconcile at 15:30 IST.",
+        f"55 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_squareoff.lock {python} {root}/trade_bot.py --squareoff >> {log_dir}/trade_bot.log 2>&1",
+        f"0 10 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/upstox_trade_sync.lock {python} {root}/sync_upstox_today_trades.py >> {log_dir}/upstox_trade_sync.log 2>&1",
         BLOCK_END,
     ]
 

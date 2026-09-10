@@ -17,7 +17,7 @@ import json
 import math
 import os
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import trade_bot
@@ -81,9 +81,10 @@ def opposite(direction: str) -> str:
 
 
 def completed_scan_slot(current=None) -> str:
-    current = current or trade_bot.now_ist()
+    # Allow one minute for the broker to publish the completed 15M candle.
+    current = (current or trade_bot.now_ist()) - timedelta(minutes=1)
     boundary = current.replace(
-        minute=current.minute - current.minute % 5,
+        minute=current.minute - current.minute % 15,
         second=0,
         microsecond=0,
     )
@@ -92,9 +93,15 @@ def completed_scan_slot(current=None) -> str:
 
 def entry_window_ok(current=None) -> bool:
     current = current or trade_bot.now_ist()
-    first = trade_bot.configured_clock("NIFTY_OPTION_BUY_FIRST_ENTRY_TIME", "09:30")
-    last = trade_bot.configured_clock("NIFTY_OPTION_BUY_LAST_ENTRY_TIME", "14:30")
-    return first <= current.time() <= last
+    first = trade_bot.configured_clock("NIFTY_OPTION_BUY_FIRST_ENTRY_TIME", "09:31")
+    last = trade_bot.configured_clock("NIFTY_OPTION_BUY_LAST_ENTRY_TIME", "14:46")
+    # The entire final scheduled minute is valid, not only 14:46:00 exactly.
+    return current.weekday() < 5 and first <= current.time().replace(second=0, microsecond=0) <= last
+
+
+def scan_due(current=None) -> bool:
+    current = current or trade_bot.now_ist()
+    return entry_window_ok(current) and current.minute % 15 == 1
 
 
 def _aligned(value, direction: str) -> bool:
@@ -693,8 +700,9 @@ def scan() -> dict:
     if trade_bot.trading_engine() != ENGINE:
         raise RuntimeError(f"TRADING_ENGINE must be {ENGINE}")
     current = trade_bot.now_ist()
-    if not entry_window_ok(current):
-        raise RuntimeError("Outside NIFTY option-buying entry window")
+    if not scan_due(current):
+        log("scan skipped: scheduled 15M scans only, one minute after candle close")
+        return {"action": "OUTSIDE_SCAN_SCHEDULE"}
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     slot = completed_scan_slot(current)

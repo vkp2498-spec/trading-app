@@ -67,7 +67,7 @@ class SyncTradingCronTests(unittest.TestCase):
         self.assertNotIn("vamsi_kb_intraday.py", updated)
         self.assertNotIn("trade_bot.py --monitor", updated)
 
-    def test_nifty_option_buy_schedule_scans_completed_candles_and_exits_at_1500(self):
+    def test_nifty_option_buy_schedule_scans_15m_and_exits_at_1525(self):
         updated = normalized_crontab(
             "0 2 * * 1-5 /usr/local/bin/token-request",
             Path("/home/ubuntu/trading-app"),
@@ -75,10 +75,18 @@ class SyncTradingCronTests(unittest.TestCase):
         )
 
         self.assertIn("vamsi_nifty_option_buy.py --scan", updated)
-        self.assertIn("1-56/5 4-8 * * 1-5", updated)
+        self.assertIn("1,16,31,46 4-8 * * 1-5", updated)
+        self.assertIn("1,16 9 * * 1-5", updated)
+        self.assertNotIn("1-56/5", updated)
         self.assertIn("trade_bot.py --monitor", updated)
-        self.assertIn("30 9 * * 1-5", updated)
+        self.assertIn("* 9 * * 1-5", updated)
+        self.assertIn("55 9 * * 1-5", updated)
+        self.assertNotIn("30 9 * * 1-5", updated)
         self.assertIn("trade_bot.py --squareoff", updated)
+        self.assertIn("0 10 * * 1-5", updated)
+        self.assertIn("sync_upstox_today_trades.py", updated)
+        self.assertIn("/usr/local/bin/token-request", updated)
+        self.assertEqual(updated, normalized_crontab(updated, Path("/home/ubuntu/trading-app"), mode="nifty-option-buy"))
         self.assertNotIn("vamsi_opening_pulse.py", updated)
         self.assertNotIn("vamsi_kb_intraday.py", updated)
 

@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -75,6 +75,38 @@ def candidate(direction="BULLISH", *, target=120.0, volume_ratio=1.6):
 
 
 class NiftyOptionBuyTests(unittest.TestCase):
+    def test_scan_schedule_has_exactly_22_completed_15m_slots(self):
+        start = datetime(2026, 9, 10, tzinfo=ZoneInfo("Asia/Kolkata"))
+        with patch.dict(strategy.os.environ, {}, clear=True):
+            times = [start + timedelta(minutes=i) for i in range(24 * 60)]
+            due = [value for value in times if strategy.scan_due(value)]
+        self.assertEqual(len(due), 22)
+        self.assertEqual(due[0].strftime("%H:%M"), "09:31")
+        self.assertEqual(due[-1].strftime("%H:%M"), "14:46")
+        self.assertTrue(all(b - a == timedelta(minutes=15) for a, b in zip(due, due[1:])))
+        self.assertEqual(strategy.completed_scan_slot(due[0]), "2026-09-10T09:30:00+05:30")
+        self.assertEqual(strategy.completed_scan_slot(due[-1]), "2026-09-10T14:45:00+05:30")
+
+    def test_last_scan_minute_and_candle_publication_delay(self):
+        last = datetime(2026, 9, 10, 14, 46, 59, tzinfo=ZoneInfo("Asia/Kolkata"))
+        with patch.dict(strategy.os.environ, {}, clear=True):
+            self.assertTrue(strategy.scan_due(last))
+            self.assertFalse(strategy.scan_due(last + timedelta(seconds=1)))
+            self.assertFalse(strategy.scan_due(last.replace(minute=45)))
+            self.assertFalse(strategy.scan_due(last.replace(day=12)))
+        self.assertEqual(strategy.completed_scan_slot(last.replace(minute=45)), "2026-09-10T14:30:00+05:30")
+
+    def test_off_schedule_invocation_never_collects_or_executes(self):
+        current = datetime(2026, 9, 10, 10, 6, tzinfo=ZoneInfo("Asia/Kolkata"))
+        with patch.object(strategy.trade_bot, "load_env"), patch.object(
+            strategy.trade_bot, "trading_engine", return_value=strategy.ENGINE
+        ), patch.object(strategy.trade_bot, "now_ist", return_value=current), patch.object(
+            strategy, "collect_candidate"
+        ) as collect, patch.object(strategy.trade_bot, "execute_selected_candidate") as execute, patch.object(strategy, "log"):
+            self.assertEqual(strategy.scan()["action"], "OUTSIDE_SCAN_SCHEDULE")
+        collect.assert_not_called()
+        execute.assert_not_called()
+
     def test_engine_is_accepted_by_central_runtime_validator(self):
         with patch.dict(
             strategy.trade_bot.os.environ,

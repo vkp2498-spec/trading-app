@@ -2215,7 +2215,7 @@ def build_nifty_option_buy_summary() -> dict:
     status = str(state.get("status") or scan.get("action") or "").upper()
     if not status:
         minute = now.hour * 60 + now.minute
-        status = "SCHEDULED" if minute < 9 * 60 + 30 else "NO SCAN"
+        status = "SCHEDULED" if minute < 9 * 60 + 31 else "NO SCAN"
     direction = str(state.get("direction") or scan.get("direction") or "").upper()
     score = safe_float(
         state.get("weighted_score"),
@@ -2255,8 +2255,8 @@ def build_nifty_option_buy_summary() -> dict:
     return {
         "engine": NIFTY_OPTION_BUY_ENGINE,
         "symbol": "NIFTY",
-        "entryTime": "09:30–14:30 IST",
-        "squareoffTime": "15:00 IST",
+        "entryTime": "09:31–14:46 IST (every 15 minutes)",
+        "squareoffTime": "15:25 IST",
         "tradeDate": today,
         "status": status,
         "hasDecision": bool(direction),
