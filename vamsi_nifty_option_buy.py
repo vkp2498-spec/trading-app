@@ -83,8 +83,7 @@ def opposite(direction: str) -> str:
 
 
 def completed_scan_slot(current=None) -> str:
-    # Allow one minute for the broker to publish the completed 15M candle.
-    current = (current or trade_bot.now_ist()) - timedelta(minutes=1)
+    current = current or trade_bot.now_ist()
     boundary = current.replace(
         minute=current.minute - current.minute % 15,
         second=0,
@@ -95,15 +94,27 @@ def completed_scan_slot(current=None) -> str:
 
 def entry_window_ok(current=None) -> bool:
     current = current or trade_bot.now_ist()
-    first = trade_bot.configured_clock("NIFTY_OPTION_BUY_FIRST_ENTRY_TIME", "09:31")
-    last = trade_bot.configured_clock("NIFTY_OPTION_BUY_LAST_ENTRY_TIME", "14:46")
-    # The entire final scheduled minute is valid, not only 14:46:00 exactly.
+    first = trade_bot.configured_clock("NIFTY_OPTION_BUY_FIRST_ENTRY_TIME", "09:15")
+    last = trade_bot.configured_clock("NIFTY_OPTION_BUY_LAST_ENTRY_TIME", "14:45")
+    # The entire final scheduled minute is valid, not only 14:45:00 exactly.
     return current.weekday() < 5 and first <= current.time().replace(second=0, microsecond=0) <= last
 
 
 def scan_due(current=None) -> bool:
     current = current or trade_bot.now_ist()
-    return entry_window_ok(current) and current.minute % 15 == 1
+    return entry_window_ok(current) and current.minute % 15 == 0
+
+
+def wait_for_candle_publication(current):
+    """Keep scans on quarter hours while allowing completed candles to publish."""
+    if not scan_due(current):
+        return
+    grace = configured_float("COMPLETED_CANDLE_GRACE_SECONDS", 8)
+    if not 0 <= grace <= 30:
+        raise RuntimeError("COMPLETED_CANDLE_GRACE_SECONDS must be between 0 and 30")
+    delay = max(grace + 2 - current.second - current.microsecond / 1_000_000, 0)
+    if delay:
+        time.sleep(delay)
 
 
 def _aligned(value, direction: str) -> bool:
@@ -750,7 +761,7 @@ def scan() -> dict:
         raise RuntimeError(f"TRADING_ENGINE must be {ENGINE}")
     current = trade_bot.now_ist()
     if not scan_due(current):
-        log("scan skipped: scheduled 15M scans only, one minute after candle close")
+        log("scan skipped: quarter-hour scans only, 09:15 through 14:45 IST")
         return {"action": "OUTSIDE_SCAN_SCHEDULE"}
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -765,6 +776,14 @@ def scan() -> dict:
             {"date": current.date().isoformat(), "slot": slot, "claimed_at": current.isoformat()},
             sort_keys=True,
         )
+
+        if (current.hour, current.minute) == (9, 15):
+            decision = {"allowed": False, "blockers": [
+                "waiting for today's first completed 15M candle; first entry assessment at 09:30"
+            ]}
+            record_scan(slot, "WAITING_FOR_CANDLE", decision)
+            log(decision["blockers"][0])
+            return {"action": "WAITING_FOR_CANDLE", "scan_slot": slot, **decision}
 
         entry_block = live_entry_block_reason()
 
@@ -833,6 +852,8 @@ def main() -> None:
     args = parser.parse_args()
     if not args.scan:
         parser.error("choose --scan")
+    trade_bot.load_env()
+    wait_for_candle_publication(trade_bot.now_ist())
     scan()
 
 

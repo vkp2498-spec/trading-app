@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -75,26 +77,56 @@ def candidate(direction="BULLISH", *, target=120.0, volume_ratio=1.6):
 
 
 class NiftyOptionBuyTests(unittest.TestCase):
-    def test_scan_schedule_has_exactly_22_completed_15m_slots(self):
+    def test_scan_schedule_has_23_quarter_hour_slots(self):
         start = datetime(2026, 9, 10, tzinfo=ZoneInfo("Asia/Kolkata"))
         with patch.dict(strategy.os.environ, {}, clear=True):
             times = [start + timedelta(minutes=i) for i in range(24 * 60)]
             due = [value for value in times if strategy.scan_due(value)]
-        self.assertEqual(len(due), 22)
-        self.assertEqual(due[0].strftime("%H:%M"), "09:31")
-        self.assertEqual(due[-1].strftime("%H:%M"), "14:46")
+        self.assertEqual(len(due), 23)
+        self.assertEqual(due[0].strftime("%H:%M"), "09:15")
+        self.assertEqual(due[1].strftime("%H:%M"), "09:30")
+        self.assertEqual(due[-1].strftime("%H:%M"), "14:45")
         self.assertTrue(all(b - a == timedelta(minutes=15) for a, b in zip(due, due[1:])))
-        self.assertEqual(strategy.completed_scan_slot(due[0]), "2026-09-10T09:30:00+05:30")
+        self.assertEqual(strategy.completed_scan_slot(due[0]), "2026-09-10T09:15:00+05:30")
         self.assertEqual(strategy.completed_scan_slot(due[-1]), "2026-09-10T14:45:00+05:30")
 
     def test_last_scan_minute_and_candle_publication_delay(self):
-        last = datetime(2026, 9, 10, 14, 46, 59, tzinfo=ZoneInfo("Asia/Kolkata"))
+        last = datetime(2026, 9, 10, 14, 45, 59, tzinfo=ZoneInfo("Asia/Kolkata"))
         with patch.dict(strategy.os.environ, {}, clear=True):
             self.assertTrue(strategy.scan_due(last))
             self.assertFalse(strategy.scan_due(last + timedelta(seconds=1)))
-            self.assertFalse(strategy.scan_due(last.replace(minute=45)))
+            self.assertFalse(strategy.scan_due(last.replace(minute=46)))
             self.assertFalse(strategy.scan_due(last.replace(day=12)))
-        self.assertEqual(strategy.completed_scan_slot(last.replace(minute=45)), "2026-09-10T14:30:00+05:30")
+        self.assertEqual(strategy.completed_scan_slot(last), "2026-09-10T14:45:00+05:30")
+
+    def test_publication_wait_is_bounded_and_only_on_schedule(self):
+        current = datetime(2026, 9, 10, 9, 30, 2, tzinfo=ZoneInfo("Asia/Kolkata"))
+        with patch.dict(strategy.os.environ, {}, clear=True), patch.object(strategy.time, "sleep") as sleep:
+            strategy.wait_for_candle_publication(current)
+            sleep.assert_called_once_with(8)
+            sleep.reset_mock()
+            strategy.wait_for_candle_publication(current.replace(second=20))
+            strategy.wait_for_candle_publication(current.replace(minute=31))
+            sleep.assert_not_called()
+
+    def test_opening_scan_records_wait_and_never_places_order(self):
+        current = datetime(2026, 9, 10, 9, 15, 10, tzinfo=ZoneInfo("Asia/Kolkata"))
+        with tempfile.TemporaryDirectory() as folder, patch.dict(strategy.os.environ, {}, clear=True), patch.object(
+            strategy, "DATA_DIR", Path(folder)
+        ), patch.object(strategy, "SCAN_STATE_FILE", Path(folder) / "state.json"), patch.object(
+            strategy, "SCAN_LOCK_FILE", Path(folder) / "lock"
+        ), patch.object(strategy.trade_bot, "load_env"), patch.object(
+            strategy.trade_bot, "trading_engine", return_value=strategy.ENGINE
+        ), patch.object(strategy.trade_bot, "now_ist", return_value=current), patch.object(
+            strategy, "record_scan"
+        ) as record, patch.object(strategy, "collect_candidate") as collect, patch.object(
+            strategy.trade_bot, "execute_selected_candidate"
+        ) as execute, patch.object(strategy, "log"):
+            self.assertEqual(strategy.scan()["action"], "WAITING_FOR_CANDLE")
+            self.assertEqual(strategy.scan()["action"], "DUPLICATE")
+        record.assert_called_once()
+        collect.assert_not_called()
+        execute.assert_not_called()
 
     def test_off_schedule_invocation_never_collects_or_executes(self):
         current = datetime(2026, 9, 10, 10, 6, tzinfo=ZoneInfo("Asia/Kolkata"))

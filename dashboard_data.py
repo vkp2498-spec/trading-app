@@ -2255,7 +2255,7 @@ def build_nifty_option_buy_summary() -> dict:
     return {
         "engine": NIFTY_OPTION_BUY_ENGINE,
         "symbol": "NIFTY",
-        "entryTime": "09:31–14:46 IST (every 15 minutes)",
+        "entryTime": "09:15–14:45 IST (every 15 minutes; entries from 09:30)",
         "squareoffTime": "15:25 IST",
         "tradeDate": today,
         "status": status,
@@ -2307,7 +2307,7 @@ def build_nifty_option_buy_summary() -> dict:
         "result": result,
         "blockers": blockers,
         "message": (
-            "Waiting for the first completed 15-minute candle and 09:31 scan."
+            "09:15 opening scan; waiting for the first completed 15-minute candle at 09:30."
             if status in {"SCHEDULED", "NO SCAN"}
             else "; ".join(blockers[:3]) if blockers
             else None

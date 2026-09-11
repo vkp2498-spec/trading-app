@@ -10,7 +10,7 @@ import vamsi_nifty_option_buy as strategy
 from test_vamsi_nifty_option_buy import candidate
 
 
-NOW = datetime(2026, 9, 8, 10, 1, tzinfo=ZoneInfo('Asia/Kolkata'))
+NOW = datetime(2026, 9, 8, 10, 0, 10, tzinfo=ZoneInfo('Asia/Kolkata'))
 
 
 def row(role='NEXT_EXPIRY_ATM', delta=.50, spread=1.0, direction='BULLISH'):

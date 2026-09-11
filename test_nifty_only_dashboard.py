@@ -15,7 +15,7 @@ class NiftyOnlyDashboardTests(unittest.TestCase):
             dashboard_data, "read_json_file", return_value={}
         ), patch.object(dashboard_data, "read_trade_history", return_value=[]):
             result = dashboard_data.build_nifty_option_buy_summary()
-        self.assertEqual(result["entryTime"], "09:31–14:46 IST (every 15 minutes)")
+        self.assertEqual(result["entryTime"], "09:15–14:45 IST (every 15 minutes; entries from 09:30)")
         self.assertEqual(result["squareoffTime"], "15:25 IST")
 
     def test_ml_shadow_payload_keeps_rejected_forecast_evidence(self):

@@ -75,8 +75,9 @@ class SyncTradingCronTests(unittest.TestCase):
         )
 
         self.assertIn("vamsi_nifty_option_buy.py --scan", updated)
-        self.assertIn("1,16,31,46 4-8 * * 1-5", updated)
-        self.assertIn("1,16 9 * * 1-5", updated)
+        self.assertIn("45 3 * * 1-5", updated)
+        self.assertIn("0,15,30,45 4-8 * * 1-5", updated)
+        self.assertIn("0,15 9 * * 1-5", updated)
         self.assertNotIn("1-56/5", updated)
         self.assertIn("trade_bot.py --monitor", updated)
         self.assertIn("* 9 * * 1-5", updated)

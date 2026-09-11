@@ -70,9 +70,10 @@ def nifty_option_buy_block(app_dir: Path) -> list[str]:
     log_dir = f"{root}/logs"
     return [
         BLOCK_START,
-        "# UTC: completed 15M scans at 09:31, 09:46, ... 14:46 IST (22 per day).",
-        f"1,16,31,46 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
-        f"1,16 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        "# UTC: scans at 09:15, 09:30, ... 14:45 IST; 09:15 waits for the first candle.",
+        f"45 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        f"0,15,30,45 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
+        f"0,15 9 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/vamsi_nifty_option_buy.lock {python} {root}/vamsi_nifty_option_buy.py --scan >> {log_dir}/trade_bot.log 2>&1",
         "# One monitor owns the broker stop, target, time stop, reversal exit and trailing.",
         f"45-59 3 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",
         f"* 4-8 * * 1-5 cd {root} && /usr/bin/flock -n /tmp/trade_bot_monitor.lock {python} {root}/trade_bot.py --monitor >> {log_dir}/trade_bot.log 2>&1",

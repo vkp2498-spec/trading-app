@@ -1,13 +1,17 @@
 # NIFTY option-buyer schedule
 
-Effective 10 September 2026 for `VAMSI_NIFTY_OPTION_BUY_V1` on Vamsi AWS.
+Effective 11 September 2026 for `VAMSI_NIFTY_OPTION_BUY_V1` on Vamsi AWS.
 
-- Scan one minute after each completed 15-minute candle: 09:31, 09:46,
-  10:01, ... 14:31, 14:46 IST (22 weekday scan opportunities).
+- Scan at 09:15, 09:30, 09:45, ... 14:30, 14:45 IST (23 weekday slots).
+- The 09:15 scan records WAITING_FOR_CANDLE: no current-session 15-minute
+  candle exists yet. The first entry assessment is at 09:30. Never substitute
+  yesterday's candle or the forming opening candle for a completed one.
+- The CLI waits until the configured candle-publication grace plus two seconds
+  into each scan minute (normally ten seconds). Existing freshness gates remain.
 - Deduplicate by the completed 15-minute boundary; reject off-schedule scan
   invocations before collecting market data or submitting orders.
-- The inclusive env window is `NIFTY_OPTION_BUY_FIRST_ENTRY_TIME=09:31` and
-  `NIFTY_OPTION_BUY_LAST_ENTRY_TIME=14:46`. The whole final minute is valid.
+- The inclusive env window is `NIFTY_OPTION_BUY_FIRST_ENTRY_TIME=09:15` and
+  `NIFTY_OPTION_BUY_LAST_ENTRY_TIME=14:45`. The whole final minute is valid.
 - Keep the existing 15M trend / 5M structure scoring, contract selection,
   allocation and daily trade controls unchanged. Scan cadence is not a change
   to the strategy's indicator timeframes.
